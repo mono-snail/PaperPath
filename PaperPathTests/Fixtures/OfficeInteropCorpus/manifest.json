@@ -1,0 +1,62 @@
+{
+  "source": "Apache POI test-data",
+  "repository": "https://github.com/apache/poi",
+  "license": "Apache License 2.0; see apache-poi/LICENSE and NOTICE",
+  "downloaded": "2026-08-16",
+  "documents": [
+    {
+      "path": "apache-poi/VariousPictures.docx",
+      "feature": "Word document with multiple image formats",
+      "sha256": "c1eecbca7de9f99e21c677e1d5b045eaa1d5a442eff4c82f0cbe9af93726a070",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/document/VariousPictures.docx"
+    },
+    {
+      "path": "apache-poi/ComplexNumberedLists.docx",
+      "feature": "Word document with complex numbering",
+      "sha256": "297a085a7d433af2eeee7661e8db21539452cb585096484774a1e9f5f258b0b6",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/document/ComplexNumberedLists.docx"
+    },
+    {
+      "path": "apache-poi/HeaderFooterUnicode.docx",
+      "feature": "Word document with Unicode headers and footers",
+      "sha256": "ec439ac0643294e1e2961b381983304e044444f3a8f0dc465a98adf9ebee0e67",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/document/HeaderFooterUnicode.docx"
+    },
+    {
+      "path": "apache-poi/ConditionalFormattingSamples.xlsx",
+      "feature": "Excel workbook with conditional formatting",
+      "sha256": "8dfa997a642c00a1da8c0750c371f204553a98c537ca046028b052f9b424a074",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/spreadsheet/ConditionalFormattingSamples.xlsx"
+    },
+    {
+      "path": "apache-poi/ExcelPivotTableSample.xlsx",
+      "feature": "Excel workbook with a pivot table",
+      "sha256": "f0ef1d61c9f3d8b27b18a876b8e24676314c6450ed64a725a7bfaa603fdd67e3",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/spreadsheet/ExcelPivotTableSample.xlsx"
+    },
+    {
+      "path": "apache-poi/WithThreeCharts.xlsx",
+      "feature": "Excel workbook with three charts",
+      "sha256": "629b69bd250d9b4e173eb2088eb80b656b7748b0287cd7b0df0c2dc22c6af7b0",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/spreadsheet/WithThreeCharts.xlsx"
+    },
+    {
+      "path": "apache-poi/SmartArt.pptx",
+      "feature": "PowerPoint presentation with SmartArt",
+      "sha256": "b97e4c6d2ee1dd4094f50f9043820610268dd452d7717c537f5456636adcc353",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/slideshow/SmartArt.pptx"
+    },
+    {
+      "path": "apache-poi/themes.pptx",
+      "feature": "PowerPoint presentation with multiple themes",
+      "sha256": "3ea86e4ee84a8bca6b99fe3a9f2a9a9186c0655df28ff92a2d02da24926c64ba",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/slideshow/themes.pptx"
+    },
+    {
+      "path": "apache-poi/with_japanese.pptx",
+      "feature": "PowerPoint presentation with Japanese text",
+      "sha256": "f0b1efbfbd70f7ee2395dc2505639f99449971ba404a6ec8cf1b97d82cf45c10",
+      "source": "https://raw.githubusercontent.com/apache/poi/trunk/test-data/slideshow/with_japanese.pptx"
+    }
+  ]
+}
