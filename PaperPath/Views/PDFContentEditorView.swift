@@ -1,6 +1,194 @@
+import ImageIO
 import PDFKit
 import PhotosUI
 import SwiftUI
+
+private enum PDFPhotoPreparation {
+    static func preparedData(
+        from data: Data,
+        maximumPixelSize: Int,
+        jpegQuality: CGFloat
+    ) -> Data? {
+        guard !Task.isCancelled,
+              data.count <= 64 * 1_024 * 1_024,
+              (256...4_096).contains(maximumPixelSize),
+              let source = CGImageSourceCreateWithData(
+                data as CFData,
+                [
+                    kCGImageSourceShouldCache: false
+                ] as CFDictionary
+              )
+        else { return nil }
+        return preparedData(
+            from: source,
+            maximumPixelSize: maximumPixelSize,
+            jpegQuality: jpegQuality
+        )
+    }
+
+    static func preparedData(
+        from fileURL: URL,
+        maximumPixelSize: Int,
+        jpegQuality: CGFloat
+    ) -> Data? {
+        let values = try? fileURL.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard !Task.isCancelled,
+              values?.isRegularFile == true,
+              values?.isSymbolicLink != true,
+              let fileSize = values?.fileSize,
+              fileSize > 0,
+              Int64(fileSize)
+                <= ProtectedPhotoTransfer.maximumEncodedByteCount,
+              let source = CGImageSourceCreateWithURL(
+                fileURL as CFURL,
+                [
+                    kCGImageSourceShouldCache: false
+                ] as CFDictionary
+              )
+        else { return nil }
+        return preparedData(
+            from: source,
+            maximumPixelSize: maximumPixelSize,
+            jpegQuality: jpegQuality
+        )
+    }
+
+    private static func preparedData(
+        from source: CGImageSource,
+        maximumPixelSize: Int,
+        jpegQuality: CGFloat
+    ) -> Data? {
+        guard !Task.isCancelled,
+              (256...4_096).contains(maximumPixelSize),
+              CGImageSourceGetCount(source) == 1,
+              let sourceProperties =
+                CGImageSourceCopyPropertiesAtIndex(
+                    source,
+                    0,
+                    nil
+                ) as? [CFString: Any],
+              let sourceWidth = (
+                  sourceProperties[kCGImagePropertyPixelWidth]
+                    as? NSNumber
+              )?.int64Value,
+              let sourceHeight = (
+                  sourceProperties[kCGImagePropertyPixelHeight]
+                    as? NSNumber
+              )?.int64Value,
+              sourceWidth > 0,
+              sourceHeight > 0,
+              sourceWidth <= 100_000,
+              sourceHeight <= 100_000
+        else { return nil }
+        let sourcePixels = sourceWidth.multipliedReportingOverflow(
+            by: sourceHeight
+        )
+        guard !sourcePixels.overflow,
+              sourcePixels.partialValue <= 200_000_000
+        else { return nil }
+
+        var attemptedEdges: Set<Int> = []
+        let edges = [
+            maximumPixelSize,
+            max(256, Int(Double(maximumPixelSize) * 0.82)),
+            max(256, Int(Double(maximumPixelSize) * 0.68))
+        ]
+        for edge in edges where attemptedEdges.insert(edge).inserted {
+            guard !Task.isCancelled else { return nil }
+            let encoded: Data? = autoreleasepool {
+                let options: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: edge
+                ]
+                guard let cgImage =
+                        CGImageSourceCreateThumbnailAtIndex(
+                            source,
+                            0,
+                            options as CFDictionary
+                        )
+                else { return nil }
+                let preservesAlpha: Bool
+                switch cgImage.alphaInfo {
+                case .first, .last, .premultipliedFirst,
+                     .premultipliedLast, .alphaOnly:
+                    preservesAlpha = true
+                case .none, .noneSkipFirst, .noneSkipLast:
+                    preservesAlpha = false
+                @unknown default:
+                    preservesAlpha = false
+                }
+                let image = UIImage(cgImage: cgImage)
+                return preservesAlpha
+                    ? image.pngData()
+                    : image.jpegData(compressionQuality: jpegQuality)
+            }
+            guard !Task.isCancelled else { return nil }
+            if let encoded,
+               !encoded.isEmpty,
+               encoded.count <= 12 * 1_024 * 1_024 {
+                return encoded
+            }
+        }
+        return nil
+    }
+}
+
+private struct PDFWebAddressField: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    @Binding var address: String
+    let accessibilityIdentifier: String
+    let validationMessage: String?
+
+    var body: some View {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                )
+            )
+            : AnyLayout(
+                HStackLayout(
+                    alignment: .center,
+                    spacing: PPSpacing.xSmall
+                )
+            )
+
+        layout {
+            TextField("https://", text: $address)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+                .submitLabel(.done)
+                .frame(maxWidth: .infinity)
+                .accessibilityIdentifier(accessibilityIdentifier)
+                .accessibilityHint(validationMessage ?? "")
+                .onChange(of: address) { _, value in
+                    guard value.count > 4_096 else { return }
+                    address = String(value.prefix(4_096))
+                }
+
+            PasteButton(payloadType: String.self) { values in
+                guard let value = values.first else { return }
+                address = String(value.prefix(4_096))
+            }
+            .frame(minWidth: 44, minHeight: 44)
+            .accessibilityHint(
+                "Pastes a web address without storing it in PaperPath"
+            )
+        }
+    }
+}
 
 struct PDFContentEditorView: View {
     private enum ContentKind: String, CaseIterable, Identifiable {
@@ -11,7 +199,11 @@ struct PDFContentEditorView: View {
         var id: String { rawValue }
 
         var title: String {
-            rawValue.capitalized
+            switch self {
+            case .text: return "Text"
+            case .photo: return "Photo"
+            case .link: return "Link"
+            }
         }
 
         var symbol: String {
@@ -29,6 +221,14 @@ struct PDFContentEditorView: View {
         case red
 
         var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .black: return "Black"
+            case .blue: return "Blue"
+            case .red: return "Red"
+            }
+        }
 
         var value: Color {
             switch self {
@@ -62,6 +262,9 @@ struct PDFContentEditorView: View {
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let pageIndex: Int
@@ -77,6 +280,8 @@ struct PDFContentEditorView: View {
     @State private var photoData: Data?
     @State private var photoPreview: UIImage?
     @State private var pagePreview: UIImage?
+    @State private var previewErrorMessage: String?
+    @State private var isLoadingPagePreview = true
     @State private var pageAspectRatio: CGFloat = 612 / 792
     @State private var bounds = PDFNormalizedRect(
         x: 0.19,
@@ -86,8 +291,15 @@ struct PDFContentEditorView: View {
     )
     @State private var isLoadingPhoto = false
     @State private var isSaving = false
+    @State private var operationStopRequested = false
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var photoLoadTask: Task<Void, Never>?
     @State private var photoLoadGeneration = 0
+    @State private var pagePreviewGeneration = 0
+    @State private var pagePreviewReloadToken = UUID()
+    @State private var isConfirmingDiscard = false
+    @State private var sourceContentRevisionID: UUID?
     @GestureState private var translation = CGSize.zero
     @GestureState private var scale: CGFloat = 1
 
@@ -96,6 +308,16 @@ struct PDFContentEditorView: View {
             GeometryReader { proxy in
                 if model.url(for: recordID) != nil {
                     editorSurface(availableSize: proxy.size)
+                } else {
+                    PPEmptyState(
+                        kind: .workspace,
+                        title: "Working copy unavailable",
+                        message: "Close this editor and reopen the document from the library."
+                    )
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity
+                    )
                 }
             }
             .background(PPColor.canvas)
@@ -109,33 +331,74 @@ struct PDFContentEditorView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button((isSaving ? "Stop" : "Cancel").localizedUI) {
+                    Button(
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isSaving
+                                ? "Stop"
+                                : "Cancel"
+                        ).localizedUI
+                    ) {
                         if isSaving {
-                            operationTask?.cancel()
-                            operationTask = nil
-                            isSaving = false
+                            stopCreatingCopy()
                         } else {
-                            dismiss()
+                            requestDismissal()
                         }
                     }
+                    .disabled(operationStopRequested)
+                    .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create Copy") {
                         createCopy()
                     }
                     .disabled(!canCreate || isSaving)
+                    .keyboardShortcut(.defaultAction)
                 }
             }
-            .task {
-                guard let url = model.url(for: recordID) else { return }
+            .task(id: pagePreviewRequestID) {
+                pagePreviewGeneration += 1
+                let generation = pagePreviewGeneration
+                pagePreview = nil
+                previewErrorMessage = nil
+                isLoadingPagePreview = true
+                guard let requestedRevisionID =
+                        model.record(id: recordID)?
+                            .contentRevisionID,
+                      let url = model.url(for: recordID)
+                else {
+                    isLoadingPagePreview = false
+                    previewErrorMessage =
+                        "The private working copy could not be opened."
+                    return
+                }
+                if sourceContentRevisionID == nil {
+                    sourceContentRevisionID = requestedRevisionID
+                }
+                guard sourceContentRevisionID
+                        == requestedRevisionID
+                else { return }
                 let preview = await PDFEditorPreviewLoader.shared.preview(
                     url: url,
                     pageIndex: pageIndex,
                     revision: model.refreshToken(for: recordID)
                 )
-                guard !Task.isCancelled, let preview else { return }
+                guard !Task.isCancelled,
+                      generation == pagePreviewGeneration,
+                      model.record(id: recordID)?
+                        .contentRevisionID
+                        == requestedRevisionID
+                else { return }
+                guard let preview else {
+                    isLoadingPagePreview = false
+                    previewErrorMessage =
+                        "The page preview could not be loaded. Try again."
+                    return
+                }
                 pageAspectRatio = CGFloat(preview.aspectRatio)
                 pagePreview = preview.image
+                isLoadingPagePreview = false
             }
             .onChange(of: kind) { _, newKind in
                 bounds = defaultBounds(for: newKind)
@@ -144,34 +407,106 @@ struct PDFContentEditorView: View {
                 guard let item else { return }
                 loadPhoto(item)
             }
-            .interactiveDismissDisabled(isSaving)
-            .onDisappear {
-                operationTask?.cancel()
-                operationTask = nil
-                photoLoadGeneration += 1
+            .onChange(
+                of: model.record(id: recordID)?
+                    .contentRevisionID
+            ) { _, revisionID in
+                guard let sourceContentRevisionID,
+                      revisionID != sourceContentRevisionID
+                else { return }
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                interruptProtectedContentEditing()
+                dismiss()
             }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    if pagePreview == nil {
+                        pagePreviewReloadToken = UUID()
+                    }
+                    if photoPreview == nil,
+                       let photoData {
+                        photoPreview = UIImage(data: photoData)
+                    }
+                } else if phase == .background {
+                    interruptProtectedContentEditing()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptProtectedContentEditing()
+            }
+            .confirmationDialog(
+                "Discard content draft?".localizedUI,
+                isPresented: $isConfirmingDiscard,
+                titleVisibility: .visible
+            ) {
+                Button(
+                    "Discard Draft".localizedUI,
+                    role: .destructive
+                ) {
+                    dismiss()
+                }
+                Button("Keep Editing".localizedUI, role: .cancel) {}
+            } message: {
+                Text(
+                    "The text, link, or selected photo has not been added to a PDF copy."
+                        .localizedUI
+                )
+            }
+            .interactiveDismissDisabled(isSaving || hasDraftContent)
+            .accessibilityAction(.escape) {
+                if isSaving {
+                    stopCreatingCopy()
+                } else {
+                    requestDismissal()
+                }
+            }
+            .onDisappear {
+                stopCreatingCopy(invalidateResult: true)
+                photoLoadTask?.cancel()
+                photoLoadTask = nil
+                photoLoadGeneration += 1
+                pagePreviewGeneration += 1
+                pagePreview = nil
+                previewErrorMessage = nil
+                photoPreview = nil
+                photoData = nil
+                text = ""
+                linkTitle = ""
+                linkAddress = ""
+            }
+            .sensoryFeedback(.error, trigger: previewErrorMessage)
+            .sensoryFeedback(.selection, trigger: kind)
         }
     }
 
     private var precisionContextBar: some View {
-        HStack(spacing: PPSpacing.medium) {
-            Label(
-                "Page \(pageIndex + 1)",
-                systemImage: "doc.text"
-            )
-            Label(kind.title, systemImage: kind.symbol)
-            Label(
-                "\(Int(bounds.width * 100))×\(Int(bounds.height * 100))%",
-                systemImage: "arrow.up.left.and.arrow.down.right"
-            )
-            Spacer(minLength: 0)
-            OnDeviceBadge(compact: true)
+        ScrollView(.horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                Label(
+                    "Page \(pageIndex + 1)",
+                    systemImage: "doc.text"
+                )
+                Label(kind.title, systemImage: kind.symbol)
+                Label(
+                    "\(Int(bounds.width * 100))×\(Int(bounds.height * 100))%",
+                    systemImage: "arrow.up.left.and.arrow.down.right"
+                )
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, PPSpacing.regular)
         }
+        .scrollIndicators(.hidden)
         .font(.caption.weight(.semibold))
         .foregroundStyle(PPColor.textSecondary)
         .lineLimit(1)
-        .padding(.horizontal, PPSpacing.regular)
-        .frame(minHeight: 38)
+        .frame(minHeight: 44)
         .background(.bar)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -193,16 +528,58 @@ struct PDFContentEditorView: View {
                     Image(uiImage: pagePreview)
                         .resizable()
                         .scaledToFit()
+                    contentOverlay(pageSize: pageSize)
+                } else if isLoadingPagePreview {
+                    previewLoadingState
+                } else if let previewErrorMessage {
+                    contentPreviewFailure(previewErrorMessage)
                 } else {
-                    ProgressView()
+                    contentPreviewFailure(
+                        "The page preview stopped before it was ready. Try again."
+                            .localizedUI
+                    )
                 }
-
-                contentOverlay(pageSize: pageSize)
             }
             .frame(width: pageSize.width, height: pageSize.height)
             .clipped()
             .shadow(color: .black.opacity(0.12), radius: 14, y: 6)
         }
+    }
+
+    private var previewLoadingState: some View {
+        VStack(spacing: PPSpacing.small) {
+            ProgressView()
+            Text("Loading page preview".localizedUI)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func contentPreviewFailure(
+        _ message: String
+    ) -> some View {
+        VStack(spacing: PPSpacing.medium) {
+            Label(
+                message.localizedUI,
+                systemImage: "doc.questionmark"
+            )
+            .font(.subheadline.weight(.semibold))
+            .multilineTextAlignment(.center)
+            Button {
+                retryPagePreview()
+            } label: {
+                Label(
+                    "Load Preview Again",
+                    systemImage: "arrow.clockwise"
+                )
+            }
+            .buttonStyle(PPQuietButtonStyle())
+            .accessibilityIdentifier(
+                "retryContentEditorPreview"
+            )
+        }
+        .padding(PPSpacing.regular)
     }
 
     private func contentOverlay(pageSize: CGSize) -> some View {
@@ -253,6 +630,10 @@ struct PDFContentEditorView: View {
                 .offset(x: 7, y: 7)
                 .accessibilityHidden(true)
         }
+        .frame(
+            width: max(44, rect.width),
+            height: max(44, rect.height)
+        )
         .position(x: rect.midX, y: rect.midY)
         .contentShape(Rectangle())
         .gesture(
@@ -271,13 +652,26 @@ struct PDFContentEditorView: View {
                 }
                 .onEnded(resize(by:))
         )
-        .accessibilityLabel("\(kind.title) placement")
-        .accessibilityHint("Drag to move or pinch to resize")
+        .accessibilityLabel(
+            AppLocalization.format(
+                "%@ placement",
+                kind.title.localizedUI
+            )
+        )
+        .accessibilityHint(
+            "Drag to move or pinch to resize".localizedUI
+        )
     }
 
     private var controls: some View {
         VStack(spacing: PPSpacing.small) {
-            Picker("Content type", selection: $kind) {
+            if isSaving {
+                copyCommitStatus(
+                    isStopping: operationStopRequested
+                )
+            }
+
+            let picker = Picker("Content type", selection: $kind) {
                 ForEach(ContentKind.allCases) { item in
                     Label(
                         item.title.localizedUI,
@@ -286,7 +680,17 @@ struct PDFContentEditorView: View {
                         .tag(item)
                 }
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
 
             PrecisionPlacementRail(
                 bounds: $bounds,
@@ -305,7 +709,7 @@ struct PDFContentEditorView: View {
                 }
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+        .disabled(isSaving)
         .padding(PPSpacing.regular)
         .background(.bar)
         .overlay(alignment: .top) {
@@ -315,11 +719,61 @@ struct PDFContentEditorView: View {
         }
     }
 
+    private func copyCommitStatus(
+        isStopping: Bool
+    ) -> some View {
+        HStack(spacing: PPSpacing.small) {
+            ProgressView()
+                .controlSize(.small)
+            Text(
+                (
+                    isStopping
+                        ? "Finishing current file commit"
+                        : "Creating private copy"
+                ).localizedUI
+            )
+            .font(.caption.weight(.semibold))
+            Spacer(minLength: 0)
+            OnDeviceBadge(compact: true)
+        }
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
     private var textControls: some View {
         VStack(spacing: PPSpacing.small) {
             TextField("Text", text: $text, axis: .vertical)
                 .lineLimit(1...3)
                 .textFieldStyle(.roundedBorder)
+                .submitLabel(.done)
+                .disabled(isSaving)
+                .onChange(of: text) { _, value in
+                    guard value.count > 2_000 else { return }
+                    text = String(value.prefix(2_000))
+                }
+            HStack(spacing: PPSpacing.small) {
+                Text("\(text.count)/2000")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .accessibilityLabel("Text length")
+                    .accessibilityValue(
+                        AppLocalization.format(
+                            "%lld of %lld",
+                            text.count,
+                            2_000
+                        )
+                    )
+                Spacer(minLength: PPSpacing.small)
+                PasteButton(payloadType: String.self) { values in
+                    guard let value = values.first else { return }
+                    text = String(value.prefix(2_000))
+                }
+                .labelStyle(.iconOnly)
+                .frame(minWidth: 44, minHeight: 44)
+                .disabled(isSaving)
+                .accessibilityLabel("Paste content text".localizedUI)
+            }
 
             HStack(spacing: PPSpacing.medium) {
                 ForEach(TextColor.allCases) { color in
@@ -339,10 +793,19 @@ struct PDFContentEditorView: View {
                                     )
                                     .padding(-4)
                             }
-                            .frame(width: 38, height: 38)
+                            .frame(width: 44, height: 44)
+                            .contentShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("\(color.rawValue) text")
+                    .accessibilityLabel(
+                        AppLocalization.format(
+                            "%@ text",
+                            color.title.localizedUI
+                        )
+                    )
+                    .accessibilityAddTraits(
+                        textColor == color ? .isSelected : []
+                    )
                 }
 
                 Slider(value: $fontSize, in: 10...42) {
@@ -377,15 +840,32 @@ struct PDFContentEditorView: View {
         VStack(spacing: PPSpacing.small) {
             TextField("Link label", text: $linkTitle)
                 .textFieldStyle(.roundedBorder)
-            TextField("https://", text: $linkAddress)
-                .textFieldStyle(.roundedBorder)
-                .textInputAutocapitalization(.never)
-                .autocorrectionDisabled()
-                .keyboardType(.URL)
+                .submitLabel(.next)
+                .onChange(of: linkTitle) { _, value in
+                    guard value.count > 240 else { return }
+                    linkTitle = String(value.prefix(240))
+                }
+            PDFWebAddressField(
+                address: $linkAddress,
+                accessibilityIdentifier: "newLinkAddress",
+                validationMessage: linkValidationMessage
+            )
+            if let linkValidationMessage {
+                Label(
+                    linkValidationMessage,
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
     }
 
     private var canCreate: Bool {
+        guard pagePreview != nil,
+              previewErrorMessage == nil
+        else { return false }
         switch kind {
         case .text:
             return !text.trimmingCharacters(
@@ -400,6 +880,35 @@ struct PDFContentEditorView: View {
         }
     }
 
+    private var hasDraftContent: Bool {
+        !text.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).isEmpty
+            || photoItem != nil
+            || photoData != nil
+            || !linkTitle.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+            || !linkAddress.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            ).isEmpty
+    }
+
+    private func requestDismissal() {
+        if hasDraftContent {
+            isConfirmingDiscard = true
+        } else {
+            dismiss()
+        }
+    }
+
+    private func retryPagePreview() {
+        pagePreview = nil
+        previewErrorMessage = nil
+        isLoadingPagePreview = true
+        pagePreviewReloadToken = UUID()
+    }
+
     private var validatedURL: URL? {
         let trimmed = linkAddress.trimmingCharacters(
             in: .whitespacesAndNewlines
@@ -411,9 +920,24 @@ struct PDFContentEditorView: View {
         guard let url = URL(string: candidate),
               let scheme = url.scheme?.lowercased(),
               scheme == "https" || scheme == "http",
-              url.host?.isEmpty == false
+              let host = url.host,
+              !host.isEmpty,
+              host.utf8.count <= 253,
+              url.user == nil,
+              url.password == nil,
+              url.absoluteString.utf8.count <= 4_096
         else { return nil }
         return url
+    }
+
+    private var linkValidationMessage: String? {
+        let trimmed = linkAddress.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !trimmed.isEmpty, validatedURL == nil else {
+            return nil
+        }
+        return "Enter a valid HTTP or HTTPS address.".localizedUI
     }
 
     private var previewFontSize: CGFloat {
@@ -421,7 +945,11 @@ struct PDFContentEditorView: View {
     }
 
     private func createCopy() {
-        guard canCreate else { return }
+        guard canCreate,
+              let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID
+        else { return }
         let overlay: PDFContentOverlay
         switch kind {
         case .text:
@@ -453,37 +981,75 @@ struct PDFContentEditorView: View {
             )
         }
         isSaving = true
+        operationStopRequested = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
-            let created = await model.createEditedCopy(
-                recordID: recordID,
-                overlays: [overlay]
-            )
-            guard !Task.isCancelled else {
-                isSaving = false
-                operationTask = nil
-                return
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createEditedCopy(
+                    recordID: recordID,
+                    overlays: [overlay],
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
             }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
             isSaving = false
             operationTask = nil
+            operationStopRequested = false
+            guard !wasStopped else {
+                model[noticeFor: paperPathSceneID] = created == nil
+                    ? "Copy creation stopped".localizedUI
+                    : "Copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return
+            }
             guard let created else { return }
-            dismiss()
             onCreated(DocumentRoute(recordID: created.id))
         }
     }
 
     private func loadPhoto(_ item: PhotosPickerItem) {
+        photoLoadTask?.cancel()
         photoLoadGeneration += 1
         let generation = photoLoadGeneration
         isLoadingPhoto = true
-        Task {
-            guard let data = try? await item.loadTransferable(type: Data.self),
-                  let prepared = await Self.preparePhoto(data)
+        photoData = nil
+        photoPreview = nil
+        photoLoadTask = Task { @MainActor in
+            defer {
+                if generation == photoLoadGeneration {
+                    isLoadingPhoto = false
+                    photoLoadTask = nil
+                    photoItem = nil
+                }
+            }
+            guard let transfer = try? await item.loadTransferable(
+                type: ProtectedPhotoTransfer.self
+            )
             else {
                 guard generation == photoLoadGeneration else {
                     return
                 }
-                isLoadingPhoto = false
-                model.noticeMessage = "The selected photo could not be opened"
+                model[noticeFor: paperPathSceneID] = "The selected photo could not be opened"
+                    .localizedUI
+                return
+            }
+            defer { transfer.discard() }
+            guard transfer.byteCount <= 32 * 1_024 * 1_024,
+                  let prepared = await Self.preparePhoto(
+                    transfer.fileURL
+                  )
+            else {
+                guard generation == photoLoadGeneration else {
+                    return
+                }
+                model[noticeFor: paperPathSceneID] = "The selected photo could not be opened"
+                    .localizedUI
                 return
             }
             guard !Task.isCancelled,
@@ -491,30 +1057,76 @@ struct PDFContentEditorView: View {
             else { return }
             photoData = prepared
             photoPreview = UIImage(data: prepared)
-            isLoadingPhoto = false
         }
     }
 
-    private static func preparePhoto(_ data: Data) async -> Data? {
-        await Task.detached(priority: .userInitiated) {
-            guard let image = UIImage(data: data) else { return nil }
-            let longestEdge = max(image.size.width, image.size.height)
-            let scale = min(1, 1_800 / max(1, longestEdge))
-            let size = CGSize(
-                width: max(1, image.size.width * scale),
-                height: max(1, image.size.height * scale)
-            )
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 1
-            format.opaque = false
-            let normalized = UIGraphicsImageRenderer(
-                size: size,
-                format: format
-            ).image { _ in
-                image.draw(in: CGRect(origin: .zero, size: size))
+    private static func preparePhoto(_ fileURL: URL) async -> Data? {
+        let worker = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return autoreleasepool {
+                PDFPhotoPreparation.preparedData(
+                    from: fileURL,
+                    maximumPixelSize: 1_800,
+                    jpegQuality: 0.86
+                )
             }
-            return normalized.jpegData(compressionQuality: 0.86)
-        }.value
+        }
+        return try? await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private var pagePreviewRequestID: String {
+        [
+            recordID.uuidString,
+            String(pageIndex),
+            String(model.refreshToken(for: recordID)),
+            pagePreviewReloadToken.uuidString
+        ].joined(separator: "-")
+    }
+
+    private func interruptProtectedContentWork() {
+        pagePreviewGeneration += 1
+        photoLoadGeneration += 1
+        photoLoadTask?.cancel()
+        photoLoadTask = nil
+        isLoadingPhoto = false
+        photoItem = nil
+        stopCreatingCopy(invalidateResult: true)
+        pagePreview = nil
+        previewErrorMessage = nil
+        isLoadingPagePreview = false
+        photoPreview = nil
+        photoData = nil
+    }
+
+    private func interruptProtectedContentEditing() {
+        interruptProtectedContentWork()
+        text = ""
+        linkTitle = ""
+        linkAddress = ""
+        dismiss()
+    }
+
+    private func stopCreatingCopy(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isSaving = false
+            operationStopRequested = false
+        }
     }
 
     private func fittedPageSize(in availableSize: CGSize) -> CGSize {
@@ -614,6 +1226,12 @@ struct PDFContentEditorView: View {
 }
 
 struct PDFLinkEditorView: View {
+    private enum PendingDraftAction {
+        case dismiss
+        case selectLink(String)
+        case switchPage(Int)
+    }
+
     private enum TargetKind: String, CaseIterable, Identifiable {
         case web
         case page
@@ -637,6 +1255,9 @@ struct PDFLinkEditorView: View {
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let pageIndex: Int
@@ -663,7 +1284,14 @@ struct PDFLinkEditorView: View {
     @State private var isConfirmingRemoval = false
     @State private var selectionFeedback = 0
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var pageLoadTask: Task<Void, Never>?
     @State private var loadGeneration = 0
+    @State private var didLoadDocument = false
+    @State private var loadRequestToken = UUID()
+    @State private var pendingDraftAction: PendingDraftAction?
+    @State private var sourceContentRevisionID: UUID?
     @GestureState private var translation = CGSize.zero
     @GestureState private var scale: CGFloat = 1
 
@@ -691,26 +1319,47 @@ struct PDFLinkEditorView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button((isSaving ? "Stop" : "Cancel").localizedUI) {
+                    Button(
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isSaving
+                                ? "Stop"
+                                : "Cancel"
+                        ).localizedUI
+                    ) {
                         if isSaving {
-                            operationTask?.cancel()
-                            operationTask = nil
-                            isSaving = false
+                            stopSavingLinkCopy()
                         } else {
-                            dismiss()
+                            requestDraftAction(.dismiss)
                         }
                     }
+                    .disabled(operationStopRequested)
+                    .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create Copy") {
                         createUpdatedCopy()
                     }
                     .disabled(!canCreate || isSaving)
+                    .keyboardShortcut(.defaultAction)
                     .accessibilityIdentifier("createLinkEditedCopy")
                 }
             }
-            .task {
+            .task(id: loadRequestToken) {
                 await loadDocument()
+            }
+            .onChange(
+                of: model.record(id: recordID)?
+                    .contentRevisionID
+            ) { _, revisionID in
+                guard let sourceContentRevisionID,
+                      revisionID != sourceContentRevisionID
+                else { return }
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                interruptProtectedLinkEditing()
             }
             .onChange(of: selectedLinkID) { _, identifier in
                 guard let identifier,
@@ -726,6 +1375,21 @@ struct PDFLinkEditorView: View {
                     linkTitle = String(value.prefix(240))
                 }
             }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active, pagePreview == nil {
+                    resumeLinkPreview()
+                } else if phase == .background {
+                    interruptProtectedLinkEditing()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptProtectedLinkEditing()
+            }
             .confirmationDialog(
                 "Remove this link?",
                 isPresented: $isConfirmingRemoval,
@@ -738,12 +1402,55 @@ struct PDFLinkEditorView: View {
             } message: {
                 Text("The current PDF stays unchanged.")
             }
-            .interactiveDismissDisabled(isSaving)
+            .confirmationDialog(
+                "Discard link edits?".localizedUI,
+                isPresented: Binding(
+                    get: { pendingDraftAction != nil },
+                    set: {
+                        if !$0 {
+                            pendingDraftAction = nil
+                        }
+                    }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button(
+                    "Discard Changes".localizedUI,
+                    role: .destructive
+                ) {
+                    performPendingDraftAction()
+                }
+                Button("Keep Editing".localizedUI, role: .cancel) {
+                    pendingDraftAction = nil
+                }
+            } message: {
+                Text(
+                    "The current link title, destination, or position has not been applied."
+                        .localizedUI
+                )
+            }
+            .interactiveDismissDisabled(isSaving || hasDraftChanges)
+            .accessibilityAction(.escape) {
+                if isSaving {
+                    stopSavingLinkCopy()
+                } else {
+                    requestDraftAction(.dismiss)
+                }
+            }
             .sensoryFeedback(.selection, trigger: selectionFeedback)
+            .sensoryFeedback(.error, trigger: loadMessage)
             .onDisappear {
-                operationTask?.cancel()
-                operationTask = nil
+                stopSavingLinkCopy(invalidateResult: true)
+                pageLoadTask?.cancel()
+                pageLoadTask = nil
                 loadGeneration += 1
+                pagePreview = nil
+                allLinks.removeAll(keepingCapacity: false)
+                selectedLinkID = nil
+                linkTitle = ""
+                webAddress = ""
+                loadMessage = nil
+                pendingDraftAction = nil
             }
         }
     }
@@ -761,10 +1468,18 @@ struct PDFLinkEditorView: View {
                     Image(uiImage: pagePreview)
                         .resizable()
                         .scaledToFit()
+                    linkOverlays(pageSize: pageSize)
+                } else if isLoading {
+                    previewLoadingState(
+                        title: "Loading link preview"
+                    )
                 } else {
-                    ProgressView()
+                    linkLoadFailure(
+                        loadMessage
+                            ?? "The page preview stopped before it was ready. Try again."
+                                .localizedUI
+                    )
                 }
-                linkOverlays(pageSize: pageSize)
             }
             .frame(width: pageSize.width, height: pageSize.height)
             .clipped()
@@ -823,10 +1538,14 @@ struct PDFLinkEditorView: View {
             .background(tint)
         }
         .frame(width: rect.width, height: rect.height)
+        .frame(
+            width: max(44, rect.width),
+            height: max(44, rect.height)
+        )
         .position(x: rect.midX, y: rect.midY)
         .contentShape(Rectangle())
         .onTapGesture {
-            selectedLinkID = link.id
+            requestDraftAction(.selectLink(link.id))
         }
         .gesture(
             DragGesture(minimumDistance: 0)
@@ -863,16 +1582,26 @@ struct PDFLinkEditorView: View {
         )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(link.title), \(link.target.title)"
+            AppLocalization.format(
+                "%@, %@",
+                link.title,
+                link.target.title.localizedUI
+            )
         )
         .accessibilityHint(
             link.target.isEditable
                 ? "Select, then drag to move or pinch to resize"
+                    .localizedUI
                 : "This link action can be removed but not edited"
+                    .localizedUI
         )
+        .accessibilityAddTraits(.isButton)
         .accessibilityAddTraits(
             isSelected ? .isSelected : []
         )
+        .accessibilityAction {
+            requestDraftAction(.selectLink(link.id))
+        }
         .accessibilityIdentifier(
             "existingLink-\(link.pageIndex)-\(link.annotationIndex)"
         )
@@ -881,6 +1610,10 @@ struct PDFLinkEditorView: View {
     @ViewBuilder
     private var controls: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
+            if isSaving {
+                linkCommitStatus
+            }
+
             if isLoading {
                 HStack(spacing: PPSpacing.small) {
                     ProgressView()
@@ -889,14 +1622,33 @@ struct PDFLinkEditorView: View {
                         .font(.subheadline.weight(.semibold))
                 }
             } else if allLinks.isEmpty {
-                Label(
-                    loadMessage ?? "No links in this document",
-                    systemImage: "link.badge.plus"
-                )
-                .font(.subheadline)
-                .foregroundStyle(PPColor.textSecondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .accessibilityIdentifier("noExistingLinks")
+                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                    Label(
+                        loadMessage ?? "No links in this document",
+                        systemImage: loadMessage == nil
+                            ? "link.badge.plus"
+                            : "exclamationmark.link"
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .accessibilityIdentifier("noExistingLinks")
+
+                    if loadMessage != nil {
+                        Button {
+                            retryLinkInspection()
+                        } label: {
+                            Label(
+                                "Inspect Again",
+                                systemImage: "arrow.clockwise"
+                            )
+                        }
+                        .buttonStyle(PPQuietButtonStyle())
+                        .accessibilityIdentifier(
+                            "retryLinkInspection"
+                        )
+                    }
+                }
             } else {
                 linkPageHeader
 
@@ -920,7 +1672,7 @@ struct PDFLinkEditorView: View {
                         } label: {
                             Label("Remove Link", systemImage: "trash")
                         }
-                        .disabled(isSaving)
+                        .disabled(!canRemove)
                         .accessibilityIdentifier("removeExistingLink")
 
                         Spacer()
@@ -932,7 +1684,7 @@ struct PDFLinkEditorView: View {
                 }
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+        .disabled(isSaving)
         .padding(PPSpacing.regular)
         .background(.bar)
         .overlay(alignment: .top) {
@@ -940,6 +1692,26 @@ struct PDFLinkEditorView: View {
                 .fill(PPColor.border.opacity(0.62))
                 .frame(height: 0.6)
         }
+    }
+
+    private var linkCommitStatus: some View {
+        HStack(spacing: PPSpacing.small) {
+            ProgressView()
+                .controlSize(.small)
+            Text(
+                (
+                    operationStopRequested
+                        ? "Finishing current file commit"
+                        : "Creating private copy"
+                ).localizedUI
+            )
+            .font(.caption.weight(.semibold))
+            Spacer(minLength: 0)
+            OnDeviceBadge(compact: true)
+        }
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
     }
 
     private var linkPageHeader: some View {
@@ -956,7 +1728,9 @@ struct PDFLinkEditorView: View {
             Menu {
                 ForEach(linkPages, id: \.self) { candidatePageIndex in
                     Button {
-                        switchToPage(candidatePageIndex)
+                        requestDraftAction(
+                            .switchPage(candidatePageIndex)
+                        )
                     } label: {
                         Label(
                             pageMenuTitle(candidatePageIndex),
@@ -968,7 +1742,12 @@ struct PDFLinkEditorView: View {
                 }
             } label: {
                 HStack(spacing: 4) {
-                    Text("Page \(activePageIndex + 1)")
+                    Text(
+                        AppLocalization.format(
+                            "Page %lld",
+                            activePageIndex + 1
+                        )
+                    )
                         .monospacedDigit()
                     Image(systemName: "chevron.up.chevron.down")
                         .font(.caption2)
@@ -976,7 +1755,12 @@ struct PDFLinkEditorView: View {
                 .font(.subheadline.weight(.semibold))
             }
             .accessibilityLabel("Page with links")
-            .accessibilityValue("Page \(activePageIndex + 1)")
+            .accessibilityValue(
+                AppLocalization.format(
+                    "Page %lld",
+                    activePageIndex + 1
+                )
+            )
             .accessibilityIdentifier("linkPageMenu")
         }
     }
@@ -997,7 +1781,7 @@ struct PDFLinkEditorView: View {
             Menu {
                 ForEach(links) { option in
                     Button {
-                        selectedLinkID = option.id
+                        requestDraftAction(.selectLink(option.id))
                     } label: {
                         Label(
                             option.title,
@@ -1026,9 +1810,14 @@ struct PDFLinkEditorView: View {
         VStack(spacing: PPSpacing.small) {
             TextField("Link label", text: $linkTitle)
                 .textFieldStyle(.roundedBorder)
+                .submitLabel(.next)
                 .accessibilityIdentifier("existingLinkLabel")
+                .onChange(of: linkTitle) { _, value in
+                    guard value.count > 240 else { return }
+                    linkTitle = String(value.prefix(240))
+                }
 
-            Picker("Link target", selection: $targetKind) {
+            let picker = Picker("Link target", selection: $targetKind) {
                 ForEach(TargetKind.allCases) { kind in
                     Label(
                         kind.title.localizedUI,
@@ -1037,8 +1826,24 @@ struct PDFLinkEditorView: View {
                         .tag(kind)
                 }
             }
-            .pickerStyle(.segmented)
-            .accessibilityIdentifier("existingLinkTarget")
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+                    .accessibilityIdentifier(
+                        "existingLinkTarget"
+                    )
+            } else {
+                picker
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier(
+                        "existingLinkTarget"
+                    )
+            }
 
             PrecisionPlacementRail(
                 bounds: $bounds,
@@ -1048,12 +1853,20 @@ struct PDFLinkEditorView: View {
 
             switch targetKind {
             case .web:
-                TextField("https://", text: $webAddress)
-                    .textFieldStyle(.roundedBorder)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.URL)
-                    .accessibilityIdentifier("existingLinkAddress")
+                PDFWebAddressField(
+                    address: $webAddress,
+                    accessibilityIdentifier: "existingLinkAddress",
+                    validationMessage: webLinkValidationMessage
+                )
+                if let webLinkValidationMessage {
+                    Label(
+                        webLinkValidationMessage,
+                        systemImage: "exclamationmark.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(PPColor.rose)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
             case .page:
                 Stepper(
                     value: $destinationPageIndex,
@@ -1075,6 +1888,54 @@ struct PDFLinkEditorView: View {
     private var selectedLink: PDFLinkAnnotationSnapshot? {
         guard let selectedLinkID else { return nil }
         return links.first { $0.id == selectedLinkID }
+    }
+
+    private var hasDraftChanges: Bool {
+        guard let selectedLink,
+              selectedLink.target.isEditable
+        else { return false }
+        guard linkTitle == selectedLink.title,
+              bounds == selectedLink.normalizedBounds
+        else { return true }
+        return draftTarget != selectedLink.target
+    }
+
+    private func requestDraftAction(
+        _ action: PendingDraftAction
+    ) {
+        guard !isSaving else { return }
+        switch action {
+        case .selectLink(let identifier):
+            guard identifier != selectedLinkID else { return }
+        case .switchPage(let pageIndex):
+            guard pageIndex != activePageIndex else { return }
+        case .dismiss:
+            break
+        }
+        if hasDraftChanges {
+            pendingDraftAction = action
+        } else {
+            performDraftAction(action)
+        }
+    }
+
+    private func performPendingDraftAction() {
+        guard let action = pendingDraftAction else { return }
+        pendingDraftAction = nil
+        performDraftAction(action)
+    }
+
+    private func performDraftAction(
+        _ action: PendingDraftAction
+    ) {
+        switch action {
+        case .dismiss:
+            dismiss()
+        case .selectLink(let identifier):
+            selectedLinkID = identifier
+        case .switchPage(let pageIndex):
+            switchToPage(pageIndex)
+        }
     }
 
     private var links: [PDFLinkAnnotationSnapshot] {
@@ -1112,13 +1973,31 @@ struct PDFLinkEditorView: View {
         guard let url = URL(string: candidate),
               let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
-              url.host?.isEmpty == false
+              let host = url.host,
+              !host.isEmpty,
+              host.utf8.count <= 253,
+              url.user == nil,
+              url.password == nil,
+              url.absoluteString.utf8.count <= 4_096
         else { return nil }
         return url
     }
 
+    private var webLinkValidationMessage: String? {
+        guard targetKind == .web else { return nil }
+        let trimmed = webAddress.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !trimmed.isEmpty, validatedWebURL == nil else {
+            return nil
+        }
+        return "Enter a valid HTTP or HTTPS address.".localizedUI
+    }
+
     private var canCreate: Bool {
         guard !isLoading,
+              pagePreview != nil,
+              loadMessage == nil,
               selectedLink?.target.isEditable == true,
               !linkTitle.trimmingCharacters(
                   in: .whitespacesAndNewlines
@@ -1128,9 +2007,33 @@ struct PDFLinkEditorView: View {
         return true
     }
 
+    private var canRemove: Bool {
+        !isLoading
+            && !isSaving
+            && pagePreview != nil
+            && loadMessage == nil
+            && selectedLink != nil
+    }
+
     private func loadDocument() async {
+        guard let requestedRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else {
+            isLoading = false
+            loadMessage = "The working copy is unavailable."
+            return
+        }
+        if sourceContentRevisionID == nil {
+            sourceContentRevisionID = requestedRevisionID
+        }
+        guard sourceContentRevisionID == requestedRevisionID else {
+            interruptProtectedLinkEditing()
+            return
+        }
         loadGeneration += 1
         let generation = loadGeneration
+        isLoading = true
+        loadMessage = nil
         guard let url = model.url(for: recordID) else {
             isLoading = false
             loadMessage = "The working copy is unavailable."
@@ -1141,7 +2044,9 @@ struct PDFLinkEditorView: View {
                 recordID: recordID
             )
             guard !Task.isCancelled,
-                  generation == loadGeneration
+                  generation == loadGeneration,
+                  model.record(id: recordID)?.contentRevisionID
+                    == requestedRevisionID
             else { return }
             allLinks = loadedLinks
             if !allLinks.contains(where: {
@@ -1151,10 +2056,25 @@ struct PDFLinkEditorView: View {
             }) {
                 activePageIndex = nearestPage
             }
+        } catch is CancellationError {
+            return
         } catch {
-            loadMessage = error.localizedDescription
+            guard generation == loadGeneration else { return }
+            loadMessage = AppLocalization
+                .userFacingErrorDescription(error)
         }
+        guard !Task.isCancelled,
+              generation == loadGeneration,
+              model.record(id: recordID)?.contentRevisionID
+                == requestedRevisionID
+        else { return }
         await loadActivePage(url: url, generation: generation)
+        guard !Task.isCancelled,
+              generation == loadGeneration,
+              model.record(id: recordID)?.contentRevisionID
+                == requestedRevisionID
+        else { return }
+        didLoadDocument = true
     }
 
     private func loadActivePage(
@@ -1175,11 +2095,17 @@ struct PDFLinkEditorView: View {
         } else {
             selectedLinkID = nil
         }
+        let loadedPreview = await preview
         guard !Task.isCancelled,
               generation == loadGeneration,
-              let loadedPreview = await preview,
               requestedPageIndex == activePageIndex
         else { return }
+        guard let loadedPreview else {
+            loadMessage = loadMessage
+                ?? "The page preview could not be loaded. Try again."
+            isLoading = false
+            return
+        }
         pagePreview = loadedPreview.image
         pageAspectRatio = CGFloat(loadedPreview.aspectRatio)
         isLoading = false
@@ -1187,20 +2113,166 @@ struct PDFLinkEditorView: View {
 
     private func switchToPage(_ requestedPageIndex: Int) {
         guard requestedPageIndex != activePageIndex,
-              linkPages.contains(requestedPageIndex),
-              let url = model.url(for: recordID)
+              linkPages.contains(requestedPageIndex)
         else { return }
+        guard let url = model.url(for: recordID) else {
+            pagePreview = nil
+            isLoading = false
+            loadMessage = "The working copy is unavailable.".localizedUI
+            return
+        }
         activePageIndex = requestedPageIndex
         loadGeneration += 1
         let generation = loadGeneration
         selectedLinkID = nil
         pagePreview = nil
+        loadMessage = nil
         isLoading = true
-        Task {
+        pageLoadTask?.cancel()
+        pageLoadTask = Task { @MainActor in
             await loadActivePage(
                 url: url,
                 generation: generation
             )
+            guard !Task.isCancelled,
+                  generation == loadGeneration
+            else { return }
+            pageLoadTask = nil
+        }
+    }
+
+    private func resumeLinkPreview() {
+        guard pageLoadTask == nil else { return }
+        if !didLoadDocument {
+            let expectedGeneration = loadGeneration + 1
+            pageLoadTask = Task { @MainActor in
+                await loadDocument()
+                guard !Task.isCancelled,
+                      loadGeneration == expectedGeneration
+                else { return }
+                pageLoadTask = nil
+            }
+            return
+        }
+        guard let url = model.url(for: recordID) else {
+            isLoading = false
+            loadMessage = "The working copy is unavailable.".localizedUI
+            return
+        }
+        loadGeneration += 1
+        let generation = loadGeneration
+        let requestedPageIndex = activePageIndex
+        isLoading = true
+        pageLoadTask = Task { @MainActor in
+            let loaded = await PDFEditorPreviewLoader.shared.preview(
+                url: url,
+                pageIndex: requestedPageIndex,
+                revision: model.refreshToken(for: recordID)
+            )
+            guard !Task.isCancelled,
+                  generation == loadGeneration,
+                  requestedPageIndex == activePageIndex
+            else { return }
+            if let loaded {
+                pagePreview = loaded.image
+                pageAspectRatio = CGFloat(loaded.aspectRatio)
+                if !allLinks.isEmpty {
+                    loadMessage = nil
+                }
+            } else {
+                loadMessage =
+                    "The page preview could not be loaded. Try again."
+            }
+            isLoading = false
+            pageLoadTask = nil
+        }
+    }
+
+    private func retryLinkInspection() {
+        loadGeneration += 1
+        pageLoadTask?.cancel()
+        pageLoadTask = nil
+        allLinks.removeAll(keepingCapacity: false)
+        selectedLinkID = nil
+        pagePreview = nil
+        loadMessage = nil
+        isLoading = true
+        didLoadDocument = false
+        loadRequestToken = UUID()
+    }
+
+    private func linkLoadFailure(
+        _ message: String
+    ) -> some View {
+        VStack(spacing: PPSpacing.medium) {
+            Label(
+                message.localizedUI,
+                systemImage: "exclamationmark.link"
+            )
+            .font(.subheadline.weight(.semibold))
+            .multilineTextAlignment(.center)
+            Button {
+                retryLinkInspection()
+            } label: {
+                Label(
+                    "Inspect Again",
+                    systemImage: "arrow.clockwise"
+                )
+            }
+            .buttonStyle(PPQuietButtonStyle())
+        }
+        .padding(PPSpacing.regular)
+    }
+
+    private func previewLoadingState(
+        title: String
+    ) -> some View {
+        VStack(spacing: PPSpacing.small) {
+            ProgressView()
+            Text(title.localizedUI)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func interruptProtectedLinkWork() {
+        loadGeneration += 1
+        pageLoadTask?.cancel()
+        pageLoadTask = nil
+        stopSavingLinkCopy(invalidateResult: true)
+        pagePreview = nil
+        isLoading = false
+    }
+
+    private func interruptProtectedLinkEditing() {
+        interruptProtectedLinkWork()
+        allLinks.removeAll(keepingCapacity: false)
+        selectedLinkID = nil
+        linkTitle = ""
+        webAddress = ""
+        loadMessage = nil
+        isConfirmingRemoval = false
+        pendingDraftAction = nil
+        dismiss()
+    }
+
+    private func stopSavingLinkCopy(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isSaving = false
+            operationStopRequested = false
         }
     }
 
@@ -1232,7 +2304,8 @@ struct PDFLinkEditorView: View {
     }
 
     private func createUpdatedCopy() {
-        guard let selectedLink,
+        guard canCreate,
+              let selectedLink,
               let draftTarget
         else { return }
         let mutation = PDFLinkMutation.update(
@@ -1250,7 +2323,9 @@ struct PDFLinkEditorView: View {
     }
 
     private func createRemovedCopy() {
-        guard let selectedLink else { return }
+        guard canRemove,
+              let selectedLink
+        else { return }
         createCopy(
             .remove(
                 pageIndex: selectedLink.pageIndex,
@@ -1262,21 +2337,40 @@ struct PDFLinkEditorView: View {
     private func createCopy(
         _ mutation: PDFLinkMutation
     ) {
+        guard let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID
+        else { return }
         isSaving = true
+        operationStopRequested = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
-            let created = await model.createLinkEditedCopy(
-                recordID: recordID,
-                mutation: mutation
-            )
-            guard !Task.isCancelled else {
-                isSaving = false
-                operationTask = nil
-                return
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createLinkEditedCopy(
+                    recordID: recordID,
+                    mutation: mutation,
+                    expectedLink: selectedLink,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
             }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
             isSaving = false
             operationTask = nil
+            operationStopRequested = false
+            guard !wasStopped else {
+                model[noticeFor: paperPathSceneID] = created == nil
+                    ? "Copy creation stopped".localizedUI
+                    : "Copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return
+            }
             guard let created else { return }
-            dismiss()
             onCreated(DocumentRoute(recordID: created.id))
         }
     }
@@ -1372,6 +2466,9 @@ struct PDFLinkEditorView: View {
 struct PDFImageReplacementView: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let pageIndex: Int
@@ -1382,16 +2479,27 @@ struct PDFImageReplacementView: View {
     @State private var replacementItem: PhotosPickerItem?
     @State private var replacementData: Data?
     @State private var replacementPreview: UIImage?
+    @State private var originalPreview: UIImage?
     @State private var pagePreview: UIImage?
     @State private var pageAspectRatio: CGFloat = 612 / 792
     @State private var isInspecting = true
     @State private var isLoadingPhoto = false
     @State private var isSaving = false
     @State private var inspectionMessage: String?
+    @State private var inspectionFailed = false
     @State private var isConfirmingSharedReplacement = false
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var photoLoadTask: Task<Void, Never>?
+    @State private var originalPreviewTask: Task<Void, Never>?
     @State private var loadGeneration = 0
     @State private var photoLoadGeneration = 0
+    @State private var originalPreviewGeneration = 0
+    @State private var didLoadDocument = false
+    @State private var previewReloadToken = UUID()
+    @State private var isConfirmingDiscard = false
+    @State private var sourceContentRevisionID: UUID?
 
     var body: some View {
         NavigationStack {
@@ -1409,15 +2517,23 @@ struct PDFImageReplacementView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button((isSaving ? "Stop" : "Cancel").localizedUI) {
+                    Button(
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isSaving
+                                ? "Stop"
+                                : "Cancel"
+                        ).localizedUI
+                    ) {
                         if isSaving {
-                            operationTask?.cancel()
-                            operationTask = nil
-                            isSaving = false
+                            stopReplacingImage()
                         } else {
-                            dismiss()
+                            requestImageDismissal()
                         }
                     }
+                    .disabled(operationStopRequested)
+                    .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create Copy") {
@@ -1428,50 +2544,60 @@ struct PDFImageReplacementView: View {
                         }
                     }
                     .disabled(!canCreate || isSaving)
+                    .keyboardShortcut(.defaultAction)
                 }
             }
-            .task {
-                loadGeneration += 1
-                let generation = loadGeneration
-                guard let url = model.url(for: recordID) else { return }
-                async let preview = PDFEditorPreviewLoader.shared.preview(
-                    url: url,
-                    pageIndex: pageIndex,
-                    revision: model.refreshToken(for: recordID)
-                )
-                do {
-                    let inspectedObjects = try await model.imageObjects(
-                        recordID: recordID,
-                        pageIndex: pageIndex
-                    )
-                    guard !Task.isCancelled,
-                          generation == loadGeneration
-                    else { return }
-                    objects = inspectedObjects
-                    selectedObjectID = objects.first(
-                        where: \.isSafelyReplaceable
-                    )?.id
-                    if objects.isEmpty {
-                        inspectionMessage =
-                            "No safely replaceable image object was found on this page."
-                    }
-                } catch {
-                    guard generation == loadGeneration else { return }
-                    inspectionMessage = error.localizedDescription
+            .task(id: previewReloadToken) {
+                if didLoadDocument {
+                    await reloadImagePagePreview()
+                } else {
+                    await loadImageDocument()
                 }
-                if let loadedPreview = await preview,
-                   !Task.isCancelled,
-                   generation == loadGeneration {
-                    pagePreview = loadedPreview.image
-                    pageAspectRatio = CGFloat(
-                        loadedPreview.aspectRatio
-                    )
-                }
-                isInspecting = false
+            }
+            .onChange(
+                of: model.record(id: recordID)?
+                    .contentRevisionID
+            ) { _, revisionID in
+                guard let sourceContentRevisionID,
+                      revisionID != sourceContentRevisionID
+                else { return }
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                interruptProtectedImageEditing()
             }
             .onChange(of: replacementItem) { _, item in
                 guard let item else { return }
                 loadPhoto(item)
+            }
+            .onChange(of: selectedObjectID) { _, _ in
+                loadOriginalPreview()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    if pagePreview == nil {
+                        previewReloadToken = UUID()
+                    }
+                    if originalPreview == nil {
+                        loadOriginalPreview()
+                    }
+                    if replacementPreview == nil,
+                       let replacementData {
+                        replacementPreview = UIImage(
+                            data: replacementData
+                        )
+                    }
+                } else if phase == .background {
+                    interruptProtectedImageEditing()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptProtectedImageEditing()
             }
             .confirmationDialog(
                 "Replace every use of this image?",
@@ -1491,47 +2617,91 @@ struct PDFImageReplacementView: View {
                     "This PDF reuses one image object in several places. The new private copy will update every reference together."
                 )
             }
-            .interactiveDismissDisabled(isSaving)
+            .confirmationDialog(
+                "Discard replacement photo?".localizedUI,
+                isPresented: $isConfirmingDiscard,
+                titleVisibility: .visible
+            ) {
+                Button(
+                    "Discard Photo".localizedUI,
+                    role: .destructive
+                ) {
+                    dismiss()
+                }
+                Button("Keep Editing".localizedUI, role: .cancel) {}
+            } message: {
+                Text(
+                    "The selected photo has not been applied to a PDF copy."
+                        .localizedUI
+                )
+            }
+            .interactiveDismissDisabled(isSaving || hasDraftReplacement)
+            .accessibilityAction(.escape) {
+                if isSaving {
+                    stopReplacingImage()
+                } else {
+                    requestImageDismissal()
+                }
+            }
+            .sensoryFeedback(.error, trigger: inspectionFailed)
+            .sensoryFeedback(
+                .selection,
+                trigger: selectedObjectID
+            )
             .onDisappear {
-                operationTask?.cancel()
-                operationTask = nil
+                stopReplacingImage(invalidateResult: true)
+                photoLoadTask?.cancel()
+                photoLoadTask = nil
+                originalPreviewTask?.cancel()
+                originalPreviewTask = nil
                 loadGeneration += 1
                 photoLoadGeneration += 1
+                originalPreviewGeneration += 1
+                pagePreview = nil
+                originalPreview = nil
+                replacementPreview = nil
+                replacementData = nil
+                objects.removeAll(keepingCapacity: false)
+                selectedObjectID = nil
+                inspectionMessage = nil
+                inspectionFailed = false
             }
         }
     }
 
     private var replacementContextBar: some View {
-        HStack(spacing: PPSpacing.medium) {
-            Label(
-                "Page \(pageIndex + 1)",
-                systemImage: "doc.text"
-            )
-            Label(
-                "\(objects.count)",
-                systemImage: "photo.stack"
-            )
-            if let selectedObject {
+        ScrollView(.horizontal) {
+            HStack(spacing: PPSpacing.medium) {
                 Label(
-                    "\(selectedObject.pixelWidth)×\(selectedObject.pixelHeight)",
-                    systemImage: "photo"
+                    "Page \(pageIndex + 1)",
+                    systemImage: "doc.text"
                 )
-                if selectedObject.replacesMultipleUses {
+                Label(
+                    "\(objects.count)",
+                    systemImage: "photo.stack"
+                )
+                if let selectedObject {
                     Label(
-                        "\(selectedObject.usageCount) uses",
-                        systemImage: "square.stack.3d.up"
+                        "\(selectedObject.pixelWidth)×\(selectedObject.pixelHeight)",
+                        systemImage: "photo"
                     )
-                    .foregroundStyle(PPColor.amber)
+                    if selectedObject.replacesMultipleUses {
+                        Label(
+                            "\(selectedObject.usageCount) uses",
+                            systemImage: "square.stack.3d.up"
+                        )
+                        .foregroundStyle(PPColor.amber)
+                    }
                 }
             }
-            Spacer(minLength: 0)
-            OnDeviceBadge(compact: true)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, PPSpacing.regular)
         }
+        .scrollIndicators(.hidden)
         .font(.caption.weight(.semibold))
         .foregroundStyle(PPColor.textSecondary)
         .lineLimit(1)
-        .padding(.horizontal, PPSpacing.regular)
-        .frame(minHeight: 38)
+        .frame(minHeight: 44)
         .background(.bar)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -1553,10 +2723,16 @@ struct PDFImageReplacementView: View {
                     Image(uiImage: pagePreview)
                         .resizable()
                         .scaledToFit()
+                    objectOverlays(pageSize: pageSize)
+                } else if isInspecting {
+                    imagePreviewLoadingState
                 } else {
-                    ProgressView()
+                    imageInspectionFailure(
+                        inspectionMessage
+                            ?? "The page preview stopped before it was ready. Try again."
+                                .localizedUI
+                    )
                 }
-                objectOverlays(pageSize: pageSize)
             }
             .frame(width: pageSize.width, height: pageSize.height)
             .clipped()
@@ -1609,13 +2785,25 @@ struct PDFImageReplacementView: View {
                                 : PPColor.accent
                         )
                     }
+                    .frame(
+                        width: max(44, rect.width),
+                        height: max(44, rect.height)
+                    )
+                    .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .position(x: rect.midX, y: rect.midY)
             .accessibilityLabel(
                 object.replacesMultipleUses
-                    ? "Shared image used \(object.usageCount) times"
-                    : "Replaceable image \(object.pixelWidth) by \(object.pixelHeight) pixels"
+                    ? AppLocalization.format(
+                        "Shared image used %lld times",
+                        object.usageCount
+                    )
+                    : AppLocalization.format(
+                        "Replaceable image %lld by %lld pixels",
+                        object.pixelWidth,
+                        object.pixelHeight
+                    )
             )
         }
     }
@@ -1630,6 +2818,10 @@ struct PDFImageReplacementView: View {
             ? "photo.badge.plus"
             : "photo.badge.arrow.down"
         return VStack(alignment: .leading, spacing: PPSpacing.small) {
+            if isSaving {
+                imageCommitStatus
+            }
+
             if isInspecting {
                 HStack(spacing: PPSpacing.small) {
                     ProgressView()
@@ -1646,6 +2838,21 @@ struct PDFImageReplacementView: View {
                 )
                 .font(.subheadline)
                 .foregroundStyle(PPColor.textSecondary)
+
+                if inspectionFailed {
+                    Button {
+                        retryImageInspection()
+                    } label: {
+                        Label(
+                            "Inspect Again",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(PPQuietButtonStyle())
+                    .accessibilityIdentifier(
+                        "retryImageInspection"
+                    )
+                }
             }
 
             if !isInspecting, !objects.isEmpty {
@@ -1675,39 +2882,37 @@ struct PDFImageReplacementView: View {
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(1)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                )
             }
 
             if let selectedObject {
-                HStack(spacing: PPSpacing.regular) {
-                    imagePreview(
-                        UIImage(data: selectedObject.jpegData),
-                        label: "Original"
-                    )
-                    Image(systemName: "arrow.right")
-                        .foregroundStyle(PPColor.textSecondary)
-                    imagePreview(
-                        replacementPreview,
-                        label: "Replacement"
-                    )
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(
-                            "\(selectedObject.pixelWidth) × \(selectedObject.pixelHeight)"
+                let summaryLayout =
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                    ? AnyLayout(
+                        VStackLayout(
+                            alignment: .leading,
+                            spacing: PPSpacing.small
                         )
-                        .font(.caption.monospacedDigit())
-                        Text("Image \(selectedObject.resourceName)")
-                            .font(.caption2)
+                    )
+                    : AnyLayout(
+                        HStackLayout(spacing: PPSpacing.regular)
+                    )
+                summaryLayout {
+                    HStack(spacing: PPSpacing.small) {
+                        imagePreview(
+                            originalPreview,
+                            label: "Original"
+                        )
+                        Image(systemName: "arrow.right")
                             .foregroundStyle(PPColor.textSecondary)
-                        Text(selectedObject.storage.detail.localizedUI)
-                            .font(.caption2.weight(.semibold))
-                            .foregroundStyle(
-                                selectedObject.storage
-                                    == .flateWithSoftMask
-                                    ? PPColor.mint
-                                    : PPColor.textSecondary
-                            )
+                        imagePreview(
+                            replacementPreview,
+                            label: "Replacement"
+                        )
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    imageObjectDetails(selectedObject)
                 }
 
                 if selectedObject.replacesMultipleUses {
@@ -1734,7 +2939,7 @@ struct PDFImageReplacementView: View {
                 .disabled(isLoadingPhoto || isSaving)
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+        .disabled(isSaving)
         .padding(PPSpacing.regular)
         .background(.bar)
         .overlay(alignment: .top) {
@@ -1742,6 +2947,26 @@ struct PDFImageReplacementView: View {
                 .fill(PPColor.border.opacity(0.62))
                 .frame(height: 0.6)
         }
+    }
+
+    private var imageCommitStatus: some View {
+        HStack(spacing: PPSpacing.small) {
+            ProgressView()
+                .controlSize(.small)
+            Text(
+                (
+                    operationStopRequested
+                        ? "Finishing current file commit"
+                        : "Creating private copy"
+                ).localizedUI
+            )
+            .font(.caption.weight(.semibold))
+            Spacer(minLength: 0)
+            OnDeviceBadge(compact: true)
+        }
+        .frame(minHeight: 44)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
     }
 
     private func imagePreview(
@@ -1769,56 +2994,289 @@ struct PDFImageReplacementView: View {
         .accessibilityElement(children: .combine)
     }
 
+    private func imageObjectDetails(
+        _ object: PDFImageObjectSnapshot
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("\(object.pixelWidth) × \(object.pixelHeight)")
+                .font(.caption.monospacedDigit())
+            Text("Image \(object.resourceName)")
+                .font(.caption2)
+                .foregroundStyle(PPColor.textSecondary)
+            Text(object.storage.detail.localizedUI)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(
+                    object.storage == .flateWithSoftMask
+                        ? PPColor.mint
+                        : PPColor.textSecondary
+                )
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private var selectedObject: PDFImageObjectSnapshot? {
         objects.first { $0.id == selectedObjectID }
     }
 
     private var canCreate: Bool {
-        selectedObject?.isSafelyReplaceable == true
+        pagePreview != nil
+            && !isInspecting
+            && !inspectionFailed
+            && selectedObject?.isSafelyReplaceable == true
             && replacementData != nil
             && !isLoadingPhoto
     }
 
+    private var hasDraftReplacement: Bool {
+        replacementItem != nil || replacementData != nil
+    }
+
+    private func requestImageDismissal() {
+        if hasDraftReplacement {
+            isConfirmingDiscard = true
+        } else {
+            dismiss()
+        }
+    }
+
+    private func loadImageDocument() async {
+        guard let requestedRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else {
+            isInspecting = false
+            inspectionMessage = "The working copy is unavailable."
+            inspectionFailed = true
+            return
+        }
+        if sourceContentRevisionID == nil {
+            sourceContentRevisionID = requestedRevisionID
+        }
+        guard sourceContentRevisionID == requestedRevisionID else {
+            interruptProtectedImageEditing()
+            return
+        }
+        loadGeneration += 1
+        let generation = loadGeneration
+        isInspecting = true
+        inspectionMessage = nil
+        inspectionFailed = false
+        guard let url = model.url(for: recordID) else {
+            isInspecting = false
+            inspectionMessage = "The working copy is unavailable."
+            inspectionFailed = true
+            return
+        }
+        async let preview = PDFEditorPreviewLoader.shared.preview(
+            url: url,
+            pageIndex: pageIndex,
+            revision: model.refreshToken(for: recordID)
+        )
+        do {
+            let inspectedObjects = try await model.imageObjects(
+                recordID: recordID,
+                pageIndex: pageIndex
+            )
+            guard !Task.isCancelled,
+                  generation == loadGeneration,
+                  model.record(id: recordID)?.contentRevisionID
+                    == requestedRevisionID
+            else { return }
+            objects = inspectedObjects
+            selectedObjectID = objects.first(
+                where: \.isSafelyReplaceable
+            )?.id
+            if objects.isEmpty {
+                inspectionMessage =
+                    "No safely replaceable image object was found on this page."
+            }
+        } catch {
+            guard !Task.isCancelled,
+                  generation == loadGeneration
+            else { return }
+            inspectionMessage = AppLocalization
+                .userFacingErrorDescription(error)
+            inspectionFailed = true
+        }
+        let loadedPreview = await preview
+        guard !Task.isCancelled,
+              generation == loadGeneration,
+              model.record(id: recordID)?.contentRevisionID
+                == requestedRevisionID
+        else { return }
+        if let loadedPreview {
+            pagePreview = loadedPreview.image
+            pageAspectRatio = CGFloat(loadedPreview.aspectRatio)
+        } else {
+            inspectionMessage =
+                "The page preview could not be loaded. Try again."
+            inspectionFailed = true
+        }
+        didLoadDocument = true
+        isInspecting = false
+    }
+
+    private func reloadImagePagePreview() async {
+        loadGeneration += 1
+        let generation = loadGeneration
+        isInspecting = true
+        inspectionFailed = false
+        guard let url = model.url(for: recordID) else {
+            inspectionMessage = "The working copy is unavailable."
+            inspectionFailed = true
+            isInspecting = false
+            return
+        }
+        let loaded = await PDFEditorPreviewLoader.shared.preview(
+            url: url,
+            pageIndex: pageIndex,
+            revision: model.refreshToken(for: recordID)
+        )
+        guard !Task.isCancelled,
+              generation == loadGeneration
+        else { return }
+        guard let loaded else {
+            inspectionMessage =
+                "The page preview could not be loaded. Try again."
+            inspectionFailed = true
+            isInspecting = false
+            return
+        }
+        pagePreview = loaded.image
+        pageAspectRatio = CGFloat(loaded.aspectRatio)
+        inspectionMessage = objects.isEmpty
+            ? "No safely replaceable image object was found on this page."
+            : nil
+        isInspecting = false
+    }
+
+    private func retryImageInspection() {
+        loadGeneration += 1
+        originalPreviewGeneration += 1
+        originalPreviewTask?.cancel()
+        originalPreviewTask = nil
+        objects.removeAll(keepingCapacity: false)
+        selectedObjectID = nil
+        pagePreview = nil
+        originalPreview = nil
+        inspectionMessage = nil
+        inspectionFailed = false
+        isInspecting = true
+        didLoadDocument = false
+        previewReloadToken = UUID()
+    }
+
+    private func imageInspectionFailure(
+        _ message: String
+    ) -> some View {
+        VStack(spacing: PPSpacing.medium) {
+            Label(
+                message.localizedUI,
+                systemImage: "photo.badge.exclamationmark"
+            )
+            .font(.subheadline.weight(.semibold))
+            .multilineTextAlignment(.center)
+            Button {
+                retryImageInspection()
+            } label: {
+                Label(
+                    "Inspect Again",
+                    systemImage: "arrow.clockwise"
+                )
+            }
+            .buttonStyle(PPQuietButtonStyle())
+        }
+        .padding(PPSpacing.regular)
+    }
+
+    private var imagePreviewLoadingState: some View {
+        VStack(spacing: PPSpacing.small) {
+            ProgressView()
+            Text("Loading image preview".localizedUI)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
     private func createCopy() {
-        guard let selectedObject,
-              let replacementData
+        guard canCreate,
+              let selectedObject,
+              let replacementData,
+              let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID
         else { return }
         isSaving = true
+        operationStopRequested = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
-            let created = await model.createImageReplacementCopy(
-                recordID: recordID,
-                snapshot: selectedObject,
-                replacementData: replacementData
-            )
-            guard !Task.isCancelled else {
-                isSaving = false
-                operationTask = nil
-                return
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createImageReplacementCopy(
+                    recordID: recordID,
+                    snapshot: selectedObject,
+                    replacementData: replacementData,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
             }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
             isSaving = false
             operationTask = nil
+            operationStopRequested = false
+            guard !wasStopped else {
+                model[noticeFor: paperPathSceneID] = created == nil
+                    ? "Copy creation stopped".localizedUI
+                    : "Copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return
+            }
             guard let created else { return }
-            dismiss()
             onCreated(DocumentRoute(recordID: created.id))
         }
     }
 
     private func loadPhoto(_ item: PhotosPickerItem) {
+        photoLoadTask?.cancel()
         photoLoadGeneration += 1
         let generation = photoLoadGeneration
         isLoadingPhoto = true
-        Task {
-            guard let data = try? await item.loadTransferable(
-                type: Data.self
-            ),
-                  let prepared = await Self.preparePhoto(data)
+        replacementData = nil
+        replacementPreview = nil
+        photoLoadTask = Task { @MainActor in
+            defer {
+                if generation == photoLoadGeneration {
+                    isLoadingPhoto = false
+                    photoLoadTask = nil
+                    replacementItem = nil
+                }
+            }
+            guard let transfer = try? await item.loadTransferable(
+                type: ProtectedPhotoTransfer.self
+            )
             else {
                 guard generation == photoLoadGeneration else {
                     return
                 }
-                isLoadingPhoto = false
-                model.noticeMessage =
-                    "The selected photo could not be opened"
+                model[noticeFor: paperPathSceneID] =
+                    "The selected photo could not be opened".localizedUI
+                return
+            }
+            defer { transfer.discard() }
+            guard transfer.byteCount <= 32 * 1_024 * 1_024,
+                  let prepared = await Self.preparePhoto(
+                    transfer.fileURL
+                  )
+            else {
+                guard generation == photoLoadGeneration else {
+                    return
+                }
+                model[noticeFor: paperPathSceneID] =
+                    "The selected photo could not be opened".localizedUI
                 return
             }
             guard !Task.isCancelled,
@@ -1826,7 +3284,42 @@ struct PDFImageReplacementView: View {
             else { return }
             replacementData = prepared
             replacementPreview = UIImage(data: prepared)
-            isLoadingPhoto = false
+        }
+    }
+
+    private func loadOriginalPreview() {
+        originalPreviewTask?.cancel()
+        originalPreviewGeneration += 1
+        let generation = originalPreviewGeneration
+        originalPreview = nil
+        guard let data = selectedObject?.jpegData else { return }
+        let selectedID = selectedObjectID
+        originalPreviewTask = Task { @MainActor in
+            defer {
+                if originalPreviewGeneration == generation {
+                    originalPreviewTask = nil
+                }
+            }
+            let worker = Task.detached(priority: .utility) {
+                autoreleasepool {
+                    PDFPhotoPreparation.preparedData(
+                        from: data,
+                        maximumPixelSize: 320,
+                        jpegQuality: 0.8
+                    )
+                }
+            }
+            let prepared = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled,
+                  generation == originalPreviewGeneration,
+                  selectedObjectID == selectedID,
+                  let prepared
+            else { return }
+            originalPreview = UIImage(data: prepared)
         }
     }
 
@@ -1859,46 +3352,68 @@ struct PDFImageReplacementView: View {
         )
     }
 
-    private static func preparePhoto(_ data: Data) async -> Data? {
-        await Task.detached(priority: .userInitiated) {
-            guard let image = UIImage(data: data) else { return nil }
-            let longestEdge = max(image.size.width, image.size.height)
-            let scale = min(1, 2_400 / max(1, longestEdge))
-            let size = CGSize(
-                width: max(1, image.size.width * scale),
-                height: max(1, image.size.height * scale)
-            )
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 1
-            let preservesAlpha: Bool
-            if let cgImage = image.cgImage {
-                preservesAlpha = switch cgImage.alphaInfo {
-                case .first, .last, .premultipliedFirst,
-                     .premultipliedLast, .alphaOnly:
-                    true
-                case .none, .noneSkipFirst, .noneSkipLast:
-                    false
-                @unknown default:
-                    false
-                }
-            } else {
-                preservesAlpha = false
+    private static func preparePhoto(_ fileURL: URL) async -> Data? {
+        let worker = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
+            return autoreleasepool {
+                PDFPhotoPreparation.preparedData(
+                    from: fileURL,
+                    maximumPixelSize: 2_400,
+                    jpegQuality: 0.9
+                )
             }
-            format.opaque = !preservesAlpha
-            let normalized = UIGraphicsImageRenderer(
-                size: size,
-                format: format
-            ).image { context in
-                if !preservesAlpha {
-                    UIColor.white.setFill()
-                    context.fill(CGRect(origin: .zero, size: size))
-                }
-                image.draw(in: CGRect(origin: .zero, size: size))
-            }
-            return preservesAlpha
-                ? normalized.pngData()
-                : normalized.jpegData(compressionQuality: 0.9)
-        }.value
+        }
+        return try? await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+    }
+
+    private func interruptProtectedImageWork() {
+        loadGeneration += 1
+        photoLoadGeneration += 1
+        originalPreviewGeneration += 1
+        photoLoadTask?.cancel()
+        photoLoadTask = nil
+        originalPreviewTask?.cancel()
+        originalPreviewTask = nil
+        stopReplacingImage(invalidateResult: true)
+        replacementItem = nil
+        isLoadingPhoto = false
+        pagePreview = nil
+        originalPreview = nil
+        replacementPreview = nil
+        replacementData = nil
+    }
+
+    private func interruptProtectedImageEditing() {
+        interruptProtectedImageWork()
+        objects.removeAll(keepingCapacity: false)
+        selectedObjectID = nil
+        inspectionMessage = nil
+        isConfirmingSharedReplacement = false
+        isConfirmingDiscard = false
+        dismiss()
+    }
+
+    private func stopReplacingImage(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isSaving = false
+            operationStopRequested = false
+        }
     }
 
 }

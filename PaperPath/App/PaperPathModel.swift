@@ -1,5 +1,15 @@
 import Foundation
+import PDFKit
 import UIKit
+
+struct ExternalDocumentHandoff: Equatable, Sendable {
+    let recordID: UUID
+    let targetSceneID: UUID?
+}
+
+private enum AppFeedbackContext {
+    @TaskLocal static var targetSceneID: UUID?
+}
 
 private struct BatchPreflightOutcome: Sendable {
     let recordID: UUID
@@ -10,9 +20,108 @@ private struct BatchPreflightOutcome: Sendable {
 
 private struct PageMutationUndo: Sendable {
     let backupURL: URL
+    let expectedRevisionID: UUID
     let bookmarkedPages: [Int]
+    let bookmarkNames: [Int: String]
+    let lastPageIndex: Int
     let taskCheckpoint: DocumentTaskCheckpoint?
     let label: String
+    var sourceRevisionID: UUID? = nil
+}
+
+private struct PageMutationNavigationState: Sendable {
+    let bookmarkedPages: [Int]
+    let bookmarkNames: [Int: String]
+    let lastPageIndex: Int
+    let taskCheckpoint: DocumentTaskCheckpoint?
+}
+
+private struct DocumentAnalysisTaskEntry {
+    let revisionID: UUID
+    let generation: UUID
+    let task: Task<Void, Never>
+}
+
+private struct ProtectedTemporaryPDF: Sendable {
+    let directoryURL: URL
+    let fileURL: URL
+    let prefix: String
+
+    init(prefix: String) {
+        self.prefix = prefix
+        directoryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(prefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+        fileURL = directoryURL.appendingPathComponent("document.pdf")
+    }
+
+    func prepare() throws {
+        try LocalFileSecurity.prepareProtectedDirectory(at: directoryURL)
+    }
+
+    func copy(
+        from sourceURL: URL,
+        expectedByteCount: Int64
+    ) throws {
+        try prepare()
+        guard expectedByteCount > 0,
+              FileManager.default.createFile(
+                  atPath: fileURL.path,
+                  contents: nil
+              )
+        else {
+            throw PaperPathError.unreadablePDF
+        }
+        try LocalFileSecurity.requireCompleteProtection(to: fileURL)
+        let input = try FileHandle(forReadingFrom: sourceURL)
+        defer { try? input.close() }
+        let output = try FileHandle(forWritingTo: fileURL)
+        defer { try? output.close() }
+        var copiedByteCount: Int64 = 0
+        while true {
+            try Task.checkCancellation()
+            let data = try input.read(upToCount: 1_048_576) ?? Data()
+            if data.isEmpty { break }
+            let (nextByteCount, overflow) = copiedByteCount
+                .addingReportingOverflow(Int64(data.count))
+            guard !overflow,
+                  nextByteCount <= expectedByteCount
+            else {
+                throw PaperPathError.unreadablePDF
+            }
+            try output.write(contentsOf: data)
+            copiedByteCount = nextByteCount
+        }
+        try Task.checkCancellation()
+        try output.synchronize()
+        guard copiedByteCount == expectedByteCount else {
+            throw PaperPathError.unreadablePDF
+        }
+        try LocalFileSecurity.requireCompleteProtection(to: fileURL)
+    }
+
+    func remove() {
+        PaperPathTemporaryArtifact.removeManagedItem(
+            containing: fileURL,
+            allowedPrefixes: [prefix]
+        )
+    }
+}
+
+private func removePageMutationTemporaryItem(containing url: URL) {
+    PaperPathTemporaryArtifact.removeManagedItem(
+        containing: url,
+        allowedPrefixes: [
+            "PaperPath-Bates-Undo-",
+            "PaperPath-Bates-Prepared-",
+            "PaperPath-Bates-Removal-Undo-",
+            "PaperPath-Bates-Removal-",
+            "PaperPath-PageUndo-",
+            "PaperPath-Mutation-"
+        ]
+    )
 }
 
 private struct PDFComparisonCacheKey: Hashable {
@@ -33,7 +142,39 @@ private struct PDFVersionComparisonCacheKey: Hashable {
     let currentRevisionID: UUID
 }
 
-private struct ByteRateWindow {
+private struct ActivePDFComparison {
+    let recordIDs: Set<UUID>
+    let task: Task<PDFChangeReview, Error>
+}
+
+private struct ActiveExclusiveDocumentWorker {
+    let operationToken: UUID
+    let cancel: @Sendable () -> Void
+}
+
+private actor PDFComparisonCoordinator {
+    private let service: PDFDeliveryAuditService
+
+    init(service: PDFDeliveryAuditService) {
+        self.service = service
+    }
+
+    func compare(
+        sourceURL: URL,
+        revisedURL: URL,
+        manualMatches: [PDFManualPageMatch] = [],
+        progress: @escaping PDFComparisonProgressHandler = { _ in }
+    ) throws -> PDFChangeReview {
+        try service.compare(
+            sourceURL: sourceURL,
+            revisedURL: revisedURL,
+            manualMatches: manualMatches,
+            progress: progress
+        )
+    }
+}
+
+struct ByteRateWindow {
     private struct Sample {
         let date: Date
         let bytes: Int64
@@ -56,19 +197,27 @@ private struct ByteRateWindow {
         processedBytes: Int64,
         at date: Date = Date()
     ) -> Double {
+        let boundedBytes = max(0, processedBytes)
+        let sampleDate = date.timeIntervalSince1970.isFinite
+            ? date
+            : Date()
         if stage != newStage
-            || processedBytes < (samples.last?.bytes ?? 0) {
+            || boundedBytes < (samples.last?.bytes ?? 0) {
             stage = newStage
-            samples = [Sample(date: date, bytes: processedBytes)]
+            samples = [
+                Sample(date: sampleDate, bytes: boundedBytes)
+            ]
             rate = 0
             history.removeAll(keepingCapacity: true)
             return rate
         }
-        guard processedBytes > (samples.last?.bytes ?? -1) else {
+        guard boundedBytes > (samples.last?.bytes ?? -1) else {
             return rate
         }
-        samples.append(Sample(date: date, bytes: processedBytes))
-        let cutoff = date.addingTimeInterval(-5)
+        samples.append(
+            Sample(date: sampleDate, bytes: boundedBytes)
+        )
+        let cutoff = sampleDate.addingTimeInterval(-5)
         while samples.count > 2,
               samples[1].date < cutoff {
             samples.removeFirst()
@@ -83,12 +232,26 @@ private struct ByteRateWindow {
             rate = 0
             return rate
         }
+        let rawDuration = last.date.timeIntervalSince(first.date)
+        guard rawDuration.isFinite else {
+            rate = 0
+            return rate
+        }
         let duration = max(
             0.05,
-            last.date.timeIntervalSince(first.date)
+            rawDuration
         )
-        rate = Double(last.bytes - first.bytes) / duration
-        if rate.isFinite, rate > 0 {
+        let (byteDelta, overflow) = last.bytes
+            .subtractingReportingOverflow(first.bytes)
+        guard !overflow, byteDelta > 0 else {
+            rate = 0
+            return rate
+        }
+        let measuredRate = Double(byteDelta) / duration
+        rate = measuredRate.isFinite && measuredRate > 0
+            ? min(Double(Int64.max / 2), measuredRate)
+            : 0
+        if rate > 0 {
             history.append(rate)
             if history.count > 24 {
                 history.removeFirst(history.count - 24)
@@ -96,10 +259,77 @@ private struct ByteRateWindow {
         }
         return rate
     }
+
+    mutating func operationProgress(
+        label: String,
+        update: PDFByteProgressUpdate,
+        current: PDFOperationProgress?
+    ) -> PDFOperationProgress? {
+        if current?.byteStage == update.stage,
+           update.processedBytes < (current?.processedBytes ?? 0) {
+            return nil
+        }
+        let now = Date()
+        let didAdvance = current?.byteStage != update.stage
+            || update.processedBytes > (current?.processedBytes ?? 0)
+            || current?.lastByteUpdateAt == nil
+        let bytesPerSecond = self.update(
+            stage: update.stage,
+            processedBytes: update.processedBytes,
+            at: now
+        )
+        let stageFraction = update.totalBytes > 0
+            ? min(
+                1,
+                max(
+                    0,
+                    Double(update.processedBytes)
+                        / Double(update.totalBytes)
+                )
+            )
+            : 0
+        let mappedFraction: Double
+        switch update.stage {
+        case .checksumming:
+            mappedFraction = stageFraction * 0.45
+        case .archiving:
+            mappedFraction = 0.45 + stageFraction * 0.55
+        case .copying, .reconstructing, .packaging, .verifying:
+            mappedFraction = stageFraction
+        }
+        let fraction = max(
+            current?.fractionCompleted ?? 0,
+            mappedFraction
+        )
+        return PDFOperationProgress(
+            label: label,
+            fractionCompleted: fraction,
+            byteStage: update.stage,
+            processedBytes: update.processedBytes,
+            totalBytes: update.totalBytes,
+            bytesPerSecond: bytesPerSecond,
+            estimatedRemainingSeconds:
+                bytesPerSecond > 0 && update.totalBytes > 0
+                    ? Double(
+                        max(
+                            0,
+                            update.totalBytes - update.processedBytes
+                        )
+                    ) / bytesPerSecond
+                    : nil,
+            throughputHistory: history,
+            lastByteUpdateAt: didAdvance
+                ? now
+                : current?.lastByteUpdateAt
+        )
+    }
 }
 
 @MainActor
 final class PaperPathModel: ObservableObject {
+    private static let maximumExternalPageSourceBytes:
+        Int64 = 1_073_741_824
+
     @Published private(set) var documents: [DocumentRecord] = [] {
         didSet {
             rebuildDocumentDerivedIndexes()
@@ -111,14 +341,18 @@ final class PaperPathModel: ObservableObject {
     @Published private(set) var ocrResults: [UUID: OCRResult] = [:]
     @Published private(set) var textIndices: [UUID: DocumentTextIndex] = [:]
     @Published private(set) var processingDocumentIDs: Set<UUID> = []
+    @Published private(set) var comparingDocumentIDs: Set<UUID> = []
     @Published private(set) var deliveryProcessingDocumentIDs: Set<UUID> = []
     @Published private(set) var batchDeliveryPendingDocumentIDs: Set<UUID> = []
     @Published private(set) var batesBatchProgress:
         PDFBatesBatchProgress?
+    @Published private(set) var isBatesBatchMutationActive = false
     @Published private(set) var batesBatchReceipts:
         [PDFSignedBatesBatchReceipt] = []
     @Published private(set) var batesReceiptVerificationProgress:
         PDFBatesBatchReceiptVerificationProgress?
+    @Published private(set) var isBatesReceiptVerificationActive =
+        false
     @Published private(set) var batesExternalMatchProgress:
         PDFBatesExternalMatchProgress?
     @Published private(set) var operationProgress: [UUID: PDFOperationProgress] = [:]
@@ -126,6 +360,8 @@ final class PaperPathModel: ObservableObject {
     @Published private(set) var savedSignatures: [SavedSignature] = []
     @Published private(set) var selectedSignatureID: UUID?
     @Published private(set) var lastBatchDeliveryRun: PDFBatchDeliveryRun?
+    @Published private(set) var batchDeliveryPersistenceError: String?
+    @Published private(set) var activeBatchDeliveryRunID: UUID?
     @Published private(set) var officeBatchRuns:
         [UUID: PDFOfficeBatchRun] = [:]
     @Published private(set) var officeProductionQueue =
@@ -149,23 +385,75 @@ final class PaperPathModel: ObservableObject {
         [PDFOfficeTrustedSigner] = []
     @Published private(set) var metadataSyncStatus =
         PDFMetadataSyncStatus.idle
+    @Published private(set) var analyzingDocumentIDs: Set<UUID> = []
     @Published var isLoading = true
-    @Published var isImporting = false
-    @Published var errorMessage: String?
-    @Published var errorOffersSettings = false
-    @Published private(set) var actionNotice: AppActionNotice?
-    @Published var noticeMessage: String? {
-        didSet {
-            if noticeMessage != nil {
-                actionNotice = nil
+    @Published private(set) var isImporting = false
+    @Published private(set) var scanImportFraction: Double?
+    @Published private var foregroundImportProgresses:
+        [UUID: PDFOperationProgress] = [:]
+    @Published private(set) var externalImportProgress:
+        PDFOperationProgress?
+    @Published private(set) var isExternalPDFImportActive = false
+    @Published private(set) var externalImportRetryAvailable = false
+    @Published private(set) var externalImportDeferredCount = 0
+    @Published private(set) var externalImportRetryMessage: String?
+    @Published private(set) var retainedEvidenceRevision = 0
+    @Published private var presentationErrorsBySceneID:
+        [UUID: AppPresentationError] = [:]
+    @Published private var unscopedPresentationError:
+        AppPresentationError?
+    @Published private var actionNoticesBySceneID:
+        [UUID: AppActionNotice] = [:]
+    @Published private var unscopedActionNotice: AppActionNotice?
+    @Published private var transientNoticesBySceneID:
+        [UUID: AppTransientNotice] = [:]
+    @Published private var unscopedTransientNotice:
+        AppTransientNotice?
+    private var activeFeedbackSceneIDs = Set<UUID>()
+    private var feedbackSceneRecency: [UUID: UInt64] = [:]
+    private var feedbackSceneSequence: UInt64 = 0
+    var noticeMessage: String? {
+        get { unscopedTransientNotice?.message }
+        set {
+            setTransientNotice(
+                newValue,
+                targetSceneID: AppFeedbackContext.targetSceneID
+            )
+        }
+    }
+    subscript(noticeFor sceneID: UUID?) -> String? {
+        get {
+            if let sceneID {
+                return transientNotice(for: sceneID)?.message
+            }
+            return unscopedTransientNotice?.message
+        }
+        set {
+            if let newValue {
+                setTransientNotice(
+                    newValue,
+                    targetSceneID: sceneID
+                )
+            } else {
+                dismissTransientNotice(from: sceneID)
             }
         }
     }
-    @Published private(set) var pendingExternalDocumentID: UUID?
-    @Published var isPresentingFullUnlock = false
+    @Published private(set) var pendingExternalDocumentHandoff:
+        ExternalDocumentHandoff?
+    var pendingExternalDocumentID: UUID? {
+        pendingExternalDocumentHandoff?.recordID
+    }
+    @Published private var fullUnlockContextsBySceneID:
+        [UUID: FullUnlockContext] = [:]
+    @Published private var unscopedFullUnlockContext:
+        FullUnlockContext?
+    @Published private var settingsPresentationSceneIDs =
+        Set<UUID>()
+    @Published private var hasUnscopedSettingsPresentationRequest =
+        false
     @Published private(set) var verifiedOutputSuccessCount =
         AppEntitlement.verifiedOutputCount
-    @Published private(set) var settingsPresentationGeneration = 0
 
     private let store: DocumentStore
     private let mutationService: PDFMutationService
@@ -177,29 +465,52 @@ final class PaperPathModel: ObservableObject {
     private let searchablePDFService: SearchablePDFService
     private let outputService: PDFOutputService
     private let deliveryAuditService: PDFDeliveryAuditService
+    private let comparisonCoordinator: PDFComparisonCoordinator
     private let documentStructureService: PDFDocumentStructureService
     private let signatureStore: SignatureStore
     private let metadataSyncService: PDFMetadataSyncService
     private var documentRecordsByID: [UUID: DocumentRecord] = [:]
+    private var isFreeVerifiedOutputReserved = false
     private var workingDocumentCache: [DocumentRecord] = []
     private var deliveryOutputCache: [DocumentRecord] = []
+    private var verifiedDeliveryOutputCountCache = 0
+    private var pinnedOfficeOutputCache: [PDFPinnedOfficeOutput] = []
+    private var pinnedOfficeStorageSummaryCache =
+        PDFOfficePinnedStorageSummary(outputCount: 0, byteCount: 0)
     private var verifiedOutputsBySourceID:
+        [UUID: [DocumentRecord]] = [:]
+    private var deliveryHistoryBySourceID:
         [UUID: [DocumentRecord]] = [:]
     private var verifiedShareTargetsByRecordID:
         [UUID: DocumentRecord] = [:]
     private var workingFingerprintCounts: [String: Int] = [:]
+    private var attentionCountCache = 0
+    private var recordsWithRecognizedText: Set<UUID> = []
+    private var residentAnalysisOrder: [UUID] = []
+    private var residentAnalysisGeneration = UUID()
+    private var documentAnalysisTasks:
+        [UUID: DocumentAnalysisTaskEntry] = [:]
+    private static let maximumResidentAnalysisRecords = 8
     private var searchMetadataCorpora: [UUID: String] = [:]
     private var searchTextCorpora: [UUID: String] = [:]
     private var searchTextCorpusCosts: [UUID: Int] = [:]
     private var streamingSearchTextRecordIDs: Set<UUID> = []
     private var searchTextCorpusCost = 0
+    private var scanImportGeneration = UUID()
+    private var batesReceiptVerificationToken: UUID?
+    private var batesExternalMatchGeneration = UUID()
+    private var officeReportVerificationGeneration = UUID()
+    private var officeExternalMatchGeneration = UUID()
     private var deliveryPreflightCache: [
         UUID: PDFDeliveryPreflightCacheEntry
     ] = [:]
+    private static let maximumInMemoryPreflightEntries = 64
     private var comparisonCache: [
         PDFComparisonCacheKey: PDFChangeReview
     ] = [:]
     private var comparisonCacheOrder: [PDFComparisonCacheKey] = []
+    private static let maximumComparisonCacheBytes: Int64 =
+        12 * 1_024 * 1_024
     private var pageAssessmentCache: [
         PDFPageAssessmentCacheKey: PDFPagePreparationAssessment
     ] = [:]
@@ -212,18 +523,62 @@ final class PaperPathModel: ObservableObject {
     private var versionComparisonCacheOrder: [
         PDFVersionComparisonCacheKey
     ] = []
+    private static let maximumVersionComparisonCacheBytes: Int64 =
+        12 * 1_024 * 1_024
+    private var activeComparisonTasks:
+        [UUID: ActivePDFComparison] = [:]
+    private var isClearingPageMatches = false
+    private var isUpdatingVersionStorage = false
+    private var isErasingAllLocalData = false
     private var pageMutationUndos: [UUID: PageMutationUndo] = [:]
+    private var pageMutationUndoOrder: [UUID] = []
+    private static let maximumPageMutationUndoCount = 4
+    private static let maximumPageMutationUndoBytes: Int64 =
+        256 * 1_024 * 1_024
+    private var initialBootstrapTask: Task<Bool, Never>?
+    private var initialBootstrapGeneration = UUID()
     private var deferredBootstrapTask: Task<Void, Never>?
+    private var deferredBackgroundWorkNeedsRestart = false
     private var metadataSyncTask: Task<Void, Never>?
     private nonisolated(unsafe) var metadataSyncObserver:
         NSObjectProtocol?
     private nonisolated(unsafe) var memoryWarningObserver:
         NSObjectProtocol?
     private var didBootstrap = false
+    private var isBootstrapping = false
     private var isApplyingMetadataSync = false
     private var isSynchronizingMetadata = false
+    private var metadataSyncNeedsFollowUp = false
+    private var metadataSyncFollowUpShowsNotice = false
+    private var metadataSyncAutomaticRetryBlocked = false
+    private var metadataSyncGeneration = UUID()
+    private var metadataSyncScheduleGeneration = UUID()
+    private static let maximumMetadataSyncPassesPerRun = 3
     private var queuedExternalPDFURLs: [URL] = []
+    private var queuedExternalPDFTargetSceneIDs: [String: UUID] = [:]
+    private var activeExternalPDFURLIdentities: Set<String> = []
     private var isProcessingExternalPDFs = false
+    private var externalPDFImportTask: Task<Void, Never>?
+    private var externalPDFImportGeneration = UUID()
+    private var externalPDFDeferredOpenGeneration: UUID?
+    private var externalImportKnownTotalCount = 0
+    private var externalImportCompletedItemCount = 0
+    private var externalImportCurrentItemFraction: Double = 0
+    private var externalImportRateWindow = ByteRateWindow()
+    private var activeForegroundImportProgressIDs: Set<UUID> = []
+    private var foregroundImportRateWindows:
+        [UUID: ByteRateWindow] = [:]
+    private var activeImportOperations: Set<UUID> = []
+    private var deferredCommittedImports: [UUID: DocumentRecord] = [:]
+    private var deferredCommittedImportSourceIdentities:
+        [UUID: String] = [:]
+    private var deferredCommittedOpenRecordIDs: [UUID] = []
+    private var deferredCommittedOpenSceneIDs: [UUID: UUID] = [:]
+    private var completedExternalImportSceneIDs: [UUID: UUID] = [:]
+    private var committedImportRestoreTask: Task<Void, Never>?
+    private var committedImportRestoreGeneration = UUID()
+    private var scanRenderTask: Task<Void, Error>?
+    private var batesBatchMutationToken: UUID?
     private var officeProductionTask: Task<Void, Never>?
     private var officeProductionCancelledJobID: UUID?
     private var officeResourceMonitorTask: Task<Void, Never>?
@@ -231,6 +586,15 @@ final class PaperPathModel: ObservableObject {
     private var officeIntegrityRateWindow = ByteRateWindow()
     private var operationRateWindows: [UUID: ByteRateWindow] = [:]
     private var exclusiveDocumentOperations: [UUID: UUID] = [:]
+    private var backgroundCancellableDocumentOperations:
+        [UUID: UUID] = [:]
+    private var cancelledExclusiveDocumentOperationTokens: Set<UUID> = []
+    private var activeExclusiveDocumentWorkers:
+        [UUID: ActiveExclusiveDocumentWorker] = [:]
+    private var importingVerifiedPackageIDs: Set<UUID> = []
+    private var importingVerifiedVersionArtifactIDs: Set<UUID> = []
+    private var versionArchiveVerificationGeneration = UUID()
+    private static let maximumQueuedExternalPDFCount = 64
 
     init(
         store: DocumentStore = DocumentStore(),
@@ -258,24 +622,45 @@ final class PaperPathModel: ObservableObject {
         self.searchablePDFService = searchablePDFService
         self.outputService = outputService
         self.deliveryAuditService = deliveryAuditService
+        self.comparisonCoordinator = PDFComparisonCoordinator(
+            service: deliveryAuditService
+        )
         self.documentStructureService = documentStructureService
         self.signatureStore = signatureStore
         self.metadataSyncService = metadataSyncService
             ?? PDFMetadataSyncService()
+        UserDefaults.standard.removeObject(
+            forKey: "library.searchHistory"
+        )
+        UserDefaults.standard.removeObject(
+            forKey: "document.findHistory"
+        )
         memoryWarningObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.releaseEvidenceCaches()
+                self?.handleMemoryPressure()
             }
         }
     }
 
     deinit {
+        initialBootstrapTask?.cancel()
         deferredBootstrapTask?.cancel()
+        for entry in documentAnalysisTasks.values {
+            entry.task.cancel()
+        }
+        for comparison in activeComparisonTasks.values {
+            comparison.task.cancel()
+        }
+        for worker in activeExclusiveDocumentWorkers.values {
+            worker.cancel()
+        }
         metadataSyncTask?.cancel()
+        externalPDFImportTask?.cancel()
+        scanRenderTask?.cancel()
         officeProductionTask?.cancel()
         officeResourceMonitorTask?.cancel()
         if let metadataSyncObserver {
@@ -291,11 +676,59 @@ final class PaperPathModel: ObservableObject {
     }
 
     func bootstrap() async {
+        await store.checkpointTrustedTime()
+        if didBootstrap {
+            await restoreCommittedImportsForForeground()
+            guard !Task.isCancelled else { return }
+            await processPendingExternalPDFs()
+            guard !Task.isCancelled else { return }
+            await restoreCommittedImportsForForeground()
+            resumeDeferredBackgroundWork()
+            return
+        }
+        if let initialBootstrapTask {
+            let completed = await initialBootstrapTask.value
+            guard !completed,
+                  !Task.isCancelled,
+                  !didBootstrap
+            else { return }
+            await bootstrap()
+            return
+        }
+        let generation = UUID()
+        initialBootstrapGeneration = generation
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return true }
+            let completed = await self.performInitialBootstrap()
+            if self.initialBootstrapGeneration == generation {
+                self.initialBootstrapTask = nil
+            }
+            return completed
+        }
+        initialBootstrapTask = task
+        let completed = await task.value
+        guard !completed,
+              !Task.isCancelled,
+              !didBootstrap
+        else { return }
+        await bootstrap()
+    }
+
+    private func performInitialBootstrap() async -> Bool {
+#if DEBUG
+        // #region debug-point B:desk-launch-navigation
+        if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "desk-launch-navigation", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "B", "msg": "[DEBUG] Bootstrap entered", "location": "performInitialBootstrap"]); URLSession.shared.dataTask(with: request).resume() }
+        defer { if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "desk-launch-navigation", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "B", "msg": "[DEBUG] Bootstrap finished", "location": "performInitialBootstrap", "data": ["count": documents.count]]); URLSession.shared.dataTask(with: request).resume() } }
+        // #endregion
+#endif
+        isBootstrapping = true
+        defer { isBootstrapping = false }
         deferredBootstrapTask?.cancel()
         deferredBootstrapTask = nil
+        deferredBackgroundWorkNeedsRestart = false
         isLoading = true
-        await discardInterruptedTemporaryFiles()
         do {
+            try await discardInterruptedTemporaryFiles()
             applyBootstrapSnapshot(
                 try await store.loadBootstrapSnapshot()
             )
@@ -303,13 +736,13 @@ final class PaperPathModel: ObservableObject {
 #if DEBUG
             let arguments = ProcessInfo.processInfo.arguments
             if arguments.contains("UITEST_RESET_DEMO") {
-                for document in documents + deletedDocuments {
-                    try await store.delete(document)
-                }
-                await store.clearBatchDeliveryRun()
-                await store.clearOfficeProductionQueue()
-                documents = []
-                deletedDocuments = []
+                try await store.eraseAllData()
+                try await signatureStore.remove()
+                AppEntitlement.resetVerifiedOutputHistoryForUITesting()
+                verifiedOutputSuccessCount = 0
+                await Task.detached(priority: .utility) {
+                    try? ExternalPDFInbox.removeAll()
+                }.value
                 try await seedDemo()
                 applyBootstrapSnapshot(
                     try await store.loadBootstrapSnapshot()
@@ -320,6 +753,9 @@ final class PaperPathModel: ObservableObject {
                 applyBootstrapSnapshot(
                     try await store.loadBootstrapSnapshot()
                 )
+            }
+            if arguments.contains("UITEST_PREPARE_FIND_INDEX") {
+                await prepareFindIndexForUITest()
             }
 #endif
             do {
@@ -347,32 +783,65 @@ final class PaperPathModel: ObservableObject {
                 try? await store.loadOfficeTrustedSigners()
             ) ?? []
             await refreshOfficeResourceSnapshot()
-            lastBatchDeliveryRun = try await store.loadBatchDeliveryRun()
-            if lastBatchDeliveryRun != nil,
-               recoverableBatchDeliveryRun() == nil {
-                lastBatchDeliveryRun = nil
-                await store.clearBatchDeliveryRun()
+            try await restoreBatchDeliveryRun()
+            do {
+                applySignatureLibrary(
+                    try await signatureStore.loadLibrary()
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                applySignatureLibrary(.empty)
+                present(error)
             }
-            applySignatureLibrary(await signatureStore.loadLibrary())
             rebuildSearchCorpora()
             didBootstrap = true
 #if DEBUG
             if arguments.contains("SCREENSHOT_SETTINGS") {
-                settingsPresentationGeneration &+= 1
+                requestSettingsPresentation(in: nil)
             } else if arguments.contains("SCREENSHOT_FULL_UNLOCK") {
-                isPresentingFullUnlock = true
+                presentFullUnlock(.settings)
             }
 #endif
             isLoading = false
             await processPendingExternalPDFs()
-            guard !isRunningAutomatedTests else { return }
-            deferredBootstrapTask?.cancel()
-            deferredBootstrapTask = Task { [weak self] in
-                await self?.finishDeferredBootstrap()
+            guard !isRunningAutomatedTests else { return true }
+            resumeDeferredBackgroundWork()
+            return true
+        } catch is CancellationError {
+            if !didBootstrap {
+                isLoading = false
             }
+            return false
         } catch {
             isLoading = false
             present(error)
+            return true
+        }
+    }
+
+    func resumeDeferredBackgroundWork() {
+        guard didBootstrap,
+              !isRunningAutomatedTests,
+              deferredCommittedImports.isEmpty,
+              !Task.isCancelled
+        else { return }
+        guard deferredBootstrapTask == nil else {
+            deferredBackgroundWorkNeedsRestart = true
+            return
+        }
+        deferredBackgroundWorkNeedsRestart = false
+        deferredBootstrapTask = Task { [weak self] in
+            await self?.finishDeferredBootstrap()
+            guard let self else { return }
+            let shouldRestart =
+                self.deferredBackgroundWorkNeedsRestart
+                    && !Task.isCancelled
+            self.deferredBootstrapTask = nil
+            self.deferredBackgroundWorkNeedsRestart = false
+            if shouldRestart {
+                self.resumeDeferredBackgroundWork()
+            }
         }
     }
 
@@ -397,14 +866,226 @@ final class PaperPathModel: ObservableObject {
         deletedDocuments = snapshot.deletedDocuments
         documentURLs = snapshot.documentURLs
         textIndices = snapshot.textIndices
-        ocrResults = snapshot.ocrResults
+        replaceOCRResults(snapshot.ocrResults)
+        residentAnalysisOrder = documents
+            .filter {
+                snapshot.textIndices[$0.id] != nil
+                    || snapshot.ocrResults[$0.id] != nil
+            }
+            .sorted {
+                let lhs = $0.lastViewedAt ?? $0.modifiedAt
+                let rhs = $1.lastViewedAt ?? $1.modifiedAt
+                if lhs != rhs {
+                    return lhs < rhs
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            .map(\.id)
         deliveryPreflightCache = snapshot.deliveryPreflightCache
+        if AppEntitlement.verifiedOutputCount == 0,
+           documents.contains(where: isVerifiedSafeShareOutput) {
+            verifiedOutputSuccessCount =
+                AppEntitlement.recordVerifiedOutput()
+        } else {
+            verifiedOutputSuccessCount =
+                AppEntitlement.verifiedOutputCount
+        }
+    }
+
+    func ensureAnalysisLoaded(for recordID: UUID) async {
+        guard let sourceRecord = record(id: recordID) else { return }
+        let needsOCR = sourceRecord.completedActions.contains(
+            .recognizeText
+        )
+        if textIndices[recordID] != nil,
+           !needsOCR || ocrResults[recordID] != nil {
+            touchResidentAnalysis(recordID)
+            return
+        }
+        guard sourceRecord.brief != nil else {
+            if needsOCR {
+                recordsWithRecognizedText.remove(recordID)
+                rebuildAttentionCount()
+                await setActionCompletion(
+                    recordID: recordID,
+                    action: .recognizeText,
+                    completed: false
+                )
+            }
+            await analyzeDocument(recordID: recordID)
+            return
+        }
+        let generation = residentAnalysisGeneration
+
+        do {
+            let snapshot = try await store.loadAnalysis(
+                for: Set([recordID])
+            )
+            try Task.checkCancellation()
+            guard residentAnalysisGeneration == generation,
+                  record(id: recordID)?.contentRevisionID
+                    == sourceRecord.contentRevisionID
+            else { return }
+            textIndices.merge(snapshot.textIndices) {
+                _, loaded in loaded
+            }
+            mergeOCRResults(snapshot.ocrResults)
+            let loadedOCRResult = snapshot.ocrResults[recordID]
+            if needsOCR,
+               loadedOCRResult.map(hasUsefulRecognizedText) != true {
+                recordsWithRecognizedText.remove(recordID)
+                rebuildAttentionCount()
+                await setActionCompletion(
+                    recordID: recordID,
+                    action: .recognizeText,
+                    completed: false
+                )
+            }
+            if snapshot.textIndices[recordID] == nil {
+                await analyzeDocument(recordID: recordID)
+            } else {
+                touchResidentAnalysis(recordID)
+                trimResidentAnalysisCache()
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            present(error)
+        }
+    }
+
+    func searchLibraryPageIndex(
+        query: String,
+        orderedRecordIDs: [UUID]
+    ) async throws -> DocumentStoreTextSearchSnapshot {
+        let candidates: [DocumentStoreTextSearchCandidate] =
+            orderedRecordIDs.compactMap {
+                recordID -> DocumentStoreTextSearchCandidate? in
+                guard let record = documentRecordsByID[recordID] else {
+                    return nil
+                }
+                return DocumentStoreTextSearchCandidate(
+                    recordID: recordID,
+                    metadataCorpus: librarySearchMetadataCorpus(
+                        for: recordID
+                    ),
+                    pageCount: record.profile.pageCount,
+                    hasAnalysis: record.brief != nil,
+                    contentRevisionID: record.contentRevisionID
+                )
+            }
+        return try await store.searchTextIndices(
+            query: query,
+            candidates: candidates
+        )
     }
 
     private func valuePropagatingCancellation<Value>(
         from task: Task<Value, Error>
     ) async throws -> Value {
-        try await withTaskCancellationHandler {
+        let value = try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        try Task.checkCancellation()
+        return value
+    }
+
+    private func valuePropagatingExclusiveCancellation<Value>(
+        from task: Task<Value, Error>,
+        recordID: UUID,
+        operationToken: UUID
+    ) async throws -> Value {
+        let value = try await valueCompletingAtomicExclusiveCommit(
+            from: task,
+            recordID: recordID,
+            operationToken: operationToken
+        )
+        try ensureExclusiveDocumentOperationIsCurrent(
+            recordID: recordID,
+            token: operationToken
+        )
+        return value
+    }
+
+    private func valueCompletingAtomicExclusiveCommit<Value>(
+        from task: Task<Value, Error>,
+        recordID: UUID,
+        operationToken: UUID
+    ) async throws -> Value {
+        do {
+            try markExclusiveDocumentOperationBackgroundCancellable(
+                recordID: recordID,
+                token: operationToken
+            )
+        } catch {
+            task.cancel()
+            throw error
+        }
+        activeExclusiveDocumentWorkers[recordID] =
+            ActiveExclusiveDocumentWorker(
+                operationToken: operationToken,
+                cancel: { task.cancel() }
+            )
+        defer {
+            if activeExclusiveDocumentWorkers[recordID]?
+                .operationToken == operationToken {
+                activeExclusiveDocumentWorkers[recordID] = nil
+            }
+        }
+        return try await withTaskCancellationHandler {
+            try await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    private func valuePropagatingExclusiveCancellation<Value>(
+        from task: Task<Value, Error>,
+        operationTokens: [UUID: UUID]
+    ) async throws -> Value {
+        let value = try await valueCompletingAtomicExclusiveCommit(
+            from: task,
+            operationTokens: operationTokens
+        )
+        for (recordID, token) in operationTokens {
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: token
+            )
+        }
+        return value
+    }
+
+    private func valueCompletingAtomicExclusiveCommit<Value>(
+        from task: Task<Value, Error>,
+        operationTokens: [UUID: UUID]
+    ) async throws -> Value {
+        defer {
+            for (recordID, token) in operationTokens
+            where activeExclusiveDocumentWorkers[recordID]?
+                .operationToken == token {
+                activeExclusiveDocumentWorkers[recordID] = nil
+            }
+        }
+        do {
+            for (recordID, token) in operationTokens {
+                try markExclusiveDocumentOperationBackgroundCancellable(
+                    recordID: recordID,
+                    token: token
+                )
+                activeExclusiveDocumentWorkers[recordID] =
+                    ActiveExclusiveDocumentWorker(
+                        operationToken: token,
+                        cancel: { task.cancel() }
+                    )
+            }
+        } catch {
+            task.cancel()
+            throw error
+        }
+        return try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
             task.cancel()
@@ -431,16 +1112,25 @@ final class PaperPathModel: ObservableObject {
                 }
                 noticeMessage = "Saved signature removed".localizedUI
             }
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
     }
 
-    func selectSavedSignature(_ id: UUID) async {
+    func selectSavedSignature(
+        _ id: UUID,
+        presentsFeedback: Bool = true
+    ) async {
         do {
             let library = try await signatureStore.select(id)
             applySignatureLibrary(library)
-            noticeMessage = "Saved signature selected".localizedUI
+            if presentsFeedback {
+                noticeMessage = "Saved signature selected".localizedUI
+            }
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
@@ -451,6 +1141,8 @@ final class PaperPathModel: ObservableObject {
             let library = try await signatureStore.remove(id: id)
             applySignatureLibrary(library)
             noticeMessage = "Saved signature removed".localizedUI
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
@@ -469,38 +1161,79 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
-    func importPDF(from url: URL) async -> DocumentRecord? {
-        isImporting = true
-        defer { isImporting = false }
+    func importPDF(
+        from url: URL,
+        progressID: UUID = UUID()
+    ) async -> DocumentRecord? {
+        let importToken = beginImportOperation()
+        beginForegroundImportProgress(
+            progressID: progressID,
+            totalItemCount: 1,
+            firstURL: url
+        )
+        defer {
+            finishForegroundImportProgress(progressID)
+            finishImportOperation(importToken)
+        }
         do {
             let record = try await importSinglePDF(
                 from: url,
-                preserveSourceLocation: true
+                analyzeAfterImport: false,
+                preserveSourceLocation: true,
+                progress: foregroundImportProgressHandler(
+                    progressID: progressID,
+                    itemIndex: 0,
+                    totalItemCount: 1,
+                    url: url
+                )
             )
             noticeMessage = "Private copy imported".localizedUI
+            resumeDeferredBackgroundWork()
             return record
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
         }
     }
 
-    func importPDFs(from urls: [URL]) async -> [DocumentRecord] {
+    func importPDFs(
+        from urls: [URL],
+        progressID: UUID = UUID()
+    ) async -> [DocumentRecord] {
         guard !urls.isEmpty else { return [] }
-        isImporting = true
-        defer { isImporting = false }
+        let importToken = beginImportOperation()
+        beginForegroundImportProgress(
+            progressID: progressID,
+            totalItemCount: urls.count,
+            firstURL: urls[0]
+        )
+        defer {
+            finishForegroundImportProgress(progressID)
+            finishImportOperation(importToken)
+        }
 
         var imported: [DocumentRecord] = []
         var failures: [Error] = []
-        for url in urls {
+        for (index, url) in urls.enumerated() {
             guard !Task.isCancelled else { break }
             do {
                 imported.append(
                     try await importSinglePDF(
                         from: url,
-                        preserveSourceLocation: true
+                        analyzeAfterImport: false,
+                        preserveSourceLocation: true,
+                        progress: foregroundImportProgressHandler(
+                            progressID: progressID,
+                            itemIndex: index,
+                            totalItemCount: urls.count,
+                            url: url
+                        )
                     )
                 )
+            } catch is CancellationError {
+                break
             } catch {
                 failures.append(error)
             }
@@ -520,106 +1253,486 @@ final class PaperPathModel: ObservableObject {
                 imported.count == 1 ? "y" : "ies"
             )
         }
+        if !imported.isEmpty {
+            resumeDeferredBackgroundWork()
+        }
         return imported
     }
 
-    func receiveExternalURL(_ url: URL) async {
+    func foregroundImportProgress(
+        for progressID: UUID
+    ) -> PDFOperationProgress? {
+        foregroundImportProgresses[progressID]
+    }
+
+    func clearForegroundImportProgress(_ progressID: UUID) {
+        activeForegroundImportProgressIDs.remove(progressID)
+        foregroundImportRateWindows[progressID] = nil
+        foregroundImportProgresses[progressID] = nil
+    }
+
+    func receiveExternalURL(
+        _ url: URL,
+        targetSceneID: UUID? = nil
+    ) async {
         if url.isFileURL {
-            guard url.pathExtension.caseInsensitiveCompare("pdf")
-                    == .orderedSame
-            else {
-                present(ExternalPDFInboxError.invalidPDF)
-                return
-            }
-            if !queuedExternalPDFURLs.contains(url) {
-                queuedExternalPDFURLs.append(url)
-            }
+            await receiveExternalURLs(
+                [url],
+                targetSceneID: targetSceneID
+            )
+            return
         } else {
             guard url.scheme?.lowercased() == "paperpath" else { return }
             if url.host?.lowercased() == "settings" {
-                settingsPresentationGeneration &+= 1
+                requestSettingsPresentation(in: targetSceneID)
                 return
             }
         }
         await processPendingExternalPDFs()
     }
 
+    func receiveExternalURLs(
+        _ urls: [URL],
+        targetSceneID: UUID? = nil
+    ) async {
+        guard !urls.isEmpty,
+              urls.allSatisfy({
+                  $0.isFileURL
+                      && $0.pathExtension.caseInsensitiveCompare("pdf")
+                          == .orderedSame
+              })
+        else {
+            present(ExternalPDFInboxError.invalidPDF)
+            return
+        }
+
+        let overflowCount = enqueueExternalPDFURLs(
+            urls,
+            targetSceneID: targetSceneID
+        )
+        if overflowCount > 0 {
+            noticeMessage =
+                "The external import queue is full. Open queued PDFs before adding more."
+                    .localizedUI
+        }
+        await processPendingExternalPDFs()
+    }
+
     func processPendingExternalPDFs() async {
-        guard didBootstrap,
+        guard didBootstrap, !Task.isCancelled else { return }
+        if let existingTask = externalPDFImportTask {
+            await existingTask.value
+            if !Task.isCancelled,
+               externalPDFImportTask == nil,
+               !externalImportRetryAvailable || !queuedExternalPDFURLs.isEmpty {
+                await processPendingExternalPDFs()
+            }
+            return
+        }
+
+        let generation = UUID()
+        externalPDFImportGeneration = generation
+        externalPDFDeferredOpenGeneration = generation
+        externalImportRetryAvailable = false
+        externalImportDeferredCount = 0
+        externalImportRetryMessage = nil
+        externalImportKnownTotalCount = 0
+        externalImportCompletedItemCount = 0
+        externalImportCurrentItemFraction = 0
+        externalImportRateWindow.reset()
+        externalImportProgress = nil
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runPendingExternalPDFImports(
+                generation: generation
+            )
+            guard self.externalPDFImportGeneration == generation
+            else { return }
+            self.externalPDFImportGeneration = UUID()
+            self.externalPDFDeferredOpenGeneration = nil
+            self.externalPDFImportTask = nil
+            self.externalImportProgress = nil
+            self.externalImportKnownTotalCount = 0
+            self.externalImportCompletedItemCount = 0
+            self.externalImportCurrentItemFraction = 0
+            self.externalImportRateWindow.reset()
+            self.isExternalPDFImportActive = false
+        }
+        externalPDFImportTask = task
+        isExternalPDFImportActive = true
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    func cancelExternalPDFImports() {
+        guard externalPDFImportTask != nil else { return }
+        externalPDFDeferredOpenGeneration = nil
+        externalImportRetryAvailable = true
+        externalPDFImportTask?.cancel()
+    }
+
+    func dismissExternalImportRetry() {
+        externalImportRetryAvailable = false
+    }
+
+    private func offerExternalImportRetry(
+        generation: UUID,
+        error: Error? = nil
+    ) {
+        guard externalPDFImportGeneration == generation else { return }
+        externalImportRetryAvailable = true
+        if let error, externalImportRetryMessage == nil {
+            switch error {
+            case PaperPathError.insufficientStorage:
+                externalImportRetryMessage =
+                    ExternalPDFInboxError.insufficientStorage.errorDescription
+            case PaperPathError.outputVerificationFailed:
+                externalImportRetryMessage =
+                    ExternalPDFInboxError.incompleteCopy.errorDescription
+            default:
+                externalImportRetryMessage =
+                    ExternalPDFInbox.retryReason(for: error).errorDescription
+            }
+        }
+    }
+
+    private func runPendingExternalPDFImports(
+        generation: UUID
+    ) async {
+        guard externalPDFImportGeneration == generation,
               !isProcessingExternalPDFs
         else { return }
 
         isProcessingExternalPDFs = true
-        isImporting = true
+        var importToken: UUID?
         defer {
-            isImporting = false
+            if let importToken {
+                finishImportOperation(importToken)
+            }
+            activeExternalPDFURLIdentities.removeAll()
             isProcessingExternalPDFs = false
         }
 
         var imported: [DocumentRecord] = []
         var failures: [Error] = []
         var attemptedSharedContainers: Set<URL> = []
+        var retryContainers: Set<URL> = []
+        var queueInspectionInterrupted = false
+        var shouldInspectSharedInbox = true
+        var didInspectSharedInbox = false
+        var completedItemCount = 0
+        var totalItemCount = 0
+        defer {
+            for record in imported {
+                completedExternalImportSceneIDs[record.id] = nil
+            }
+            if externalPDFImportGeneration == generation {
+                externalImportDeferredCount =
+                    retryContainers.count + queuedExternalPDFURLs.count
+                externalImportRetryAvailable =
+                    externalImportDeferredCount > 0
+                        || queueInspectionInterrupted
+                        || Task.isCancelled && !didInspectSharedInbox
+                if !externalImportRetryAvailable {
+                    externalImportRetryMessage = nil
+                }
+            }
+        }
 
         while true {
             guard !Task.isCancelled else { break }
             let directURLs = queuedExternalPDFURLs
             queuedExternalPDFURLs.removeAll()
+            let directURLIdentities = Set(
+                directURLs.map(externalPDFURLIdentity)
+            )
+            activeExternalPDFURLIdentities.formUnion(
+                directURLIdentities
+            )
+            let excludedContainers = attemptedSharedContainers
+            let inspectsInbox = shouldInspectSharedInbox
             let inboxTask = Task.detached(priority: .utility) {
-                try ExternalPDFInbox.pendingItems()
+                guard inspectsInbox else {
+                    return ExternalPDFInboxSnapshot(
+                        items: [],
+                        discardedInvalidItemCount: 0
+                    )
+                }
+                return try ExternalPDFInbox.pendingSnapshot(
+                    excludingContainers: excludedContainers
+                )
             }
-            let pendingItems = (
-                try? await valuePropagatingCancellation(
+            let pendingItems: [ExternalPDFInboxItem]
+            do {
+                let snapshot = try await valuePropagatingCancellation(
                     from: inboxTask
                 )
-            ) ?? []
-            guard !Task.isCancelled else { break }
+                pendingItems = snapshot.items
+                didInspectSharedInbox = didInspectSharedInbox || inspectsInbox
+                for deferred in snapshot.deferredItems
+                where attemptedSharedContainers.insert(deferred.containerURL).inserted {
+                    retryContainers.insert(deferred.containerURL)
+                    failures.append(deferred.reason)
+                    offerExternalImportRetry(
+                        generation: generation,
+                        error: deferred.reason
+                    )
+                }
+                if snapshot.discardedInvalidItemCount > 0 {
+                    failures.append(
+                        contentsOf: Array(
+                            repeating:
+                                ExternalPDFInboxError.incompleteCopy,
+                            count:
+                                snapshot.discardedInvalidItemCount
+                        )
+                    )
+                }
+            } catch is CancellationError {
+                queueInspectionInterrupted = true
+                activeExternalPDFURLIdentities.subtract(
+                    directURLIdentities
+                )
+                enqueueExternalPDFURLs(directURLs, atFront: true)
+                return
+            } catch ExternalPDFInboxError.sharedContainerUnavailable {
+                // Passive inbox polling should not interrupt direct imports
+                // when the extension container is unavailable.
+                pendingItems = []
+                shouldInspectSharedInbox = false
+            } catch {
+                failures.append(error)
+                queueInspectionInterrupted = true
+                shouldInspectSharedInbox = false
+                offerExternalImportRetry(generation: generation, error: error)
+                pendingItems = []
+            }
+            guard !Task.isCancelled else {
+                retryContainers.formUnion(pendingItems.map(\.containerURL))
+                activeExternalPDFURLIdentities.subtract(
+                    directURLIdentities
+                )
+                enqueueExternalPDFURLs(directURLs, atFront: true)
+                break
+            }
             let sharedItems = pendingItems.filter {
                 attemptedSharedContainers.insert($0.containerURL).inserted
             }
-            guard !directURLs.isEmpty || !sharedItems.isEmpty else { break }
+            retryContainers.formUnion(sharedItems.map(\.containerURL))
+            guard !directURLs.isEmpty || !sharedItems.isEmpty else {
+                if queuedExternalPDFURLs.isEmpty {
+                    break
+                }
+                continue
+            }
+            if importToken == nil {
+                importToken = beginImportOperation()
+            }
+            totalItemCount += directURLs.count + sharedItems.count
 
-            for url in directURLs {
-                guard !Task.isCancelled else { break }
-                do {
-                    imported.append(
-                        try await importSinglePDF(
-                            from: url,
-                            preserveSourceLocation: true
+            for (offset, url) in directURLs.enumerated() {
+                guard !Task.isCancelled else {
+                    activeExternalPDFURLIdentities.subtract(
+                        Set(
+                            directURLs[offset...].map(
+                                externalPDFURLIdentity
+                            )
                         )
                     )
+                    enqueueExternalPDFURLs(
+                        Array(directURLs[offset...]),
+                        atFront: true
+                    )
+                    break
+                }
+                let urlIdentity = externalPDFURLIdentity(url)
+                let currentName = url.deletingPathExtension()
+                    .lastPathComponent
+                publishExternalImportProgress(
+                    PDFImportProgressUpdate(
+                        stage: .preparing,
+                        fractionCompleted: 0
+                    ),
+                    generation: generation,
+                    currentName: currentName,
+                    completedItemCount: completedItemCount,
+                    totalItemCount: totalItemCount
+                )
+                do {
+                    let record = try await importSinglePDF(
+                        from: url,
+                        analyzeAfterImport: false,
+                        preserveSourceLocation: true,
+                        deferredOpenGeneration: generation,
+                        progress: externalImportProgressHandler(
+                            generation: generation,
+                            currentName: currentName,
+                            completedItemCount:
+                                completedItemCount,
+                            totalItemCount: totalItemCount
+                        )
+                    )
+                    if let targetSceneID =
+                            queuedExternalPDFTargetSceneIDs[urlIdentity] {
+                        completedExternalImportSceneIDs[record.id] =
+                            targetSceneID
+                    }
+                    queuedExternalPDFTargetSceneIDs[urlIdentity] = nil
+                    imported.append(record)
+                } catch is CancellationError {
+                    let remainingURLs = Array(
+                        directURLs[offset...]
+                    ).filter {
+                        !hasDeferredCommittedImport(from: $0)
+                    }
+                    activeExternalPDFURLIdentities.subtract(
+                        Set(
+                            directURLs[offset...].map(
+                                externalPDFURLIdentity
+                            )
+                        )
+                    )
+                    enqueueExternalPDFURLs(
+                        remainingURLs,
+                        atFront: true
+                    )
+                    break
                 } catch {
+                    queuedExternalPDFTargetSceneIDs[urlIdentity] = nil
                     failures.append(error)
                 }
+                activeExternalPDFURLIdentities.remove(urlIdentity)
+                completedItemCount += 1
             }
 
             for item in sharedItems {
-                guard !Task.isCancelled else { break }
-                do {
-                    let record = try await importSinglePDF(
-                        from: item.fileURL,
-                        preferredName: item.preferredName,
-                        preserveSourceLocation: false
+                guard !Task.isCancelled else {
+                    offerExternalImportRetry(generation: generation)
+                    break
+                }
+                publishExternalImportProgress(
+                    PDFImportProgressUpdate(
+                        stage: .preparing,
+                        fractionCompleted: 0
+                    ),
+                    generation: generation,
+                    currentName: item.preferredName,
+                    completedItemCount: completedItemCount,
+                    totalItemCount: totalItemCount
+                )
+                if hasImportedSharedInboxItem(item.id) {
+                    publishExternalImportProgress(
+                        PDFImportProgressUpdate(
+                            stage: .complete,
+                            fractionCompleted: 1
+                        ),
+                        generation: generation,
+                        currentName: item.preferredName,
+                        completedItemCount: completedItemCount,
+                        totalItemCount: totalItemCount
                     )
-                    imported.append(record)
-                    _ = try? await Task.detached(priority: .utility) {
+                    try? await Task.detached(priority: .utility) {
                         try ExternalPDFInbox.remove(item)
                     }.value
+                    retryContainers.remove(item.containerURL)
+                    completedItemCount += 1
+                    continue
+                }
+                let claimedItem: ExternalPDFInboxItem
+                do {
+                    claimedItem = try await Task.detached(
+                        priority: .utility
+                    ) {
+                        try ExternalPDFInbox.claim(item)
+                    }.value
+                    attemptedSharedContainers.insert(claimedItem.containerURL)
+                } catch is CancellationError {
+                    offerExternalImportRetry(generation: generation)
+                    break
                 } catch {
                     failures.append(error)
+                    offerExternalImportRetry(generation: generation, error: error)
+                    completedItemCount += 1
+                    continue
                 }
+                do {
+                    let record = try await importSinglePDF(
+                        from: claimedItem.fileURL,
+                        preferredName: claimedItem.preferredName,
+                        analyzeAfterImport: false,
+                        preserveSourceLocation: false,
+                        expectedSHA256: claimedItem.expectedSHA256,
+                        expectedByteCount: claimedItem.byteCount,
+                        sharedImportID: claimedItem.id,
+                        deferredOpenGeneration: generation,
+                        progress: externalImportProgressHandler(
+                            generation: generation,
+                            currentName: claimedItem.preferredName,
+                            completedItemCount: completedItemCount,
+                            totalItemCount: totalItemCount
+                        )
+                    )
+                    imported.append(record)
+                    retryContainers.remove(item.containerURL)
+                    try? await Task.detached(priority: .utility) {
+                        try ExternalPDFInbox.complete(claimedItem)
+                    }.value
+                } catch is CancellationError {
+                    let alreadyCommitted =
+                        hasImportedSharedInboxItem(claimedItem.id)
+                    if alreadyCommitted {
+                        retryContainers.remove(item.containerURL)
+                    }
+                    try? await Task.detached(priority: .utility) {
+                        if alreadyCommitted {
+                            try ExternalPDFInbox.complete(claimedItem)
+                        } else {
+                            try ExternalPDFInbox.restore(claimedItem)
+                        }
+                    }.value
+                    break
+                } catch {
+                    failures.append(error)
+                    let shouldDiscard =
+                        Self.shouldDiscardSharedInboxItem(after: error)
+                    if !shouldDiscard {
+                        offerExternalImportRetry(generation: generation, error: error)
+                    } else {
+                        retryContainers.remove(item.containerURL)
+                    }
+                    try? await Task.detached(priority: .utility) {
+                        if shouldDiscard {
+                            try ExternalPDFInbox.complete(claimedItem)
+                        } else {
+                            try ExternalPDFInbox.restore(claimedItem)
+                        }
+                    }.value
+                }
+                completedItemCount += 1
             }
         }
 
+        guard !Task.isCancelled else { return }
         guard !imported.isEmpty || !failures.isEmpty else { return }
         if let firstImported = imported.first {
-            pendingExternalDocumentID = firstImported.id
+            pendingExternalDocumentHandoff = ExternalDocumentHandoff(
+                recordID: firstImported.id,
+                targetSceneID:
+                    completedExternalImportSceneIDs[firstImported.id]
+            )
+            resumeDeferredBackgroundWork()
         }
 
         if imported.isEmpty, let firstFailure = failures.first {
-            present(firstFailure)
+            if retryContainers.isEmpty && !queueInspectionInterrupted {
+                present(firstFailure)
+            }
         } else if !failures.isEmpty {
             noticeMessage = AppLocalization.format(
-                "%lld imported · %lld couldn’t be opened",
+                "%lld imported · %lld need attention",
                 imported.count,
                 failures.count
             )
@@ -632,9 +1745,35 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
+    func pendingExternalDocumentID(
+        for sceneID: UUID
+    ) -> UUID? {
+        guard let handoff = pendingExternalDocumentHandoff,
+              handoff.targetSceneID == nil
+                || handoff.targetSceneID == sceneID
+        else { return nil }
+        return handoff.recordID
+    }
+
     func clearPendingExternalDocument(_ recordID: UUID) {
         guard pendingExternalDocumentID == recordID else { return }
-        pendingExternalDocumentID = nil
+        pendingExternalDocumentHandoff = nil
+    }
+
+    func releaseExternalDocumentTarget(for sceneID: UUID) {
+        if let handoff = pendingExternalDocumentHandoff,
+           handoff.targetSceneID == sceneID {
+            pendingExternalDocumentHandoff = ExternalDocumentHandoff(
+                recordID: handoff.recordID,
+                targetSceneID: nil
+            )
+        }
+        queuedExternalPDFTargetSceneIDs = queuedExternalPDFTargetSceneIDs
+            .filter { $0.value != sceneID }
+        deferredCommittedOpenSceneIDs = deferredCommittedOpenSceneIDs
+            .filter { $0.value != sceneID }
+        completedExternalImportSceneIDs = completedExternalImportSceneIDs
+            .filter { $0.value != sceneID }
     }
 
     func createPaperTemplate(
@@ -643,23 +1782,35 @@ final class PaperPathModel: ObservableObject {
         pageCount: Int,
         title: String
     ) async -> DocumentRecord? {
-        isImporting = true
-        defer { isImporting = false }
+        let importToken = beginImportOperation()
+        defer { finishImportOperation(importToken) }
 
         let normalizedTitle = title
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let finalTitle = normalizedTitle.isEmpty
-            ? "\(kind.title) Paper"
-            : String(normalizedTitle.prefix(80))
-        let temporaryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "PaperPath-Template-\(UUID().uuidString).pdf"
+            ? AppLocalization.format(
+                "%@ Paper",
+                kind.title.localizedUI
             )
+            : String(normalizedTitle.prefix(80))
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "PaperPath-DocumentExport-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        let temporaryURL = temporaryDirectory
+            .appendingPathComponent("template.pdf")
         defer {
-            try? FileManager.default.removeItem(at: temporaryURL)
+            PaperPathTemporaryArtifact.removeManagedItem(
+                containing: temporaryDirectory,
+                allowedPrefixes: ["PaperPath-DocumentExport-"]
+            )
         }
 
         do {
+            try LocalFileSecurity.prepareProtectedDirectory(
+                at: temporaryDirectory
+            )
             let renderer = PaperTemplateRenderer()
             let renderTask = Task.detached(priority: .userInitiated) {
                 try renderer.render(
@@ -678,7 +1829,10 @@ final class PaperPathModel: ObservableObject {
                 analyzeAfterImport: true,
                 preserveSourceLocation: false
             )
-            noticeMessage = "\(kind.title) PDF created on this device"
+            noticeMessage = AppLocalization.format(
+                "%@ PDF created on this device",
+                kind.title.localizedUI
+            )
             return record
         } catch is CancellationError {
             return nil
@@ -692,14 +1846,20 @@ final class PaperPathModel: ObservableObject {
         if let existing = workingDocuments.first {
             return existing.id
         }
-        isImporting = true
-        defer { isImporting = false }
-        let temporaryURL = temporaryPDFURL(prefix: "PaperPath-Sample")
-        defer {
-            try? FileManager.default.removeItem(at: temporaryURL)
-        }
+        let importToken = beginImportOperation()
+        defer { finishImportOperation(importToken) }
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-DocumentExport-"
+        )
+        let temporaryURL = temporaryArtifact.fileURL
+        defer { temporaryArtifact.remove() }
         do {
-            try DemoPDFBuilder.create(at: temporaryURL)
+            try temporaryArtifact.prepare()
+            let renderTask = Task.detached(priority: .userInitiated) {
+                try DemoPDFBuilder.create(at: temporaryURL)
+            }
+            try await valuePropagatingCancellation(from: renderTask)
+            try Task.checkCancellation()
             let record = try await importSinglePDF(
                 from: temporaryURL,
                 preferredName: "Project handoff sample",
@@ -707,6 +1867,8 @@ final class PaperPathModel: ObservableObject {
             )
             noticeMessage = "Local sample created".localizedUI
             return record.id
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
@@ -714,9 +1876,11 @@ final class PaperPathModel: ObservableObject {
     }
 
     func duplicate(recordID: UUID) async -> DocumentRecord? {
+        await ensureAnalysisLoaded(for: recordID)
+        guard !Task.isCancelled else { return nil }
         guard let source = record(id: recordID) else { return nil }
-        isImporting = true
-        defer { isImporting = false }
+        let importToken = beginImportOperation()
+        defer { finishImportOperation(importToken) }
 
         do {
             var duplicated = try await store.duplicate(source)
@@ -734,14 +1898,21 @@ final class PaperPathModel: ObservableObject {
                ) {
                 duplicated = analyzed
                 textIndices[duplicated.id] = textIndex
+                touchResidentAnalysis(duplicated.id)
+                trimResidentAnalysisCache()
                 if let ocrResult = ocrResults[source.id] {
-                    ocrResults[duplicated.id] = ocrResult
+                    setOCRResult(
+                        ocrResult,
+                        for: duplicated.id
+                    )
                 }
             }
 
             replace(duplicated)
-            noticeMessage = "Independent working copy created"
+            noticeMessage = "Independent working copy created".localizedUI
             return duplicated
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
@@ -763,21 +1934,21 @@ final class PaperPathModel: ObservableObject {
     }
 
     func importScan(
-        pages: [ScanPageImage]
+        pages: [ScanPageImage],
+        onCommit: (DocumentRecord) -> Void = { _ in }
     ) async -> DocumentRecord? {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, yyyy 'Scan'"
         return await importImagePages(
             pages,
             options: .document,
-            preferredName: formatter.string(from: Date()),
-            successMessage: "Scan saved on device"
+            preferredName: AppLocalization.datedDocumentName(
+                "Scan · %@"
+            ),
+            successMessage: "Scan saved on device",
+            onCommit: onCommit
         )
     }
 
     func importImages(_ images: [UIImage]) async -> DocumentRecord? {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "MMM d, yyyy 'Images'"
         return await importImagePages(
             images.map {
                 ScanPageImage(
@@ -786,8 +1957,11 @@ final class PaperPathModel: ObservableObject {
                 )
             },
             options: .original,
-            preferredName: formatter.string(from: Date()),
-            successMessage: "Image PDF created on device"
+            preferredName: AppLocalization.datedDocumentName(
+                "Images · %@"
+            ),
+            successMessage: "Image PDF created on device",
+            onCommit: { _ in }
         )
     }
 
@@ -795,223 +1969,512 @@ final class PaperPathModel: ObservableObject {
         _ pages: [ScanPageImage],
         options: ScanProcessingOptions,
         preferredName: String,
-        successMessage: String
+        successMessage: String,
+        onCommit: (DocumentRecord) -> Void
     ) async -> DocumentRecord? {
-        isImporting = true
-        defer { isImporting = false }
-        let temporaryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("PaperPath-Scan-\(UUID().uuidString).pdf")
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let generation = UUID()
+        scanImportGeneration = generation
+        let importToken = beginImportOperation()
+        scanImportFraction = 0
+        defer {
+            finishImportOperation(importToken)
+            if scanImportGeneration == generation {
+                scanRenderTask = nil
+                scanImportFraction = nil
+            }
+        }
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains(
+            "UITEST_DELAY_SCAN_CREATION"
+        ) {
+            try? await Task.sleep(for: .seconds(5))
+            guard !Task.isCancelled else { return nil }
+        }
+#endif
+        let temporaryDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "PaperPath-DocumentExport-\(UUID().uuidString)",
+                isDirectory: true
+            )
+
+        let temporaryURL = temporaryDirectory
+            .appendingPathComponent("scan.pdf")
+        defer {
+            PaperPathTemporaryArtifact.removeManagedItem(
+                containing: temporaryDirectory,
+                allowedPrefixes: ["PaperPath-DocumentExport-"]
+            )
+        }
 
         do {
+            try LocalFileSecurity.prepareProtectedDirectory(
+                at: temporaryDirectory
+            )
             let renderer = scanRenderer
+            scanRenderTask?.cancel()
             let renderTask = Task.detached(priority: .userInitiated) {
                 try renderer.render(
                     pages: pages,
                     to: temporaryURL,
                     options: options
-                )
+                ) { [weak self] value in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.scanImportGeneration == generation
+                        else { return }
+                        self.scanImportFraction = max(
+                            self.scanImportFraction ?? 0,
+                            min(1, max(0, value))
+                        )
+                    }
+                }
             }
+            scanRenderTask = renderTask
             try await valuePropagatingCancellation(from: renderTask)
             try Task.checkCancellation()
+            guard scanImportGeneration == generation else {
+                throw CancellationError()
+            }
             let record = try await store.importPDF(
                 from: temporaryURL,
                 preferredName: preferredName
             )
+            onCommit(record)
+            guard !Task.isCancelled,
+                  scanImportGeneration == generation
+            else {
+                deferredCommittedImports[record.id] = record
+                return await restoreCommittedImportIfForeground(
+                    record
+                )
+            }
             replace(record)
             documentURLs[record.id] = await store.url(for: record)
-            await analyzeDocument(recordID: record.id)
-            noticeMessage = successMessage
+            noticeMessage = successMessage.localizedUI
+            resumeDeferredBackgroundWork()
             return self.record(id: record.id)
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
         }
     }
 
-    func rename(recordID: UUID, to name: String) async {
-        guard let record = record(id: recordID) else { return }
+    private var canRestoreCommittedImportsInForeground: Bool {
+        !isErasingAllLocalData
+            && UIApplication.shared.applicationState == .active
+            && UIApplication.shared.isProtectedDataAvailable
+    }
+
+    func restoreCommittedImportsForForeground() async {
+        if let committedImportRestoreTask {
+            await committedImportRestoreTask.value
+        }
+        guard committedImportRestoreTask == nil,
+              canRestoreCommittedImportsInForeground,
+              !deferredCommittedImports.isEmpty
+        else { return }
+        let generation = UUID()
+        committedImportRestoreGeneration = generation
+        let task = Task { @MainActor [weak self] in
+            await self?.performCommittedImportRestore()
+            guard let self,
+                  self.committedImportRestoreGeneration == generation
+            else { return }
+            self.committedImportRestoreTask = nil
+        }
+        committedImportRestoreTask = task
+        await task.value
+    }
+
+    private func restoreCommittedImportIfForeground(
+        _ committed: DocumentRecord
+    ) async -> DocumentRecord? {
+        guard canRestoreCommittedImportsInForeground else { return nil }
+        let resolvedURL = await store.url(for: committed)
+        guard canRestoreCommittedImportsInForeground else { return nil }
+        deferredCommittedImports[committed.id] = nil
+        deferredCommittedImportSourceIdentities[committed.id] = nil
+        deferredCommittedOpenSceneIDs[committed.id] = nil
+        deferredCommittedOpenRecordIDs.removeAll {
+            $0 == committed.id
+        }
+        replace(committed)
+        documentURLs[committed.id] = resolvedURL
+        resumeDeferredBackgroundWork()
+        return record(id: committed.id) ?? committed
+    }
+
+    private func performCommittedImportRestore() async {
+        guard canRestoreCommittedImportsInForeground else { return }
+        var restoredCount = 0
+        var pendingExternalOpenID: UUID?
+        var pendingExternalOpenSceneID: UUID?
+        while !deferredCommittedImports.isEmpty {
+            guard !Task.isCancelled,
+                  canRestoreCommittedImportsInForeground
+            else { return }
+            let pending = Array(deferredCommittedImports.values)
+            let pendingIDs = Set(pending.map(\.id))
+            if pendingExternalOpenID == nil {
+                pendingExternalOpenID =
+                    deferredCommittedOpenRecordIDs.first {
+                        pendingIDs.contains($0)
+                    }
+                if let pendingExternalOpenID {
+                    pendingExternalOpenSceneID =
+                        deferredCommittedOpenSceneIDs[
+                            pendingExternalOpenID
+                        ]
+                }
+            }
+            var resolvedURLs: [UUID: URL] = [:]
+            resolvedURLs.reserveCapacity(pending.count)
+            for record in pending {
+                guard !Task.isCancelled,
+                      canRestoreCommittedImportsInForeground
+                else { return }
+                resolvedURLs[record.id] = await store.url(for: record)
+            }
+            guard !Task.isCancelled,
+                  canRestoreCommittedImportsInForeground
+            else { return }
+            replace(pending)
+            documentURLs.merge(resolvedURLs) { _, latest in latest }
+            for record in pending {
+                deferredCommittedImports[record.id] = nil
+                deferredCommittedImportSourceIdentities[record.id] = nil
+                deferredCommittedOpenSceneIDs[record.id] = nil
+            }
+            deferredCommittedOpenRecordIDs.removeAll {
+                pendingIDs.contains($0)
+            }
+            restoredCount += pending.count
+        }
+        if pendingExternalDocumentID == nil,
+           let pendingExternalOpenID {
+            pendingExternalDocumentHandoff =
+                ExternalDocumentHandoff(
+                    recordID: pendingExternalOpenID,
+                    targetSceneID: pendingExternalOpenSceneID
+                )
+        }
+        noticeMessage = AppLocalization.format(
+            "%lld private cop%@ restored after interruption",
+            restoredCount,
+            restoredCount == 1 ? "y" : "ies"
+        )
+        resumeDeferredBackgroundWork()
+    }
+
+    @discardableResult
+    func rename(
+        recordID: UUID,
+        to name: String,
+        expectedName: String
+    ) async -> Bool {
+        guard let record = record(id: recordID) else { return false }
+        guard record.displayName == expectedName else {
+            noticeMessage =
+                "The document name changed in another window. Review it and try again."
+                    .localizedUI
+            return false
+        }
         do {
-            let updated = try await store.rename(record, to: name)
-            replace(updated)
-            noticeMessage = "Name updated".localizedUI
+            let updated = try await store.rename(
+                record,
+                to: name,
+                expectedName: expectedName
+            )
+            if replaceMetadataRecordIfCurrent(updated) {
+                noticeMessage = "Name updated".localizedUI
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
+    @discardableResult
     func updateWorkflow(
         recordID: UUID,
         status: DocumentWorkflowStatus
-    ) async {
-        guard let record = record(id: recordID) else { return }
+    ) async -> Bool {
+        guard let record = record(id: recordID) else { return false }
         do {
             let updated = try await store.updateWorkflow(record, status: status)
-            replace(updated)
-            noticeMessage = AppLocalization.format(
-                "Moved to %@",
-                status.title.localizedUI
-            )
+            if replaceMetadataRecordIfCurrent(updated) {
+                noticeMessage = AppLocalization.format(
+                    "Moved to %@",
+                    status.title.localizedUI
+                )
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
-    func togglePinned(recordID: UUID) async {
-        guard let record = record(id: recordID) else { return }
+    @discardableResult
+    func togglePinned(
+        recordID: UUID,
+        expectedIsPinned: Bool
+    ) async -> Bool {
+        guard let record = record(id: recordID) else { return false }
+        guard record.isPinned == expectedIsPinned else {
+            noticeMessage =
+                "The pin state changed in another window. Review it and try again."
+                    .localizedUI
+            return false
+        }
         do {
-            let updated = try await store.setPinned(
+            let updated = try await store.togglePinned(
                 record,
-                isPinned: !record.isPinned
+                expectedIsPinned: expectedIsPinned
             )
-            replace(updated)
-            noticeMessage = updated.isPinned ? "Pinned" : "Unpinned"
+            if replaceMetadataRecordIfCurrent(updated) {
+                noticeMessage = updated.isPinned ? "Pinned" : "Unpinned"
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
+    @discardableResult
     func setPinned(
         recordIDs: Set<UUID>,
         isPinned: Bool
-    ) async {
+    ) async -> Bool {
         let records = documents.filter {
             recordIDs.contains($0.id) && $0.isPinned != isPinned
         }
-        guard !records.isEmpty else { return }
+        guard !records.isEmpty else { return true }
 
         do {
-            for record in records {
-                let updated = try await store.setPinned(
-                    record,
-                    isPinned: isPinned
+            let updated = try await store.setPinned(
+                recordIDs: Set(records.map(\.id)),
+                isPinned: isPinned
+            )
+            let appliedCount =
+                replaceMetadataRecordsIfCurrent(updated)
+            if appliedCount > 0 {
+                noticeMessage = AppLocalization.format(
+                    isPinned
+                        ? "%lld private copies pinned"
+                        : "%lld private copies unpinned",
+                    appliedCount
                 )
-                replace(updated)
             }
-            noticeMessage = isPinned
-                ? "\(records.count) private copies pinned"
-                : "\(records.count) private copies unpinned"
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
+    @discardableResult
     func updateWorkflow(
         recordIDs: Set<UUID>,
         status: DocumentWorkflowStatus
-    ) async {
+    ) async -> Bool {
         let records = documents.filter {
             recordIDs.contains($0.id)
                 && $0.workflowStatus != status
         }
-        guard !records.isEmpty else { return }
+        guard !records.isEmpty else { return true }
 
         do {
-            for record in records {
-                let updated = try await store.updateWorkflow(
-                    record,
-                    status: status
-                )
-                replace(updated)
-            }
-            noticeMessage = AppLocalization.format(
-                "%lld private copies moved to %@",
-                records.count,
-                status.title.localizedUI
+            let updated = try await store.updateWorkflow(
+                recordIDs: Set(records.map(\.id)),
+                status: status
             )
+            let appliedCount =
+                replaceMetadataRecordsIfCurrent(updated)
+            if appliedCount > 0 {
+                noticeMessage = AppLocalization.format(
+                    "%lld private copies moved to %@",
+                    appliedCount,
+                    status.title.localizedUI
+                )
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
-    func updateTags(recordID: UUID, tags: [String]) async {
-        guard let record = record(id: recordID) else { return }
+    @discardableResult
+    func updateTags(
+        recordID: UUID,
+        tags: [String],
+        expectedTags: [String]
+    ) async -> Bool {
+        guard let record = record(id: recordID) else { return false }
+        guard record.tags == expectedTags else {
+            noticeMessage =
+                "The tags changed in another window. Review them and try again."
+                    .localizedUI
+            return false
+        }
         do {
-            let updated = try await store.updateTags(record, tags: tags)
-            replace(updated)
-            noticeMessage = "Tags updated".localizedUI
+            let updated = try await store.updateTags(
+                record,
+                tags: tags,
+                expectedTags: expectedTags
+            )
+            if replaceMetadataRecordIfCurrent(updated) {
+                noticeMessage = "Tags updated".localizedUI
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
+    @discardableResult
     func updateTags(
         recordIDs: Set<UUID>,
         adding tagsToAdd: [String] = [],
         removing tagsToRemove: [String] = []
-    ) async {
-        let records = documents.filter {
-            recordIDs.contains($0.id)
-        }
-        guard !records.isEmpty else { return }
+    ) async -> Bool {
+        guard !recordIDs.isEmpty else { return false }
 
         do {
-            for record in records {
-                var tags = record.tags.filter { existing in
-                    !tagsToRemove.contains {
-                        $0.caseInsensitiveCompare(existing)
-                            == .orderedSame
-                    }
-                }
-                for candidate in tagsToAdd where !tags.contains(
-                    where: {
-                        $0.caseInsensitiveCompare(candidate)
-                            == .orderedSame
-                    }
-                ) {
-                    tags.append(candidate)
-                }
-                let updated = try await store.updateTags(
-                    record,
-                    tags: tags
+            let updated = try await store.updateTags(
+                recordIDs: recordIDs,
+                adding: tagsToAdd,
+                removing: tagsToRemove
+            )
+            let appliedCount =
+                replaceMetadataRecordsIfCurrent(updated)
+            if appliedCount > 0 {
+                noticeMessage = AppLocalization.format(
+                    "%lld private copies updated",
+                    appliedCount
                 )
-                replace(updated)
             }
-            noticeMessage = "\(records.count) private copies updated"
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
+    @discardableResult
     func updateDueDate(
         recordID: UUID,
-        dueAt: Date?
-    ) async {
-        guard let record = record(id: recordID) else { return }
+        dueAt: Date?,
+        expectedDueAt: Date?
+    ) async -> Bool {
+        guard let record = record(id: recordID) else { return false }
+        let calendar = Calendar.current
+        let currentDueAt = record.dueAt.map {
+            calendar.startOfDay(for: $0)
+        }
+        let normalizedExpected = expectedDueAt.map {
+            calendar.startOfDay(for: $0)
+        }
+        guard currentDueAt == normalizedExpected else {
+            noticeMessage =
+                "The due date changed in another window. Review it and try again."
+                    .localizedUI
+            return false
+        }
         do {
             let updated = try await store.updateDueDate(
                 record,
-                dueAt: dueAt
+                dueAt: dueAt,
+                expectedDueAt: normalizedExpected
             )
-            replace(updated)
-            await LocalDueReminderScheduler.update(
+            let applied =
+                replaceMetadataRecordIfCurrent(updated)
+            let effectiveDueDate = self.record(id: recordID)?.dueAt
+            let reminderUpdated = await LocalDueReminderScheduler.update(
                 recordID: recordID,
-                dueAt: updated.dueAt
+                dueAt: effectiveDueDate
             )
-            noticeMessage = dueAt == nil
-                ? "Due date removed".localizedUI
-                : "Due date updated".localizedUI
+            if applied,
+               dueAt != nil,
+               UserDefaults.standard.bool(
+                   forKey: AppPreferences.dueRemindersEnabledKey
+               ),
+               !reminderUpdated {
+                noticeMessage =
+                    "Due date saved, but its reminder could not be scheduled."
+                        .localizedUI
+            } else if applied {
+                noticeMessage = dueAt == nil
+                    ? "Due date removed".localizedUI
+                    : "Due date updated".localizedUI
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
+    @discardableResult
     func updatePrivateNote(
         recordID: UUID,
-        note: String?
-    ) async {
-        guard let record = record(id: recordID) else { return }
+        note: String?,
+        expectedNote: String?
+    ) async -> Bool {
+        guard let record = record(id: recordID) else { return false }
+        let normalizedExpected = expectedNote?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let boundedExpected: String? =
+            if let normalizedExpected, !normalizedExpected.isEmpty {
+                String(normalizedExpected.prefix(1_000))
+            } else {
+                nil
+            }
+        guard record.privateNote == boundedExpected else {
+            noticeMessage =
+                "The private note changed in another window. Review it and try again."
+                    .localizedUI
+            return false
+        }
         do {
             let updated = try await store.updatePrivateNote(
                 record,
-                note: note
+                note: note,
+                expectedNote: boundedExpected
             )
-            replace(updated)
-            noticeMessage = updated.privateNote == nil
-                ? "Private note removed".localizedUI
-                : "Private note saved on this device".localizedUI
+            if replaceMetadataRecordIfCurrent(updated) {
+                noticeMessage = updated.privateNote == nil
+                    ? "Private note removed".localizedUI
+                    : "Private note saved on this device".localizedUI
+            }
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
         }
     }
 
@@ -1025,7 +2488,7 @@ final class PaperPathModel: ObservableObject {
                 receipt,
                 for: record
             )
-            replace(updated, schedulesMetadataSync: false)
+            synchronizeCommittedOfficeReceipts(updated, expectedRecord: record)
         } catch {
             // Office export remains usable if local receipt history fails.
         }
@@ -1034,7 +2497,8 @@ final class PaperPathModel: ObservableObject {
     func retainOfficeExport(
         recordID: UUID,
         receipt: PDFOfficeExportReceipt,
-        sourceURL: URL
+        sourceURL: URL,
+        expectedContentRevisionID: UUID? = nil
     ) async -> (
         receipt: PDFOfficeExportReceipt,
         url: URL
@@ -1042,15 +2506,19 @@ final class PaperPathModel: ObservableObject {
         guard let record = record(id: recordID) else {
             return nil
         }
+        let requestedRevision = expectedContentRevisionID
+            ?? receipt.sourceRevisionID ?? record.contentRevisionID
+        guard requestedRevision == record.contentRevisionID else { return nil }
+        var boundReceipt = receipt
+        boundReceipt.sourceRevisionID = requestedRevision
         do {
             let retained = try await store.retainOfficeExport(
-                receipt,
+                boundReceipt,
                 sourceURL: sourceURL,
                 for: record
             )
-            replace(retained.record, schedulesMetadataSync: false)
-            try? FileManager.default.removeItem(at: sourceURL)
-            cleanupOfficeExportContainer(for: sourceURL)
+            synchronizeCommittedOfficeReceipts(retained.record, expectedRecord: record)
+            await discardTemporaryExportCopies(at: [sourceURL])
             return (
                 receipt: retained.receipt,
                 url: retained.url
@@ -1058,51 +2526,235 @@ final class PaperPathModel: ObservableObject {
         } catch {
             await recordOfficeExportReceipt(
                 recordID: recordID,
-                receipt: receipt
+                receipt: boundReceipt
             )
             return nil
         }
     }
 
-    func reusableOfficeExportURL(
+    private func synchronizeCommittedOfficeReceipts(
+        _ updated: DocumentRecord,
+        expectedRecord: DocumentRecord
+    ) {
+        if replaceMetadataRecordIfCurrent(updated, schedulesMetadataSync: false) {
+            return
+        }
+        guard var resident = record(id: updated.id),
+              resident.contentRevisionID == updated.contentRevisionID,
+              resident.officeReceipts == expectedRecord.officeReceipts
+        else { return }
+        resident.officeReceipts = updated.officeReceipts
+        resident.modifiedAt = max(resident.modifiedAt, updated.modifiedAt)
+        replace(
+            resident,
+            schedulesMetadataSync: false,
+            invalidatesSearchText: false
+        )
+    }
+
+    func prepareReusableOfficeExportShareCopy(
         recordID: UUID,
-        receipt: PDFOfficeExportReceipt
+        receiptID: UUID,
+        progress: @escaping @MainActor @Sendable (
+            PDFByteProgressUpdate
+        ) -> Void = { _ in }
     ) async -> URL? {
-        guard let record = record(id: recordID) else {
+        guard let operationToken = acquireExclusiveDocumentOperation(
+            recordID: recordID
+        ) else {
             return nil
         }
-        return await store.reusableOfficeExportURL(
-            for: receipt,
-            record: record
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
+        guard let record = record(id: recordID),
+              let receipt = record.officeReceipts.first(
+                  where: { $0.id == receiptID }
+              )
+        else { return nil }
+        let requestedRevision = record.contentRevisionID
+        let destination = officeShareDestinationURL(
+            for: receipt
         )
+        do {
+            try Task.checkCancellation()
+            let prepared = try await store
+                .prepareOfficeExportShareCopy(
+                receiptID: receiptID,
+                for: record,
+                destinationURL: destination
+            ) { update in
+                Task { @MainActor in
+                    progress(update)
+                }
+            }
+            replace(
+                prepared.record,
+                schedulesMetadataSync: false
+            )
+            try Task.checkCancellation()
+            guard self.record(id: recordID)?.contentRevisionID
+                    == requestedRevision
+            else {
+                await discardTemporaryExportCopies(
+                    at: [destination]
+                )
+                throw PaperPathError.outputVerificationFailed(
+                    "the source PDF changed while its Office share copy was prepared"
+                )
+            }
+            return prepared.url
+        } catch is CancellationError {
+            await discardTemporaryExportCopies(at: [destination])
+            return nil
+        } catch {
+            await discardTemporaryExportCopies(at: [destination])
+            guard !Task.isCancelled else { return nil }
+            await refreshOfficeBatchArtifactState(recordID: recordID)
+            present(error)
+            return nil
+        }
+    }
+
+    func prepareReusableOfficeExportShareCopies(
+        recordID: UUID,
+        receiptIDs: [UUID],
+        progress: @escaping @MainActor @Sendable (
+            PDFByteProgressUpdate
+        ) -> Void = { _ in }
+    ) async -> [URL]? {
+        guard !receiptIDs.isEmpty,
+              Set(receiptIDs).count == receiptIDs.count,
+              let operationToken = acquireExclusiveDocumentOperation(
+                  recordID: recordID
+              )
+        else { return nil }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
+        guard var currentRecord = record(id: recordID) else {
+            return nil
+        }
+        let requestedRevision = currentRecord.contentRevisionID
+        let receiptsByID = Dictionary(
+            currentRecord.officeReceipts.map {
+                ($0.id, $0)
+            },
+            uniquingKeysWith: { existing, _ in existing }
+        )
+        let receipts = receiptIDs.compactMap { receiptsByID[$0] }
+        guard receipts.count == receiptIDs.count,
+              receipts.allSatisfy({ $0.fileSizeBytes > 0 })
+        else { return nil }
+        let totalWorkBytes = receipts.reduce(Int64.zero) {
+            total,
+            receipt in
+            saturatedByteTotal(
+                [
+                    total,
+                    receipt.fileSizeBytes,
+                    receipt.fileSizeBytes,
+                    receipt.fileSizeBytes
+                ]
+            )
+        }
+        let totalUnitCount = receipts.count * 3
+        var preparedURLs: [URL] = []
+        preparedURLs.reserveCapacity(receipts.count)
+        var completedWorkBytes = Int64.zero
+        do {
+            for (index, receipt) in receipts.enumerated() {
+                try Task.checkCancellation()
+                let destination = officeShareDestinationURL(
+                    for: receipt
+                )
+                let completedBeforeCurrent = completedWorkBytes
+                let prepared = try await store
+                    .prepareOfficeExportShareCopy(
+                        receiptID: receipt.id,
+                        for: currentRecord,
+                        destinationURL: destination
+                    ) { update in
+                        let currentProcessed = min(
+                            max(0, update.totalBytes),
+                            max(0, update.processedBytes)
+                        )
+                        let (sum, overflow) =
+                            completedBeforeCurrent
+                                .addingReportingOverflow(
+                                    currentProcessed
+                                )
+                        let cumulativeProcessed =
+                            overflow ? Int64.max : sum
+                        let cumulativeUpdate =
+                            PDFByteProgressUpdate(
+                                stage: update.stage,
+                                processedBytes: min(
+                                    totalWorkBytes,
+                                    cumulativeProcessed
+                                ),
+                                totalBytes: totalWorkBytes,
+                                completedUnitCount: min(
+                                    totalUnitCount,
+                                    index * 3
+                                        + update.completedUnitCount
+                                ),
+                                totalUnitCount: totalUnitCount,
+                                currentUnitName:
+                                    update.currentUnitName
+                            )
+                        Task { @MainActor in
+                            progress(cumulativeUpdate)
+                        }
+                    }
+                replace(
+                    prepared.record,
+                    schedulesMetadataSync: false
+                )
+                currentRecord = prepared.record
+                preparedURLs.append(prepared.url)
+                completedWorkBytes = saturatedByteTotal(
+                    [
+                        completedWorkBytes,
+                        receipt.fileSizeBytes,
+                        receipt.fileSizeBytes,
+                        receipt.fileSizeBytes
+                    ]
+                )
+            }
+            try Task.checkCancellation()
+            guard self.record(id: recordID)?.contentRevisionID
+                    == requestedRevision
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the source PDF changed while its Office share copies were prepared"
+                )
+            }
+            return preparedURLs
+        } catch is CancellationError {
+            await discardTemporaryExportCopies(at: preparedURLs)
+            return nil
+        } catch {
+            await discardTemporaryExportCopies(at: preparedURLs)
+            guard !Task.isCancelled else { return nil }
+            await refreshOfficeBatchArtifactState(recordID: recordID)
+            present(error)
+            return nil
+        }
     }
 
     var pinnedOfficeOutputs: [PDFPinnedOfficeOutput] {
-        documents.flatMap { record in
-            record.officeReceipts
-                .filter(\.isPinned)
-                .map {
-                    PDFPinnedOfficeOutput(
-                        recordID: record.id,
-                        documentName: record.displayName,
-                        receipt: $0
-                    )
-                }
-        }
-        .sorted {
-            ($0.receipt.pinnedAt ?? .distantPast)
-                > ($1.receipt.pinnedAt ?? .distantPast)
-        }
+        pinnedOfficeOutputCache
     }
 
     var pinnedOfficeStorageSummary: PDFOfficePinnedStorageSummary {
-        let outputs = pinnedOfficeOutputs
-        return PDFOfficePinnedStorageSummary(
-            outputCount: outputs.count,
-            byteCount: outputs.reduce(Int64(0)) {
-                $0 + $1.receipt.fileSizeBytes
-            }
-        )
+        pinnedOfficeStorageSummaryCache
     }
 
     func setOfficeExportPinned(
@@ -1110,8 +2762,18 @@ final class PaperPathModel: ObservableObject {
         receiptID: UUID,
         pinned: Bool
     ) async {
+        guard let operationToken = acquireExclusiveDocumentOperation(
+            recordID: recordID
+        ) else { return }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
         guard let record = record(id: recordID) else { return }
         do {
+            try Task.checkCancellation()
             if pinned,
                let receipt = record.officeReceipts.first(
                     where: { $0.id == receiptID }
@@ -1130,46 +2792,54 @@ final class PaperPathModel: ObservableObject {
                 for: record
             )
             replace(updated, schedulesMetadataSync: false)
+            try Task.checkCancellation()
             noticeMessage = pinned
                 ? "Office output pinned on this device".localizedUI
                 : "Office output returns to seven-day retention".localizedUI
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
     }
 
     func unpinAllOfficeExports() async {
-        let outputs = pinnedOfficeOutputs
-        guard !outputs.isEmpty else { return }
-        var unpinnedCount = 0
-        for output in outputs {
-            guard let record = record(id: output.recordID) else {
-                continue
-            }
-            do {
-                let updated = try await store.setOfficeExportPinned(
-                    receiptID: output.receipt.id,
-                    pinned: false,
-                    for: record
-                )
-                replace(updated, schedulesMetadataSync: false)
-                unpinnedCount += 1
-            } catch {
-                present(error)
-                return
-            }
+        let unpinnedCount = pinnedOfficeOutputs.count
+        guard unpinnedCount > 0 else { return }
+        do {
+            try Task.checkCancellation()
+            let updatedRecords = try await store
+                .unpinAllOfficeExports()
+            replace(
+                updatedRecords,
+                schedulesMetadataSync: false
+            )
+            guard !Task.isCancelled else { return }
+            noticeMessage = AppLocalization.format(
+                "%lld Office output%@ returned to standard retention",
+                unpinnedCount,
+                unpinnedCount == 1 ? "" : "s"
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            present(error)
         }
-        noticeMessage = AppLocalization.format(
-            "%lld Office output%@ returned to standard retention",
-            unpinnedCount,
-            unpinnedCount == 1 ? "" : "s"
-        )
     }
 
     func makeOfficeBatchArchive(
         recordID: UUID,
         batchID: UUID
-    ) async throws -> URL {
+    ) async throws -> (archive: URL, report: URL) {
+        let operationToken = try beginExclusiveDocumentOperation(
+            recordID: recordID
+        )
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
         guard let record = record(id: recordID),
               let run = officeBatchRuns[recordID],
               run.id == batchID,
@@ -1187,23 +2857,63 @@ final class PaperPathModel: ObservableObject {
                 ($0.batchSegmentIndex ?? 0)
                     < ($1.batchSegmentIndex ?? 0)
             }
-        guard !receipts.isEmpty else {
+        guard !receipts.isEmpty,
+              receipts.count == run.completedCount
+        else {
             throw PaperPathError.insufficientSelection(
-                "No retained Office batch parts are available."
+                "Not every completed Office batch part is available."
             )
         }
 
         var retainedSources: [OfficeBatchArchiveSource] = []
-        var manifestParts: [[String: Any]] = []
+        var deliveryEntries: [PDFOfficeDeliveryEntry] = []
+        var currentRecord = record
         for receipt in receipts {
-            try Task.checkCancellation()
-            guard let url = await store.reusableOfficeExportURL(
-                for: receipt,
-                record: record
-            ) else { continue }
-            let partNumber = (receipt.batchSegmentIndex ?? 0) + 1
-            let startPage = (receipt.sourcePageStartIndex ?? 0) + 1
-            let endPage = (receipt.sourcePageEndIndex ?? 0) + 1
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            )
+            let store = self.store
+            let recordToVerify = currentRecord
+            let verificationTask = Task {
+                try await store.verifyOfficeExport(
+                    receiptID: receipt.id,
+                    for: recordToVerify
+                )
+            }
+            let verification =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: verificationTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            replace(
+                verification.record,
+                schedulesMetadataSync: false
+            )
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            )
+            currentRecord = verification.record
+            guard verification.status.isVerified,
+                  let url = verification.url
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    AppLocalization.format(
+                        "Office batch part %lld failed: %@",
+                        receipt.batchSegmentIndex.map { $0 + 1 } ?? 1,
+                        verification.status.title.localizedUI
+                    )
+                )
+            }
+            let verifiedReceipt = verification.receipt
+            let partNumber =
+                (verifiedReceipt.batchSegmentIndex ?? 0) + 1
+            let startPage =
+                (verifiedReceipt.sourcePageStartIndex ?? 0) + 1
+            let endPage =
+                (verifiedReceipt.sourcePageEndIndex ?? 0) + 1
             let archiveName = String(
                 format:
                     "%02d-part-%02d-pages-%d-%d.%@",
@@ -1211,7 +2921,7 @@ final class PaperPathModel: ObservableObject {
                 partNumber,
                 startPage,
                 endPage,
-                receipt.format.fileExtension
+                verifiedReceipt.format.fileExtension
             )
             retainedSources.append(
                 OfficeBatchArchiveSource(
@@ -1219,22 +2929,43 @@ final class PaperPathModel: ObservableObject {
                     archiveName: archiveName
                 )
             )
-            manifestParts.append(
-                [
-                    "file": archiveName,
-                    "part": partNumber,
-                    "pages": "\(startPage)-\(endPage)",
-                    "bytes": receipt.fileSizeBytes,
-                    "receipt_id": receipt.id.uuidString,
-                    "sha256":
-                        receipt.artifactSHA256 ?? "unavailable"
-                ]
+            deliveryEntries.append(
+                PDFOfficeDeliveryEntry(
+                    sourceRecordID: currentRecord.id,
+                    sourceRevisionID:
+                        run.plan.sourceRevisionID,
+                    sourceName: currentRecord.displayName,
+                    receiptID: verifiedReceipt.id,
+                    format: verifiedReceipt.format,
+                    archiveName: archiveName,
+                    byteCount: verifiedReceipt.fileSizeBytes,
+                    sha256:
+                        verifiedReceipt.artifactSHA256
+                            ?? "unavailable"
+                )
             )
         }
-        guard !retainedSources.isEmpty else {
+        guard !retainedSources.isEmpty,
+              deliveryEntries.count == retainedSources.count
+        else {
             throw PaperPathError.insufficientSelection(
                 "The retained Office batch parts are no longer available."
             )
+        }
+        let signedArchiveWorkingBytes = saturatedByteTotal(
+            deliveryEntries.lazy.map(\.byteCount),
+            reserve: 16 * 1_024 * 1_024
+        )
+        guard signedArchiveWorkingBytes
+                <= 1_024 * 1_024 * 1_024
+        else {
+            throw PaperPathError.fileTooLarge
+        }
+        await refreshOfficeResourceSnapshot()
+        if let available =
+            officeResourceSnapshot.availableCapacityBytes,
+           available < signedArchiveWorkingBytes {
+            throw PaperPathError.insufficientStorage
         }
 
         let directory = FileManager.default.temporaryDirectory
@@ -1245,38 +2976,76 @@ final class PaperPathModel: ObservableObject {
         try LocalFileSecurity.prepareProtectedDirectory(
             at: directory
         )
-        let manifestURL = directory.appendingPathComponent(
-            "PaperPath-batch-manifest.json"
+        let reportURL = directory.appendingPathComponent(
+            "\(safeExportName(record.displayName))-\(run.id.uuidString.prefix(8))-verification.json"
         )
+        let archiveKind =
+            run.completedCount == run.segments.count
+                ? "signed-batch"
+                : "signed-partial-batch"
         let destination = directory.appendingPathComponent(
-            "\(safeExportName(record.displayName))-\(run.plan.format.fileExtension)-batch.zip"
+            "\(safeExportName(record.displayName))-\(run.plan.format.fileExtension)-\(archiveKind).zip"
         )
         do {
-            let manifest: [String: Any] = [
-                "schema": "PaperPath Office Batch V31",
-                "batch_id": run.id.uuidString,
-                "source_revision_id": run.plan.sourceRevisionID.uuidString,
-                "format": run.plan.format.fileExtension.uppercased(),
-                "source_pages": run.plan.sourcePageCount,
-                "completed_parts": retainedSources.count,
-                "planned_parts": run.plan.segmentCount,
-                "created_at": ISO8601DateFormatter().string(
-                    from: run.startedAt
-                ),
-                "parts": manifestParts
+            let store = self.store
+            let evidenceDateTask = Task {
+                try await store.trustedEvidenceIssuanceDate()
+            }
+            let packageCreatedAt =
+                try await valuePropagatingExclusiveCancellation(
+                    from: evidenceDateTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            let package = PDFOfficeDeliveryPackage(
+                id: run.id,
+                createdAt: packageCreatedAt,
+                entries: deliveryEntries
+            )
+            let payload = PDFOfficeVerificationPayload(
+                schema: "PaperPath Office Delivery V34",
+                packageID: package.id,
+                createdAt: package.createdAt,
+                expiresAt: package.expiresAt,
+                verifiedOutputs: deliveryEntries.count,
+                files: deliveryEntries
+            )
+            guard payload.isStructurallyValid(at: packageCreatedAt)
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the signed Office batch identity is invalid"
+                )
+            }
+            let signingTask = Task {
+                try await store.signOfficeDeliveryPayload(payload)
+            }
+            let signedReport =
+                try await valuePropagatingExclusiveCancellation(
+                    from: signingTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            officeDeliverySigningKeyID =
+                signedReport.signature.keyID
+            let reportEncoder = JSONEncoder()
+            reportEncoder.outputFormatting = [
+                .prettyPrinted,
+                .sortedKeys
             ]
-            let manifestData = try JSONSerialization.data(
-                withJSONObject: manifest,
-                options: [.prettyPrinted, .sortedKeys]
+            reportEncoder.dateEncodingStrategy = .iso8601
+            let manifestData = try reportEncoder.encode(
+                signedReport
             )
-            try manifestData.write(to: manifestURL, options: .atomic)
+            try manifestData.write(to: reportURL, options: .atomic)
             try LocalFileSecurity.requireCompleteProtection(
-                to: manifestURL
+                to: reportURL
             )
+            LocalFileSecurity.excludeFromBackup(reportURL)
             retainedSources.append(
                 OfficeBatchArchiveSource(
-                    sourceURL: manifestURL,
-                    archiveName: manifestURL.lastPathComponent
+                    sourceURL: reportURL,
+                    archiveName:
+                        "PaperPath-delivery-manifest.json"
                 )
             )
 
@@ -1309,15 +3078,37 @@ final class PaperPathModel: ObservableObject {
                     }
                 )
             }
-            try await withTaskCancellationHandler {
-                try await archiveTask.value
-            } onCancel: {
-                archiveTask.cancel()
-            }
-            try? FileManager.default.removeItem(at: manifestURL)
-            return destination
+            try await valuePropagatingExclusiveCancellation(
+                from: archiveTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            try await verifyCreatedOfficeDeliveryArchive(
+                at: destination,
+                expectedReport: signedReport,
+                progress: { update in
+                    Task { @MainActor [weak self] in
+                        self?.publishOperationByteProgress(
+                            recordID: recordID,
+                            label: operationLabel,
+                            update: update
+                        )
+                    }
+                }
+            )
+            try LocalFileSecurity.requireCompleteProtection(
+                to: destination
+            )
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            )
+            noticeMessage =
+                "Signed Office batch and verification report ready"
+                    .localizedUI
+            return (destination, reportURL)
         } catch {
-            try? FileManager.default.removeItem(at: directory)
+            await discardTemporaryExportCopies(at: [directory])
             throw error
         }
     }
@@ -1511,7 +3302,8 @@ final class PaperPathModel: ObservableObject {
             return
         }
         officeProductionQueue.jobs[index].stage = .cancelled
-        officeProductionQueue.jobs[index].completedAt = Date()
+        officeProductionQueue.jobs[index].completedAt =
+            PDFOfficeTimeAnchor.process.trustedDate()
         officeProductionQueue.jobs[index].detail =
             "Removed before production started"
         await persistOfficeProductionQueue()
@@ -1575,7 +3367,8 @@ final class PaperPathModel: ObservableObject {
             }
             updateOfficeProductionJob(jobID) { job in
                 job.stage = .analyzing
-                job.startedAt = job.startedAt ?? Date()
+                job.startedAt = job.startedAt
+                    ?? PDFOfficeTimeAnchor.process.trustedDate()
                 job.completedAt = nil
                 job.detail = "Checking source revision and route"
             }
@@ -1610,7 +3403,8 @@ final class PaperPathModel: ObservableObject {
                     guard run.completedCount == run.segments.count else {
                         updateOfficeProductionJob(jobID) {
                             $0.stage = .attention
-                            $0.completedAt = Date()
+                            $0.completedAt =
+                                PDFOfficeTimeAnchor.process.trustedDate()
                             $0.receiptIDs = receiptIDs
                             $0.detail = AppLocalization.format(
                                 "%lld of %lld parts retained",
@@ -1630,7 +3424,8 @@ final class PaperPathModel: ObservableObject {
 
                 updateOfficeProductionJob(jobID) {
                     $0.stage = .completed
-                    $0.completedAt = Date()
+                    $0.completedAt =
+                        PDFOfficeTimeAnchor.process.trustedDate()
                     $0.receiptIDs = receiptIDs
                     $0.detail = receiptIDs.count == 1
                         ? "Integrity-sealed output retained"
@@ -1645,7 +3440,9 @@ final class PaperPathModel: ObservableObject {
                     officeProductionCancelledJobID == jobID
                 updateOfficeProductionJob(jobID) {
                     $0.stage = wasCancelled ? .cancelled : .paused
-                    $0.completedAt = wasCancelled ? Date() : nil
+                    $0.completedAt = wasCancelled
+                        ? PDFOfficeTimeAnchor.process.trustedDate()
+                        : nil
                     $0.detail = wasCancelled
                         ? "Production cancelled"
                         : "Paused safely between local operations"
@@ -1656,8 +3453,10 @@ final class PaperPathModel: ObservableObject {
             } catch {
                 updateOfficeProductionJob(jobID) {
                     $0.stage = .attention
-                    $0.completedAt = Date()
-                    $0.detail = error.localizedDescription
+                    $0.completedAt =
+                        PDFOfficeTimeAnchor.process.trustedDate()
+                    $0.detail = AppLocalization
+                        .userFacingErrorDescription(error)
                 }
                 await persistOfficeProductionQueue()
             }
@@ -1682,7 +3481,8 @@ final class PaperPathModel: ObservableObject {
             }
             if !existing.retryableSegmentIDs.isEmpty,
                let resumed = try await resumeOfficeBatch(
-                    recordID: job.recordID
+                    recordID: job.recordID,
+                    queueJobID: job.id
                ) {
                 try Task.checkCancellation()
                 return resumed
@@ -1690,7 +3490,9 @@ final class PaperPathModel: ObservableObject {
         }
         guard let created = try await makeOfficeBatch(
             recordID: job.recordID,
-            format: job.format
+            format: job.format,
+            expectedSourceRevisionID: job.sourceRevisionID,
+            queueJobID: job.id
         ) else {
             throw PaperPathError.storageFailure(
                 "The segmented Office job could not start."
@@ -1705,7 +3507,8 @@ final class PaperPathModel: ObservableObject {
     ) async throws -> PDFOfficeExportReceipt {
         let artifact = try await makeTextExport(
             recordID: job.recordID,
-            format: job.format
+            format: job.format,
+            expectedContentRevisionID: job.sourceRevisionID
         )
         defer {
             try? FileManager.default.removeItem(at: artifact.url)
@@ -1745,7 +3548,8 @@ final class PaperPathModel: ObservableObject {
         guard let retained = await retainOfficeExport(
             recordID: job.recordID,
             receipt: receipt,
-            sourceURL: artifact.url
+            sourceURL: artifact.url,
+            expectedContentRevisionID: job.sourceRevisionID
         ) else {
             throw PaperPathError.storageFailure(
                 "The Office output could not be retained."
@@ -1776,11 +3580,13 @@ final class PaperPathModel: ObservableObject {
             where: { $0.id == jobID }
         ) else { return }
         update(&officeProductionQueue.jobs[index])
-        officeProductionQueue.updatedAt = Date()
+        officeProductionQueue.updatedAt =
+            PDFOfficeTimeAnchor.process.trustedDate()
     }
 
     private func persistOfficeProductionQueue() async {
-        officeProductionQueue.updatedAt = Date()
+        officeProductionQueue.updatedAt =
+            PDFOfficeTimeAnchor.process.trustedDate()
         officeProductionQueue.boundHistory()
         do {
             try await store.saveOfficeProductionQueue(
@@ -1799,7 +3605,8 @@ final class PaperPathModel: ObservableObject {
                   let issue = officeProductionSourceIssue(for: job)
             else { continue }
             officeProductionQueue.jobs[index].stage = .attention
-            officeProductionQueue.jobs[index].completedAt = Date()
+            officeProductionQueue.jobs[index].completedAt =
+                PDFOfficeTimeAnchor.process.trustedDate()
             officeProductionQueue.jobs[index].detail = issue.localizedUI
             changed = true
         }
@@ -2003,9 +3810,12 @@ final class PaperPathModel: ObservableObject {
             )
         }
         await refreshOfficeResourceSnapshot()
-        let deliveryWorkingBytes = artifacts.reduce(Int64(0)) {
-            $0 + $1.receipt.fileSizeBytes
-        } + 64 * 1_024 * 1_024
+        let deliveryWorkingBytes = saturatedByteTotal(
+            artifacts.lazy.map {
+                max(0, $0.receipt.fileSizeBytes)
+            },
+            reserve: 64 * 1_024 * 1_024
+        )
         if let available =
             officeResourceSnapshot.availableCapacityBytes,
            available < deliveryWorkingBytes {
@@ -2066,7 +3876,10 @@ final class PaperPathModel: ObservableObject {
                     )
                 )
             }
+            let packageCreatedAt = try await store
+                .trustedEvidenceIssuanceDate()
             var package = PDFOfficeDeliveryPackage(
+                createdAt: packageCreatedAt,
                 entries: deliveryEntries
             )
             let payload = PDFOfficeVerificationPayload(
@@ -2145,6 +3958,28 @@ final class PaperPathModel: ObservableObject {
             } onCancel: {
                 archiveTask.cancel()
             }
+            try await verifyCreatedOfficeDeliveryArchive(
+                at: destination,
+                expectedReport: signedReport,
+                progress: { update in
+                    Task { @MainActor [weak self] in
+                        self?.publishOfficeIntegrityProgress(
+                            generation: archiveGeneration,
+                            completedCount:
+                                update.completedUnitCount,
+                            totalCount: update.totalUnitCount,
+                            currentSourceName:
+                                update.currentUnitName.isEmpty
+                                ? "Delivery package"
+                                : update.currentUnitName,
+                            processedBytes: update.processedBytes,
+                            totalBytes: update.totalBytes,
+                            startedAt: archiveStartedAt,
+                            activity: update.stage
+                        )
+                    }
+                }
+            )
             let retained = try await store
                 .retainOfficeDeliveryPackage(
                     package,
@@ -2159,34 +3994,420 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
+    private func verifyCreatedOfficeDeliveryArchive(
+        at archiveURL: URL,
+        expectedReport: PDFOfficeSignedVerificationReport,
+        progress: @escaping PDFByteProgressHandler
+    ) async throws {
+        let worker = Task.detached(priority: .utility) {
+            try PDFVersionArchiveVerificationService()
+                .verifyOfficeDeliveryArchive(
+                    archiveURL: archiveURL,
+                    progress: progress
+                )
+        }
+        let inspection = try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        guard inspection.signedReport == expectedReport else {
+            throw PaperPathError.outputVerificationFailed(
+                "the Office archive manifest changed after packaging"
+            )
+        }
+        let signatureResult = try await store
+            .verifyOfficeDeliveryReport(inspection.signedReport)
+        guard signatureResult.isVerified else {
+            throw PaperPathError.outputVerificationFailed(
+                "the Office archive signature could not be verified"
+            )
+        }
+    }
+
     func officeDeliveryPackageURLs(
-        _ package: PDFOfficeDeliveryPackage
+        _ package: PDFOfficeDeliveryPackage,
+        reportOnly: Bool = false
     ) async throws -> (archive: URL, report: URL) {
-        try await store.officeDeliveryPackageURLs(for: package)
+        try await store.officeDeliveryPackageURLs(
+            for: package,
+            reportOnly: reportOnly
+        )
     }
 
     func verifyOfficeDeliveryReport(
         at url: URL
     ) async throws -> PDFOfficeReportVerificationResult {
-        let result = try await store.verifyOfficeDeliveryReport(
-            at: url
-        )
+        let generation = UUID()
+        officeReportVerificationGeneration = generation
+        releaseOfficeReportVerification()
+        var verifiedDirectory: URL?
+        var keepsVerifiedDirectory = false
+        defer {
+            if !keepsVerifiedDirectory,
+               let verifiedDirectory {
+                Self.discardVerifiedOfficeDeliveryDirectory(
+                    verifiedDirectory
+                )
+            }
+        }
+        let result: PDFOfficeReportVerificationResult
+        if url.pathExtension.lowercased() == "zip" {
+            let hasScopedAccess =
+                url.startAccessingSecurityScopedResource()
+            defer {
+                if hasScopedAccess {
+                    url.stopAccessingSecurityScopedResource()
+                }
+            }
+            let archiveGeneration = UUID()
+            let startedAt = Date()
+            officeIntegrityGeneration = archiveGeneration
+            officeIntegrityProgress = nil
+            officeIntegrityRateWindow.reset()
+            defer {
+                if officeIntegrityGeneration == archiveGeneration {
+                    officeIntegrityGeneration = nil
+                    officeIntegrityProgress = nil
+                    officeIntegrityRateWindow.reset()
+                }
+            }
+            let extractionDirectory = FileManager.default
+                .temporaryDirectory
+                .appendingPathComponent(
+                    "\(PaperPathTemporaryArtifact.verifiedOfficeDeliveryPrefix)\(UUID().uuidString)",
+                    isDirectory: true
+                )
+            verifiedDirectory = extractionDirectory
+            let worker = Task.detached(priority: .userInitiated) {
+                do {
+                    try LocalFileSecurity.prepareProtectedDirectory(
+                        at: extractionDirectory
+                    )
+                    return try PDFVersionArchiveVerificationService()
+                        .verifyOfficeDeliveryArchive(
+                            archiveURL: url,
+                            extractionDirectory: extractionDirectory
+                        ) { update in
+                            Task { @MainActor [weak self] in
+                                self?.publishOfficeIntegrityProgress(
+                                    generation: archiveGeneration,
+                                    completedCount:
+                                        update.completedUnitCount,
+                                    totalCount:
+                                        update.totalUnitCount,
+                                    currentSourceName:
+                                        update.currentUnitName.isEmpty
+                                        ? "Signed ZIP"
+                                        : update.currentUnitName,
+                                    processedBytes:
+                                        update.processedBytes,
+                                    totalBytes: update.totalBytes,
+                                    startedAt: startedAt,
+                                    activity: update.stage
+                                )
+                            }
+                        }
+                } catch {
+                    Self.discardVerifiedOfficeDeliveryDirectory(
+                        extractionDirectory
+                    )
+                    throw error
+                }
+            }
+            let inspection = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            try Task.checkCancellation()
+            let verifiedReport = try await store
+                .verifyOfficeDeliveryReport(
+                inspection.signedReport
+            )
+            var archiveResult = verifiedReport.appendingDetail(
+                AppLocalization.format(
+                    "%lld ZIP entries matched CRC, byte count, and SHA-256.",
+                    inspection.verifiedFileCount
+                )
+            )
+            if archiveResult.isVerified {
+                let formatStartedAt = Date()
+                officeIntegrityRateWindow.reset()
+                let formatWorker = Task.detached(
+                    priority: .userInitiated
+                ) {
+                    try PDFOfficeArtifactFormatVerificationService()
+                        .verify(
+                            inspection.signedReport.payload.files,
+                            extractedFileURLs:
+                                inspection.extractedFileURLs
+                        ) { update in
+                            Task { @MainActor [weak self] in
+                                self?.publishOfficeIntegrityProgress(
+                                    generation: archiveGeneration,
+                                    completedCount:
+                                        update.completedUnitCount,
+                                    totalCount:
+                                        update.totalUnitCount,
+                                    currentSourceName:
+                                        update.currentUnitName,
+                                    processedBytes:
+                                        update.processedBytes,
+                                    totalBytes: update.totalBytes,
+                                    startedAt: formatStartedAt,
+                                    activity: update.stage
+                                )
+                            }
+                        }
+                }
+                let formatEvidence =
+                    try await withTaskCancellationHandler {
+                        try await formatWorker.value
+                    } onCancel: {
+                        formatWorker.cancel()
+                    }
+                try Task.checkCancellation()
+                let artifacts = try inspection.signedReport.payload
+                    .files.map { entry in
+                        guard let artifactURL =
+                                inspection.extractedFileURLs[
+                                    entry.archiveName
+                                ],
+                              let evidence =
+                                formatEvidence[entry.receiptID]
+                        else {
+                            throw PaperPathError.outputVerificationFailed(
+                                "the verified Office files could not be extracted"
+                            )
+                        }
+                        return PDFOfficeVerifiedArtifact(
+                            entry: entry,
+                            url: artifactURL,
+                            formatEvidence: evidence
+                        )
+                    }
+                archiveResult = archiveResult
+                    .appendingDetail(
+                        AppLocalization.format(
+                            "%lld Office file formats passed structural verification.",
+                            artifacts.count
+                        )
+                    )
+                    .attachingVerifiedArtifacts(artifacts)
+            }
+            result = archiveResult
+        } else {
+            result = try await store.verifyOfficeDeliveryReport(
+                at: url
+            )
+        }
+        guard officeReportVerificationGeneration == generation
+        else {
+            throw CancellationError()
+        }
         officeTrustedSigners = (
             try? await store.loadOfficeTrustedSigners()
         ) ?? officeTrustedSigners
+        guard officeReportVerificationGeneration == generation
+        else {
+            throw CancellationError()
+        }
         lastOfficeReportVerification = result
+        keepsVerifiedDirectory = !result.verifiedArtifacts.isEmpty
         return result
     }
 
     func clearOfficeReportVerification() {
-        lastOfficeReportVerification = nil
+        officeReportVerificationGeneration = UUID()
+        officeExternalMatchGeneration = UUID()
+        releaseOfficeReportVerification()
         officeExternalMatchProgress = nil
+    }
+
+    private func releaseOfficeReportVerification() {
+        let artifacts =
+            lastOfficeReportVerification?.verifiedArtifacts ?? []
+        lastOfficeReportVerification = nil
+        guard let firstURL = artifacts.first?.url else { return }
+        Self.discardVerifiedOfficeDeliveryDirectory(
+            firstURL.deletingLastPathComponent()
+        )
+    }
+
+    nonisolated private static func
+        discardVerifiedOfficeDeliveryDirectory(
+            _ directory: URL
+        ) {
+        Task.detached(priority: .utility) {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: directory,
+                allowedPrefixes: [
+                    PaperPathTemporaryArtifact
+                        .verifiedOfficeDeliveryPrefix
+                ]
+            )
+        }
+    }
+
+    func revalidateOfficeArtifactsForSharing(
+        receiptIDs: Set<UUID>
+    ) async throws -> [URL] {
+        guard let verification = lastOfficeReportVerification,
+              !verification.verifiedArtifacts.isEmpty,
+              !receiptIDs.isEmpty
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Choose at least one verified Office file."
+            )
+        }
+        let initialWallDate = Date()
+        let initialSystemUptime = ProcessInfo.processInfo.systemUptime
+        let initialStatus = verification.effectiveStatus(
+            at: initialWallDate,
+            systemUptime: initialSystemUptime
+        )
+        guard initialStatus != .expired else {
+            invalidateOfficeReportVerification()
+            throw PaperPathError.outputVerificationFailed(
+                "This signed Office report has expired. Verify a current delivery package before sharing."
+            )
+        }
+        guard initialStatus == .verified,
+              let signedReport = verification.signedReport
+        else {
+            invalidateOfficeReportVerification()
+            throw PaperPathError.outputVerificationFailed(
+                "The signed Office report must be verified again before sharing."
+            )
+        }
+        let artifacts = verification.verifiedArtifacts.filter {
+            receiptIDs.contains($0.id)
+        }
+        guard artifacts.count == receiptIDs.count else {
+            throw PaperPathError.outputVerificationFailed(
+                "The verified Office selection is invalid."
+            )
+        }
+
+        let reportGeneration = officeReportVerificationGeneration
+        let refreshedReport = try await store
+            .verifyOfficeDeliveryReport(signedReport)
+        guard officeReportVerificationGeneration == reportGeneration
+        else {
+            throw CancellationError()
+        }
+        let refreshedWallDate = Date()
+        let refreshedSystemUptime = ProcessInfo.processInfo.systemUptime
+        let refreshedStatus = refreshedReport.effectiveStatus(
+            at: refreshedWallDate,
+            systemUptime: refreshedSystemUptime
+        )
+        guard refreshedStatus == .verified else {
+            invalidateOfficeReportVerification()
+            throw PaperPathError.outputVerificationFailed(
+                refreshedStatus == .expired
+                    ? "This signed Office report expired before sharing."
+                    : "The signed Office report no longer passes verification."
+            )
+        }
+        let progressGeneration = UUID()
+        let startedAt = Date()
+        let totalBytes = saturatedByteTotal(
+            artifacts.lazy.map { max(0, $0.entry.byteCount) }
+        )
+        officeIntegrityGeneration = progressGeneration
+        officeIntegrityProgress = nil
+        officeIntegrityRateWindow.reset()
+        publishOfficeIntegrityProgress(
+            generation: progressGeneration,
+            completedCount: 0,
+            totalCount: artifacts.count,
+            currentSourceName:
+                artifacts.first?.entry.archiveName ?? "",
+            processedBytes: 0,
+            totalBytes: totalBytes,
+            startedAt: startedAt,
+            activity: .checksumming
+        )
+        defer {
+            if officeIntegrityGeneration == progressGeneration {
+                officeIntegrityGeneration = nil
+                officeIntegrityProgress = nil
+                officeIntegrityRateWindow.reset()
+            }
+        }
+
+        let worker = Task.detached(priority: .userInitiated) {
+            try PDFOfficeArtifactShareVerificationService().verify(
+                artifacts
+            ) { update in
+                Task { @MainActor [weak self] in
+                    self?.publishOfficeIntegrityProgress(
+                        generation: progressGeneration,
+                        completedCount: update.completedUnitCount,
+                        totalCount: update.totalUnitCount,
+                        currentSourceName:
+                            update.currentUnitName,
+                        processedBytes: update.processedBytes,
+                        totalBytes: update.totalBytes,
+                        startedAt: startedAt,
+                        activity: update.stage
+                    )
+                }
+            }
+        }
+        let urls: [URL]
+        do {
+            urls = try await withTaskCancellationHandler {
+                try await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            if officeReportVerificationGeneration
+                == reportGeneration {
+                officeReportVerificationGeneration = UUID()
+                releaseOfficeReportVerification()
+            }
+            throw error
+        }
+        try Task.checkCancellation()
+        guard officeReportVerificationGeneration == reportGeneration,
+              let current = lastOfficeReportVerification,
+              current.verifiedArtifacts.filter({
+                  receiptIDs.contains($0.id)
+              }) == artifacts
+        else {
+            throw CancellationError()
+        }
+        let finalWallDate = Date()
+        let finalSystemUptime = ProcessInfo.processInfo.systemUptime
+        guard current.isVerified(
+            at: finalWallDate,
+            systemUptime: finalSystemUptime
+        ) else {
+            invalidateOfficeReportVerification()
+            throw PaperPathError.outputVerificationFailed(
+                "This signed Office report expired before sharing."
+            )
+        }
+        return urls
+    }
+
+    private func invalidateOfficeReportVerification() {
+        officeReportVerificationGeneration = UUID()
+        releaseOfficeReportVerification()
     }
 
     func matchExternalOfficeDeliveryFiles(
         report: PDFOfficeSignedVerificationReport,
         candidateURLs: [URL]
     ) async -> PDFOfficeExternalMatchReport? {
+        let generation = UUID()
+        officeExternalMatchGeneration = generation
         officeExternalMatchProgress = nil
         do {
             let result = try await store
@@ -2194,17 +4415,26 @@ final class PaperPathModel: ObservableObject {
                     report: report,
                     candidateURLs: candidateURLs
                 ) { [weak self] progress in
+                    guard self?.officeExternalMatchGeneration
+                            == generation
+                    else { return }
                     self?.officeExternalMatchProgress = progress
                 }
+            guard officeExternalMatchGeneration == generation
+            else { return nil }
             if officeExternalMatchProgress?.packageID
                 == report.payload.packageID {
                 officeExternalMatchProgress = nil
             }
             return result
         } catch is CancellationError {
-            officeExternalMatchProgress = nil
+            if officeExternalMatchGeneration == generation {
+                officeExternalMatchProgress = nil
+            }
             return nil
         } catch {
+            guard officeExternalMatchGeneration == generation
+            else { return nil }
             officeExternalMatchProgress = nil
             present(error)
             return nil
@@ -2285,6 +4515,18 @@ final class PaperPathModel: ObservableObject {
                     displayName: displayName,
                     note: note
                 )
+            if let verification = lastOfficeReportVerification,
+               verification.keyID == keyID,
+               verification.trustStatus == .trusted,
+               let signer = officeTrustedSigners.first(
+                where: { $0.keyID == keyID }
+               ) {
+                lastOfficeReportVerification =
+                    verification.updatingTrust(
+                        .trusted,
+                        signerName: signer.displayName
+                    )
+            }
             return true
         } catch {
             present(error)
@@ -2299,22 +4541,14 @@ final class PaperPathModel: ObservableObject {
         do {
             officeTrustedSigners = try await store
                 .trustOfficeReportSigner(verification)
-            if let keyID = verification.keyID {
+            if let keyID = verification.keyID,
+               let signer = officeTrustedSigners.first(
+                where: { $0.keyID == keyID }
+               ) {
                 lastOfficeReportVerification =
-                    PDFOfficeReportVerificationResult(
-                        status: verification.status,
-                        packageID: verification.packageID,
-                        keyID: keyID,
-                        sourceCount: verification.sourceCount,
-                        outputCount: verification.outputCount,
-                        createdAt: verification.createdAt,
-                        detail: verification.detail,
-                        publicKeyBase64:
-                            verification.publicKeyBase64,
-                        trustStatus: .trusted,
-                        trustedSignerName:
-                            "Signer \(keyID.prefix(8))",
-                        signedReport: verification.signedReport
+                    verification.updatingTrust(
+                        .trusted,
+                        signerName: signer.displayName
                     )
             }
             noticeMessage = "Signer trusted on this device"
@@ -2325,30 +4559,24 @@ final class PaperPathModel: ObservableObject {
 
     func removeOfficeTrustedSigner(
         _ keyID: String
-    ) async {
+    ) async -> Bool {
         do {
             officeTrustedSigners = try await store
                 .removeOfficeTrustedSigner(keyID)
             if lastOfficeReportVerification?.keyID == keyID,
                let verification = lastOfficeReportVerification {
                 lastOfficeReportVerification =
-                    PDFOfficeReportVerificationResult(
-                        status: verification.status,
-                        packageID: verification.packageID,
-                        keyID: verification.keyID,
-                        sourceCount: verification.sourceCount,
-                        outputCount: verification.outputCount,
-                        createdAt: verification.createdAt,
-                        detail: verification.detail,
-                        publicKeyBase64:
-                            verification.publicKeyBase64,
-                        trustStatus: .unknown,
-                        trustedSignerName: nil,
-                        signedReport: verification.signedReport
+                    verification.updatingTrust(
+                        .unknown,
+                        signerName: nil
                     )
             }
+            noticeMessage = "Signer trust removed from this device"
+                .localizedUI
+            return true
         } catch {
             present(error)
+            return false
         }
     }
 
@@ -2409,7 +4637,9 @@ final class PaperPathModel: ObservableObject {
                     .map { max(0, $0.fileSizeBytes) } ?? 0
             }
         }
-        let totalBytes = receiptByteCounts.values.reduce(0, +)
+        let totalBytes = saturatedByteTotal(
+            receiptByteCounts.values
+        )
         let startedAt = Date()
         let generation = UUID()
         officeIntegrityProgress = nil
@@ -2454,7 +4684,9 @@ final class PaperPathModel: ObservableObject {
                 )
                 guard let current = record(id: job.recordID) else {
                     completedCount += 1
-                    processedBytes += receiptBytes
+                    processedBytes = saturatedByteTotal(
+                        [processedBytes, receiptBytes]
+                    )
                     continue
                 }
                 let verification = try await store.verifyOfficeExport(
@@ -2486,7 +4718,9 @@ final class PaperPathModel: ObservableObject {
                 )
                 verifications.append(verification)
                 completedCount += 1
-                processedBytes += receiptBytes
+                processedBytes = saturatedByteTotal(
+                    [processedBytes, receiptBytes]
+                )
                 publishOfficeIntegrityProgress(
                     generation: generation,
                     completedCount: completedCount,
@@ -2509,7 +4743,7 @@ final class PaperPathModel: ObservableObject {
             checkedCount: checkedCount,
             verifiedCount: verifiedCount,
             failedCount: checkedCount - verifiedCount,
-            checkedAt: Date()
+            checkedAt: await store.trustedDeliveryDate()
         )
         return (verifications, report)
     }
@@ -2539,9 +4773,10 @@ final class PaperPathModel: ObservableObject {
             officeIntegrityProgress?.activity == activity
             ? officeIntegrityProgress?.processedBytes ?? 0
             : 0
+        let boundedTotalBytes = max(0, totalBytes)
         let boundedBytes = max(
             previousBytes,
-            min(max(0, processedBytes), max(0, totalBytes))
+            min(max(0, processedBytes), boundedTotalBytes)
         )
         let previousProgress = officeIntegrityProgress
         let didAdvance =
@@ -2553,7 +4788,7 @@ final class PaperPathModel: ObservableObject {
             processedBytes: boundedBytes
         )
         let remaining = bytesPerSecond > 0
-            ? Double(max(0, totalBytes - boundedBytes))
+            ? Double(boundedTotalBytes - boundedBytes)
                 / bytesPerSecond
             : nil
         officeIntegrityProgress = PDFOfficeIntegrityProgress(
@@ -2561,7 +4796,7 @@ final class PaperPathModel: ObservableObject {
             totalCount: totalCount,
             currentSourceName: currentSourceName,
             processedBytes: boundedBytes,
-            totalBytes: totalBytes,
+            totalBytes: boundedTotalBytes,
             bytesPerSecond: bytesPerSecond,
             estimatedRemainingSeconds: remaining,
             activity: activity,
@@ -2589,29 +4824,91 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
-    func toggleBookmark(recordID: UUID, pageIndex: Int) async {
+    @discardableResult
+    func toggleBookmark(
+        recordID: UUID,
+        pageIndex: Int,
+        expectedContentRevisionID: UUID
+    ) async -> Bool {
         guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID,
               pageIndex >= 0,
               pageIndex < record.profile.pageCount
-        else { return }
-        var pages = Set(record.bookmarkedPages)
-        if pages.contains(pageIndex) {
-            pages.remove(pageIndex)
-        } else {
-            pages.insert(pageIndex)
-        }
+        else { return false }
         do {
-            let updated = try await store.updateBookmarks(
+            let updated = try await store.toggleBookmark(
                 record,
-                pages: Array(pages),
-                preserveNames: true
+                pageIndex: pageIndex
             )
+            guard updated.contentRevisionID
+                    == expectedContentRevisionID
+            else { return false }
+            guard let resident = self.record(id: recordID),
+                  resident.contentRevisionID
+                    == expectedContentRevisionID
+            else { return false }
+            guard resident.modifiedAt <= updated.modifiedAt else {
+                return true
+            }
             replace(updated)
-            noticeMessage = pages.contains(pageIndex)
-                ? "Page \(pageIndex + 1) bookmarked"
-                : "Bookmark removed"
+            noticeMessage = updated.bookmarkedPages.contains(pageIndex)
+                ? AppLocalization.format(
+                    "Page %lld bookmarked",
+                    pageIndex + 1
+                )
+                : "Bookmark removed".localizedUI
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
+            return false
+        }
+    }
+
+    @discardableResult
+    func saveBookmark(
+        recordID: UUID,
+        pageIndex: Int,
+        name: String?,
+        expectedContentRevisionID: UUID
+    ) async -> Bool {
+        guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID,
+              pageIndex >= 0,
+              pageIndex < record.profile.pageCount
+        else { return false }
+        do {
+            let updated = try await store.saveBookmark(
+                record,
+                pageIndex: pageIndex,
+                name: name
+            )
+            guard updated.contentRevisionID
+                    == expectedContentRevisionID
+            else { return false }
+            guard let resident = self.record(id: recordID),
+                  resident.contentRevisionID
+                    == expectedContentRevisionID
+            else { return false }
+            guard resident.modifiedAt <= updated.modifiedAt else {
+                return true
+            }
+            replace(updated)
+            noticeMessage = updated.bookmarkNames[pageIndex] == nil
+                ? AppLocalization.format(
+                    "Page %lld bookmarked",
+                    pageIndex + 1
+                )
+                : "Bookmark named".localizedUI
+            return true
+        } catch is CancellationError {
+            return false
+        } catch {
+            present(error)
+            return false
         }
     }
 
@@ -2627,10 +4924,17 @@ final class PaperPathModel: ObservableObject {
                 pageIndex: pageIndex,
                 name: name
             )
+            guard let resident = self.record(id: recordID),
+                  resident.contentRevisionID
+                    == record.contentRevisionID,
+                  resident.modifiedAt <= updated.modifiedAt
+            else { return }
             replace(updated)
             noticeMessage = updated.bookmarkNames[pageIndex] == nil
                 ? "Bookmark name removed"
                 : "Bookmark named"
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
@@ -2638,20 +4942,43 @@ final class PaperPathModel: ObservableObject {
 
     func updateReadingPosition(
         recordID: UUID,
-        pageIndex: Int
+        pageIndex: Int,
+        expectedContentRevisionID: UUID,
+        viewedAt: Date = Date()
     ) async {
-        guard let record = record(id: recordID) else { return }
+        guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID
+        else { return }
         if record.lastPageIndex == pageIndex,
            let lastViewedAt = record.lastViewedAt,
-           Date().timeIntervalSince(lastViewedAt) < 30 {
+           viewedAt <= lastViewedAt
+                || viewedAt.timeIntervalSince(lastViewedAt) < 30 {
             return
         }
         do {
             let updated = try await store.updateReadingPosition(
-                record,
-                pageIndex: pageIndex
+                recordID: recordID,
+                pageIndex: pageIndex,
+                expectedRevisionID:
+                    expectedContentRevisionID,
+                viewedAt: viewedAt
             )
-            replace(updated)
+            guard updated.contentRevisionID
+                    == expectedContentRevisionID
+            else { return }
+            guard let resident = self.record(id: recordID),
+                  resident.contentRevisionID
+                    == expectedContentRevisionID,
+                  (resident.lastViewedAt ?? .distantPast)
+                    <= (updated.lastViewedAt ?? .distantPast)
+            else { return }
+            replace(
+                updated,
+                invalidatesSearchText: false
+            )
+        } catch is CancellationError {
+            return
         } catch {
             // Reading remains usable even if this noncritical state fails.
         }
@@ -2661,20 +4988,30 @@ final class PaperPathModel: ObservableObject {
         excluding recordID: UUID,
         limit: Int = 5
     ) -> [DocumentRecord] {
+        let boundedLimit = max(0, limit)
+        guard boundedLimit > 0 else { return [] }
         let currentRole = record(id: recordID)?.isDeliveryArtifact
-        return documents
-            .filter {
-                guard $0.id != recordID else { return false }
-                guard let currentRole else { return true }
-                return $0.isDeliveryArtifact == currentRole
+        var recent: [DocumentRecord] = []
+        recent.reserveCapacity(min(boundedLimit, documents.count))
+        for candidate in documents {
+            guard candidate.id != recordID else { continue }
+            if let currentRole,
+               candidate.isDeliveryArtifact != currentRole {
+                continue
             }
-            .sorted {
-                let left = $0.lastViewedAt ?? $0.modifiedAt
-                let right = $1.lastViewedAt ?? $1.modifiedAt
-                return left > right
+            let candidateDate =
+                candidate.lastViewedAt ?? candidate.modifiedAt
+            let insertionIndex = recent.firstIndex {
+                candidateDate
+                    > ($0.lastViewedAt ?? $0.modifiedAt)
+            } ?? recent.endIndex
+            guard insertionIndex < boundedLimit else { continue }
+            recent.insert(candidate, at: insertionIndex)
+            if recent.count > boundedLimit {
+                recent.removeLast()
             }
-            .prefix(max(0, limit))
-            .map { $0 }
+        }
+        return recent
     }
 
     func synchronizeMetadata(
@@ -2686,48 +5023,126 @@ final class PaperPathModel: ObservableObject {
             metadataSyncStatus = metadataSyncDisabledStatus
             return
         }
-        guard !isRunningAutomatedTests,
-              !isSynchronizingMetadata
-        else { return }
+        guard !isRunningAutomatedTests else { return }
+        if showNotice {
+            metadataSyncAutomaticRetryBlocked = false
+        } else {
+            guard !metadataSyncAutomaticRetryBlocked else { return }
+        }
+        if isSynchronizingMetadata {
+            requestMetadataSyncFollowUp(
+                showNotice: showNotice
+            )
+            return
+        }
+        metadataSyncScheduleGeneration = UUID()
+        metadataSyncTask?.cancel()
+        metadataSyncTask = nil
+        let generation = metadataSyncGeneration
         isSynchronizingMetadata = true
+        var shouldShowCompletionNotice = showNotice
+        var completed = true
+        var completedPassCount = 0
+        repeat {
+            metadataSyncNeedsFollowUp = false
+            metadataSyncFollowUpShowsNotice = false
+            completed = await performMetadataSyncPass(
+                generation: generation
+            )
+            completedPassCount += 1
+            guard metadataSyncGeneration == generation else {
+                return
+            }
+            shouldShowCompletionNotice =
+                shouldShowCompletionNotice
+                    || metadataSyncFollowUpShowsNotice
+        } while completed
+            && metadataSyncNeedsFollowUp
+            && completedPassCount
+                < Self.maximumMetadataSyncPassesPerRun
+        let shouldRetryAfterFailure =
+            !completed && metadataSyncNeedsFollowUp
+        isSynchronizingMetadata = false
+        metadataSyncNeedsFollowUp = false
+        metadataSyncFollowUpShowsNotice = false
+        if shouldRetryAfterFailure {
+            scheduleMetadataSync(delay: .milliseconds(250))
+        }
+        guard shouldShowCompletionNotice else { return }
+        switch metadataSyncStatus.state {
+        case .synced:
+            noticeMessage = "Document metadata synced".localizedUI
+        case .unavailable:
+            noticeMessage =
+                "iCloud metadata sync is unavailable".localizedUI
+        case .failed:
+            noticeMessage = "Metadata sync could not finish".localizedUI
+        case .idle, .syncing:
+            break
+        }
+    }
+
+    private func performMetadataSyncPass(
+        generation: UUID
+    ) async -> Bool {
         metadataSyncStatus = PDFMetadataSyncStatus(
             state: .syncing,
             documentCount: metadataSyncStatus.documentCount,
             updatedAt: metadataSyncStatus.updatedAt,
             detail: "Merging lightweight metadata through iCloud."
         )
-        defer { isSynchronizingMetadata = false }
         do {
             let fingerprintedRecords = try await store
                 .ensureContentFingerprints(for: documents)
-            for record in fingerprintedRecords
-            where self.record(id: record.id)?.contentFingerprint
-                != record.contentFingerprint {
-                replace(record, schedulesMetadataSync: false)
+            synchronizeCommittedFingerprints(fingerprintedRecords)
+            guard metadataSyncGeneration == generation,
+                  UserDefaults.standard.bool(
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                  )
+            else { return false }
+            let preparation =
+                try await metadataSyncService.prepareSynchronization(
+                    records: fingerprintedRecords
+                )
+            guard metadataSyncGeneration == generation else {
+                return false
             }
-            let result = try metadataSyncService.synchronize(
-                records: fingerprintedRecords
-            )
             isApplyingMetadataSync = true
             defer { isApplyingMetadataSync = false }
-            for update in result.updates {
-                guard let current = record(id: update.recordID) else {
-                    continue
+            let updatedRecords = try await store.applyMetadataSync(
+                preparation.updates
+            )
+            let expectedStates = Dictionary(
+                uniqueKeysWithValues: preparation.updates.map {
+                    ($0.recordID, $0.expectedLocalState)
                 }
-                let updated = try await store.applyMetadataSync(
-                    update,
-                    to: current
+            )
+            for updated in updatedRecords {
+                guard let expectedState = expectedStates[updated.id]
+                else { continue }
+                synchronizeCommittedMetadataRecord(
+                    updated,
+                    expectedLocalState: expectedState
                 )
-                replace(updated, schedulesMetadataSync: false)
             }
+            guard !Task.isCancelled,
+                  metadataSyncGeneration == generation,
+                  UserDefaults.standard.bool(
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                  )
+            else { return false }
+            try metadataSyncService.checkpointAppliedMetadata(
+                preparation
+            )
+            let result = try metadataSyncService.commit(preparation)
             let detail: String
             if result.isCloudAvailable {
                 detail = result.eligibleDocumentCount == 0
                     ? "No matching document metadata is ready to sync."
-                    : "Page position, bookmarks, tags, status, and verified receipts are current. PDF files stay local."
+                    : "Page position, bookmarks, tags, status, and receipt summaries are current. PDF files and extracted text stay local."
             } else {
                 detail =
-                    "Sign in to iCloud and enable PaperPath iCloud access to sync metadata. PDF files stay local."
+                    "Sign in to iCloud and enable PaperPath iCloud access to sync metadata. PDF files and extracted text stay local."
             }
             metadataSyncStatus = PDFMetadataSyncStatus(
                 state: result.isCloudAvailable
@@ -2737,24 +5152,85 @@ final class PaperPathModel: ObservableObject {
                 updatedAt: result.synchronizedAt,
                 detail: detail
             )
-            if showNotice {
-                noticeMessage = result.isCloudAvailable
-                    ? "Document metadata synced"
-                    : "iCloud metadata sync is unavailable"
-            }
+            return true
         } catch is CancellationError {
-            return
+            return false
+        } catch PDFMetadataSyncApplyError.localStateChanged,
+                PDFMetadataSyncCommitError.remoteStateChanged {
+            guard metadataSyncGeneration == generation else {
+                return false
+            }
+            requestMetadataSyncFollowUp(showNotice: false)
+            return false
         } catch {
+            guard metadataSyncGeneration == generation else {
+                return false
+            }
             metadataSyncStatus = PDFMetadataSyncStatus(
                 state: .failed,
                 documentCount: metadataSyncStatus.documentCount,
                 updatedAt: metadataSyncStatus.updatedAt,
-                detail: error.localizedDescription
+                detail: AppLocalization
+                    .userFacingErrorDescription(error)
             )
-            if showNotice {
-                noticeMessage = "Metadata sync could not finish".localizedUI
-            }
+            return false
         }
+    }
+
+    private func synchronizeCommittedFingerprints(
+        _ storedRecords: [DocumentRecord]
+    ) {
+        for storedRecord in storedRecords {
+            guard let fingerprint = storedRecord.contentFingerprint,
+                  var residentRecord = record(id: storedRecord.id),
+                  residentRecord.contentRevisionID
+                    == storedRecord.contentRevisionID,
+                  residentRecord.contentFingerprint != fingerprint
+            else { continue }
+            residentRecord.contentFingerprint = fingerprint
+            replace(
+                residentRecord,
+                schedulesMetadataSync: false,
+                invalidatesSearchText: false
+            )
+        }
+    }
+
+    private func synchronizeCommittedMetadataRecord(
+        _ storedRecord: DocumentRecord,
+        expectedLocalState: PDFMetadataSyncLocalState
+    ) {
+        guard let residentRecord = record(id: storedRecord.id),
+              residentRecord.contentRevisionID
+                == storedRecord.contentRevisionID
+        else { return }
+        let storedState = PDFMetadataSyncLocalState(storedRecord)
+        if storedState.matchesPersistenceRepresentation(
+            of: residentRecord
+        ) {
+            return
+        }
+        guard expectedLocalState.matchesPersistenceRepresentation(
+            of: residentRecord
+        ) else { return }
+        var mergedRecord = residentRecord
+        mergedRecord.lastPageIndex = storedRecord.lastPageIndex
+        mergedRecord.lastViewedAt = storedRecord.lastViewedAt
+        mergedRecord.bookmarkedPages = storedRecord.bookmarkedPages
+        mergedRecord.workflowStatus = storedRecord.workflowStatus
+        mergedRecord.isPinned = storedRecord.isPinned
+        mergedRecord.tags = storedRecord.tags
+        mergedRecord.completedActions = storedRecord.completedActions
+        mergedRecord.deliveryReceipt = storedRecord.deliveryReceipt
+        mergedRecord.modifiedAt = max(
+            residentRecord.modifiedAt,
+            storedRecord.modifiedAt
+        )
+        replace(
+            mergedRecord,
+            schedulesMetadataSync: false,
+            invalidatesSearchText: false
+        )
     }
 
     func setMetadataSyncEnabled(_ enabled: Bool) async {
@@ -2763,11 +5239,12 @@ final class PaperPathModel: ObservableObject {
             forKey: AppPreferences.metadataSyncEnabledKey
         )
         if enabled {
+            metadataSyncAutomaticRetryBlocked = false
             startMetadataSyncObservation()
             await synchronizeMetadata()
         } else {
-            metadataSyncTask?.cancel()
-            metadataSyncTask = nil
+            invalidateMetadataSyncWork()
+            metadataSyncAutomaticRetryBlocked = false
             if let metadataSyncObserver {
                 NotificationCenter.default.removeObserver(
                     metadataSyncObserver
@@ -2780,10 +5257,23 @@ final class PaperPathModel: ObservableObject {
     }
 
     func deleteSyncedMetadata() async {
+        invalidateMetadataSyncWork()
+        metadataSyncAutomaticRetryBlocked = false
+        if let metadataSyncObserver {
+            NotificationCenter.default.removeObserver(
+                metadataSyncObserver
+            )
+            self.metadataSyncObserver = nil
+        }
+        UserDefaults.standard.set(
+            false,
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        metadataSyncStatus = metadataSyncDisabledStatus
         do {
             try metadataSyncService.clearSyncedMetadata()
-            metadataSyncStatus = metadataSyncDisabledStatus
-            noticeMessage = "Synced metadata deleted".localizedUI
+            noticeMessage =
+                "Synced metadata deleted and sync turned off".localizedUI
         } catch {
             present(error)
         }
@@ -2794,34 +5284,15 @@ final class PaperPathModel: ObservableObject {
     ) async -> PDFSourceLocationSnapshot? {
         guard let record = record(id: recordID) else { return nil }
         do {
-            return try await store.sourceLocation(for: record)
+            try Task.checkCancellation()
+            let snapshot = try await store.sourceLocation(for: record)
+            try Task.checkCancellation()
+            return snapshot
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
-        }
-    }
-
-    @discardableResult
-    func writeBackToSource(recordID: UUID) async -> Bool {
-        guard let record = record(id: recordID),
-              let operationToken = acquireExclusiveDocumentOperation(
-                recordID: recordID
-              )
-        else { return false }
-        defer {
-            finishExclusiveDocumentOperation(
-                recordID: recordID,
-                token: operationToken
-            )
-        }
-        do {
-            let updated = try await store.writeBackToSource(record)
-            replace(updated)
-            noticeMessage = "Original updated in Files".localizedUI
-            return true
-        } catch {
-            present(error)
-            return false
         }
     }
 
@@ -2842,16 +5313,23 @@ final class PaperPathModel: ObservableObject {
                 )
                 return nil
             }
-            isImporting = true
-            defer { isImporting = false }
+            let importToken = beginImportOperation()
+            defer { finishImportOperation(importToken) }
             let imported = try await importSinglePDF(
                 from: url,
-                preferredName: "\(record.displayName) - Files update",
+                preferredName: AppLocalization.format(
+                    "%@ - Files update",
+                    record.displayName
+                ),
+                analyzeAfterImport: false,
                 preserveSourceLocation: true
             )
             noticeMessage = "Updated source imported as a new private copy"
                 .localizedUI
+            resumeDeferredBackgroundWork()
             return imported
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
@@ -2880,6 +5358,15 @@ final class PaperPathModel: ObservableObject {
             noticeMessage = reason.localizedUI
             return false
         }
+        guard let operationToken =
+            acquireExclusiveDocumentOperation(recordID: recordID)
+        else { return false }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
         do {
             let deleted = try await store.moveToTrash(record)
             removeRecordState(recordID)
@@ -2895,6 +5382,8 @@ final class PaperPathModel: ObservableObject {
                 action: .restoreTrash(recordIDs: [recordID])
             )
             return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
             return false
@@ -2917,13 +5406,23 @@ final class PaperPathModel: ObservableObject {
             )
             return false
         }
+        let orderedIDs = records.map(\.id)
+        guard let operationTokens =
+            acquireExclusiveDocumentOperations(
+                recordIDs: orderedIDs
+            )
+        else { return false }
+        defer {
+            finishExclusiveDocumentOperations(operationTokens)
+        }
 
         do {
-            for record in records {
-                let deleted = try await store.moveToTrash(record)
-                removeRecordState(record.id)
-                deletedDocuments.append(deleted)
-            }
+            let deleted = try await store.moveToTrash(
+                recordIDs: Set(orderedIDs)
+            )
+            let deletedIDs = Set(deleted.map(\.id))
+            removeRecordsState(deletedIDs)
+            deletedDocuments.append(contentsOf: deleted)
             deletedDocuments.sort {
                 ($0.deletedAt ?? .distantPast)
                     > ($1.deletedAt ?? .distantPast)
@@ -2931,38 +5430,246 @@ final class PaperPathModel: ObservableObject {
             presentActionNotice(
                 message: AppLocalization.format(
                     "%lld items moved to Trash",
-                    records.count
+                    deleted.count
                 ),
                 detail: "Restore the complete selection in one step.",
                 kind: .recovery,
                 action: .restoreTrash(
-                    recordIDs: records.map(\.id)
+                    recordIDs: deleted.map(\.id)
                 )
             )
             return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
             return false
         }
     }
 
-    func dismissActionNotice(id: UUID? = nil) {
-        guard id == nil || actionNotice?.id == id else { return }
-        actionNotice = nil
+    func withFeedbackTarget<Value>(
+        _ sceneID: UUID?,
+        operation: () async throws -> Value
+    ) async rethrows -> Value {
+        try await AppFeedbackContext.$targetSceneID.withValue(
+            sceneID
+        ) {
+            try await operation()
+        }
+    }
+
+    func feedbackSceneDidBecomeActive(_ sceneID: UUID) {
+        activeFeedbackSceneIDs.insert(sceneID)
+        feedbackSceneSequence &+= 1
+        feedbackSceneRecency[sceneID] = feedbackSceneSequence
+        adoptUnscopedFeedback(into: sceneID)
+    }
+
+    func feedbackSceneDidResignActive(_ sceneID: UUID) {
+        activeFeedbackSceneIDs.remove(sceneID)
+        if let targetSceneID = preferredActiveFeedbackSceneID {
+            adoptUnscopedFeedback(into: targetSceneID)
+        }
+    }
+
+    func feedbackSceneDidDisconnect(_ sceneID: UUID) {
+        activeFeedbackSceneIDs.remove(sceneID)
+        feedbackSceneRecency[sceneID] = nil
+        fullUnlockContextsBySceneID[sceneID] = nil
+        settingsPresentationSceneIDs.remove(sceneID)
+        if let targetSceneID = preferredActiveFeedbackSceneID {
+            adoptUnscopedFeedback(into: targetSceneID)
+        }
+    }
+
+    func fullUnlockContext(
+        for sceneID: UUID
+    ) -> FullUnlockContext? {
+        if let context = fullUnlockContextsBySceneID[sceneID] {
+            return context
+        }
+        guard preferredActiveFeedbackSceneID == sceneID
+        else { return nil }
+        return unscopedFullUnlockContext
+    }
+
+    func dismissFullUnlock(from sceneID: UUID) {
+        if fullUnlockContextsBySceneID[sceneID] != nil {
+            fullUnlockContextsBySceneID[sceneID] = nil
+        } else if preferredActiveFeedbackSceneID == sceneID {
+            unscopedFullUnlockContext = nil
+        }
+    }
+
+    func settingsPresentationRequested(
+        for sceneID: UUID?
+    ) -> Bool {
+        guard let sceneID else {
+            return activeFeedbackSceneIDs.isEmpty
+                && hasUnscopedSettingsPresentationRequest
+        }
+        return settingsPresentationSceneIDs.contains(sceneID)
+            || (
+                preferredActiveFeedbackSceneID == sceneID
+                    && hasUnscopedSettingsPresentationRequest
+            )
+    }
+
+    func consumeSettingsPresentationRequest(
+        for sceneID: UUID?
+    ) {
+        guard let sceneID else {
+            if activeFeedbackSceneIDs.isEmpty {
+                hasUnscopedSettingsPresentationRequest = false
+            }
+            return
+        }
+        if settingsPresentationSceneIDs.remove(sceneID) != nil {
+            return
+        }
+        if preferredActiveFeedbackSceneID == sceneID {
+            hasUnscopedSettingsPresentationRequest = false
+        }
+    }
+
+    func transientNotice(
+        for sceneID: UUID
+    ) -> AppTransientNotice? {
+        transientNoticesBySceneID[sceneID]
+            ?? unscopedTransientNoticeForScene(sceneID)
+    }
+
+    func presentNotice(
+        _ message: String?,
+        in sceneID: UUID?
+    ) {
+        if let message {
+            setTransientNotice(message, targetSceneID: sceneID)
+        } else {
+            dismissTransientNotice(from: sceneID)
+        }
+    }
+
+    func dismissTransientNotice(
+        id: UUID? = nil,
+        from sceneID: UUID? = nil
+    ) {
+        if let sceneID,
+           let notice = transientNoticesBySceneID[sceneID],
+           id == nil || notice.id == id {
+            transientNoticesBySceneID[sceneID] = nil
+            return
+        }
+        guard let notice = unscopedTransientNotice,
+              id == nil || notice.id == id
+        else { return }
+        unscopedTransientNotice = nil
+    }
+
+    func releaseTransientNoticeTarget(for sceneID: UUID) {
+        guard let notice = transientNoticesBySceneID.removeValue(
+            forKey: sceneID
+        ) else { return }
+        if let targetSceneID = preferredActiveFeedbackSceneID,
+           transientNoticesBySceneID[targetSceneID] == nil {
+            transientNoticesBySceneID[targetSceneID] =
+                notice.targetingScene(targetSceneID)
+        } else {
+            unscopedTransientNotice = notice.targetingScene(nil)
+        }
+    }
+
+    func presentationError(
+        for sceneID: UUID?
+    ) -> AppPresentationError? {
+        if let sceneID,
+           let error = presentationErrorsBySceneID[sceneID] {
+            return error
+        }
+        guard let sceneID,
+              preferredActiveFeedbackSceneID == sceneID
+        else { return nil }
+        return unscopedPresentationError
+    }
+
+    func presentErrorMessage(
+        _ message: String,
+        offersSettings: Bool = false,
+        in sceneID: UUID?
+    ) {
+        setPresentationError(
+            message,
+            offersSettings: offersSettings,
+            targetSceneID: sceneID
+        )
+    }
+
+    func clearError(from sceneID: UUID? = nil) {
+        if let sceneID,
+           presentationErrorsBySceneID[sceneID] != nil {
+            presentationErrorsBySceneID[sceneID] = nil
+            return
+        }
+        unscopedPresentationError = nil
+    }
+
+    func releasePresentationErrorTarget(for sceneID: UUID) {
+        presentationErrorsBySceneID[sceneID] = nil
+    }
+
+    func dismissActionNotice(
+        id: UUID? = nil,
+        from sceneID: UUID? = nil
+    ) {
+        if let sceneID,
+           let notice = actionNoticesBySceneID[sceneID],
+           id == nil || notice.id == id {
+            actionNoticesBySceneID[sceneID] = nil
+            return
+        }
+        guard let notice = unscopedActionNotice,
+              id == nil || notice.id == id
+        else { return }
+        unscopedActionNotice = nil
     }
 
     func performNoticeAction(
-        _ notice: AppActionNotice
+        _ notice: AppActionNotice,
+        from sceneID: UUID? = nil
     ) async {
-        guard actionNotice?.id == notice.id else { return }
-        actionNotice = nil
-        switch notice.action {
-        case .restoreTrash(let recordIDs):
-            await restoreDeletedDocuments(recordIDs: recordIDs)
-        case .undoPageChange(let recordID):
-            _ = await undoLastPageChange(recordID: recordID)
-        case .undoPageChanges(let recordIDs):
-            _ = await undoLastPageChanges(recordIDs: recordIDs)
+        let currentNotice = sceneID.map {
+            actionNotice(for: $0)
+        } ?? unscopedActionNotice
+        guard currentNotice?.id == notice.id
+        else { return }
+        dismissActionNotice(id: notice.id, from: sceneID)
+        await withFeedbackTarget(sceneID) {
+            switch notice.action {
+            case .restoreTrash(let recordIDs):
+                await restoreDeletedDocuments(recordIDs: recordIDs)
+            case .undoPageChange(let recordID):
+                _ = await undoLastPageChange(recordID: recordID)
+            case .undoPageChanges(let recordIDs):
+                _ = await undoLastPageChanges(recordIDs: recordIDs)
+            }
+        }
+    }
+
+    func actionNotice(for sceneID: UUID) -> AppActionNotice? {
+        actionNoticesBySceneID[sceneID]
+            ?? unscopedActionNoticeForScene(sceneID)
+    }
+
+    func releaseActionNoticeTarget(for sceneID: UUID) {
+        guard let notice = actionNoticesBySceneID.removeValue(
+            forKey: sceneID
+        ) else { return }
+        if let targetSceneID = preferredActiveFeedbackSceneID,
+           actionNoticesBySceneID[targetSceneID] == nil {
+            actionNoticesBySceneID[targetSceneID] =
+                notice.targetingScene(targetSceneID)
+        } else {
+            unscopedActionNotice = notice.targetingScene(nil)
         }
     }
 
@@ -2973,29 +5680,63 @@ final class PaperPathModel: ObservableObject {
         let records = deletedDocuments.filter {
             requested.contains($0.id)
         }
-        guard !records.isEmpty else { return }
+        guard !records.isEmpty else {
+            noticeMessage =
+                "That recovery point is no longer available."
+                    .localizedUI
+            return
+        }
+        let orderedIDs = records.map(\.id)
+        guard let operationTokens =
+            acquireExclusiveDocumentOperations(
+                recordIDs: orderedIDs
+            )
+        else { return }
+        defer {
+            finishExclusiveDocumentOperations(operationTokens)
+        }
 
         var restoredIDs: Set<UUID> = []
         var restoredRecords: [DocumentRecord] = []
         do {
-            for record in records {
-                let restored = try await store.restoreFromTrash(record)
-                restoredIDs.insert(restored.id)
-                restoredRecords.append(restored)
+            restoredRecords = try await store.restoreFromTrash(
+                recordIDs: Set(records.map(\.id))
+            )
+            restoredIDs = Set(restoredRecords.map(\.id))
+            deletedDocuments.removeAll {
+                restoredIDs.contains($0.id)
+            }
+            clearActionNotice(referencing: restoredIDs)
+            replace(restoredRecords)
+            for restored in restoredRecords {
                 documentURLs[restored.id] = await store.url(
                     for: restored
                 )
             }
-            deletedDocuments.removeAll {
-                restoredIDs.contains($0.id)
+            if let analysis = try? await store.loadAnalysis(
+                for: restoredIDs
+            ) {
+                textIndices.merge(analysis.textIndices) {
+                    _, restored in restored
+                }
+                mergeOCRResults(analysis.ocrResults)
+                for recordID in restoredIDs
+                where analysis.textIndices[recordID] != nil
+                    || analysis.ocrResults[recordID] != nil {
+                    touchResidentAnalysis(recordID)
+                }
+                trimResidentAnalysisCache()
             }
-            textIndices = try await store.loadTextIndices()
-            ocrResults = try await store.loadOCRResults()
-            documents.append(contentsOf: restoredRecords)
-            rebuildSearchCorpora()
-            sortDocuments()
-            if restoredIDs.count == 1,
-               let restored = records.first {
+            let unavailableCount =
+                max(0, requested.count - restoredIDs.count)
+            if unavailableCount > 0 {
+                noticeMessage = AppLocalization.format(
+                    "%lld restored · %lld no longer available",
+                    restoredIDs.count,
+                    unavailableCount
+                )
+            } else if restoredIDs.count == 1,
+                      let restored = restoredRecords.first {
                 noticeMessage = (
                     restored.isDeliveryArtifact
                         ? "Delivery output restored"
@@ -3007,21 +5748,9 @@ final class PaperPathModel: ObservableObject {
                     restoredIDs.count
                 )
             }
+        } catch is CancellationError {
+            return
         } catch {
-            if !restoredIDs.isEmpty {
-                documents.append(contentsOf: restoredRecords)
-                deletedDocuments.removeAll {
-                    restoredIDs.contains($0.id)
-                }
-                if let restoredIndices = try? await store.loadTextIndices() {
-                    textIndices = restoredIndices
-                }
-                if let restoredOCR = try? await store.loadOCRResults() {
-                    ocrResults = restoredOCR
-                }
-                rebuildSearchCorpora()
-                sortDocuments()
-            }
             present(error)
         }
     }
@@ -3040,10 +5769,22 @@ final class PaperPathModel: ObservableObject {
         guard let record = deletedDocuments.first(
             where: { $0.id == recordID }
         ) else { return }
+        guard let operationToken =
+            acquireExclusiveDocumentOperation(recordID: recordID)
+        else { return }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
         do {
             try await store.permanentlyDelete(record)
             deletedDocuments.removeAll { $0.id == recordID }
+            clearActionNotice(referencing: Set([recordID]))
             noticeMessage = "Item permanently deleted".localizedUI
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
@@ -3052,38 +5793,60 @@ final class PaperPathModel: ObservableObject {
     func emptyTrash() async {
         let records = deletedDocuments
         guard !records.isEmpty else { return }
-        var deletedCount = 0
+        let orderedIDs = records.map(\.id)
+        guard let operationTokens =
+            acquireExclusiveDocumentOperations(
+                recordIDs: orderedIDs
+            )
+        else { return }
+        defer {
+            finishExclusiveDocumentOperations(operationTokens)
+        }
         do {
-            for record in records {
-                try await store.permanentlyDelete(record)
-                deletedDocuments.removeAll { $0.id == record.id }
-                deletedCount += 1
-            }
-            noticeMessage = "Trash emptied".localizedUI
-        } catch {
-            if deletedCount > 0 {
-                noticeMessage = AppLocalization.format(
-                    "%lld Trash item%@ deleted before the operation stopped",
-                    deletedCount,
-                    deletedCount == 1 ? "" : "s"
+            let deletedIDs = Set(
+                try await store.permanentlyDelete(
+                    recordIDs: Set(orderedIDs)
                 )
+            )
+            deletedDocuments.removeAll {
+                deletedIDs.contains($0.id)
             }
+            clearActionNotice(referencing: deletedIDs)
+            noticeMessage = "Trash emptied".localizedUI
+        } catch is CancellationError {
+            return
+        } catch {
             present(error)
         }
     }
 
-    func eraseAllLocalData() async {
-        isImporting = true
-        defer { isImporting = false }
+    @discardableResult
+    func eraseAllLocalData() async -> Bool {
+        guard !hasActiveLocalDataOperations else {
+            noticeMessage =
+                "Finish or stop active document work before deleting local data."
+                    .localizedUI
+            return false
+        }
+        isErasingAllLocalData = true
+        let importToken = beginImportOperation()
+        defer {
+            finishImportOperation(importToken)
+            isErasingAllLocalData = false
+        }
         deferredBootstrapTask?.cancel()
         deferredBootstrapTask = nil
+        deferredBackgroundWorkNeedsRestart = false
+        cancelAllDocumentAnalysis()
         officeProductionTask?.cancel()
         officeProductionTask = nil
         officeResourceMonitorTask?.cancel()
         officeResourceMonitorTask = nil
+        invalidateMetadataSyncWork()
+        metadataSyncAutomaticRetryBlocked = false
         do {
             try await store.eraseAllData()
-            try? await signatureStore.remove()
+            try await signatureStore.remove()
             metadataSyncService.clearLocalMetadata()
             if let metadataSyncObserver {
                 NotificationCenter.default.removeObserver(
@@ -3091,8 +5854,6 @@ final class PaperPathModel: ObservableObject {
                 )
                 self.metadataSyncObserver = nil
             }
-            metadataSyncTask?.cancel()
-            metadataSyncTask = nil
             UserDefaults.standard.set(
                 false,
                 forKey: AppPreferences.metadataSyncEnabledKey
@@ -3101,9 +5862,18 @@ final class PaperPathModel: ObservableObject {
                 false,
                 forKey: AppPreferences.dueRemindersEnabledKey
             )
-            LocalDueReminderScheduler.disableAll()
-            try? ExternalPDFInbox.removeAll()
-            await discardInterruptedTemporaryFiles()
+            await LocalDueReminderScheduler.disableAll()
+            let removedSharedImports = await Task.detached(
+                priority: .utility
+            ) {
+                do {
+                    try ExternalPDFInbox.removeAll()
+                    return true
+                } catch {
+                    return false
+                }
+            }.value
+            try await discardInterruptedTemporaryFiles()
             UserDefaults.standard.removeObject(
                 forKey: "library.searchHistory"
             )
@@ -3115,8 +5885,10 @@ final class PaperPathModel: ObservableObject {
             deletedDocuments = []
             documentURLs = [:]
             refreshTokens = [:]
-            ocrResults = [:]
+            replaceOCRResults([:])
             textIndices = [:]
+            residentAnalysisOrder = []
+            residentAnalysisGeneration = UUID()
             processingDocumentIDs = []
             deliveryProcessingDocumentIDs = []
             batchDeliveryPendingDocumentIDs = []
@@ -3125,15 +5897,89 @@ final class PaperPathModel: ObservableObject {
             savedSignatures = []
             selectedSignatureID = nil
             lastBatchDeliveryRun = nil
+            officeBatchRuns = [:]
+            officeProductionQueue = PDFOfficeProductionQueue()
+            officeResourceSnapshot = .initial
+            lastOfficeIntegrityReport = nil
+            officeIntegrityProgress = nil
+            officeDeliveryPackages = []
+            officeDeliverySigningKeyID = nil
+            lastOfficeReportVerification = nil
+            officeExternalMatchProgress = nil
+            officeSigningIdentityCard = nil
+            officeTrustedSigners = []
             batesBatchReceipts = []
+            batesBatchProgress = nil
+            batesBatchMutationToken = nil
+            isBatesBatchMutationActive = false
+            batesReceiptVerificationToken = nil
+            isBatesReceiptVerificationActive = false
+            batesReceiptVerificationProgress = nil
+            batesExternalMatchProgress = nil
             searchMetadataCorpora = [:]
             releaseSearchTextCorpora()
             deliveryPreflightCache = [:]
+            releaseEvidenceCaches()
+            for undo in pageMutationUndos.values {
+                removePageMutationTemporaryItem(
+                    containing: undo.backupURL
+                )
+            }
             pageMutationUndos = [:]
+            operationRateWindows = [:]
+            exclusiveDocumentOperations = [:]
+            importingVerifiedPackageIDs = []
+            importingVerifiedVersionArtifactIDs = []
+            versionArchiveVerificationGeneration = UUID()
+            officeProductionCancelledJobID = nil
+            officeIntegrityGeneration = nil
+            officeIntegrityRateWindow.reset()
+            scanImportGeneration = UUID()
+            batesExternalMatchGeneration = UUID()
+            officeReportVerificationGeneration = UUID()
+            officeExternalMatchGeneration = UUID()
+            scanImportFraction = nil
+            deferredCommittedImports = [:]
+            deferredCommittedImportSourceIdentities = [:]
+            deferredCommittedOpenRecordIDs = []
+            deferredCommittedOpenSceneIDs = [:]
+            committedImportRestoreGeneration = UUID()
+            committedImportRestoreTask?.cancel()
+            committedImportRestoreTask = nil
+            queuedExternalPDFURLs = []
+            queuedExternalPDFTargetSceneIDs = [:]
+            activeExternalPDFURLIdentities = []
+            completedExternalImportSceneIDs = [:]
+            externalPDFImportGeneration = UUID()
+            externalPDFDeferredOpenGeneration = nil
+            externalPDFImportTask = nil
+            externalImportProgress = nil
+            externalImportKnownTotalCount = 0
+            externalImportCompletedItemCount = 0
+            externalImportCurrentItemFraction = 0
+            externalImportRateWindow.reset()
+            activeForegroundImportProgressIDs = []
+            foregroundImportProgresses = [:]
+            foregroundImportRateWindows = [:]
+            isExternalPDFImportActive = false
+            externalImportRetryAvailable = false
+            externalImportDeferredCount = 0
+            externalImportRetryMessage = nil
+            retainedEvidenceRevision &+= 1
+            pendingExternalDocumentHandoff = nil
             metadataSyncStatus = metadataSyncDisabledStatus
-            noticeMessage = "All local PaperPath data deleted".localizedUI
+            actionNoticesBySceneID = [:]
+            unscopedActionNotice = nil
+            transientNoticesBySceneID = [:]
+            unscopedTransientNotice = nil
+            noticeMessage = removedSharedImports
+                ? "All local PaperPath data deleted".localizedUI
+                : "Private library deleted, but queued shared imports could not be removed."
+                    .localizedUI
+            return removedSharedImports
         } catch {
             present(error)
+            return false
         }
     }
 
@@ -3154,6 +6000,22 @@ final class PaperPathModel: ObservableObject {
             value: -retentionDays,
             to: Date()
         ) ?? Date.distantPast
+        let expiredIDs = deletedDocuments.compactMap {
+            record -> UUID? in
+            guard let deletedAt = record.deletedAt,
+                  deletedAt < cutoff
+            else { return nil }
+            return record.id
+        }
+        guard !expiredIDs.isEmpty else { return }
+        guard let operationTokens =
+            acquireExclusiveDocumentOperations(
+                recordIDs: expiredIDs
+            )
+        else { return }
+        defer {
+            finishExclusiveDocumentOperations(operationTokens)
+        }
         do {
             let purgedIDs = try await store.purgeDeleted(
                 before: cutoff
@@ -3161,10 +6023,16 @@ final class PaperPathModel: ObservableObject {
             guard !purgedIDs.isEmpty else { return }
             let purged = Set(purgedIDs)
             deletedDocuments.removeAll { purged.contains($0.id) }
+            clearActionNotice(referencing: purged)
             if showNotice {
-                noticeMessage =
-                    "\(purgedIDs.count) expired Trash item\(purgedIDs.count == 1 ? "" : "s") deleted"
+                noticeMessage = AppLocalization.format(
+                    "%lld expired Trash item%@ deleted",
+                    purgedIDs.count,
+                    purgedIDs.count == 1 ? "" : "s"
+                )
             }
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
@@ -3173,6 +6041,51 @@ final class PaperPathModel: ObservableObject {
     func localStorageSnapshot() async -> LocalStorageSnapshot? {
         do {
             return try await store.storageSnapshot()
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    func localStorageInventory() async throws
+        -> DocumentStoreStorageInventory {
+        try Task.checkCancellation()
+        return try await store.storageInventory()
+    }
+
+    @discardableResult
+    func clearSavedPageMatches() async -> Int? {
+        guard !isClearingPageMatches else { return nil }
+        isClearingPageMatches = true
+        defer { isClearingPageMatches = false }
+        let comparisonTasks = cancelActiveComparisonWork()
+        for task in comparisonTasks {
+            _ = try? await task.value
+        }
+        do {
+            try Task.checkCancellation()
+            let removedCount =
+                try await store.clearPageMatchCorrections()
+            comparisonCache.removeAll(keepingCapacity: false)
+            comparisonCacheOrder.removeAll(keepingCapacity: false)
+            versionComparisonCache.removeAll(
+                keepingCapacity: false
+            )
+            versionComparisonCacheOrder.removeAll(
+                keepingCapacity: false
+            )
+            if !Task.isCancelled {
+                noticeMessage = removedCount > 0
+                    ? AppLocalization.format(
+                        "%lld saved comparison records cleared",
+                        removedCount
+                    )
+                    : "Saved page-match metadata cleared"
+                        .localizedUI
+            }
+            return removedCount
         } catch is CancellationError {
             return nil
         } catch {
@@ -3202,7 +6115,10 @@ final class PaperPathModel: ObservableObject {
                 for: record,
                 label: label
             )
+            retainedEvidenceRevision &+= 1
             return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
             return false
@@ -3214,49 +6130,87 @@ final class PaperPathModel: ObservableObject {
     ) async -> [PDFVersionSnapshot] {
         do {
             return try await store.versions(for: recordID)
+        } catch is CancellationError {
+            return []
         } catch {
             present(error)
             return []
         }
     }
 
+    func versionHistoryOverview(
+        recordID: UUID
+    ) async -> (
+        versions: [PDFVersionSnapshot],
+        pinnedStorageSummary: PDFPinnedVersionStorageSummary
+    )? {
+        do {
+            return try await store.versionHistoryOverview(for: recordID)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
     func deliveryMilestoneEvidence(
         recordID: UUID,
-        receiptID: UUID
-    ) async -> PDFDeliveryMilestoneEvidence {
+        receiptID: UUID,
+        retainedReceipt: PDFDeliveryReceipt? = nil
+    ) async -> PDFDeliveryMilestoneEvidence? {
         guard let record = record(id: recordID),
-              let receipt = record.deliveryReceipt,
+              let receipt = retainedReceipt ?? record.deliveryReceipt,
               receipt.id == receiptID,
               receipt.isVerified
         else { return .unavailable }
         do {
-            let matching = try await store.versions(for: recordID)
+            let overview = try await store.versionHistoryOverview(
+                for: recordID
+            )
+            try Task.checkCancellation()
+            guard let current = self.record(id: recordID),
+                  current.contentRevisionID == record.contentRevisionID
+            else { return nil }
+            let matching = overview.versions
                 .filter { $0.matchesDeliveryReceipt(receipt) }
             let linked = matching.filter {
                 $0.linkedDeliveryReceiptID == receiptID
-                    && (
-                        $0.isPinnedMilestone
-                            || $0.resolvedMilestoneName != nil
-                    )
+                    && $0.isPinnedMilestone
             }
-            .sorted { $0.createdAt > $1.createdAt }
+            .sorted {
+                if $0.createdAt != $1.createdAt {
+                    return $0.createdAt > $1.createdAt
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+            let matchingUnlinked = matching.first {
+                !$0.isPinnedMilestone
+                    || $0.linkedDeliveryReceiptID != receiptID
+            }
             let availability: PDFDeliveryMilestoneAvailability
             if !linked.isEmpty {
                 availability = .linked
-            } else if record.hasCurrentDeliveryReceipt {
+            } else if current.deliveryReceipt?.id == receipt.id,
+                      current.hasCurrentDeliveryReceipt {
                 availability = .protectCurrent
-            } else if !matching.isEmpty {
+            } else if current.deliveryReceipt?.id == receipt.id,
+                      !matching.isEmpty {
                 availability = .protectRecovery
             } else {
                 availability = .unavailable
             }
             return PDFDeliveryMilestoneEvidence(
                 availability: availability,
-                linkedMilestones: linked
+                linkedMilestones: linked,
+                matchingUnlinkedMilestone: matchingUnlinked,
+                pinnedStorageSummary: overview.pinnedStorageSummary
             )
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
-            return .unavailable
+            return nil
         }
     }
 
@@ -3288,7 +6242,10 @@ final class PaperPathModel: ObservableObject {
                     ).localizedUI
                 )
             noticeMessage = "Verified version protected".localizedUI
+            retainedEvidenceRevision &+= 1
             return milestone
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
@@ -3298,20 +6255,56 @@ final class PaperPathModel: ObservableObject {
     func pinnedVersionMilestones() async -> [PDFVersionSnapshot] {
         do {
             return try await store.pinnedVersionMilestones()
+        } catch is CancellationError {
+            return []
         } catch {
             present(error)
             return []
         }
     }
 
-    func unpinAllVersionMilestones() async {
+    func pinnedVersionStorageSummary()
+        async -> PDFPinnedVersionStorageSummary? {
         do {
+            let milestones = try await store.pinnedVersionMilestones()
+            return PDFPinnedVersionStorageSummary.measuring(milestones)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    func unpinAllVersionMilestones() async {
+        guard activeComparisonTasks.isEmpty,
+              !isUpdatingVersionStorage
+        else {
+            noticeMessage =
+                "Stop active comparisons before changing version retention."
+                    .localizedUI
+            return
+        }
+        isUpdatingVersionStorage = true
+        defer { isUpdatingVersionStorage = false }
+        do {
+            try Task.checkCancellation()
             let count = try await store.unpinAllVersionMilestones()
+            retainedEvidenceRevision &+= 1
+            versionComparisonCache.removeAll(
+                keepingCapacity: false
+            )
+            versionComparisonCacheOrder.removeAll(
+                keepingCapacity: false
+            )
+            try Task.checkCancellation()
             noticeMessage = AppLocalization.format(
                 "%lld milestone%@ returned to standard retention",
                 count,
                 count == 1 ? "" : "s"
             )
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
@@ -3321,29 +6314,54 @@ final class PaperPathModel: ObservableObject {
         _ milestone: PDFVersionSnapshot,
         pinned: Bool
     ) async {
+        guard let operationToken =
+                acquireExclusiveDocumentOperation(
+                    recordID: milestone.documentID
+                )
+        else { return }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: milestone.documentID,
+                token: operationToken
+            )
+        }
         do {
+            try Task.checkCancellation()
             _ = try await store.updateVersionMilestone(
                 snapshotID: milestone.id,
                 recordID: milestone.documentID,
                 name: milestone.milestoneName,
                 pinned: pinned,
                 linkedDeliveryReceiptID:
-                    milestone.linkedDeliveryReceiptID
+                    pinned
+                        ? milestone.linkedDeliveryReceiptID
+                        : nil
             )
+            retainedEvidenceRevision &+= 1
+            invalidateVersionComparisonCaches(
+                for: Set([milestone.documentID])
+            )
+            try Task.checkCancellation()
             noticeMessage = pinned
                 ? "Milestone version protected".localizedUI
                 : "Milestone returned to standard retention".localizedUI
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
     }
 
     func makePinnedVersionArchive(
-        recordID: UUID? = nil
+        recordID: UUID? = nil,
+        progress: @escaping @MainActor @Sendable (
+            PDFByteProgressUpdate
+        ) -> Void = { _ in }
     ) async -> URL? {
         do {
             let allMilestones = try await store
                 .pinnedVersionMilestones()
+            try Task.checkCancellation()
             let milestones = allMilestones.filter {
                 recordID == nil || $0.documentID == recordID
             }
@@ -3352,14 +6370,19 @@ final class PaperPathModel: ObservableObject {
                     "Pin at least one version milestone before archiving."
                 )
             }
-            let archiveBytes = milestones.reduce(Int64(0)) {
-                $0 + max(0, $1.byteCount)
-            }
+            let archiveBytes = saturatedByteTotal(
+                milestones.lazy.map { max(0, $0.byteCount) }
+            )
+            let requiredArchiveBytes = saturatedByteTotal(
+                CollectionOfOne(archiveBytes),
+                reserve: 16 * 1_024 * 1_024
+            )
             if let available = try await store
                 .availableCapacityForOfficeProduction(),
-               available < archiveBytes + 16 * 1_024 * 1_024 {
+               available < requiredArchiveBytes {
                 throw PaperPathError.insufficientStorage
             }
+            try Task.checkCancellation()
 
             let directory = FileManager.default.temporaryDirectory
                 .appendingPathComponent(
@@ -3396,7 +6419,7 @@ final class PaperPathModel: ObservableObject {
                         format: "%02d-%@-%@.pdf",
                         index + 1,
                         safeExportName(documentName),
-                        String(milestone.id.uuidString.prefix(8))
+                        milestone.id.uuidString
                     )
                     sources.append(
                         OfficeBatchArchiveSource(
@@ -3420,13 +6443,16 @@ final class PaperPathModel: ObservableObject {
                     )
                 }
 
+                let archiveCreatedAt = try await store
+                    .trustedEvidenceIssuanceDate()
                 let manifest = PDFVersionArchiveManifest(
-                    schema: "PaperPath Version Archive V49",
-                    createdAt: Date(),
+                    schema: PDFVersionArchiveManifest.currentSchema,
+                    createdAt: archiveCreatedAt,
                     entries: entries
                 )
                 let signedManifest = try await store
                     .signVersionArchiveManifest(manifest)
+                try Task.checkCancellation()
                 officeDeliverySigningKeyID =
                     signedManifest.signature.keyID
                 let encoder = JSONEncoder()
@@ -3452,16 +6478,22 @@ final class PaperPathModel: ObservableObject {
                     try OfficeBatchArchiveService().createArchive(
                         sources: archiveSources,
                         destination: destination
-                    )
+                    ) { update in
+                        Task { @MainActor in
+                            progress(update)
+                        }
+                    }
                 }
                 try await withTaskCancellationHandler {
                     try await archiveTask.value
                 } onCancel: {
                     archiveTask.cancel()
                 }
+                try Task.checkCancellation()
                 try LocalFileSecurity.requireCompleteProtection(
                     to: destination
                 )
+                try Task.checkCancellation()
                 try? FileManager.default.removeItem(at: manifestURL)
                 return destination
             } catch {
@@ -3471,14 +6503,26 @@ final class PaperPathModel: ObservableObject {
         } catch is CancellationError {
             return nil
         } catch {
+            guard !Task.isCancelled else { return nil }
             present(error)
             return nil
         }
     }
 
     func verifyPinnedVersionArchive(
-        at sourceURL: URL
+        at sourceURL: URL,
+        progress: @escaping @MainActor @Sendable (
+            PDFByteProgressUpdate
+        ) -> Void = { _ in }
     ) async -> PDFVersionArchiveVerificationReport? {
+        let generation = UUID()
+        versionArchiveVerificationGeneration = generation
+        let extractionDirectory = FileManager.default
+            .temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.verifiedVersionArchivePrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
         let hasScopedAccess =
             sourceURL.startAccessingSecurityScopedResource()
         defer {
@@ -3487,28 +6531,149 @@ final class PaperPathModel: ObservableObject {
             }
         }
         do {
+            try LocalFileSecurity.prepareProtectedDirectory(
+                at: extractionDirectory
+            )
+            let timeAnchor = await store.deliveryTimeAnchor()
             let worker = Task.detached(priority: .userInitiated) {
-                try PDFVersionArchiveVerificationService().verify(
-                    archiveURL: sourceURL
+                try PDFVersionArchiveVerificationService(
+                    timeAnchor: timeAnchor
                 )
+                    .verifyCoordinated(
+                        archiveURL: sourceURL,
+                        extractionDirectory: extractionDirectory
+                    ) { update in
+                        Task { @MainActor in
+                            progress(update)
+                        }
+                    }
             }
             let rawReport = try await withTaskCancellationHandler {
                 try await worker.value
             } onCancel: {
                 worker.cancel()
             }
+            guard !Task.isCancelled,
+                  versionArchiveVerificationGeneration == generation
+            else {
+                throw CancellationError()
+            }
             let resolvedReport = try await store
                 .resolveVersionArchiveTrust(rawReport)
+            guard !Task.isCancelled,
+                  versionArchiveVerificationGeneration == generation
+            else {
+                throw CancellationError()
+            }
             officeTrustedSigners = (
                 try? await store.loadOfficeTrustedSigners()
             ) ?? officeTrustedSigners
+            guard !Task.isCancelled,
+                  versionArchiveVerificationGeneration == generation
+            else {
+                throw CancellationError()
+            }
+            if !resolvedReport.canRecoverArtifacts {
+                try? FileManager.default.removeItem(
+                    at: extractionDirectory
+                )
+            }
             return resolvedReport
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(at: extractionDirectory)
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(at: extractionDirectory)
+            guard !Task.isCancelled else { return nil }
+            present(error)
+            return nil
+        }
+    }
+
+    func importVerifiedVersionArchiveArtifact(
+        _ report: PDFVersionArchiveVerificationReport,
+        itemID: UUID
+    ) async -> DocumentRecord? {
+        guard report.canRecoverArtifacts,
+              report.verifiedArtifact(for: itemID) != nil
+        else {
+            present(
+                PaperPathError.outputVerificationFailed(
+                    "the signed archive must pass verification before recovery"
+                )
+            )
+            return nil
+        }
+        guard importingVerifiedVersionArtifactIDs.insert(itemID)
+                .inserted
+        else {
+            noticeMessage =
+                "This milestone is already being recovered".localizedUI
+            return nil
+        }
+        let importToken = beginImportOperation()
+        defer {
+            importingVerifiedVersionArtifactIDs.remove(itemID)
+            finishImportOperation(importToken)
+        }
+
+        do {
+            let imported = try await store
+                .importVerifiedVersionArchiveArtifact(
+                    report,
+                    itemID: itemID
+                )
+            guard !Task.isCancelled else {
+                deferredCommittedImports[imported.id] = imported
+                return await restoreCommittedImportIfForeground(
+                    imported
+                )
+            }
+            let wasAlreadyImported = record(id: imported.id) != nil
+            replace(imported)
+            documentURLs[imported.id] = await store.url(for: imported)
+            noticeMessage = wasAlreadyImported
+                ? "This exact milestone is already in PaperPath".localizedUI
+                : "Milestone recovered as a private copy".localizedUI
+            if !wasAlreadyImported {
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    await self?.analyzeDocument(recordID: imported.id)
+                }
+            }
+            return self.record(id: imported.id) ?? imported
         } catch is CancellationError {
             return nil
         } catch {
             present(error)
             return nil
         }
+    }
+
+    func discardVerifiedVersionArchiveArtifacts(
+        in report: PDFVersionArchiveVerificationReport
+    ) async {
+        guard let url = report.verifiedArtifacts.first?.url else {
+            return
+        }
+        await Task.detached(priority: .utility) {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: [
+                    PaperPathTemporaryArtifact
+                        .verifiedVersionArchivePrefix
+                ]
+            )
+        }.value
+    }
+
+    func discardVersionArchive(at url: URL) async {
+        await Task.detached(priority: .utility) {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: ["PaperPath-Version-Archive-"]
+            )
+        }.value
     }
 
     func trustVersionArchiveSigner(
@@ -3533,10 +6698,19 @@ final class PaperPathModel: ObservableObject {
 
     func verifyDeliveryPackage(
         at sourceURL: URL,
+        presentsFailure: Bool = true,
+        onFailure: @escaping @MainActor @Sendable (
+            PDFDeliveryPackageVerificationFailure
+        ) -> Void = { _ in },
         progress: @escaping @MainActor @Sendable (
             PDFByteProgressUpdate
         ) -> Void
     ) async -> PDFDeliveryPackageVerificationReport? {
+        let extractionDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.verifiedDeliveryPackagePrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
         let hasScopedAccess =
             sourceURL.startAccessingSecurityScopedResource()
         defer {
@@ -3545,10 +6719,17 @@ final class PaperPathModel: ObservableObject {
             }
         }
         do {
+            try LocalFileSecurity.prepareProtectedDirectory(
+                at: extractionDirectory
+            )
+            let timeAnchor = await store.deliveryTimeAnchor()
             let worker = Task.detached(priority: .userInitiated) {
-                try PDFVersionArchiveVerificationService()
-                    .verifyDeliveryPackage(
-                        archiveURL: sourceURL
+                try PDFVersionArchiveVerificationService(
+                    timeAnchor: timeAnchor
+                )
+                    .verifyDeliveryPackageCoordinated(
+                        archiveURL: sourceURL,
+                        extractionDirectory: extractionDirectory
                     ) { update in
                         Task { @MainActor in
                             progress(update)
@@ -3560,22 +6741,198 @@ final class PaperPathModel: ObservableObject {
             } onCancel: {
                 worker.cancel()
             }
+            try Task.checkCancellation()
             let resolvedReport = try await store
                 .resolveDeliveryPackageTrust(rawReport)
+            try Task.checkCancellation()
             officeTrustedSigners = (
                 try? await store.loadOfficeTrustedSigners()
             ) ?? officeTrustedSigners
-            if resolvedReport.status == .verified {
-                noticeMessage =
-                    "Delivery package verified on this device".localizedUI
+            try Task.checkCancellation()
+            if resolvedReport.verifiedArtifactURL == nil {
+                try? FileManager.default.removeItem(
+                    at: extractionDirectory
+                )
             }
             return resolvedReport
+        } catch is CancellationError {
+            try? FileManager.default.removeItem(
+                at: extractionDirectory
+            )
+            return nil
+        } catch {
+            try? FileManager.default.removeItem(
+                at: extractionDirectory
+            )
+            guard !Task.isCancelled else { return nil }
+            onFailure(
+                deliveryPackageVerificationFailure(for: error)
+            )
+            if presentsFailure {
+                present(error)
+            }
+            return nil
+        }
+    }
+
+    private func deliveryPackageVerificationFailure(
+        for error: Error
+    ) -> PDFDeliveryPackageVerificationFailure {
+        if LocalFileSecurity.isInsufficientStorageError(error) {
+            return PDFDeliveryPackageVerificationFailure(
+                kind: .storage,
+                detail: PaperPathError.insufficientStorage
+                    .errorDescription
+                    ?? "Free some storage and try again."
+            )
+        }
+
+        if let paperPathError = error as? PaperPathError {
+            switch paperPathError {
+            case .fileTooLarge:
+                return PDFDeliveryPackageVerificationFailure(
+                    kind: .sourceLimit,
+                    detail:
+                        "Delivery packages larger than 1 GB cannot be verified on this device."
+                )
+            case .outputVerificationFailed(let reason):
+                let lowercasedReason = reason.lowercased()
+                let isAccessFailure =
+                    lowercasedReason.contains("coordinated")
+                    || lowercasedReason.contains("readable zip")
+                    || lowercasedReason.contains("unavailable")
+                return PDFDeliveryPackageVerificationFailure(
+                    kind: isAccessFailure ? .access : .integrity,
+                    detail: paperPathError.errorDescription
+                        ?? reason.localizedUI
+                )
+            case .insufficientStorage:
+                return PDFDeliveryPackageVerificationFailure(
+                    kind: .storage,
+                    detail: paperPathError.errorDescription
+                        ?? "Free some storage and try again."
+                )
+            default:
+                break
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSCocoaErrorDomain
+            || nsError.domain == NSPOSIXErrorDomain {
+            return PDFDeliveryPackageVerificationFailure(
+                kind: .access,
+                detail:
+                    "Keep the package downloaded in Files, then choose it again."
+            )
+        }
+
+        return PDFDeliveryPackageVerificationFailure(
+            kind: .unknown,
+            detail: (error as? LocalizedError)?.errorDescription
+                ?? "PaperPath could not read this delivery package."
+        )
+    }
+
+    func importVerifiedDeliveryArtifact(
+        _ report: PDFDeliveryPackageVerificationReport
+    ) async -> DocumentRecord? {
+        guard report.status == .verified,
+              report.canOpenArtifact
+        else {
+            present(
+                PaperPathError.outputVerificationFailed(
+                    "the delivery package must pass verification before import"
+                )
+            )
+            return nil
+        }
+        guard importingVerifiedPackageIDs.insert(report.packageID)
+                .inserted
+        else {
+            noticeMessage =
+                "This verified PDF is already being imported".localizedUI
+            return nil
+        }
+        let importToken = beginImportOperation()
+        defer {
+            importingVerifiedPackageIDs.remove(report.packageID)
+            finishImportOperation(importToken)
+        }
+
+        do {
+            let imported = try await store
+                .importVerifiedDeliveryArtifact(report)
+            guard !Task.isCancelled else {
+                deferredCommittedImports[imported.id] = imported
+                return await restoreCommittedImportIfForeground(
+                    imported
+                )
+            }
+            let wasAlreadyImported = record(id: imported.id) != nil
+            replace(imported)
+            documentURLs[imported.id] = await store.url(for: imported)
+            noticeMessage = wasAlreadyImported
+                ? "This exact verified PDF is already in PaperPath"
+                    .localizedUI
+                : "Verified PDF imported as a private copy".localizedUI
+            if !wasAlreadyImported {
+                Task { @MainActor [weak self] in
+                    await Task.yield()
+                    await self?.analyzeDocument(recordID: imported.id)
+                }
+            }
+            return self.record(id: imported.id) ?? imported
         } catch is CancellationError {
             return nil
         } catch {
             present(error)
             return nil
         }
+    }
+
+    func prepareVerifiedDeliveryArtifactShareCopy(
+        _ report: PDFDeliveryPackageVerificationReport,
+        progress: @escaping @MainActor @Sendable (
+            PDFByteProgressUpdate
+        ) -> Void = { _ in }
+    ) async -> URL? {
+        var preparedURL: URL?
+        do {
+            preparedURL = try await store
+                .prepareVerifiedDeliveryArtifactShareCopy(
+                    report
+                ) { update in
+                    Task { @MainActor in
+                        progress(update)
+                    }
+                }
+            try Task.checkCancellation()
+            return preparedURL
+        } catch is CancellationError {
+            if let preparedURL {
+                await discardFilesExportCopy(at: preparedURL)
+            }
+            return nil
+        } catch {
+            if let preparedURL {
+                await discardFilesExportCopy(at: preparedURL)
+            }
+            present(error)
+            return nil
+        }
+    }
+
+    func discardVerifiedDeliveryArtifact(at url: URL) async {
+        await Task.detached(priority: .utility) {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: [
+                    PaperPathTemporaryArtifact
+                        .verifiedDeliveryPackagePrefix
+                ]
+            )
+        }.value
     }
 
     func trustDeliveryPackageSigner(
@@ -3607,6 +6964,8 @@ final class PaperPathModel: ObservableObject {
                 snapshotID: snapshotID,
                 recordID: recordID
             )
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
@@ -3620,7 +6979,19 @@ final class PaperPathModel: ObservableObject {
         pinned: Bool,
         linksCurrentDeliveryReceipt: Bool
     ) async -> [PDFVersionSnapshot]? {
+        guard let operationToken =
+                acquireExclusiveDocumentOperation(
+                    recordID: recordID
+                )
+        else { return nil }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
         do {
+            try Task.checkCancellation()
             guard let version = try await store.versions(
                 for: recordID
             ).first(where: { $0.id == snapshotID }) else {
@@ -3644,6 +7015,7 @@ final class PaperPathModel: ObservableObject {
             } else {
                 linkedReceiptID = nil
             }
+            try Task.checkCancellation()
             let versions = try await store.updateVersionMilestone(
                 snapshotID: snapshotID,
                 recordID: recordID,
@@ -3651,10 +7023,18 @@ final class PaperPathModel: ObservableObject {
                 pinned: pinned,
                 linkedDeliveryReceiptID: linkedReceiptID
             )
-            noticeMessage = pinned
-                ? "Milestone version protected".localizedUI
-                : "Version details updated".localizedUI
+            retainedEvidenceRevision &+= 1
+            invalidateVersionComparisonCaches(
+                for: Set([recordID])
+            )
+            if !Task.isCancelled {
+                noticeMessage = pinned
+                    ? "Milestone version protected".localizedUI
+                    : "Version details updated".localizedUI
+            }
             return versions
+        } catch is CancellationError {
+            return nil
         } catch {
             present(error)
             return nil
@@ -3663,7 +7043,47 @@ final class PaperPathModel: ObservableObject {
 
     func compareVersion(
         recordID: UUID,
-        snapshotID: UUID
+        snapshotID: UUID,
+        manualMatches: [PDFManualPageMatch]? = nil,
+        progress: @escaping @MainActor @Sendable (
+            PDFComparisonProgress
+        ) -> Void = { _ in }
+    ) async throws -> PDFChangeReview {
+        guard !isClearingPageMatches,
+              !isUpdatingVersionStorage,
+              !isErasingAllLocalData
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Local storage is being updated. Try the comparison again when it finishes."
+            )
+        }
+        guard !isProcessing(recordID) else {
+            throw PaperPathError.insufficientSelection(
+                "Another operation is already using this PDF. Wait for it to finish or stop it before trying again."
+            )
+        }
+        return try await performTrackedComparison(
+            recordIDs: [recordID]
+        ) {
+            workGeneration in
+            try await self.compareVersionCore(
+                recordID: recordID,
+                snapshotID: snapshotID,
+                manualMatches: manualMatches,
+                workGeneration: workGeneration,
+                progress: progress
+            )
+        }
+    }
+
+    private func compareVersionCore(
+        recordID: UUID,
+        snapshotID: UUID,
+        manualMatches: [PDFManualPageMatch]?,
+        workGeneration: UUID,
+        progress: @escaping @MainActor @Sendable (
+            PDFComparisonProgress
+        ) -> Void
     ) async throws -> PDFChangeReview {
         guard let currentRecord = record(id: recordID),
               let currentURL = documentURLs[recordID]
@@ -3675,40 +7095,133 @@ final class PaperPathModel: ObservableObject {
             snapshotID: snapshotID,
             currentRevisionID: currentRecord.contentRevisionID
         )
-        if let cached = versionComparisonCache[key] {
+        if manualMatches == nil,
+           let cached = versionComparisonCache[key] {
             touchVersionComparisonCache(key)
+            progress(
+                PDFComparisonProgress(
+                    stage: .complete,
+                    completedPageCount: cached.comparedPageCount,
+                    totalPageCount: cached.comparedPageCount,
+                    fractionCompleted: 1
+                )
+            )
             return cached
+        }
+        guard let snapshot = try await store.versions(
+            for: recordID
+        ).first(where: { $0.id == snapshotID }) else {
+            throw PaperPathError.storageFailure(
+                "The selected recovery version is unavailable."
+            )
         }
         let historicalURL = try await store.versionFileURL(
             snapshotID: snapshotID,
             recordID: recordID
         )
-        let service = deliveryAuditService
-        let task = Task.detached(
-            priority: .userInitiated
-        ) {
-            try service.compare(
-                sourceURL: historicalURL,
-                revisedURL: currentURL
-            )
-        }
-        let review = try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        let correctionLookup:
+            PDFManualPageMatchCorrectionLookup =
+            if manualMatches == nil {
+                try await store.pageMatchCorrection(
+                    context: .versionSnapshot,
+                    sourceDocumentID: recordID,
+                    sourceRevisionID:
+                        snapshot.contentRevisionID,
+                    revisedDocumentID: recordID,
+                    revisedRevisionID:
+                        currentRecord.contentRevisionID,
+                    versionSnapshotID: snapshotID,
+                    sourcePageCount: snapshot.pageCount,
+                    revisedPageCount:
+                        currentRecord.profile.pageCount
+                )
+            } else {
+                .none
+            }
+        let restoredCorrection = correctionLookup.correction
+        let resolvedManualMatches =
+            manualMatches
+                ?? restoredCorrection?.matches
+                ?? []
+        let comparedReview = try await comparisonCoordinator.compare(
+            sourceURL: historicalURL,
+            revisedURL: currentURL,
+            manualMatches: resolvedManualMatches
+        ) { update in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.activeComparisonTasks[workGeneration]
+                        != nil
+                else { return }
+                progress(update)
+            }
         }
         try Task.checkCancellation()
-        guard record(id: recordID)?.contentRevisionID
+        guard activeComparisonTasks[workGeneration] != nil,
+              record(id: recordID)?.contentRevisionID
                 == currentRecord.contentRevisionID
         else {
             throw CancellationError()
         }
+        let persistence:
+            PDFManualPageMatchPersistence?
+        if manualMatches != nil {
+            if comparedReview.resolvedManualPageMatches.isEmpty {
+                try await store.removePageMatchCorrection(
+                    context: .versionSnapshot,
+                    sourceDocumentID: recordID,
+                    revisedDocumentID: recordID,
+                    versionSnapshotID: snapshotID
+                )
+                persistence = nil
+            } else {
+                let evictedCount =
+                    try await store.savePageMatchCorrection(
+                        PDFManualPageMatchCorrection(
+                            context: .versionSnapshot,
+                            sourceDocumentID: recordID,
+                            sourceRevisionID:
+                                snapshot.contentRevisionID,
+                            revisedDocumentID: recordID,
+                            revisedRevisionID:
+                                currentRecord.contentRevisionID,
+                            versionSnapshotID: snapshotID,
+                            sourcePageCount: snapshot.pageCount,
+                            revisedPageCount:
+                                currentRecord.profile.pageCount,
+                            matches: comparedReview
+                                .resolvedManualPageMatches,
+                            updatedAt: Date()
+                        )
+                    )
+                if evictedCount > 0 {
+                    noticeMessage = AppLocalization.format(
+                        "%lld older saved comparison record%@ removed to stay within the local limit",
+                        evictedCount,
+                        evictedCount == 1 ? "" : "s"
+                    )
+                }
+                persistence = .savedOnDevice
+            }
+        } else {
+            persistence = restoredCorrection == nil
+                ? nil
+                : .restoredFromDevice
+            if correctionLookup.discardedStaleCorrection {
+                noticeMessage =
+                    "Saved page matches were reset because the working copy or saved version changed."
+                        .localizedUI
+            }
+        }
+        try Task.checkCancellation()
+        guard activeComparisonTasks[workGeneration] != nil else {
+            throw CancellationError()
+        }
+        let review = comparedReview
+            .markingManualPageMatchPersistence(persistence)
         versionComparisonCache[key] = review
         touchVersionComparisonCache(key)
-        while versionComparisonCacheOrder.count > 4 {
-            let oldest = versionComparisonCacheOrder.removeFirst()
-            versionComparisonCache[oldest] = nil
-        }
+        trimVersionComparisonCache()
         return review
     }
 
@@ -3717,6 +7230,35 @@ final class PaperPathModel: ObservableObject {
     ) {
         versionComparisonCacheOrder.removeAll { $0 == key }
         versionComparisonCacheOrder.append(key)
+    }
+
+    private func trimVersionComparisonCache() {
+        var estimatedBytes = versionComparisonCache.values.reduce(
+            Int64.zero
+        ) {
+            saturatedCacheCost(
+                $0,
+                $1.estimatedCacheByteCount
+            )
+        }
+        while versionComparisonCacheOrder.count > 1 {
+            let exceedsCount =
+                versionComparisonCacheOrder.count > 4
+            let exceedsBytes =
+                estimatedBytes
+                    > Self.maximumVersionComparisonCacheBytes
+            guard exceedsCount || exceedsBytes else { break }
+            let oldest = versionComparisonCacheOrder.removeFirst()
+            if let removed = versionComparisonCache.removeValue(
+                forKey: oldest
+            ) {
+                estimatedBytes = max(
+                    0,
+                    estimatedBytes
+                        - removed.estimatedCacheByteCount
+                )
+            }
+        }
     }
 
     private func releaseEvidenceCaches() {
@@ -3730,6 +7272,46 @@ final class PaperPathModel: ObservableObject {
         releaseSearchTextCorpora()
         ocrService.releaseCachedResources()
         scanRenderer.releaseCachedResources()
+    }
+
+    private func handleMemoryPressure() {
+        scanImportGeneration = UUID()
+        cancelAllDocumentAnalysis()
+        cancelActiveComparisonWork()
+        cancelBackgroundCancellableDocumentOperations()
+        scanRenderTask?.cancel()
+        scanRenderTask = nil
+        scanImportFraction = nil
+        if officeProductionTask != nil
+            || officeProductionQueue.hasRunnableJobs {
+            officeProductionQueue.isSuspended = true
+            officeProductionCancelledJobID = nil
+            officeProductionTask?.cancel()
+            officeResourceMonitorTask?.cancel()
+            officeResourceMonitorTask = nil
+        }
+        releaseEvidenceCaches()
+        releaseResidentAnalysis(retainingRecordCount: 0)
+    }
+
+    func checkpointTrustedTime() {
+        Task(priority: .utility) { [store] in
+            await store.checkpointTrustedTime()
+        }
+    }
+
+    func releaseTransientResourcesForBackground() {
+        checkpointTrustedTime()
+        initialBootstrapTask?.cancel()
+        deferredBootstrapTask?.cancel()
+        deferredBootstrapTask = nil
+        deferredBackgroundWorkNeedsRestart = false
+        committedImportRestoreGeneration = UUID()
+        committedImportRestoreTask?.cancel()
+        committedImportRestoreTask = nil
+        pauseMetadataSyncForBackground()
+        externalPDFImportTask?.cancel()
+        handleMemoryPressure()
     }
 
     @discardableResult
@@ -3749,33 +7331,71 @@ final class PaperPathModel: ObservableObject {
             )
         }
         do {
-            let currentVersion = try await store.createVersionSnapshot(
-                for: record,
-                label: "Restore version".localizedUI,
-                preservingVersionID: snapshotID
-            )
-            let restored = try await store.restoreVersion(
-                snapshotID: snapshotID,
-                for: record
-            )
-            try? await store.enforceVersionRetention(
-                preserving: currentVersion.id
-            )
+            let store = self.store
+            let snapshotTask = Task {
+                try await store.createVersionSnapshot(
+                    for: record,
+                    label: "Restore version".localizedUI,
+                    preservingVersionID: snapshotID
+                )
+            }
+            let currentVersion =
+                try await valuePropagatingExclusiveCancellation(
+                    from: snapshotTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            let restoreTask = Task {
+                try await store.restoreVersion(
+                    snapshotID: snapshotID,
+                    for: record
+                )
+            }
+            let restored =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: restoreTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
             replace(restored)
             textIndices[recordID] = nil
-            ocrResults[recordID] = nil
+            setOCRResult(nil, for: recordID)
             refreshTokens[recordID, default: 0] += 1
             if let undo = pageMutationUndos.removeValue(
                 forKey: recordID
             ) {
-                try? FileManager.default.removeItem(
-                    at: undo.backupURL
+                removePageMutationTemporaryItem(
+                    containing: undo.backupURL
                 )
             }
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
+            let retentionTask = Task {
+                try await store.enforceVersionRetention(
+                    preserving: currentVersion.id
+                )
+            }
+            _ = try? await valuePropagatingExclusiveCancellation(
+                from: retentionTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
             await analyzeDocument(recordID: recordID)
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
             noticeMessage = "Version restored · current state saved"
                 .localizedUI
             return true
+        } catch is CancellationError {
+            return false
         } catch {
             present(error)
             return false
@@ -3796,6 +7416,19 @@ final class PaperPathModel: ObservableObject {
             label: "Recognizing text".localizedUI,
             fractionCompleted: 0
         )
+        do {
+            try markExclusiveDocumentOperationBackgroundCancellable(
+                recordID: recordID,
+                token: operationToken
+            )
+        } catch {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+            operationProgress[recordID] = nil
+            return false
+        }
         defer {
             finishExclusiveDocumentOperation(
                 recordID: recordID,
@@ -3804,21 +7437,48 @@ final class PaperPathModel: ObservableObject {
             operationProgress[recordID] = nil
         }
         do {
-            let result = try await ocrService.recognize(
-                url: url,
-                configuration: configuration
-            ) { [weak self] value in
-                Task { @MainActor [weak self] in
-                    guard self?.exclusiveDocumentOperations[recordID]
-                        == operationToken
-                    else { return }
-                    self?.operationProgress[recordID]
-                        = PDFOperationProgress(
+            let service = ocrService
+            let appliedConfiguration = try service.validated(configuration)
+            let identity = OCRCheckpointIdentity(
+                recordID: recordID,
+                revisionID: record.contentRevisionID,
+                pageCount: record.profile.pageCount,
+                configuration: appliedConfiguration
+            )
+            let checkpoint = try await store.prepareOCRCheckpoint(identity)
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID, token: operationToken
+            )
+            let checkpointStore = store
+            let recognitionTask = Task {
+                try await service.recognize(
+                    url: url,
+                    configuration: appliedConfiguration,
+                    checkpoint: checkpoint,
+                    onPageCompleted: { page in
+                        try await checkpointStore.saveOCRCheckpointPage(page, identity: identity)
+                    }
+                ) { [weak self] value in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.exclusiveDocumentOperationIsCurrent(
+                                recordID: recordID,
+                                token: operationToken
+                              )
+                        else { return }
+                        self.updateOperationFraction(
+                            recordID: recordID,
                             label: "Recognizing text".localizedUI,
                             fractionCompleted: value
                         )
+                    }
                 }
             }
+            let result = try await valuePropagatingExclusiveCancellation(
+                from: recognitionTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
             let textService = textIndexService
             let understandingService = understandingService
             let analysisTask = Task.detached(
@@ -3834,33 +7494,72 @@ final class PaperPathModel: ObservableObject {
                 try Task.checkCancellation()
                 return (index, brief)
             }
-            let (index, brief) = try await valuePropagatingCancellation(
-                from: analysisTask
+            let (index, brief) =
+                try await valuePropagatingExclusiveCancellation(
+                    from: analysisTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
             )
-            try Task.checkCancellation()
             guard let currentRecord = self.record(id: recordID),
                   currentRecord.contentRevisionID
                     == record.contentRevisionID
             else {
                 throw CancellationError()
             }
-            let updated = try await store.saveAnalysis(
-                currentRecord,
-                brief: brief,
-                textIndex: index,
-                ocrResult: result
-            )
-            let completed = try await store.setActionCompletion(
-                updated,
-                action: .recognizeText,
-                completed: true
-            )
-            ocrResults[recordID] = result
+            let store = self.store
+            let saveTask = Task {
+                try await store.saveAnalysis(
+                    currentRecord,
+                    brief: brief,
+                    textIndex: index,
+                    ocrResult: result
+                )
+            }
+            let updated =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: saveTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            setOCRResult(result, for: recordID)
             textIndices[recordID] = index
-            replace(completed)
-            noticeMessage = result.text.isEmpty
-                ? "No readable text found"
-                : "Text indexed on device"
+            replace(updated)
+            try? await store.removeOCRCheckpoint(identity)
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
+            let hasUsefulText = hasUsefulRecognizedText(result)
+            let completionTask = Task {
+                try await store.setActionCompletion(
+                    updated,
+                    action: .recognizeText,
+                    completed: hasUsefulText
+                )
+            }
+            let completed =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: completionTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            replace(
+                completed,
+                invalidatesSearchText: false
+            )
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
+            noticeMessage = (
+                hasUsefulText
+                    ? "Text indexed on device"
+                    : "No readable text found"
+            ).localizedUI
             return true
         } catch is CancellationError {
             return false
@@ -3870,16 +7569,65 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
+    func savedOCRPageCount(
+        recordID: UUID,
+        configuration: OCRRecognitionConfiguration
+    ) async throws -> Int {
+        let applied = try ocrService.validated(configuration)
+        let summary = try await ocrRecoverySummary(recordID: recordID)
+        return summary?.identity.configuration == applied ? summary?.completedPageCount ?? 0 : 0
+    }
+
+    func ocrRecoverySummary(recordID: UUID) async throws -> OCRRecoverySummary? {
+        guard UIApplication.shared.isProtectedDataAvailable,
+              let record = record(id: recordID), !record.profile.isLocked else { return nil }
+        let summary = try await store.loadOCRRecoverySummary(for: record)
+        try Task.checkCancellation()
+        guard UIApplication.shared.isProtectedDataAvailable,
+              self.record(id: recordID)?.contentRevisionID == record.contentRevisionID else {
+            throw CancellationError()
+        }
+        if let summary {
+            guard try ocrService.validated(summary.identity.configuration)
+                == summary.identity.configuration else { return nil }
+        }
+        return summary
+    }
+
+#if DEBUG
+    func loadWorkflowDiagnosticSnapshot() async throws {
+        applyBootstrapSnapshot(try await store.loadBootstrapSnapshot())
+        try await restoreBatchDeliveryRun()
+        didBootstrap = true
+        isLoading = false
+    }
+#endif
+
     func correctRecognizedText(
         recordID: UUID,
         pageIndex: Int,
         blockID: UUID,
+        expectedBlock: OCRTextBlock? = nil,
         replacement: String
     ) async -> Bool {
         let normalized = replacement
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .split(whereSeparator: \.isWhitespace)
+            .joined(separator: " ")
         guard !normalized.isEmpty,
               normalized.count <= 500,
+              normalized.utf8.count <= 2_048,
+              normalized.unicodeScalars.allSatisfy({
+                  let codePoint = $0.value
+                  let isBidirectionalControl =
+                      (0x202A...0x202E).contains(codePoint)
+                          || (0x2066...0x2069).contains(codePoint)
+                  return !CharacterSet.controlCharacters.contains($0)
+                      && !CharacterSet.illegalCharacters.contains($0)
+                      && !isBidirectionalControl
+              })
+        else { return false }
+        await ensureAnalysisLoaded(for: recordID)
+        guard !Task.isCancelled,
               let record = record(id: recordID),
               let result = ocrResults[recordID],
               let pageOffset = result.pages.firstIndex(where: {
@@ -3888,8 +7636,20 @@ final class PaperPathModel: ObservableObject {
               let blockOffset = result.pages[pageOffset]
                 .blocks.firstIndex(where: {
                     $0.id == blockID
-                })
+                }),
+              expectedBlock.map({
+                  result.pages[pageOffset].blocks[blockOffset] == $0
+              }) ?? true,
+              let operationToken = acquireExclusiveDocumentOperation(
+                recordID: recordID
+              )
         else { return false }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
 
         var blocks = result.pages[pageOffset].blocks
         let source = blocks[blockOffset]
@@ -3938,25 +7698,40 @@ final class PaperPathModel: ObservableObject {
                 try Task.checkCancellation()
                 return (index, brief)
             }
-            let (index, brief) = try await valuePropagatingCancellation(
-                from: analysisTask
-            )
-            try Task.checkCancellation()
+            let (index, brief) =
+                try await valuePropagatingExclusiveCancellation(
+                    from: analysisTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
             guard let currentRecord = self.record(id: recordID),
                   currentRecord.contentRevisionID
                     == record.contentRevisionID
             else {
                 throw CancellationError()
             }
-            let updated = try await store.saveAnalysis(
-                currentRecord,
-                brief: brief,
-                textIndex: index,
-                ocrResult: updatedResult
-            )
-            ocrResults[recordID] = updatedResult
+            let store = self.store
+            let saveTask = Task {
+                try await store.saveAnalysis(
+                    currentRecord,
+                    brief: brief,
+                    textIndex: index,
+                    ocrResult: updatedResult
+                )
+            }
+            let updated =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: saveTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            setOCRResult(updatedResult, for: recordID)
             textIndices[recordID] = index
             replace(updated)
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
             noticeMessage = "Recognition correction saved locally"
                 .localizedUI
             return true
@@ -3983,14 +7758,19 @@ final class PaperPathModel: ObservableObject {
             return nil
         }
 
-        isImporting = true
-        defer { isImporting = false }
-        let temporaryURL = temporaryPDFURL(prefix: "Combined")
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let importToken = beginImportOperation()
+        defer { finishImportOperation(importToken) }
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-DocumentExport-"
+        )
+        let temporaryURL = temporaryArtifact.fileURL
+        let outputRevisionID = UUID()
+        defer { temporaryArtifact.remove() }
 
         do {
             let service = compositionService
             let combineTask = Task.detached(priority: .userInitiated) {
+                try temporaryArtifact.prepare()
                 try service.combine(urls: urls, to: temporaryURL)
             }
             try await valuePropagatingCancellation(from: combineTask)
@@ -4004,7 +7784,8 @@ final class PaperPathModel: ObservableObject {
             let fallback = "\(records.first?.displayName ?? "Combined") + \(records.count - 1)"
             let created = try await importSinglePDF(
                 from: temporaryURL,
-                preferredName: name.isEmpty ? fallback : name
+                preferredName: name.isEmpty ? fallback : name,
+                contentRevisionID: outputRevisionID
             )
             noticeMessage = AppLocalization.format(
                 "%lld PDFs combined locally",
@@ -4012,6 +7793,14 @@ final class PaperPathModel: ObservableObject {
             )
             return created
         } catch is CancellationError {
+            if let committed = documents.first(where: {
+                $0.contentRevisionID == outputRevisionID
+            }) {
+                noticeMessage =
+                    "Copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return committed
+            }
             return nil
         } catch {
             present(error)
@@ -4036,28 +7825,48 @@ final class PaperPathModel: ObservableObject {
                 token: operationToken
             )
         }
-        let temporaryURL = temporaryPDFURL(prefix: "Extracted")
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-DocumentExport-"
+        )
+        let temporaryURL = temporaryArtifact.fileURL
+        let outputRevisionID = UUID()
+        defer { temporaryArtifact.remove() }
 
         do {
             let service = compositionService
             let selectedIndices = indices.sorted()
             let task = Task.detached(priority: .userInitiated) {
+                try temporaryArtifact.prepare()
                 try service.extractPages(
                     from: sourceURL,
                     indices: selectedIndices,
                     to: temporaryURL
                 )
             }
-            try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
+            try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            guard self.record(id: recordID)?.contentRevisionID
+                    == record.contentRevisionID
+            else {
+                throw CancellationError()
             }
-            try Task.checkCancellation()
-            let created = try await importSinglePDF(
-                from: temporaryURL,
-                preferredName: "\(record.displayName) - pages"
+            let importTask = Task { @MainActor in
+                try await self.importSinglePDF(
+                    from: temporaryURL,
+                    preferredName: AppLocalization.format(
+                        "%@ - extracted pages",
+                        record.displayName
+                    ),
+                    contentRevisionID: outputRevisionID
+                )
+            }
+            let created = try await valuePropagatingExclusiveCancellation(
+                from: importTask,
+                recordID: recordID,
+                operationToken: operationToken
             )
             noticeMessage = AppLocalization.format(
                 "%lld page%@ extracted",
@@ -4066,6 +7875,14 @@ final class PaperPathModel: ObservableObject {
             )
             return created
         } catch is CancellationError {
+            if let committed = documents.first(where: {
+                $0.contentRevisionID == outputRevisionID
+            }) {
+                noticeMessage =
+                    "Copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return committed
+            }
             return nil
         } catch {
             present(error)
@@ -4073,8 +7890,26 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
-    func createSearchableCopy(recordID: UUID) async -> DocumentRecord? {
+    func createSearchableCopy(
+        recordID: UUID,
+        expectedContentRevisionID: UUID
+    ) async -> DocumentRecord? {
+        guard record(id: recordID)?.contentRevisionID
+                == expectedContentRevisionID
+        else {
+            present(PDFBatchDeliveryIssue.sourceChanged)
+            return nil
+        }
+        await ensureAnalysisLoaded(for: recordID)
+        guard !Task.isCancelled else { return nil }
         guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID
+        else {
+            present(PDFBatchDeliveryIssue.sourceChanged)
+            return nil
+        }
+        guard
               let sourceURL = documentURLs[recordID],
               let result = ocrResults[recordID]
         else {
@@ -4085,42 +7920,104 @@ final class PaperPathModel: ObservableObject {
             recordID: recordID
         ) else { return nil }
 
+        let operationLabel = "Creating searchable PDF".localizedUI
+        operationProgress[recordID] = PDFOperationProgress(
+            label: operationLabel,
+            fractionCompleted: 0
+        )
         defer {
             finishExclusiveDocumentOperation(
                 recordID: recordID,
                 token: operationToken
             )
+            operationProgress[recordID] = nil
         }
-        let temporaryURL = temporaryPDFURL(prefix: "Searchable")
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-DocumentExport-"
+        )
+        let temporaryURL = temporaryArtifact.fileURL
+        let outputRevisionID = UUID()
+        defer { temporaryArtifact.remove() }
 
         do {
             let service = searchablePDFService
+            let reportProgress: PDFProgressHandler = { [weak self] value in
+                Task { @MainActor [weak self] in
+                    guard let self,
+                          self.exclusiveDocumentOperationIsCurrent(
+                            recordID: recordID,
+                            token: operationToken
+                          )
+                    else { return }
+                    self.updateOperationFraction(
+                        recordID: recordID,
+                        label: operationLabel,
+                        fractionCompleted: min(0.9, max(0, value) * 0.9)
+                    )
+                }
+            }
             let task = Task.detached(priority: .userInitiated) {
+                try temporaryArtifact.prepare()
                 try service.createSearchableCopy(
                     sourceURL: sourceURL,
                     ocrResult: result,
-                    destination: temporaryURL
+                    destination: temporaryURL,
+                    progress: reportProgress
                 )
             }
-            try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
+            try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            operationProgress[recordID] = PDFOperationProgress(
+                label: operationLabel,
+                fractionCompleted: 0.94
+            )
+            guard self.record(id: recordID)?.contentRevisionID
+                    == record.contentRevisionID
+            else {
+                throw CancellationError()
             }
-            try Task.checkCancellation()
-            let created = try await importSinglePDF(
-                from: temporaryURL,
-                preferredName: "\(record.displayName) - searchable"
+            let importTask = Task { @MainActor in
+                try await self.importSinglePDF(
+                    from: temporaryURL,
+                    preferredName: AppLocalization.format(
+                        "%@ - searchable",
+                        record.displayName
+                    ),
+                    contentRevisionID: outputRevisionID
+                )
+            }
+            let created = try await valuePropagatingExclusiveCancellation(
+                from: importTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            operationProgress[recordID] = PDFOperationProgress(
+                label: operationLabel,
+                fractionCompleted: 1
             )
             await markSourceCompleted(
                 recordID: recordID,
                 action: .makeSearchable,
                 marksReady: false
             )
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            )
             noticeMessage = "Searchable PDF copy created".localizedUI
             return created
         } catch is CancellationError {
+            if let committed = documents.first(where: {
+                $0.contentRevisionID == outputRevisionID
+            }) {
+                noticeMessage =
+                    "Searchable copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return committed
+            }
             return nil
         } catch {
             present(error)
@@ -4131,12 +8028,15 @@ final class PaperPathModel: ObservableObject {
     func createCompressedCopy(
         recordID: UUID,
         quality: PDFCompressionQuality,
+        expectedContentRevisionID: UUID,
         presentsFeedback: Bool = true,
         onFailure: ((PDFBatchDeliveryIssue) -> Void)? = nil
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "compressed",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Compressed copy",
             notice: "Compressed copy created and verified",
             operationKind: .compressed,
             presentsFeedback: presentsFeedback,
@@ -4153,9 +8053,13 @@ final class PaperPathModel: ObservableObject {
 
     func compressionEstimate(
         recordID: UUID,
-        quality: PDFCompressionQuality
+        quality: PDFCompressionQuality,
+        expectedContentRevisionID: UUID
     ) async throws -> PDFCompressionEstimate {
-        guard let sourceURL = documentURLs[recordID] else {
+        guard record(id: recordID)?.contentRevisionID
+                == expectedContentRevisionID,
+              let sourceURL = documentURLs[recordID]
+        else {
             throw PaperPathError.unreadablePDF
         }
         let service = outputService
@@ -4165,23 +8069,33 @@ final class PaperPathModel: ObservableObject {
                 quality: quality
             )
         }
-        return try await withTaskCancellationHandler {
+        let estimate = try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
             task.cancel()
         }
+        try Task.checkCancellation()
+        guard record(id: recordID)?.contentRevisionID
+                == expectedContentRevisionID
+        else {
+            throw CancellationError()
+        }
+        return estimate
     }
 
     func deliveryPreflight(
         recordID: UUID
     ) async throws -> PDFDeliveryPreflightAssessment {
+        try Task.checkCancellation()
         guard let record = record(id: recordID),
               let sourceURL = documentURLs[recordID]
         else {
             throw PaperPathError.unreadablePDF
         }
         if let cached = deliveryPreflightCache[recordID],
-           cached.revisionID == record.contentRevisionID {
+           cached.revisionID == record.contentRevisionID,
+           cached.usesCurrentRules {
+            try Task.checkCancellation()
             return cached.assessment
         }
         let service = deliveryAuditService
@@ -4193,27 +8107,40 @@ final class PaperPathModel: ObservableObject {
         } onCancel: {
             task.cancel()
         }
-        if self.record(id: recordID)?.contentRevisionID
-            == record.contentRevisionID {
-            let entry = PDFDeliveryPreflightCacheEntry(
-                recordID: recordID,
-                revisionID: record.contentRevisionID,
-                checkedAt: Date(),
-                assessment: assessment
-            )
-            deliveryPreflightCache[recordID] = entry
-            try? await store.saveDeliveryPreflight(entry)
+        try Task.checkCancellation()
+        guard self.record(id: recordID)?.contentRevisionID
+            == record.contentRevisionID
+        else {
+            throw CancellationError()
         }
+        let entry = PDFDeliveryPreflightCacheEntry(
+            recordID: recordID,
+            revisionID: record.contentRevisionID,
+            checkedAt: Date(),
+            assessment: assessment
+        )
+        try? await store.saveDeliveryPreflight(entry)
+        try Task.checkCancellation()
+        guard self.record(id: recordID)?.contentRevisionID
+            == record.contentRevisionID
+        else {
+            throw CancellationError()
+        }
+        deliveryPreflightCache[recordID] = entry
+        trimDeliveryPreflightCache(retaining: [recordID])
         return assessment
     }
 
     func createRedactedCopy(
         recordID: UUID,
-        marks: [PDFRedactionMark]
+        marks: [PDFRedactionMark],
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "redacted",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Redacted copy",
             notice: "Redacted copy created and verified",
             operationKind: .redacted
         ) { [outputService] source, destination, progress in
@@ -4229,11 +8156,14 @@ final class PaperPathModel: ObservableObject {
     func createProtectedCopy(
         recordID: UUID,
         password: String,
-        permissions: PDFProtectionPermissions = .restricted
+        permissions: PDFProtectionPermissions = .restricted,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "protected",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Protected copy",
             notice: "Protected copy created and verified",
             operationKind: .protected,
             unlockPassword: password
@@ -4250,14 +8180,21 @@ final class PaperPathModel: ObservableObject {
 
     func createUnlockedCopy(
         recordID: UUID,
-        password: String
+        password: String,
+        expectedContentRevisionID: UUID,
+        presentsFeedback: Bool = true,
+        onFailure: ((PDFBatchDeliveryIssue) -> Void)? = nil
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "editable",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Editable copy",
             notice: "Editable private copy created and checked",
             operationKind: .unlocked,
-            unlockPassword: password
+            unlockPassword: password,
+            presentsFeedback: presentsFeedback,
+            onFailure: onFailure
         ) { [outputService] source, destination, progress in
             try outputService.removePassword(
                 sourceURL: source,
@@ -4268,10 +8205,15 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
-    func createFlattenedCopy(recordID: UUID) async -> DocumentRecord? {
+    func createFlattenedCopy(
+        recordID: UUID,
+        expectedContentRevisionID: UUID
+    ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "flattened",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Flattened copy",
             notice: "Flattened copy created and verified",
             operationKind: .flattened
         ) { [outputService] source, destination, progress in
@@ -4323,11 +8265,14 @@ final class PaperPathModel: ObservableObject {
 
     func createPrintReadyCopy(
         recordID: UUID,
-        options: PDFPrintPreparationOptions
+        options: PDFPrintPreparationOptions,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "print-ready",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Print-ready copy",
             notice: "Print-ready copy created and verified",
             operationKind: .printPrepared
         ) { [outputService] source, destination, progress in
@@ -4379,11 +8324,14 @@ final class PaperPathModel: ObservableObject {
 
     func createBookletCopy(
         recordID: UUID,
-        options: PDFBookletOptions
+        options: PDFBookletOptions,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "booklet",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Booklet copy",
             notice: "Booklet copy created and verified",
             operationKind: .bookletPrepared
         ) { [outputService] source, destination, progress in
@@ -4398,11 +8346,14 @@ final class PaperPathModel: ObservableObject {
 
     func createEditedCopy(
         recordID: UUID,
-        overlays: [PDFContentOverlay]
+        overlays: [PDFContentOverlay],
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "edited",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Edited copy",
             notice: "Edited copy created and verified",
             operationKind: .edited
         ) { [outputService] source, destination, progress in
@@ -4443,11 +8394,15 @@ final class PaperPathModel: ObservableObject {
 
     func createLinkEditedCopy(
         recordID: UUID,
-        mutation: PDFLinkMutation
+        mutation: PDFLinkMutation,
+        expectedLink: PDFLinkAnnotationSnapshot? = nil,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "links-edited",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Links edited",
             notice: "Link-edited copy created and verified",
             operationKind: .edited
         ) { [outputService] source, destination, progress in
@@ -4455,6 +8410,7 @@ final class PaperPathModel: ObservableObject {
                 sourceURL: source,
                 destination: destination,
                 mutation: mutation,
+                expectedLink: expectedLink,
                 progress: progress
             )
         }
@@ -4489,11 +8445,14 @@ final class PaperPathModel: ObservableObject {
     func createImageReplacementCopy(
         recordID: UUID,
         snapshot: PDFImageObjectSnapshot,
-        replacementData: Data
+        replacementData: Data,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "image-replaced",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Image replaced",
             notice: "Image replacement copy created and verified",
             operationKind: .edited
         ) { [outputService] source, destination, progress in
@@ -4508,18 +8467,27 @@ final class PaperPathModel: ObservableObject {
     }
 
     func createBookmarkOutlineCopy(
-        recordID: UUID
+        recordID: UUID,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
-        guard let pages = record(id: recordID)?
-            .bookmarkedPages,
-              !pages.isEmpty
+        guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID
+        else {
+            present(PDFBatchDeliveryIssue.sourceChanged)
+            return nil
+        }
+        let pages = record.bookmarkedPages
+        guard !pages.isEmpty
         else {
             noticeMessage = "Bookmark at least one page first".localizedUI
             return nil
         }
         return await createOutputCopy(
             recordID: recordID,
-            outputName: "outlined",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Outline copy",
             notice: "PDF outline created from local bookmarks",
             operationKind: .edited
         ) { [outputService] source, destination, progress in
@@ -4534,11 +8502,14 @@ final class PaperPathModel: ObservableObject {
 
     func createPageLabeledCopy(
         recordID: UUID,
-        rules: [PDFPageLabelRule]
+        rules: [PDFPageLabelRule],
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "page-labeled",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Page labeled",
             notice: "Standard PDF page labels created and verified",
             operationKind: .edited
         ) { [outputService] source, destination, progress in
@@ -4556,11 +8527,16 @@ final class PaperPathModel: ObservableObject {
         selection: PDFTextSelectionSnapshot,
         replacement: String,
         fontStyle: PDFTextReplacementFontStyle,
-        alignment: PDFTextReplacementAlignment
+        alignment: PDFTextReplacementAlignment,
+        expectedContentRevisionID: UUID
     ) async -> PDFTextReplacementAssessment {
-        guard let sourceURL = documentURLs[recordID] else {
+        guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID,
+              let sourceURL = documentURLs[recordID]
+        else {
             return PDFTextReplacementAssessment(
-                status: .blocked,
+                status: .unavailable,
                 title: "Document unavailable",
                 detail: "The working copy could not be opened.",
                 resolvedFontName: nil,
@@ -4574,6 +8550,7 @@ final class PaperPathModel: ObservableObject {
                 alignment: alignment
             )
         }
+        let revisionID = record.contentRevisionID
         let service = outputService
         let task = Task.detached(priority: .userInitiated) {
             try service.assessTextReplacement(
@@ -4585,14 +8562,34 @@ final class PaperPathModel: ObservableObject {
             )
         }
         do {
-            return try await withTaskCancellationHandler {
+            let urls = try await withTaskCancellationHandler {
                 try await task.value
             } onCancel: {
                 task.cancel()
             }
+            try Task.checkCancellation()
+            guard self.record(id: recordID)?.contentRevisionID
+                    == revisionID
+            else {
+                return PDFTextReplacementAssessment(
+                    status: .blocked,
+                    title: "Document changed",
+                    detail: "Select the text again before replacing it.",
+                    resolvedFontName: nil,
+                    resolvedFontSize: 0,
+                    resolvedLineSpacing: 0,
+                    reflowedLineCount: 0,
+                    backgroundColor: nil,
+                    regionBackgroundColors: [],
+                    flowRegionTexts: [],
+                    fontStyle: fontStyle,
+                    alignment: alignment
+                )
+            }
+            return urls
         } catch is CancellationError {
             return PDFTextReplacementAssessment(
-                status: .blocked,
+                status: .unavailable,
                 title: "Layout check stopped",
                 detail: "No PDF was changed.",
                 resolvedFontName: nil,
@@ -4607,9 +8604,10 @@ final class PaperPathModel: ObservableObject {
             )
         } catch {
             return PDFTextReplacementAssessment(
-                status: .blocked,
+                status: .unavailable,
                 title: "Cannot inspect selection",
-                detail: error.localizedDescription,
+                detail: AppLocalization
+                    .userFacingErrorDescription(error),
                 resolvedFontName: nil,
                 resolvedFontSize: 0,
                 resolvedLineSpacing: 0,
@@ -4627,11 +8625,14 @@ final class PaperPathModel: ObservableObject {
         recordID: UUID,
         selection: PDFTextSelectionSnapshot,
         replacement: String,
-        assessment: PDFTextReplacementAssessment
+        assessment: PDFTextReplacementAssessment,
+        expectedContentRevisionID: UUID
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
-            outputName: "text-replaced",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Text replacement copy",
             notice: "Text replacement copy created and verified",
             operationKind: .textReplaced
         ) { [outputService] source, destination, progress in
@@ -4648,26 +8649,47 @@ final class PaperPathModel: ObservableObject {
 
     func createSafeShareCopy(
         recordID: UUID,
+        expectedContentRevisionID: UUID,
         presentsFeedback: Bool = true,
         onFailure: ((PDFBatchDeliveryIssue) -> Void)? = nil,
         bypassesEntitlement: Bool = false
     ) async -> DocumentRecord? {
-        guard bypassesEntitlement
-                || isRunningAutomatedTests
-                || AppEntitlement.canCreateSingleVerifiedOutput
-        else {
-            isPresentingFullUnlock = true
+        let reservesFreeOutput: Bool
+        if bypassesEntitlement
+            || isRunningAutomatedTests
+            || AppEntitlement.canCreateVerifiedOutput {
+            reservesFreeOutput = false
+        } else if AppEntitlement.verifiedOutputCount == 0,
+                  !isFreeVerifiedOutputReserved {
+            isFreeVerifiedOutputReserved = true
+            reservesFreeOutput = true
+        } else {
+            presentFullUnlock(.singleVerifiedOutput)
             return nil
         }
+        defer {
+            if reservesFreeOutput {
+                isFreeVerifiedOutputReserved = false
+            }
+        }
+        let existingOutputIDs = verifiedSafeShareOutputIDs(
+            for: recordID
+        )
+        var creationIssue: PDFBatchDeliveryIssue?
         let created = await createOutputCopy(
             recordID: recordID,
-            outputName: "verified",
+            expectedContentRevisionID:
+                expectedContentRevisionID,
+            outputNameKey: "Verified copy",
             notice: "Verified copy created and checked",
             operationKind: .safeShare,
             completesAction: .safeShare,
             marksSourceReady: true,
             presentsFeedback: presentsFeedback,
-            onFailure: onFailure
+            onFailure: {
+                creationIssue = $0
+                onFailure?($0)
+            }
         ) { [outputService] source, destination, progress in
             try outputService.safeShare(
                 sourceURL: source,
@@ -4675,21 +8697,82 @@ final class PaperPathModel: ObservableObject {
                 progress: progress
             )
         }
-        if created != nil {
+        let createdDurableOutput = created != nil
+            || !verifiedSafeShareOutputIDs(for: recordID)
+                .isSubset(of: existingOutputIDs)
+        if createdDurableOutput, !isRunningAutomatedTests {
             verifiedOutputSuccessCount =
                 AppEntitlement.recordVerifiedOutput()
-        } else {
+        } else if !createdDurableOutput,
+                  !isRunningAutomatedTests,
+                  creationIssue?.phase != .cancelled {
             AppEntitlement.recordVerifiedFailure()
         }
         return created
     }
 
+    private func verifiedSafeShareOutputIDs(
+        for sourceRecordID: UUID
+    ) -> Set<UUID> {
+        Set(
+            (documents + Array(deferredCommittedImports.values))
+                .filter {
+                    $0.sourceDocumentID == sourceRecordID
+                        && isVerifiedSafeShareOutput($0)
+                }
+                .map(\.id)
+        )
+    }
+
+    private func isVerifiedSafeShareOutput(
+        _ record: DocumentRecord
+    ) -> Bool {
+        record.hasCurrentDeliveryReceipt
+            && record.deliveryReceipt?.isDeliveryOutput == true
+            && record.deliveryReceipt?.operation == .safeShare
+    }
+
+    func beginBatchDeliveryRun(id: UUID) -> Bool {
+        guard activeBatchDeliveryRunID == nil else {
+            noticeMessage = "Another batch is already running.".localizedUI
+            return false
+        }
+        activeBatchDeliveryRunID = id
+        return true
+    }
+
+    func endBatchDeliveryRun(id: UUID) {
+        if activeBatchDeliveryRunID == id { activeBatchDeliveryRunID = nil }
+    }
+
+    private func restoreBatchDeliveryRun() async throws {
+        lastBatchDeliveryRun = try await store.loadBatchDeliveryRun()
+        if lastBatchDeliveryRun != nil, currentBatchDeliveryRun() == nil {
+            lastBatchDeliveryRun = nil
+            await store.clearBatchDeliveryRun()
+        }
+    }
+
     func createSafeShareBatch(
         recordIDs: [UUID],
+        runID: UUID? = nil,
+        expectedRevisionIDs: [UUID: UUID]? = nil,
         onUpdate: @escaping (PDFBatchDeliveryItem) -> Void
     ) async -> [PDFBatchDeliveryItem] {
         var seen = Set<UUID>()
         let sourceIDs = recordIDs.filter { seen.insert($0).inserted }
+        let ownedRunID = runID ?? UUID()
+        let ownsRun = runID.map { activeBatchDeliveryRunID == $0 }
+            ?? beginBatchDeliveryRun(id: ownedRunID)
+        defer {
+            if ownsRun, runID == nil { endBatchDeliveryRun(id: ownedRunID) }
+        }
+        guard ownsRun, batchDeliveryPendingDocumentIDs.isEmpty else {
+            let issue = PDFBatchDeliveryIssue.blocked("Another batch is already running.")
+            return sourceIDs.map {
+                PDFBatchDeliveryItem(sourceRecordID: $0, stage: .blocked, detail: issue.message, issue: issue)
+            }
+        }
         guard sourceIDs.count <= 64 else {
             let issue = PDFBatchDeliveryIssue.blocked(
                 "Choose up to 64 PDFs in one batch."
@@ -4703,9 +8786,7 @@ final class PaperPathModel: ObservableObject {
                 )
             }
         }
-        guard isRunningAutomatedTests || AppEntitlement.isUnlocked
-        else {
-            isPresentingFullUnlock = true
+        guard authorizeBatchVerifiedOutput() else {
             let issue = PDFBatchDeliveryIssue.blocked(
                 "Lifetime access is required for batch Verified Output."
             )
@@ -4769,6 +8850,12 @@ final class PaperPathModel: ObservableObject {
                 continue
             }
 
+            if let expectedRevisionIDs,
+               expectedRevisionIDs[sourceID] != source.contentRevisionID {
+                publish(.changedSource(sourceID))
+                continue
+            }
+
             if let existing = verifiedShareTarget(for: sourceID) {
                 publish(
                     PDFBatchDeliveryItem(
@@ -4808,35 +8895,14 @@ final class PaperPathModel: ObservableObject {
                 return
             }
             guard let assessment = outcome.assessment else { return }
-            if let blocked = assessment.items.first(
-                where: { $0.status == .blocked }
-            ) {
-                let issue = PDFBatchDeliveryIssue.blocked(
-                    blocked.detail
-                )
+            if let review = assessment.batchAttentionItem {
+                let issue = review.status == .blocked
+                    ? PDFBatchDeliveryIssue.blocked(review.detail)
+                    : PDFBatchDeliveryIssue.review(review.detail)
                 publish(
                     PDFBatchDeliveryItem(
                         sourceRecordID: outcome.recordID,
-                        stage: .blocked,
-                        detail: blocked.detail,
-                        issue: issue
-                    )
-                )
-                return
-            }
-            if let review = assessment.items.first(
-                where: {
-                    $0.status == .review
-                        && $0.reviewPageIndex != nil
-                }
-            ) {
-                let issue = PDFBatchDeliveryIssue.review(
-                    review.detail
-                )
-                publish(
-                    PDFBatchDeliveryItem(
-                        sourceRecordID: outcome.recordID,
-                        stage: .needsReview,
+                        stage: review.status == .blocked ? .blocked : .needsReview,
                         detail: review.detail,
                         reviewPageIndex: review.reviewPageIndex,
                         issue: issue
@@ -4899,36 +8965,14 @@ final class PaperPathModel: ObservableObject {
                 continue
             }
 
-            if let blocked = assessment.items.first(
-                where: { $0.status == .blocked }
-            ) {
-                let issue = PDFBatchDeliveryIssue.blocked(
-                    blocked.detail
-                )
+            if let pageReview = assessment.batchAttentionItem {
+                let issue = pageReview.status == .blocked
+                    ? PDFBatchDeliveryIssue.blocked(pageReview.detail)
+                    : PDFBatchDeliveryIssue.review(pageReview.detail)
                 publish(
                     PDFBatchDeliveryItem(
                         sourceRecordID: sourceID,
-                        stage: .blocked,
-                        detail: blocked.detail,
-                        issue: issue
-                    )
-                )
-                continue
-            }
-
-            if let pageReview = assessment.items.first(
-                where: {
-                    $0.status == .review
-                        && $0.reviewPageIndex != nil
-                }
-            ) {
-                let issue = PDFBatchDeliveryIssue.review(
-                    pageReview.detail
-                )
-                publish(
-                    PDFBatchDeliveryItem(
-                        sourceRecordID: sourceID,
-                        stage: .needsReview,
+                        stage: pageReview.status == .blocked ? .blocked : .needsReview,
                         detail: pageReview.detail,
                         reviewPageIndex: pageReview.reviewPageIndex,
                         issue: issue
@@ -4947,9 +8991,25 @@ final class PaperPathModel: ObservableObject {
                 )
             )
 
+            guard let expectedContentRevisionID =
+                    outcome.revisionID
+            else {
+                let issue = PDFBatchDeliveryIssue.sourceChanged
+                publish(
+                    PDFBatchDeliveryItem(
+                        sourceRecordID: sourceID,
+                        stage: .failed,
+                        detail: issue.message,
+                        issue: issue
+                    )
+                )
+                continue
+            }
             var creationIssue: PDFBatchDeliveryIssue?
             let output = await createSafeShareCopy(
                 recordID: sourceID,
+                expectedContentRevisionID:
+                    expectedContentRevisionID,
                 presentsFeedback: false,
                 onFailure: { creationIssue = $0 },
                 bypassesEntitlement: true
@@ -5013,30 +9073,64 @@ final class PaperPathModel: ObservableObject {
         return results
     }
 
+    @discardableResult
+    func authorizeBatchVerifiedOutput() -> Bool {
+        guard isRunningAutomatedTests
+                || AppEntitlement.canCreateVerifiedOutput
+        else {
+            presentFullUnlock(.batchVerifiedOutput)
+            return false
+        }
+        return true
+    }
+
+    private func presentFullUnlock(_ context: FullUnlockContext) {
+        if let sceneID = resolvedFeedbackTarget(
+            AppFeedbackContext.targetSceneID
+        ) {
+            fullUnlockContextsBySceneID[sceneID] = context
+        } else {
+            unscopedFullUnlockContext = context
+        }
+    }
+
+    @discardableResult
     func saveBatchDeliveryRun(
         id: UUID,
         sourceRecordIDs: [UUID],
+        sourceRevisionIDs: [UUID: UUID],
         items: [PDFBatchDeliveryItem],
-        startedAt: Date
-    ) async {
+        startedAt: Date,
+        snapshotAt: Date = Date()
+    ) async -> Bool {
+        guard activeBatchDeliveryRunID == nil || activeBatchDeliveryRunID == id else { return false }
+        var canonicalStartedAt = startedAt
+        if let current = lastBatchDeliveryRun {
+            if id == current.id {
+                guard snapshotAt >= current.updatedAt else { return false }
+                canonicalStartedAt = current.startedAt
+            } else {
+                guard startedAt >= current.startedAt else { return false }
+            }
+        }
         var seen = Set<UUID>()
         let validSourceIDs = sourceRecordIDs.filter { recordID in
             guard seen.insert(recordID).inserted,
-                  let source = record(id: recordID)
+                  let source = record(id: recordID),
+                  sourceRevisionIDs[recordID] != nil
             else { return false }
             return source.isWorkingCopy
                 && !source.profile.isLocked
                 && documentURLs[recordID] != nil
         }
         guard !validSourceIDs.isEmpty else {
-            await clearBatchDeliveryRun()
-            return
+            return false
         }
         let revisions = Dictionary(
             validSourceIDs.compactMap {
                 recordID -> (UUID, UUID)? in
-                guard let revisionID = record(id: recordID)?
-                    .contentRevisionID
+                guard let revisionID =
+                    sourceRevisionIDs[recordID]
                 else { return nil }
                 return (recordID, revisionID)
             },
@@ -5050,18 +9144,35 @@ final class PaperPathModel: ObservableObject {
         )
         let run = PDFBatchDeliveryRun(
             id: id,
-            startedAt: startedAt,
-            updatedAt: Date(),
+            startedAt: canonicalStartedAt,
+            updatedAt: max(canonicalStartedAt, snapshotAt),
             sourceRecordIDs: validSourceIDs,
             sourceRevisionIDs: revisions,
-            items: validSourceIDs.compactMap { itemByID[$0] }
+            items: validSourceIDs.compactMap { recordID in
+                guard record(id: recordID)?.contentRevisionID == revisions[recordID] else {
+                    return .changedSource(recordID)
+                }
+                return itemByID[recordID]
+            }
         )
         lastBatchDeliveryRun = run
-        try? await store.saveBatchDeliveryRun(run)
+        do {
+            try await store.saveBatchDeliveryRun(run)
+            if lastBatchDeliveryRun == run { batchDeliveryPersistenceError = nil }
+            return true
+        } catch {
+            if lastBatchDeliveryRun == run {
+                batchDeliveryPersistenceError =
+                    "Batch progress could not be saved. Completed PDFs remain in Results.".localizedUI
+            }
+            return false
+        }
     }
 
     func clearBatchDeliveryRun() async {
+        guard activeBatchDeliveryRunID == nil else { return }
         lastBatchDeliveryRun = nil
+        batchDeliveryPersistenceError = nil
         await store.clearBatchDeliveryRun()
     }
 
@@ -5069,12 +9180,12 @@ final class PaperPathModel: ObservableObject {
         guard let run = lastBatchDeliveryRun else { return nil }
         let validIDs = run.sourceRecordIDs.filter { recordID in
             guard let current = documentRecordsByID[recordID],
-                  let revisionID = run.sourceRevisionIDs[recordID],
+                  run.sourceRevisionIDs[recordID] != nil,
                   current.isWorkingCopy,
                   !current.profile.isLocked,
                   documentURLs[recordID] != nil
             else { return false }
-            return current.contentRevisionID == revisionID
+            return true
         }
         let validIDSet = Set(validIDs)
         let itemByID = Dictionary(
@@ -5084,12 +9195,30 @@ final class PaperPathModel: ObservableObject {
             uniquingKeysWith: { _, newest in newest }
         )
         let validItems = validIDs.map { recordID in
+            guard documentRecordsByID[recordID]?.contentRevisionID
+                    == run.sourceRevisionIDs[recordID] else {
+                return PDFBatchDeliveryItem.changedSource(recordID)
+            }
             let item = itemByID[recordID] ?? PDFBatchDeliveryItem(
                 sourceRecordID: recordID,
                 stage: .stopped,
                 detail: PDFBatchDeliveryIssue.cancelled.message,
                 issue: .cancelled
             )
+            if let output = verifiedShareTarget(for: recordID) {
+                return PDFBatchDeliveryItem(
+                    sourceRecordID: recordID,
+                    outputRecordID: output.id,
+                    stage: item.stage.isShareable
+                        && item.outputRecordID == output.id
+                        ? item.stage
+                        : .reused,
+                    detail: item.stage.isShareable
+                        && item.outputRecordID == output.id
+                        ? item.detail
+                        : "Current verified copy reused"
+                )
+            }
             if !item.stage.isFinal,
                !batchDeliveryPendingDocumentIDs.contains(recordID) {
                 return PDFBatchDeliveryItem(
@@ -5097,19 +9226,6 @@ final class PaperPathModel: ObservableObject {
                     stage: .stopped,
                     detail: PDFBatchDeliveryIssue.cancelled.message,
                     issue: .cancelled
-                )
-            }
-            if item.stage.isShareable,
-               let output = verifiedShareTarget(for: recordID) {
-                return PDFBatchDeliveryItem(
-                    sourceRecordID: recordID,
-                    outputRecordID: output.id,
-                    stage: item.outputRecordID == output.id
-                        ? item.stage
-                        : .reused,
-                    detail: item.outputRecordID == output.id
-                        ? item.detail
-                        : "Current verified copy reused"
                 )
             }
             if item.stage.isShareable {
@@ -5169,7 +9285,8 @@ final class PaperPathModel: ObservableObject {
                 continue
             }
             if let cached = deliveryPreflightCache[recordID],
-               cached.revisionID == record.contentRevisionID {
+               cached.revisionID == record.contentRevisionID,
+               cached.usesCurrentRules {
                 let outcome = BatchPreflightOutcome(
                     recordID: recordID,
                     revisionID: record.contentRevisionID,
@@ -5228,6 +9345,7 @@ final class PaperPathModel: ObservableObject {
             }
         }
 
+        var cachedRecordIDs: Set<UUID> = []
         for outcome in outcomes.values {
             guard let revisionID = outcome.revisionID,
                   let assessment = outcome.assessment,
@@ -5241,9 +9359,41 @@ final class PaperPathModel: ObservableObject {
                 assessment: assessment
             )
             deliveryPreflightCache[outcome.recordID] = entry
+            cachedRecordIDs.insert(outcome.recordID)
             try? await store.saveDeliveryPreflight(entry)
         }
+        trimDeliveryPreflightCache(
+            retaining: cachedRecordIDs
+        )
         return outcomes
+    }
+
+    private func trimDeliveryPreflightCache(
+        retaining recordIDs: Set<UUID>
+    ) {
+        guard deliveryPreflightCache.count
+                > Self.maximumInMemoryPreflightEntries
+        else { return }
+        var orderedIDs = recordIDs.sorted {
+            $0.uuidString < $1.uuidString
+        }
+        let retainedSet = Set(orderedIDs)
+        orderedIDs.append(
+            contentsOf: documents.lazy
+                .filter {
+                    self.deliveryPreflightCache[$0.id] != nil
+                        && !retainedSet.contains($0.id)
+                }
+                .map(\.id)
+        )
+        let keepIDs = Set(
+            orderedIDs.prefix(
+                Self.maximumInMemoryPreflightEntries
+            )
+        )
+        deliveryPreflightCache = deliveryPreflightCache.filter {
+            keepIDs.contains($0.key)
+        }
     }
 
     private var preflightConcurrencyLimit: Int {
@@ -5292,7 +9442,8 @@ final class PaperPathModel: ObservableObject {
                 revisionID: request.revisionID,
                 assessment: nil,
                 issue: .preflightFailed(
-                    error.localizedDescription
+                    AppLocalization
+                        .userFacingErrorDescription(error)
                 )
             )
         }
@@ -5324,12 +9475,33 @@ final class PaperPathModel: ObservableObject {
 
     func makeTextExport(
         recordID: UUID,
-        format: PDFTextExportFormat = .plainText
+        format: PDFTextExportFormat = .plainText,
+        expectedContentRevisionID: UUID? = nil,
+        pageRange: ClosedRange<Int>? = nil
     ) async throws -> PDFTextExportArtifact {
+        guard let requestedRevision = expectedContentRevisionID
+            ?? record(id: recordID)?.contentRevisionID
+        else { throw PaperPathError.unreadablePDF }
+        await ensureAnalysisLoaded(for: recordID)
+        try Task.checkCancellation()
         guard let record = record(id: recordID),
               let sourceURL = documentURLs[recordID]
         else {
             throw PaperPathError.unreadablePDF
+        }
+        guard record.contentRevisionID == requestedRevision else {
+            throw PaperPathError.outputVerificationFailed("the source changed before export")
+        }
+        if let pageRange {
+            guard pageRange.lowerBound >= 0,
+                  pageRange.upperBound < record.profile.pageCount,
+                  pageRange.count <= (format.officePageLimit ?? PDFCompositionService.maximumPageCount),
+                  record.profile.allowsCopying, !record.profile.isLocked
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "Choose an unlocked page range within this format's page limit."
+                )
+            }
         }
         if format.isOfficeFormat {
             try await validateOfficeProductionResources(
@@ -5338,7 +9510,10 @@ final class PaperPathModel: ObservableObject {
             )
         }
 
-        let requestedRevision = record.contentRevisionID
+        try Task.checkCancellation()
+        guard self.record(id: recordID)?.contentRevisionID == requestedRevision else {
+            throw PaperPathError.outputVerificationFailed("the source changed before export")
+        }
         let operationToken = try beginExclusiveDocumentOperation(
             recordID: recordID
         )
@@ -5349,20 +9524,21 @@ final class PaperPathModel: ObservableObject {
             )
         }
 
-        let officeContainer = format.isOfficeFormat
-            ? FileManager.default.temporaryDirectory
-                .appendingPathComponent(
-                    "PaperPath-Office-Export-\(UUID().uuidString)",
-                    isDirectory: true
-                )
-            : nil
-        let destinationRoot = officeContainer
-            ?? FileManager.default.temporaryDirectory
-        let destination = destinationRoot
+        let exportContainer = FileManager.default.temporaryDirectory
             .appendingPathComponent(
-                "\(safeExportName(record.displayName))-\(UUID().uuidString).\(format.fileExtension)"
+                format.isOfficeFormat
+                    ? "PaperPath-Office-Export-\(UUID().uuidString)"
+                    : "PaperPath-DocumentExport-\(UUID().uuidString)",
+                isDirectory: true
             )
-        let label = "Exporting \(format.title.lowercased())"
+        let destination = exportContainer
+            .appendingPathComponent(
+                "\(safeExportName(record.displayName))\(pageRange.map { "-pages-\($0.lowerBound + 1)-\($0.upperBound + 1)" } ?? "")-\(UUID().uuidString).\(format.fileExtension)"
+            )
+        let label = AppLocalization.format(
+            "Exporting %@",
+            format.title.localizedUI
+        )
         operationProgress[recordID] = PDFOperationProgress(
             label: label,
             fractionCompleted: 0
@@ -5373,27 +9549,51 @@ final class PaperPathModel: ObservableObject {
             operationRateWindows[recordID] = nil
         }
         do {
-            if let officeContainer {
-                try LocalFileSecurity.prepareProtectedDirectory(
-                    at: officeContainer
-                )
-            }
+            try LocalFileSecurity.prepareProtectedDirectory(
+                at: exportContainer
+            )
             let service = outputService
             let textIndex = textIndices[recordID]
             let task = Task.detached(priority: .userInitiated) {
-                try service.exportText(
-                    sourceURL: sourceURL,
+                let rangeSource = exportContainer.appendingPathComponent("selected-source.pdf")
+                defer {
+                    if pageRange != nil { try? FileManager.default.removeItem(at: rangeSource) }
+                }
+                var effectiveSource = sourceURL
+                var effectiveIndex = textIndex
+                var effectiveProfile = record.profile
+                if let pageRange {
+                    guard let source = PDFDocument(url: sourceURL),
+                          !source.isLocked, source.allowsCopying,
+                          pageRange.upperBound < source.pageCount
+                    else { throw PaperPathError.lockedPDF }
+                    try PDFCompositionService().extractPages(
+                        from: sourceURL, indices: Array(pageRange), to: rangeSource
+                    )
+                    try LocalFileSecurity.requireCompleteProtection(to: rangeSource)
+                    try Task.checkCancellation()
+                    effectiveProfile = try PDFInspectionService().inspect(url: rangeSource)
+                    effectiveIndex = textIndex?.segment(
+                        from: pageRange.lowerBound, through: pageRange.upperBound
+                    )
+                    effectiveSource = rangeSource
+                }
+                let evidence = try service.exportText(
+                    sourceURL: effectiveSource,
                     destination: destination,
-                    textIndex: textIndex,
+                    textIndex: effectiveIndex,
                     title: record.displayName,
                     format: format,
-                    profile: record.profile,
+                    profile: effectiveProfile,
                     byteProgress: { update in
                         Task { @MainActor [weak self] in
-                            guard self?.operationProgress[recordID]?
-                                .label == label
+                            guard let self,
+                                  self.exclusiveDocumentOperationIsCurrent(
+                                    recordID: recordID,
+                                    token: operationToken
+                                  )
                             else { return }
-                            self?.publishOperationByteProgress(
+                            self.publishOperationByteProgress(
                                 recordID: recordID,
                                 label: label,
                                 update: update
@@ -5402,58 +9602,64 @@ final class PaperPathModel: ObservableObject {
                     }
                 ) { value in
                     Task { @MainActor [weak self] in
-                        guard self?.operationProgress[recordID]?.label
-                            == label
+                        guard let self,
+                              self.exclusiveDocumentOperationIsCurrent(
+                                recordID: recordID,
+                                token: operationToken
+                              )
                         else { return }
-                        self?.updateOperationFraction(
+                        self.updateOperationFraction(
                             recordID: recordID,
                             label: label,
                             fractionCompleted: value
                         )
                     }
                 }
+                return (evidence, effectiveProfile)
             }
-            let evidence = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-            }
-            try Task.checkCancellation()
+            let (evidence, effectiveProfile) = try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
             guard self.record(id: recordID)?.contentRevisionID
                 == requestedRevision
             else {
-                try? FileManager.default.removeItem(at: destination)
                 throw PaperPathError.outputVerificationFailed(
                     "the source changed during export"
                 )
             }
             let outputValues = try destination.resourceValues(
-                forKeys: [.isRegularFileKey, .fileSizeKey]
+                forKeys: [
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey,
+                    .fileSizeKey
+                ]
             )
             guard outputValues.isRegularFile == true,
+                  outputValues.isSymbolicLink != true,
                   (outputValues.fileSize ?? 0) > 0
             else {
                 throw PaperPathError.outputVerificationFailed(
                     "the generated file is empty"
                 )
             }
-            if format.isOfficeFormat {
-                try LocalFileSecurity.requireCompleteProtection(
-                    to: destination
-                )
-            }
+            try LocalFileSecurity.requireCompleteProtection(
+                to: destination
+            )
             return PDFTextExportArtifact(
                 url: destination,
-                runtimeEvidence: evidence
+                runtimeEvidence: evidence,
+                sourceProfile: effectiveProfile
             )
         } catch is CancellationError {
-            try? FileManager.default.removeItem(
-                at: officeContainer ?? destination
+            await discardTemporaryExportCopies(
+                at: [exportContainer]
             )
             throw CancellationError()
         } catch {
-            try? FileManager.default.removeItem(
-                at: officeContainer ?? destination
+            await discardTemporaryExportCopies(
+                at: [exportContainer]
             )
             throw error
         }
@@ -5491,10 +9697,15 @@ final class PaperPathModel: ObservableObject {
 
     func makeOfficeBatch(
         recordID: UUID,
-        format: PDFTextExportFormat
+        format: PDFTextExportFormat,
+        expectedSourceRevisionID: UUID? = nil,
+        queueJobID: UUID? = nil
     ) async throws -> PDFOfficeBatchRun? {
         guard let record = record(id: recordID),
-              format.isOfficeFormat
+              format.isOfficeFormat,
+              expectedSourceRevisionID == nil
+                || expectedSourceRevisionID
+                    == record.contentRevisionID
         else { return nil }
 
         let plan = PDFOfficeBatchPlan(
@@ -5507,13 +9718,15 @@ final class PaperPathModel: ObservableObject {
         return try await executeOfficeBatch(
             recordID: recordID,
             run: run,
-            selectedSegmentIDs: Set(plan.segments.map(\.id))
+            selectedSegmentIDs: Set(plan.segments.map(\.id)),
+            queueJobID: queueJobID
         )
     }
 
     func resumeOfficeBatch(
         recordID: UUID,
-        selectedSegmentIDs: Set<UUID>? = nil
+        selectedSegmentIDs: Set<UUID>? = nil,
+        queueJobID: UUID? = nil
     ) async throws -> PDFOfficeBatchRun? {
         guard let run = officeBatchRuns[recordID],
               let record = record(id: recordID),
@@ -5527,15 +9740,19 @@ final class PaperPathModel: ObservableObject {
         return try await executeOfficeBatch(
             recordID: recordID,
             run: run,
-            selectedSegmentIDs: selected
+            selectedSegmentIDs: selected,
+            queueJobID: queueJobID
         )
     }
 
     private func executeOfficeBatch(
         recordID: UUID,
         run initialRun: PDFOfficeBatchRun,
-        selectedSegmentIDs: Set<UUID>
+        selectedSegmentIDs: Set<UUID>,
+        queueJobID: UUID?
     ) async throws -> PDFOfficeBatchRun? {
+        await ensureAnalysisLoaded(for: recordID)
+        try Task.checkCancellation()
         guard let record = record(id: recordID),
               let sourceURL = documentURLs[recordID],
               initialRun.plan.sourceRevisionID
@@ -5549,10 +9766,24 @@ final class PaperPathModel: ObservableObject {
             recordID: recordID,
             format: format
         )
-        let operationLabel =
-            "Exporting \(format.fileExtension.uppercased()) batch"
+        let operationLabel = AppLocalization.format(
+            "Exporting %@ batch",
+            format.fileExtension.uppercased()
+        )
         let operationToken = try beginExclusiveDocumentOperation(
             recordID: recordID
+        )
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+            operationProgress[recordID] = nil
+            operationRateWindows[recordID] = nil
+        }
+        try markExclusiveDocumentOperationBackgroundCancellable(
+            recordID: recordID,
+            token: operationToken
         )
 
         var run = initialRun
@@ -5573,14 +9804,6 @@ final class PaperPathModel: ObservableObject {
             fractionCompleted: 0
         )
         operationRateWindows[recordID] = ByteRateWindow()
-        defer {
-            finishExclusiveDocumentOperation(
-                recordID: recordID,
-                token: operationToken
-            )
-            operationProgress[recordID] = nil
-            operationRateWindows[recordID] = nil
-        }
 
         let service = outputService
         let composition = compositionService
@@ -5589,7 +9812,10 @@ final class PaperPathModel: ObservableObject {
         do {
             for segment in plan.segments
                 where selectedSegmentIDs.contains(segment.id) {
-                try Task.checkCancellation()
+                try ensureExclusiveDocumentOperationIsCurrent(
+                    recordID: recordID,
+                    token: operationToken
+                )
                 guard self.record(id: recordID)?.contentRevisionID
                         == plan.sourceRevisionID
                 else {
@@ -5643,12 +9869,11 @@ final class PaperPathModel: ObservableObject {
                             to: segmentURL
                         )
                     }
-                    try await withTaskCancellationHandler {
-                        try await extractionTask.value
-                    } onCancel: {
-                        extractionTask.cancel()
-                    }
-                    try Task.checkCancellation()
+                    try await valuePropagatingExclusiveCancellation(
+                        from: extractionTask,
+                        recordID: recordID,
+                        operationToken: operationToken
+                    )
                     try LocalFileSecurity.requireCompleteProtection(
                         to: segmentURL
                     )
@@ -5660,11 +9885,11 @@ final class PaperPathModel: ObservableObject {
                         try inspector.inspect(url: segmentURL)
                     }
                     let segmentProfile =
-                        try await withTaskCancellationHandler {
-                            try await inspectionTask.value
-                        } onCancel: {
-                            inspectionTask.cancel()
-                        }
+                        try await valuePropagatingExclusiveCancellation(
+                            from: inspectionTask,
+                            recordID: recordID,
+                            operationToken: operationToken
+                        )
                     let segmentTextIndex = sourceTextIndex?.segment(
                         from: segment.startPageIndex,
                         through: segment.endPageIndex
@@ -5692,7 +9917,15 @@ final class PaperPathModel: ObservableObject {
                             profile: segmentProfile,
                             byteProgress: { update in
                                 Task { @MainActor [weak self] in
-                                    self?.publishOperationByteProgress(
+                                    guard let self,
+                                          self.exclusiveDocumentOperationIsCurrent(
+                                            recordID: recordID,
+                                            token: operationToken
+                                          ),
+                                          self.officeBatchRuns[recordID]?.id
+                                            == plan.id
+                                    else { return }
+                                    self.publishOperationByteProgress(
                                         recordID: recordID,
                                         label: operationLabel,
                                         update: update
@@ -5701,7 +9934,15 @@ final class PaperPathModel: ObservableObject {
                             }
                         ) { value in
                             Task { @MainActor [weak self] in
-                                self?.updateOperationFraction(
+                                guard let self,
+                                      self.exclusiveDocumentOperationIsCurrent(
+                                        recordID: recordID,
+                                        token: operationToken
+                                      ),
+                                      self.officeBatchRuns[recordID]?.id
+                                        == plan.id
+                                else { return }
+                                self.updateOperationFraction(
                                     recordID: recordID,
                                     label: operationLabel,
                                     fractionCompleted: (
@@ -5711,7 +9952,7 @@ final class PaperPathModel: ObservableObject {
                                         max(1, plan.segmentCount)
                                     )
                                 )
-                                self?.updateOfficeBatchSegment(
+                                self.updateOfficeBatchSegment(
                                     recordID: recordID,
                                     batchID: plan.id,
                                     segmentIndex: segment.index,
@@ -5723,12 +9964,11 @@ final class PaperPathModel: ObservableObject {
                         }
                     }
                     let runtimeEvidence =
-                        try await withTaskCancellationHandler {
-                            try await exportTask.value
-                        } onCancel: {
-                            exportTask.cancel()
-                        }
-                    try Task.checkCancellation()
+                        try await valuePropagatingExclusiveCancellation(
+                            from: exportTask,
+                            recordID: recordID,
+                            operationToken: operationToken
+                        )
                     try LocalFileSecurity.requireCompleteProtection(
                         to: outputURL
                     )
@@ -5771,7 +10011,8 @@ final class PaperPathModel: ObservableObject {
                     guard let retained = await retainOfficeExport(
                         recordID: recordID,
                         receipt: receipt,
-                        sourceURL: outputURL
+                        sourceURL: outputURL,
+                        expectedContentRevisionID: plan.sourceRevisionID
                     ) else {
                         throw PaperPathError.storageFailure(
                             "The completed segment could not be retained."
@@ -5787,6 +10028,10 @@ final class PaperPathModel: ObservableObject {
                         receiptID: retained.receipt.id
                     )
                     await persistOfficeBatchRun(recordID: recordID)
+                    try ensureExclusiveDocumentOperationIsCurrent(
+                        recordID: recordID,
+                        token: operationToken
+                    )
                 } catch is CancellationError {
                     throw CancellationError()
                 } catch {
@@ -5796,7 +10041,8 @@ final class PaperPathModel: ObservableObject {
                         segmentIndex: segment.index,
                         status: .failed,
                         fractionCompleted: 1,
-                        failureDetail: error.localizedDescription
+                        failureDetail: AppLocalization
+                            .userFacingErrorDescription(error)
                     )
                     await persistOfficeBatchRun(recordID: recordID)
                 }
@@ -5806,22 +10052,58 @@ final class PaperPathModel: ObservableObject {
             await persistOfficeBatchRun(recordID: recordID)
             return officeBatchRuns[recordID]
         } catch is CancellationError {
-            cancelOfficeBatch(
-                recordID: recordID,
-                batchID: plan.id,
-                selectedSegmentIDs: selectedSegmentIDs
-            )
+            if let queueJobID,
+               officeProductionCancelledJobID != queueJobID {
+                pauseOfficeBatch(
+                    recordID: recordID,
+                    batchID: plan.id,
+                    selectedSegmentIDs: selectedSegmentIDs
+                )
+            } else {
+                cancelOfficeBatch(
+                    recordID: recordID,
+                    batchID: plan.id,
+                    selectedSegmentIDs: selectedSegmentIDs
+                )
+            }
             await persistOfficeBatchRun(recordID: recordID)
+            if queueJobID != nil {
+                throw CancellationError()
+            }
             return officeBatchRuns[recordID]
         } catch {
             failOfficeBatch(
                 recordID: recordID,
                 batchID: plan.id,
-                detail: error.localizedDescription
+                detail: AppLocalization
+                    .userFacingErrorDescription(error)
             )
             await persistOfficeBatchRun(recordID: recordID)
             return officeBatchRuns[recordID]
         }
+    }
+
+    private func pauseOfficeBatch(
+        recordID: UUID,
+        batchID: UUID,
+        selectedSegmentIDs: Set<UUID>
+    ) {
+        guard var run = officeBatchRuns[recordID],
+              run.id == batchID
+        else { return }
+        run.completedAt = nil
+        run.status = .paused
+        for index in run.segments.indices
+            where selectedSegmentIDs.contains(run.segments[index].id)
+                && run.segments[index].status != .completed
+                && run.segments[index].status != .failed {
+            run.segments[index].status = .queued
+            run.segments[index].fractionCompleted = 0
+            run.segments[index].receiptID = nil
+            run.segments[index].failureDetail =
+                "Interrupted safely. Resume to continue this part."
+        }
+        officeBatchRuns[recordID] = run
     }
 
     private func updateOfficeBatchSegment(
@@ -5835,13 +10117,18 @@ final class PaperPathModel: ObservableObject {
     ) {
         guard var run = officeBatchRuns[recordID],
               run.id == batchID,
+              run.status == .running,
               run.segments.indices.contains(segmentIndex)
         else { return }
-        run.status = .running
+        let previous = run.segments[segmentIndex]
+        guard !previous.status.isTerminal else { return }
+        let boundedFraction = fractionCompleted.isFinite
+            ? min(1, max(0, fractionCompleted))
+            : previous.fractionCompleted
         run.segments[segmentIndex].status = status
-        run.segments[segmentIndex].fractionCompleted = min(
-            1,
-            max(0, fractionCompleted)
+        run.segments[segmentIndex].fractionCompleted = max(
+            previous.fractionCompleted,
+            boundedFraction
         )
         if let receiptID {
             run.segments[segmentIndex].receiptID = receiptID
@@ -5884,7 +10171,7 @@ final class PaperPathModel: ObservableObject {
         guard var run = officeBatchRuns[recordID],
               run.id == batchID
         else { return }
-        run.completedAt = Date()
+        run.completedAt = PDFOfficeTimeAnchor.process.trustedDate()
         if run.completedCount == run.segments.count {
             run.status = .completed
             noticeMessage = AppLocalization.format(
@@ -5913,7 +10200,7 @@ final class PaperPathModel: ObservableObject {
         guard var run = officeBatchRuns[recordID],
               run.id == batchID
         else { return }
-        run.completedAt = Date()
+        run.completedAt = PDFOfficeTimeAnchor.process.trustedDate()
         run.status = run.completedCount > 0 ? .partial : .cancelled
         for index in run.segments.indices
             where selectedSegmentIDs.contains(run.segments[index].id)
@@ -5934,7 +10221,7 @@ final class PaperPathModel: ObservableObject {
         guard var run = officeBatchRuns[recordID],
               run.id == batchID
         else { return }
-        run.completedAt = Date()
+        run.completedAt = PDFOfficeTimeAnchor.process.trustedDate()
         run.status = run.completedCount > 0 ? .partial : .failed
         if let index = run.segments.firstIndex(
             where: {
@@ -5959,12 +10246,72 @@ final class PaperPathModel: ObservableObject {
                 return (
                     record.id,
                     stored.restored(
-                        currentRevisionID: record.contentRevisionID
+                        currentRevisionID: record.contentRevisionID,
+                        availableReceiptIDs:
+                            availableOfficeBatchReceiptIDs(
+                                in: record,
+                                for: stored
+                            )
                     )
                 )
             },
             uniquingKeysWith: { _, newest in newest }
         )
+    }
+
+    private func availableOfficeBatchReceiptIDs(
+        in record: DocumentRecord,
+        for run: PDFOfficeBatchRun
+    ) -> Set<UUID> {
+        let receiptsByID = Dictionary(
+            record.officeReceipts.map { ($0.id, $0) },
+            uniquingKeysWith: { existing, _ in existing }
+        )
+        return Set(
+            run.segments.compactMap { result in
+                guard result.status == .completed,
+                      let receiptID = result.receiptID,
+                      let receipt = receiptsByID[receiptID],
+                      receipt.format == run.plan.format,
+                      receipt.batchID == run.id,
+                      receipt.batchSegmentIndex
+                        == result.segment.index,
+                      receipt.batchSegmentCount
+                        == run.segments.count,
+                      receipt.sourcePageStartIndex
+                        == result.segment.startPageIndex,
+                      receipt.sourcePageEndIndex
+                        == result.segment.endPageIndex,
+                      receipt.fileSizeBytes > 0,
+                      receipt.artifactAvailability(
+                        for: record.contentRevisionID
+                      ) == .reusable,
+                      receipt.integrityStatus != .missing,
+                      receipt.integrityStatus != .mismatch,
+                      receipt.integrityStatus != .sourceChanged
+                else { return nil }
+                return receiptID
+            }
+        )
+    }
+
+    private func refreshOfficeBatchArtifactState(
+        recordID: UUID
+    ) async {
+        do {
+            guard let updated = try await store
+                .reconcileOfficeBatchArtifacts(for: recordID)
+            else { return }
+            replace(updated, schedulesMetadataSync: false)
+            if officeBatchRuns[recordID] == nil,
+               let restored = updated.officeBatchRun {
+                officeBatchRuns[recordID] = restored
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            return
+        }
     }
 
     private func persistOfficeBatchRun(
@@ -5996,7 +10343,10 @@ final class PaperPathModel: ObservableObject {
                 "PaperPath-Images-\(UUID().uuidString)",
                 isDirectory: true
             )
-        let label = "Exporting \(preset.title.lowercased())"
+        let label = AppLocalization.format(
+            "Exporting %@",
+            preset.title.localizedUI
+        )
         operationProgress[recordID] = PDFOperationProgress(
             label: label,
             fractionCompleted: 0
@@ -6017,27 +10367,31 @@ final class PaperPathModel: ObservableObject {
                     preset: preset
                 ) { value in
                     Task { @MainActor [weak self] in
-                        guard self?.exclusiveDocumentOperations[recordID]
-                            == operationToken
+                        guard let self,
+                              self.exclusiveDocumentOperationIsCurrent(
+                                recordID: recordID,
+                                token: operationToken
+                              )
                         else { return }
-                        self?.operationProgress[recordID]
-                            = PDFOperationProgress(
-                                label: label,
-                                fractionCompleted: value
-                            )
+                        self.updateOperationFraction(
+                            recordID: recordID,
+                            label: label,
+                            fractionCompleted: value
+                        )
                     }
                 }
             }
-            return try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-            }
+            let urls = try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            return urls
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: directory)
+            await discardTemporaryExportCopies(at: [directory])
             return []
         } catch {
-            try? FileManager.default.removeItem(at: directory)
+            await discardTemporaryExportCopies(at: [directory])
             present(error)
             return []
         }
@@ -6056,7 +10410,7 @@ final class PaperPathModel: ObservableObject {
                 "PaperPath-EmbeddedImages-\(UUID().uuidString)",
                 isDirectory: true
             )
-        let label = "Exporting embedded images"
+        let label = "Exporting embedded images".localizedUI
         operationProgress[recordID] = PDFOperationProgress(
             label: label,
             fractionCompleted: 0
@@ -6076,46 +10430,68 @@ final class PaperPathModel: ObservableObject {
                     directory: directory
                 ) { value in
                     Task { @MainActor [weak self] in
-                        guard self?.exclusiveDocumentOperations[recordID]
-                            == operationToken
+                        guard let self,
+                              self.exclusiveDocumentOperationIsCurrent(
+                                recordID: recordID,
+                                token: operationToken
+                              )
                         else { return }
-                        self?.operationProgress[recordID]
-                            = PDFOperationProgress(
-                                label: label,
-                                fractionCompleted: value
-                            )
+                        self.updateOperationFraction(
+                            recordID: recordID,
+                            label: label,
+                            fractionCompleted: value
+                        )
                     }
                 }
             }
-            let result = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-            }
+            let result = try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
             let duplicateCount = max(
                 0,
                 result.occurrenceCount
                     - result.unsupportedOccurrenceCount
                     - result.uniqueImageCount
             )
-            let kindSummary =
-                "\(result.originalStreamFileCount) original, \(result.losslessPNGFileCount) lossless PNG"
+            let kindSummary = AppLocalization.format(
+                "%lld original · %lld lossless PNG",
+                result.originalStreamFileCount,
+                result.losslessPNGFileCount
+            )
             if result.unsupportedOccurrenceCount > 0 {
-                noticeMessage =
-                    "Exported \(result.uniqueImageCount) image\(result.uniqueImageCount == 1 ? "" : "s") (\(kindSummary)); \(result.unsupportedOccurrenceCount) unsupported use\(result.unsupportedOccurrenceCount == 1 ? "" : "s") skipped"
+                noticeMessage = AppLocalization.format(
+                    "Exported %lld image%@ (%@); %lld unsupported use%@ skipped",
+                    result.uniqueImageCount,
+                    result.uniqueImageCount == 1 ? "" : "s",
+                    kindSummary,
+                    result.unsupportedOccurrenceCount,
+                    result.unsupportedOccurrenceCount == 1 ? "" : "s"
+                )
             } else if duplicateCount > 0 {
-                noticeMessage =
-                    "Exported \(result.uniqueImageCount) image\(result.uniqueImageCount == 1 ? "" : "s") (\(kindSummary)); \(duplicateCount) repeated use\(duplicateCount == 1 ? "" : "s") deduplicated"
+                noticeMessage = AppLocalization.format(
+                    "Exported %lld image%@ (%@); %lld repeated use%@ deduplicated",
+                    result.uniqueImageCount,
+                    result.uniqueImageCount == 1 ? "" : "s",
+                    kindSummary,
+                    duplicateCount,
+                    duplicateCount == 1 ? "" : "s"
+                )
             } else {
-                noticeMessage =
-                    "Exported \(result.uniqueImageCount) image\(result.uniqueImageCount == 1 ? "" : "s") (\(kindSummary))"
+                noticeMessage = AppLocalization.format(
+                    "Exported %lld image%@ (%@)",
+                    result.uniqueImageCount,
+                    result.uniqueImageCount == 1 ? "" : "s",
+                    kindSummary
+                )
             }
             return result.urls
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: directory)
+            await discardTemporaryExportCopies(at: [directory])
             return []
         } catch {
-            try? FileManager.default.removeItem(at: directory)
+            await discardTemporaryExportCopies(at: [directory])
             present(error)
             return []
         }
@@ -6175,11 +10551,15 @@ final class PaperPathModel: ObservableObject {
         recordID: UUID,
         indices: Set<Int>
     ) async -> Bool {
-        guard let record = record(id: recordID),
+        guard record(id: recordID) != nil,
               !indices.isEmpty
         else { return false }
         let sorted = indices.sorted()
-        let bookmarks = record.bookmarkedPages
+
+        func shiftedOriginalPage(_ page: Int) -> Int? {
+            page + sorted.prefix { $0 < page }.count
+        }
+
         let succeeded = await performPageMutation(
             recordID: recordID,
             label: sorted.count == 1
@@ -6187,89 +10567,50 @@ final class PaperPathModel: ObservableObject {
                 : AppLocalization.format(
                     "Duplicate %lld pages",
                     sorted.count
-                )
+                ),
+            navigationTransform: shiftedOriginalPage
         ) { service, url in
             try service.duplicatePages(at: sorted, in: url)
         }
-        guard succeeded else { return false }
-
-        func shiftedOriginalPage(_ page: Int) -> Int {
-            page + sorted.prefix { $0 < page }.count
-        }
-        await replaceBookmarks(
-            recordID: recordID,
-            pages: bookmarks.map(shiftedOriginalPage)
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint,
-            transform: shiftedOriginalPage
-        )
-        return true
+        return succeeded
     }
 
     func deletePage(recordID: UUID, index: Int) async {
-        guard let record = record(id: recordID) else { return }
-        let bookmarks = record.bookmarkedPages
+        guard record(id: recordID) != nil else { return }
         let succeeded = await performPageMutation(
             recordID: recordID,
-            label: "Remove page".localizedUI
+            label: "Remove page".localizedUI,
+            navigationTransform: { page in
+                if page == index { return nil }
+                return page > index ? page - 1 : page
+            }
         ) { service, url in
             try service.deletePage(at: index, in: url)
         }
         guard succeeded else { return }
-        await replaceBookmarks(
-            recordID: recordID,
-            pages: bookmarks.compactMap { page in
-                if page == index { return nil }
-                return page > index ? page - 1 : page
-            }
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint
-        ) { page in
-            if page == index { return nil }
-            return page > index ? page - 1 : page
-        }
     }
 
     func deletePages(
         recordID: UUID,
         indices: Set<Int>
     ) async -> Bool {
-        guard let record = record(id: recordID) else { return false }
+        guard record(id: recordID) != nil else { return false }
         let sorted = indices.sorted()
-        let bookmarks = record.bookmarkedPages
         let succeeded = await performPageMutation(
             recordID: recordID,
             label: AppLocalization.format(
                 "Remove %lld pages",
                 indices.count
-            )
+            ),
+            navigationTransform: { page in
+                guard !indices.contains(page) else { return nil }
+                let removedBefore = sorted.prefix { $0 < page }.count
+                return page - removedBefore
+            }
         ) { service, url in
             try service.deletePages(at: sorted, in: url)
         }
-        guard succeeded else { return false }
-        await replaceBookmarks(
-            recordID: recordID,
-            pages: bookmarks.compactMap { bookmark in
-                guard !indices.contains(bookmark) else { return nil }
-                let removedBefore = sorted.prefix {
-                    $0 < bookmark
-                }.count
-                return bookmark - removedBefore
-            }
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint
-        ) { page in
-            guard !indices.contains(page) else { return nil }
-            let removedBefore = sorted.prefix { $0 < page }.count
-            return page - removedBefore
-        }
-        return true
+        return succeeded
     }
 
     func movePage(
@@ -6277,32 +10618,20 @@ final class PaperPathModel: ObservableObject {
         index: Int,
         direction: PDFMutationService.MoveDirection
     ) async {
-        guard let record = record(id: recordID) else { return }
+        guard record(id: recordID) != nil else { return }
         let target = direction == .earlier ? index - 1 : index + 1
-        let bookmarks = record.bookmarkedPages
         let succeeded = await performPageMutation(
             recordID: recordID,
-            label: "Move page".localizedUI
-        ) { service, url in
-            try service.movePage(at: index, direction: direction, in: url)
-        }
-        guard succeeded else { return }
-        await replaceBookmarks(
-            recordID: recordID,
-            pages: bookmarks.map { page in
+            label: "Move page".localizedUI,
+            navigationTransform: { page in
                 if page == index { return target }
                 if page == target { return index }
                 return page
             }
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint
-        ) { page in
-            if page == index { return target }
-            if page == target { return index }
-            return page
+        ) { service, url in
+            try service.movePage(at: index, direction: direction, in: url)
         }
+        guard succeeded else { return }
     }
 
     func movePage(
@@ -6311,23 +10640,12 @@ final class PaperPathModel: ObservableObject {
         to destinationIndex: Int
     ) async {
         guard sourceIndex != destinationIndex,
-              let record = record(id: recordID)
+              record(id: recordID) != nil
         else { return }
-        let bookmarks = record.bookmarkedPages
         let succeeded = await performPageMutation(
             recordID: recordID,
-            label: "Reorder pages".localizedUI
-        ) { service, url in
-            try service.movePage(
-                from: sourceIndex,
-                to: destinationIndex,
-                in: url
-            )
-        }
-        guard succeeded else { return }
-        await replaceBookmarks(
-            recordID: recordID,
-            pages: bookmarks.map { page in
+            label: "Reorder pages".localizedUI,
+            navigationTransform: { page in
                 if page == sourceIndex {
                     return destinationIndex
                 }
@@ -6343,26 +10661,14 @@ final class PaperPathModel: ObservableObject {
                 }
                 return page
             }
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint
-        ) { page in
-            if page == sourceIndex {
-                return destinationIndex
-            }
-            if sourceIndex < destinationIndex,
-               page > sourceIndex,
-               page <= destinationIndex {
-                return page - 1
-            }
-            if sourceIndex > destinationIndex,
-               page >= destinationIndex,
-               page < sourceIndex {
-                return page + 1
-            }
-            return page
+        ) { service, url in
+            try service.movePage(
+                from: sourceIndex,
+                to: destinationIndex,
+                in: url
+            )
         }
+        guard succeeded else { return }
     }
 
     func reorderPages(
@@ -6377,14 +10683,6 @@ final class PaperPathModel: ObservableObject {
                   (0..<record.profile.pageCount).contains($0)
               })
         else { return false }
-        let bookmarks = record.bookmarkedPages
-        let succeeded = await performPageMutation(
-            recordID: recordID,
-            label: label
-        ) { service, url in
-            try service.reorderPages(order: order, in: url)
-        }
-        guard succeeded else { return false }
         let destinationBySource = Dictionary(
             order.enumerated().map {
                 destination,
@@ -6393,19 +10691,16 @@ final class PaperPathModel: ObservableObject {
             },
             uniquingKeysWith: { current, _ in current }
         )
-        await replaceBookmarks(
+        let succeeded = await performPageMutation(
             recordID: recordID,
-            pages: bookmarks.compactMap {
+            label: label,
+            navigationTransform: {
                 destinationBySource[$0]
             }
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint
-        ) {
-            destinationBySource[$0]
+        ) { service, url in
+            try service.reorderPages(order: order, in: url)
         }
-        return true
+        return succeeded
     }
 
     func replacePage(
@@ -6415,7 +10710,7 @@ final class PaperPathModel: ObservableObject {
         sourceIndex: Int
     ) async -> Bool {
         guard recordID != sourceRecordID,
-              let record = record(id: recordID),
+              record(id: recordID) != nil,
               let sourceURL = documentURLs[sourceRecordID]
         else { return false }
         let succeeded = await performPageMutation(
@@ -6423,20 +10718,14 @@ final class PaperPathModel: ObservableObject {
             label: AppLocalization.format(
                 "Replace page %lld",
                 index + 1
-            )
+            ),
+            clearingTaskCheckpointAt: index
         ) { service, destinationURL in
             try service.replacePage(
                 at: index,
                 withPageAt: sourceIndex,
                 from: sourceURL,
                 in: destinationURL
-            )
-        }
-        if succeeded {
-            await clearTaskCheckpointIfReplaced(
-                recordID: recordID,
-                pageIndex: index,
-                checkpoint: record.taskCheckpoint
             )
         }
         return succeeded
@@ -6453,26 +10742,61 @@ final class PaperPathModel: ObservableObject {
             }
         }
         let id = UUID()
-        let temporaryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "PaperPath-Replacement-\(id.uuidString).pdf"
-            )
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-Replacement-"
+        )
+        let temporaryURL = temporaryArtifact.fileURL
         do {
             let service = mutationService
+            let maximumBytes =
+                Self.maximumExternalPageSourceBytes
             let task = Task.detached(
                 priority: .userInitiated
             ) {
-                try FileManager.default.copyItem(
-                    at: sourceURL,
-                    to: temporaryURL
+                try Task.checkCancellation()
+                let sourceValues = try sourceURL.resourceValues(
+                    forKeys: [
+                        .fileSizeKey,
+                        .isRegularFileKey,
+                        .isSymbolicLinkKey
+                    ]
                 )
-                LocalFileSecurity.applyCompleteProtection(
-                    to: temporaryURL
+                guard sourceValues.isRegularFile == true,
+                      sourceValues.isSymbolicLink != true,
+                      let sourceSize = sourceValues.fileSize,
+                      sourceSize > 0
+                else {
+                    throw PaperPathError.unreadablePDF
+                }
+                guard Int64(sourceSize)
+                    <= maximumBytes
+                else {
+                    throw PaperPathError.fileTooLarge
+                }
+                try Task.checkCancellation()
+                try temporaryArtifact.copy(
+                    from: sourceURL,
+                    expectedByteCount: Int64(sourceSize)
                 )
+                let copiedValues = try temporaryURL.resourceValues(
+                    forKeys: [
+                        .fileSizeKey,
+                        .isRegularFileKey,
+                        .isSymbolicLinkKey
+                    ]
+                )
+                guard copiedValues.isRegularFile == true,
+                      copiedValues.isSymbolicLink != true,
+                      copiedValues.fileSize == sourceSize
+                else {
+                    throw PaperPathError.unreadablePDF
+                }
+                try Task.checkCancellation()
                 let assessment = try service
-                    .pagePreparationAssessment(
+                    .pageGeometryAssessment(
                         in: temporaryURL,
-                        revisionID: id
+                        revisionID: id,
+                        pageIndices: [0]
                     )
                 let size = try temporaryURL.resourceValues(
                     forKeys: [.fileSizeKey]
@@ -6489,12 +10813,12 @@ final class PaperPathModel: ObservableObject {
             }
             return try await valuePropagatingCancellation(from: task)
         } catch is CancellationError {
-            try? FileManager.default.removeItem(
+            await Self.removeTemporaryReplacementFile(
                 at: temporaryURL
             )
             return nil
         } catch {
-            try? FileManager.default.removeItem(
+            await Self.removeTemporaryReplacementFile(
                 at: temporaryURL
             )
             present(error)
@@ -6527,10 +10851,10 @@ final class PaperPathModel: ObservableObject {
             return nil
         }
         let id = UUID()
-        let temporaryURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "PaperPath-Replacement-\(id.uuidString).pdf"
-            )
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-Replacement-"
+        )
+        let temporaryURL = temporaryArtifact.fileURL
         do {
             let renderer = scanRenderer
             let assessmentService = mutationService
@@ -6538,19 +10862,21 @@ final class PaperPathModel: ObservableObject {
                 priority: .userInitiated
             ) {
                 try Task.checkCancellation()
+                try temporaryArtifact.prepare()
                 try renderer.render(
                     pages: pages,
                     to: temporaryURL,
                     options: .document
                 )
                 try Task.checkCancellation()
-                LocalFileSecurity.applyCompleteProtection(
+                try LocalFileSecurity.requireCompleteProtection(
                     to: temporaryURL
                 )
                 let assessment = try assessmentService
-                    .pagePreparationAssessment(
+                    .pageGeometryAssessment(
                         in: temporaryURL,
-                        revisionID: id
+                        revisionID: id,
+                        pageIndices: [0]
                     )
                 let size = try temporaryURL.resourceValues(
                     forKeys: [.fileSizeKey]
@@ -6565,10 +10891,14 @@ final class PaperPathModel: ObservableObject {
             }
             return try await valuePropagatingCancellation(from: task)
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: temporaryURL)
+            await Self.removeTemporaryReplacementFile(
+                at: temporaryURL
+            )
             return nil
         } catch {
-            try? FileManager.default.removeItem(at: temporaryURL)
+            await Self.removeTemporaryReplacementFile(
+                at: temporaryURL
+            )
             present(error)
             return nil
         }
@@ -6577,7 +10907,21 @@ final class PaperPathModel: ObservableObject {
     func discardExternalPageSource(
         _ source: PDFExternalPageSource
     ) {
-        try? FileManager.default.removeItem(at: source.url)
+        let url = source.url
+        Task.detached(priority: .utility) {
+            await Self.removeTemporaryReplacementFile(at: url)
+        }
+    }
+
+    nonisolated private static func removeTemporaryReplacementFile(
+        at url: URL
+    ) async {
+        await Task.detached(priority: .utility) {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: ["PaperPath-Replacement-"]
+            )
+        }.value
     }
 
     func replacePage(
@@ -6586,13 +10930,14 @@ final class PaperPathModel: ObservableObject {
         from source: PDFExternalPageSource,
         sourceIndex: Int
     ) async -> Bool {
-        guard let record = record(id: recordID) else { return false }
+        guard record(id: recordID) != nil else { return false }
         let succeeded = await performPageMutation(
             recordID: recordID,
             label: AppLocalization.format(
                 "Replace page %lld",
                 index + 1
-            )
+            ),
+            clearingTaskCheckpointAt: index
         ) { service, destinationURL in
             try service.replacePage(
                 at: index,
@@ -6601,23 +10946,27 @@ final class PaperPathModel: ObservableObject {
                 in: destinationURL
             )
         }
-        if succeeded {
-            await clearTaskCheckpointIfReplaced(
-                recordID: recordID,
-                pageIndex: index,
-                checkpoint: record.taskCheckpoint
-            )
-        }
         return succeeded
     }
 
     @discardableResult
     func addInk(
         recordID: UUID,
-        payload: PDFInkPayload
+        payload: PDFInkPayload,
+        expectedContentRevisionID: UUID
     ) async -> Bool {
+        guard record(id: recordID)?.contentRevisionID
+                == expectedContentRevisionID
+        else {
+            noticeMessage =
+                "The PDF changed before this action started. Review the updated PDF."
+                    .localizedUI
+            return false
+        }
         let succeeded = await mutate(
             recordID: recordID,
+            expectedContentRevisionID:
+                expectedContentRevisionID,
             invalidatesAnalysis: false,
             snapshotLabel: payload.placement == .signature
                 ? "Add signature".localizedUI
@@ -6638,13 +10987,24 @@ final class PaperPathModel: ObservableObject {
                 recordID: recordID,
                 signaturePageIndex: payload.pageIndex
             )
-            await updateTaskCheckpoint(
+            let checkpointSaved = await updateTaskCheckpoint(
                 recordID: recordID,
-                checkpoint: checkpoint
+                checkpoint: checkpoint,
+                presentsFeedback: false
             )
-            noticeMessage = checkpoint.stage == .verify
-                ? "Signature added · Verify & Share is ready"
-                : "Signature added · \(checkpoint.stage.title)"
+            if checkpointSaved {
+                noticeMessage = checkpoint.stage == .verify
+                    ? "Signature added · Verify & Share is ready"
+                        .localizedUI
+                    : AppLocalization.format(
+                        "Signature added · %@",
+                        checkpoint.stage.title.localizedUI
+                    )
+            } else {
+                noticeMessage =
+                    "Signature added · reopen the form to refresh the next step"
+                        .localizedUI
+            }
         }
         return true
     }
@@ -6653,10 +11013,12 @@ final class PaperPathModel: ObservableObject {
         recordID: UUID,
         signaturePageIndex: Int
     ) async -> DocumentTaskCheckpoint {
+        let contentRevisionID = record(id: recordID)?
+            .contentRevisionID
         guard let url = documentURLs[recordID] else {
             return DocumentTaskCheckpoint(
-                stage: .verify,
-                pageIndex: signaturePageIndex
+                stage: .fillForm,
+                contentRevisionID: contentRevisionID
             )
         }
         do {
@@ -6674,21 +11036,26 @@ final class PaperPathModel: ObservableObject {
                     fieldName: next.name,
                     normalizedBounds: next.kind == .signature
                         ? next.normalizedBounds
-                        : nil
+                        : nil,
+                    contentRevisionID: contentRevisionID
                 )
             }
             if report.hasXFA {
-                return DocumentTaskCheckpoint(stage: .fillForm)
+                return DocumentTaskCheckpoint(
+                    stage: .fillForm,
+                    contentRevisionID: contentRevisionID
+                )
             }
         } catch {
             return DocumentTaskCheckpoint(
-                stage: .verify,
-                pageIndex: signaturePageIndex
+                stage: .fillForm,
+                contentRevisionID: contentRevisionID
             )
         }
         return DocumentTaskCheckpoint(
             stage: .verify,
-            pageIndex: signaturePageIndex
+            pageIndex: signaturePageIndex,
+            contentRevisionID: contentRevisionID
         )
     }
 
@@ -6768,6 +11135,51 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
+    private func beginBatesBatchMutation() -> UUID? {
+        guard batesBatchMutationToken == nil,
+              batesReceiptVerificationToken == nil
+        else {
+            noticeMessage =
+                "Another Bates operation is already running. Finish or stop it before starting a new one."
+                    .localizedUI
+            return nil
+        }
+        let token = UUID()
+        batesBatchMutationToken = token
+        isBatesBatchMutationActive = true
+        return token
+    }
+
+    private func finishBatesBatchMutation(_ token: UUID) {
+        guard batesBatchMutationToken == token else { return }
+        batesBatchMutationToken = nil
+        batesBatchProgress = nil
+        isBatesBatchMutationActive = false
+    }
+
+    private func beginBatesReceiptVerification() -> UUID? {
+        guard batesReceiptVerificationToken == nil,
+              batesBatchMutationToken == nil
+        else {
+            noticeMessage =
+                "Another Bates operation is already running. Finish or stop it before starting a new one."
+                    .localizedUI
+            return nil
+        }
+        let token = UUID()
+        batesReceiptVerificationToken = token
+        batesReceiptVerificationProgress = nil
+        isBatesReceiptVerificationActive = true
+        return token
+    }
+
+    private func finishBatesReceiptVerification(_ token: UUID) {
+        guard batesReceiptVerificationToken == token else { return }
+        batesReceiptVerificationToken = nil
+        batesReceiptVerificationProgress = nil
+        isBatesReceiptVerificationActive = false
+    }
+
     func batesBatchPlan(
         recordIDs: [UUID],
         startNumber: Int64,
@@ -6796,6 +11208,9 @@ final class PaperPathModel: ObservableObject {
     func applyBatesNumbersBatch(
         _ plan: PDFBatesBatchPlan
     ) async -> Bool {
+        guard let batchToken = beginBatesBatchMutation()
+        else { return false }
+        defer { finishBatesBatchMutation(batchToken) }
         let recordIDs = plan.items.map(\.recordID)
         guard let operationTokens =
                 acquireExclusiveDocumentOperations(
@@ -6804,7 +11219,6 @@ final class PaperPathModel: ObservableObject {
         else { return false }
         defer {
             finishExclusiveDocumentOperations(operationTokens)
-            batesBatchProgress = nil
         }
 
         let label = AppLocalization.format(
@@ -6816,19 +11230,42 @@ final class PaperPathModel: ObservableObject {
         var keepsBackupsForUndo = false
         defer {
             for prepared in preparedCopies {
-                try? FileManager.default.removeItem(
-                    at: prepared.preparedURL
+                removePageMutationTemporaryItem(
+                    containing: prepared.preparedURL
                 )
             }
             if !keepsBackupsForUndo {
                 for backup in backups.values {
-                    try? FileManager.default.removeItem(at: backup)
+                    removePageMutationTemporaryItem(
+                        containing: backup
+                    )
                 }
             }
         }
 
         do {
+            let sourceURLs = try plan.items.map { item in
+                guard let url = documentURLs[item.recordID] else {
+                    throw PaperPathError.storageFailure(
+                        "A selected working copy is unavailable."
+                    )
+                }
+                return url
+            }
+            let store = self.store
+            let capacityTask = Task {
+                try await store.ensureTemporaryWorkingCapacity(
+                    for: sourceURLs,
+                    copyMultiplier: 6,
+                    reserveBytes: 32 * 1_024 * 1_024
+                )
+            }
+            try await valuePropagatingExclusiveCancellation(
+                from: capacityTask,
+                operationTokens: operationTokens
+            )
             var recordsByID: [UUID: DocumentRecord] = [:]
+            var completedPages = 0
             for (offset, item) in plan.items.enumerated() {
                 try Task.checkCancellation()
                 guard let record = record(id: item.recordID),
@@ -6851,9 +11288,15 @@ final class PaperPathModel: ObservableObject {
                     totalPageCount: plan.totalPageCount,
                     currentDocumentName: item.sourceName
                 )
-                _ = try await store.createVersionSnapshot(
-                    for: record,
-                    label: label
+                let snapshotTask = Task {
+                    try await store.createVersionSnapshot(
+                        for: record,
+                        label: label
+                    )
+                }
+                _ = try await valuePropagatingExclusiveCancellation(
+                    from: snapshotTask,
+                    operationTokens: operationTokens
                 )
                 batesBatchProgress = PDFBatesBatchProgress(
                     stage: .snapshotting,
@@ -6873,32 +11316,34 @@ final class PaperPathModel: ObservableObject {
                         "A selected working copy is unavailable."
                     )
                 }
-                let backupURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(
-                        "PaperPath-Bates-Undo-\(UUID().uuidString).pdf"
-                    )
-                let preparedURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(
-                        "PaperPath-Bates-Prepared-\(UUID().uuidString).pdf"
-                    )
+                let backupArtifact = ProtectedTemporaryPDF(
+                    prefix: "PaperPath-Bates-Undo-"
+                )
+                let preparedArtifact = ProtectedTemporaryPDF(
+                    prefix: "PaperPath-Bates-Prepared-"
+                )
+                let backupURL = backupArtifact.fileURL
+                let preparedURL = preparedArtifact.fileURL
                 let payload = plan.payload(for: item)
                 let mutationService = self.mutationService
                 let preparationTask = Task.detached(
                     priority: .userInitiated
                 ) {
                     try Task.checkCancellation()
+                    try backupArtifact.prepare()
+                    try preparedArtifact.prepare()
                     try FileManager.default.copyItem(
                         at: sourceURL,
                         to: backupURL
                     )
-                    LocalFileSecurity.applyCompleteProtection(
+                    try LocalFileSecurity.requireCompleteProtection(
                         to: backupURL
                     )
                     try FileManager.default.copyItem(
                         at: backupURL,
                         to: preparedURL
                     )
-                    LocalFileSecurity.applyCompleteProtection(
+                    try LocalFileSecurity.requireCompleteProtection(
                         to: preparedURL
                     )
                     try mutationService.applyBatesNumbers(
@@ -6907,12 +11352,13 @@ final class PaperPathModel: ObservableObject {
                     )
                 }
                 do {
-                    try await valuePropagatingCancellation(
-                        from: preparationTask
+                    try await valuePropagatingExclusiveCancellation(
+                        from: preparationTask,
+                        operationTokens: operationTokens
                     )
                 } catch {
-                    try? FileManager.default.removeItem(at: backupURL)
-                    try? FileManager.default.removeItem(at: preparedURL)
+                    backupArtifact.remove()
+                    preparedArtifact.remove()
                     throw error
                 }
                 backups[item.recordID] = backupURL
@@ -6923,9 +11369,18 @@ final class PaperPathModel: ObservableObject {
                         preparedURL: preparedURL
                     )
                 )
-                let completedPages = plan.items
-                    .prefix(offset + 1)
-                    .reduce(0) { $0 + $1.pageCount }
+                let (nextCompletedPages, pageCountOverflow) =
+                    completedPages.addingReportingOverflow(
+                        item.pageCount
+                    )
+                guard !pageCountOverflow,
+                      nextCompletedPages <= plan.totalPageCount
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the Bates batch page count changed during preparation"
+                    )
+                }
+                completedPages = nextCompletedPages
                 batesBatchProgress = PDFBatesBatchProgress(
                     stage: .preparing,
                     completedDocumentCount: offset + 1,
@@ -6953,11 +11408,19 @@ final class PaperPathModel: ObservableObject {
                 totalPageCount: plan.totalPageCount,
                 currentDocumentName: "All selected PDFs".localizedUI
             )
-            let commit = try await store
-                .replaceWorkingCopiesAndCreateBatesReceipt(
-                with: preparedCopies,
-                plan: plan
-            )
+            let copiesToCommit = preparedCopies
+            let commitTask = Task {
+                try await store
+                    .replaceWorkingCopiesAndCreateBatesReceipt(
+                        with: copiesToCommit,
+                        plan: plan
+                    )
+            }
+            let commit =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: commitTask,
+                    operationTokens: operationTokens
+                )
             let updatedRecords = commit.records
             guard let issuedReceipt = commit.batesReceipt else {
                 throw PaperPathError.storageFailure(
@@ -6973,15 +11436,19 @@ final class PaperPathModel: ObservableObject {
                 deliveryPreflightCache[updated.id] = nil
                 refreshTokens[updated.id, default: 0] += 1
                 if let previous = pageMutationUndos[updated.id] {
-                    try? FileManager.default.removeItem(
-                        at: previous.backupURL
+                    removePageMutationTemporaryItem(
+                        containing: previous.backupURL
                     )
                 }
                 if let backup = backups[updated.id],
                    recordsByID[updated.id] != nil {
                     pageMutationUndos[updated.id] = PageMutationUndo(
                         backupURL: backup,
+                        expectedRevisionID:
+                            updated.contentRevisionID,
                         bookmarkedPages: updated.bookmarkedPages,
+                        bookmarkNames: updated.bookmarkNames,
+                        lastPageIndex: updated.lastPageIndex,
                         taskCheckpoint: updated.taskCheckpoint,
                         label: label
                     )
@@ -7043,7 +11510,12 @@ final class PaperPathModel: ObservableObject {
         guard !entries.isEmpty,
               entries.count <= PDFBatesBatchPlan.maximumDocumentCount,
               receipt.payload.totalPageCount
-                <= PDFBatesBatchPlan.maximumPageCount,
+                <= PDFBatesBatchPlan.maximumPageCount
+        else { return false }
+        guard let batchToken = beginBatesBatchMutation()
+        else { return false }
+        defer { finishBatesBatchMutation(batchToken) }
+        guard
               let operationTokens =
                 acquireExclusiveDocumentOperations(
                     recordIDs: recordIDs
@@ -7051,7 +11523,6 @@ final class PaperPathModel: ObservableObject {
         else { return false }
         defer {
             finishExclusiveDocumentOperations(operationTokens)
-            batesBatchProgress = nil
             if batesReceiptVerificationProgress?.receiptID
                 == receiptID {
                 batesReceiptVerificationProgress = nil
@@ -7067,13 +11538,15 @@ final class PaperPathModel: ObservableObject {
         var keepsBackupsForUndo = false
         defer {
             for prepared in preparedCopies {
-                try? FileManager.default.removeItem(
-                    at: prepared.preparedURL
+                removePageMutationTemporaryItem(
+                    containing: prepared.preparedURL
                 )
             }
             if !keepsBackupsForUndo {
                 for backup in backups.values {
-                    try? FileManager.default.removeItem(at: backup)
+                    removePageMutationTemporaryItem(
+                        containing: backup
+                    )
                 }
             }
         }
@@ -7087,10 +11560,19 @@ final class PaperPathModel: ObservableObject {
                     currentDocumentName:
                         "Checking numbered PDFs".localizedUI
                 )
-            let verification = try await store
-                .verifyBatesBatchReceipt(receipt) { [weak self] progress in
+            let store = self.store
+            let verificationTask = Task {
+                try await store.verifyBatesBatchReceipt(
+                    receipt
+                ) { [weak self] progress in
                     self?.batesReceiptVerificationProgress = progress
                 }
+            }
+            let verification =
+                try await valuePropagatingExclusiveCancellation(
+                    from: verificationTask,
+                    operationTokens: operationTokens
+                )
             batesReceiptVerificationProgress = nil
             guard verification.signatureStatus == .verified,
                   verification.items.count == entries.count,
@@ -7103,6 +11585,25 @@ final class PaperPathModel: ObservableObject {
                 )
             }
 
+            let sourceURLs = try entries.map { entry in
+                guard let url = documentURLs[entry.recordID] else {
+                    throw PaperPathError.storageFailure(
+                        "A numbered working copy is unavailable."
+                    )
+                }
+                return url
+            }
+            let capacityTask = Task {
+                try await store.ensureTemporaryWorkingCapacity(
+                    for: sourceURLs,
+                    copyMultiplier: 5,
+                    reserveBytes: 32 * 1_024 * 1_024
+                )
+            }
+            try await valuePropagatingExclusiveCancellation(
+                from: capacityTask,
+                operationTokens: operationTokens
+            )
             var recordsByID: [UUID: DocumentRecord] = [:]
             for (offset, entry) in entries.enumerated() {
                 try Task.checkCancellation()
@@ -7127,9 +11628,15 @@ final class PaperPathModel: ObservableObject {
                     totalPageCount: receipt.payload.totalPageCount,
                     currentDocumentName: entry.displayName
                 )
-                _ = try await store.createVersionSnapshot(
-                    for: record,
-                    label: label
+                let snapshotTask = Task {
+                    try await store.createVersionSnapshot(
+                        for: record,
+                        label: label
+                    )
+                }
+                _ = try await valuePropagatingExclusiveCancellation(
+                    from: snapshotTask,
+                    operationTokens: operationTokens
                 )
                 batesBatchProgress = PDFBatesBatchProgress(
                     stage: .snapshotting,
@@ -7150,31 +11657,33 @@ final class PaperPathModel: ObservableObject {
                         "A numbered working copy is unavailable."
                     )
                 }
-                let backupURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(
-                        "PaperPath-Bates-Removal-Undo-\(UUID().uuidString).pdf"
-                    )
-                let preparedURL = FileManager.default.temporaryDirectory
-                    .appendingPathComponent(
-                        "PaperPath-Bates-Removal-\(UUID().uuidString).pdf"
-                    )
+                let backupArtifact = ProtectedTemporaryPDF(
+                    prefix: "PaperPath-Bates-Removal-Undo-"
+                )
+                let preparedArtifact = ProtectedTemporaryPDF(
+                    prefix: "PaperPath-Bates-Removal-"
+                )
+                let backupURL = backupArtifact.fileURL
+                let preparedURL = preparedArtifact.fileURL
                 let mutationService = self.mutationService
                 let preparationTask = Task.detached(
                     priority: .userInitiated
                 ) {
                     try Task.checkCancellation()
+                    try backupArtifact.prepare()
+                    try preparedArtifact.prepare()
                     try FileManager.default.copyItem(
                         at: sourceURL,
                         to: backupURL
                     )
-                    LocalFileSecurity.applyCompleteProtection(
+                    try LocalFileSecurity.requireCompleteProtection(
                         to: backupURL
                     )
                     try FileManager.default.copyItem(
                         at: backupURL,
                         to: preparedURL
                     )
-                    LocalFileSecurity.applyCompleteProtection(
+                    try LocalFileSecurity.requireCompleteProtection(
                         to: preparedURL
                     )
                     let removed = try mutationService
@@ -7188,12 +11697,13 @@ final class PaperPathModel: ObservableObject {
                     }
                 }
                 do {
-                    try await valuePropagatingCancellation(
-                        from: preparationTask
+                    try await valuePropagatingExclusiveCancellation(
+                        from: preparationTask,
+                        operationTokens: operationTokens
                     )
                 } catch {
-                    try? FileManager.default.removeItem(at: backupURL)
-                    try? FileManager.default.removeItem(at: preparedURL)
+                    backupArtifact.remove()
+                    preparedArtifact.remove()
                     throw error
                 }
                 backups[entry.recordID] = backupURL
@@ -7204,7 +11714,19 @@ final class PaperPathModel: ObservableObject {
                         preparedURL: preparedURL
                     )
                 )
-                completedPages += entry.pageCount
+                let (nextCompletedPages, pageCountOverflow) =
+                    completedPages.addingReportingOverflow(
+                        entry.pageCount
+                    )
+                guard !pageCountOverflow,
+                      nextCompletedPages
+                        <= receipt.payload.totalPageCount
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the Bates removal page count changed during preparation"
+                    )
+                }
+                completedPages = nextCompletedPages
                 batesBatchProgress = PDFBatesBatchProgress(
                     stage: .removing,
                     completedDocumentCount: offset + 1,
@@ -7232,10 +11754,18 @@ final class PaperPathModel: ObservableObject {
                 totalPageCount: receipt.payload.totalPageCount,
                 currentDocumentName: "All numbered PDFs".localizedUI
             )
-            let commit = try await store
-                .replaceWorkingCopiesAndCreateBatesRemovalReceipt(
-                    with: preparedCopies,
-                    receiptID: receiptID
+            let copiesToCommit = preparedCopies
+            let commitTask = Task {
+                try await store
+                    .replaceWorkingCopiesAndCreateBatesRemovalReceipt(
+                        with: copiesToCommit,
+                        receiptID: receiptID
+                    )
+            }
+            let commit =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: commitTask,
+                    operationTokens: operationTokens
                 )
             guard let updatedReceipt = commit.batesReceipt,
                   updatedReceipt.removal != nil
@@ -7253,15 +11783,19 @@ final class PaperPathModel: ObservableObject {
                 deliveryPreflightCache[updated.id] = nil
                 refreshTokens[updated.id, default: 0] += 1
                 if let previous = pageMutationUndos[updated.id] {
-                    try? FileManager.default.removeItem(
-                        at: previous.backupURL
+                    removePageMutationTemporaryItem(
+                        containing: previous.backupURL
                     )
                 }
                 if let backup = backups[updated.id],
                    let original = recordsByID[updated.id] {
                     pageMutationUndos[updated.id] = PageMutationUndo(
                         backupURL: backup,
+                        expectedRevisionID:
+                            updated.contentRevisionID,
                         bookmarkedPages: original.bookmarkedPages,
+                        bookmarkNames: original.bookmarkNames,
+                        lastPageIndex: original.lastPageIndex,
                         taskCheckpoint: original.taskCheckpoint,
                         label: label
                     )
@@ -7313,6 +11847,12 @@ final class PaperPathModel: ObservableObject {
                 "This Bates receipt is no longer available.".localizedUI
             return nil
         }
+        guard let verificationToken =
+                beginBatesReceiptVerification()
+        else { return nil }
+        defer {
+            finishBatesReceiptVerification(verificationToken)
+        }
         do {
             batesReceiptVerificationProgress =
                 PDFBatesBatchReceiptVerificationProgress(
@@ -7323,17 +11863,17 @@ final class PaperPathModel: ObservableObject {
                     currentDocumentName:
                         "Signed manifest".localizedUI
                 )
-            defer {
-                if batesReceiptVerificationProgress?.receiptID
-                    == receiptID {
-                    batesReceiptVerificationProgress = nil
-                }
-            }
-            return try await store.verifyBatesBatchReceipt(
+            let report = try await store.verifyBatesBatchReceipt(
                 receipt
             ) { [weak self] progress in
+                guard self?.batesReceiptVerificationToken
+                        == verificationToken
+                else { return }
                 self?.batesReceiptVerificationProgress = progress
             }
+            guard batesReceiptVerificationToken == verificationToken
+            else { return nil }
+            return report
         } catch is CancellationError {
             return nil
         } catch {
@@ -7346,9 +11886,14 @@ final class PaperPathModel: ObservableObject {
         receiptID: UUID
     ) async -> URL? {
         do {
-            return try await store.exportBatesBatchReceipt(
+            let url = try await store.exportBatesBatchReceipt(
                 receiptID: receiptID
             )
+            guard !Task.isCancelled else {
+                await discardTemporaryExportCopies(at: [url])
+                return nil
+            }
+            return url
         } catch is CancellationError {
             return nil
         } catch {
@@ -7360,25 +11905,31 @@ final class PaperPathModel: ObservableObject {
     func inspectExternalBatesBatchReceipt(
         at sourceURL: URL
     ) async -> PDFBatesBatchReceiptInspection? {
-        batesReceiptVerificationProgress = nil
+        guard let verificationToken =
+                beginBatesReceiptVerification()
+        else { return nil }
+        defer {
+            finishBatesReceiptVerification(verificationToken)
+        }
         do {
             let inspection = try await store
                 .inspectExternalBatesBatchReceipt(
                     at: sourceURL
                 ) { [weak self] progress in
+                    guard self?.batesReceiptVerificationToken
+                            == verificationToken
+                    else { return }
                     self?.batesReceiptVerificationProgress =
                         progress
                 }
-            if batesReceiptVerificationProgress?.receiptID
-                == inspection.id {
-                batesReceiptVerificationProgress = nil
-            }
+            guard batesReceiptVerificationToken == verificationToken
+            else { return nil }
             return inspection
         } catch is CancellationError {
-            batesReceiptVerificationProgress = nil
             return nil
         } catch {
-            batesReceiptVerificationProgress = nil
+            guard batesReceiptVerificationToken == verificationToken
+            else { return nil }
             present(error)
             return nil
         }
@@ -7405,23 +11956,33 @@ final class PaperPathModel: ObservableObject {
         receipt: PDFSignedBatesBatchReceipt,
         candidateURLs: [URL]
     ) async -> PDFBatesExternalMatchReport? {
+        let generation = UUID()
+        batesExternalMatchGeneration = generation
         batesExternalMatchProgress = nil
         do {
             let report = try await store.matchExternalBatesPDFs(
                 receipt: receipt,
                 candidateURLs: candidateURLs
             ) { [weak self] progress in
+                guard self?.batesExternalMatchGeneration == generation
+                else { return }
                 self?.batesExternalMatchProgress = progress
             }
+            guard batesExternalMatchGeneration == generation
+            else { return nil }
             if batesExternalMatchProgress?.receiptID
                 == receipt.id {
                 batesExternalMatchProgress = nil
             }
             return report
         } catch is CancellationError {
-            batesExternalMatchProgress = nil
+            if batesExternalMatchGeneration == generation {
+                batesExternalMatchProgress = nil
+            }
             return nil
         } catch {
+            guard batesExternalMatchGeneration == generation
+            else { return nil }
             batesExternalMatchProgress = nil
             present(error)
             return nil
@@ -7433,10 +11994,15 @@ final class PaperPathModel: ObservableObject {
         report: PDFBatesExternalMatchReport
     ) async -> URL? {
         do {
-            return try await store.exportSignedBatesMatchReport(
+            let url = try await store.exportSignedBatesMatchReport(
                 receipt: receipt,
                 report: report
             )
+            guard !Task.isCancelled else {
+                await discardTemporaryExportCopies(at: [url])
+                return nil
+            }
+            return url
         } catch is CancellationError {
             return nil
         } catch {
@@ -7525,10 +12091,20 @@ final class PaperPathModel: ObservableObject {
     @discardableResult
     func addFormField(
         recordID: UUID,
-        payload: PDFFormFieldPayload
+        payload: PDFFormFieldPayload,
+        expectedContentRevisionID: UUID
     ) async -> Bool {
+        guard record(id: recordID)?.contentRevisionID
+                == expectedContentRevisionID
+        else {
+            noticeMessage =
+                "The PDF changed before this action started. Review the updated PDF."
+                    .localizedUI
+            return false
+        }
         let succeeded = await mutate(
             recordID: recordID,
+            expectedContentRevisionID: expectedContentRevisionID,
             invalidatesAnalysis: false,
             snapshotLabel: AppLocalization.format(
                 "Add %@ field",
@@ -7569,12 +12145,16 @@ final class PaperPathModel: ObservableObject {
 
     @discardableResult
     func refreshFormAutomation(
-        recordID: UUID
+        recordID: UUID,
+        expectedContentRevisionID: UUID? = nil,
+        presentsFeedback: Bool = true
     ) async -> Bool {
         let succeeded = await mutate(
             recordID: recordID,
+            expectedContentRevisionID: expectedContentRevisionID,
             invalidatesAnalysis: false,
-            snapshotLabel: "Refresh form calculations".localizedUI
+            snapshotLabel: "Refresh form calculations".localizedUI,
+            presentsFeedback: presentsFeedback
         ) { service, url in
             try service.refreshFormAutomation(in: url)
         }
@@ -7593,10 +12173,12 @@ final class PaperPathModel: ObservableObject {
         guard insertionIndex >= 0,
               insertionIndex <= record.profile.pageCount
         else { return }
-        let bookmarks = record.bookmarkedPages
         let succeeded = await performPageMutation(
             recordID: recordID,
-            label: "Insert page".localizedUI
+            label: "Insert page".localizedUI,
+            navigationTransform: {
+                $0 >= insertionIndex ? $0 + 1 : $0
+            }
         ) { service, url in
             try service.insertBlankPage(
                 at: insertionIndex,
@@ -7604,18 +12186,6 @@ final class PaperPathModel: ObservableObject {
             )
         }
         guard succeeded else { return }
-        await replaceBookmarks(
-            recordID: recordID,
-            pages: bookmarks.map {
-                $0 >= insertionIndex ? $0 + 1 : $0
-            }
-        )
-        await remapTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: record.taskCheckpoint
-        ) {
-            $0 >= insertionIndex ? $0 + 1 : $0
-        }
     }
 
     func insertBlankPage(recordID: UUID, after index: Int) async {
@@ -7626,17 +12196,15 @@ final class PaperPathModel: ObservableObject {
     }
 
     func appendPages(recordID: UUID, from sourceURL: URL) async {
-        let hasAccess = sourceURL.startAccessingSecurityScopedResource()
-        defer {
-            if hasAccess {
-                sourceURL.stopAccessingSecurityScopedResource()
-            }
-        }
+        guard let prepared = await prepareExternalPageSource(
+            from: sourceURL
+        ) else { return }
+        defer { discardExternalPageSource(prepared) }
         _ = await performPageMutation(
             recordID: recordID,
             label: "Add pages".localizedUI
         ) { service, url in
-            try service.appendPages(from: sourceURL, in: url)
+            try service.appendPages(from: prepared.url, in: url)
         }
     }
 
@@ -7664,8 +12232,11 @@ final class PaperPathModel: ObservableObject {
             )
         }
         if succeeded {
-            noticeMessage =
-                "\(indices.count) page\(indices.count == 1 ? "" : "s") copied"
+            noticeMessage = AppLocalization.format(
+                "%lld page%@ copied",
+                indices.count,
+                indices.count == 1 ? "" : "s"
+            )
         }
         return succeeded
     }
@@ -7721,6 +12292,89 @@ final class PaperPathModel: ObservableObject {
                 insetsByPage,
                 in: url
             )
+        }
+    }
+
+    func pageGeometryItem(
+        recordID: UUID,
+        pageIndex: Int
+    ) async -> PDFPagePreparationItem? {
+        guard let record = record(id: recordID),
+              let sourceURL = documentURLs[recordID],
+              (0..<record.profile.pageCount).contains(pageIndex)
+        else { return nil }
+        let requestedRevision = record.contentRevisionID
+        let cacheKey = PDFPageAssessmentCacheKey(
+            recordID: recordID,
+            revisionID: requestedRevision
+        )
+        if let cached = pageAssessmentCache[cacheKey],
+           let item = cached.pages.first(
+               where: { $0.pageIndex == pageIndex }
+           ) {
+            touchPageAssessmentCache(cacheKey)
+            return item
+        }
+        let service = mutationService
+        let task = Task.detached(priority: .userInitiated) {
+            try service.pageGeometryAssessment(
+                in: sourceURL,
+                revisionID: requestedRevision,
+                pageIndices: [pageIndex]
+            )
+        }
+        do {
+            let assessment = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            try Task.checkCancellation()
+            guard self.record(id: recordID)?.contentRevisionID
+                == requestedRevision
+            else { return nil }
+            return assessment.pages.first
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    func pageGeometryItem(
+        source: PDFExternalPageSource,
+        pageIndex: Int
+    ) async -> PDFPagePreparationItem? {
+        guard (0..<source.pageCount).contains(pageIndex) else {
+            return nil
+        }
+        if let item = source.assessment.pages.first(
+            where: { $0.pageIndex == pageIndex }
+        ) {
+            return item
+        }
+        let service = mutationService
+        let task = Task.detached(priority: .userInitiated) {
+            try service.pageGeometryAssessment(
+                in: source.url,
+                revisionID: source.id,
+                pageIndices: [pageIndex]
+            )
+        }
+        do {
+            let assessment = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            try Task.checkCancellation()
+            return assessment.pages.first
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
         }
     }
 
@@ -7804,16 +12458,56 @@ final class PaperPathModel: ObservableObject {
     }
 
     func canUndoPageChange(recordID: UUID) -> Bool {
-        pageMutationUndos[recordID] != nil
+        guard let undo = pageMutationUndos[recordID],
+              record(id: recordID)?.contentRevisionID
+                == undo.expectedRevisionID
+        else { return false }
+        return FileManager.default.fileExists(
+            atPath: undo.backupURL.path
+        )
     }
 
-    func undoLastPageChange(recordID: UUID) async -> Bool {
+    func pageRecoveryRevision(recordID: UUID, after sourceRevisionID: UUID) -> UUID? {
         guard let undo = pageMutationUndos[recordID],
-              let record = record(id: recordID),
-              let destination = documentURLs[recordID],
-              let operationToken = acquireExclusiveDocumentOperation(
-                recordID: recordID
+              undo.sourceRevisionID == sourceRevisionID,
+              record(id: recordID)?.contentRevisionID == undo.expectedRevisionID
+        else { return nil }
+        return undo.expectedRevisionID
+    }
+
+    func undoLastPageChange(
+        recordID: UUID,
+        expectedContentRevisionID: UUID? = nil
+    ) async -> Bool {
+        if let expectedContentRevisionID,
+           record(id: recordID)?.contentRevisionID != expectedContentRevisionID {
+            noticeMessage =
+                "The PDF changed after that recovery point. No changes were undone.".localizedUI
+            return false
+        }
+        guard let undo = pageMutationUndos[recordID],
+              let record = record(id: recordID)
+        else {
+            noticeMessage =
+                "That recovery point is no longer available."
+                    .localizedUI
+            return false
+        }
+        guard record.contentRevisionID
+                == undo.expectedRevisionID,
+              FileManager.default.fileExists(
+                atPath: undo.backupURL.path
               )
+        else {
+            discardPageMutationUndo(recordID: recordID)
+            noticeMessage =
+                "The PDF changed after that recovery point. No changes were undone."
+                    .localizedUI
+            return false
+        }
+        guard let operationToken = acquireExclusiveDocumentOperation(
+            recordID: recordID
+        )
         else { return false }
         defer {
             finishExclusiveDocumentOperation(
@@ -7822,57 +12516,73 @@ final class PaperPathModel: ObservableObject {
             )
         }
         do {
-            _ = try await store.createVersionSnapshot(
-                for: record,
-                label: AppLocalization.format(
-                    "Undo %@",
-                    undo.label.localizedUI
-                )
-            )
-            let task = Task.detached(priority: .userInitiated) {
-                try Task.checkCancellation()
-                let replacement = destination
-                    .deletingLastPathComponent()
-                    .appendingPathComponent(
-                        ".undo-\(UUID().uuidString).pdf"
+            let store = self.store
+            let snapshotTask = Task {
+                try await store.createVersionSnapshot(
+                    for: record,
+                    label: AppLocalization.format(
+                        "Undo %@",
+                        undo.label.localizedUI
                     )
-                defer {
-                    try? FileManager.default.removeItem(at: replacement)
-                }
-                try FileManager.default.copyItem(
-                    at: undo.backupURL,
-                    to: replacement
-                )
-                try Task.checkCancellation()
-                _ = try FileManager.default.replaceItemAt(
-                    destination,
-                    withItemAt: replacement
                 )
             }
-            try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
+            _ = try await valuePropagatingExclusiveCancellation(
+                from: snapshotTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            let restoreTask = Task {
+                try await store.replaceWorkingCopies(
+                    with: [
+                        PreparedPDFWorkingCopy(
+                            recordID: recordID,
+                            sourceRevisionID:
+                                record.contentRevisionID,
+                            preparedURL: undo.backupURL,
+                            restoredBookmarkedPages:
+                                undo.bookmarkedPages,
+                            restoredBookmarkNames:
+                                undo.bookmarkNames,
+                            restoredLastPageIndex:
+                                undo.lastPageIndex,
+                            restoredTaskCheckpoint:
+                                undo.taskCheckpoint,
+                            restoresNavigationState: true
+                        )
+                    ],
+                    invalidateAnalysis: true
+                )
             }
-            var refreshed = try await store.refresh(
-                record,
-                invalidateAnalysis: true
-            )
-            refreshed = try await store.updateBookmarks(
-                refreshed,
-                pages: undo.bookmarkedPages
-            )
-            refreshed = try await store.updateTaskCheckpoint(
-                refreshed,
-                checkpoint: undo.taskCheckpoint
-            )
+            let restored =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: restoreTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
+            guard let refreshed = restored.first(
+                where: { $0.id == recordID }
+            ) else {
+                throw PaperPathError.storageFailure(
+                    "The page recovery did not commit."
+                )
+            }
             replace(refreshed)
             textIndices[recordID] = nil
-            ocrResults[recordID] = nil
+            setOCRResult(nil, for: recordID)
             refreshTokens[recordID, default: 0] += 1
             pageMutationUndos[recordID] = nil
-            try? FileManager.default.removeItem(at: undo.backupURL)
+            removePageMutationTemporaryItem(
+                containing: undo.backupURL
+            )
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
             await analyzeDocument(recordID: recordID)
+            guard exclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            ) else { return true }
             noticeMessage = AppLocalization.format(
                 "%@ undone",
                 undo.label.localizedUI
@@ -7901,15 +12611,29 @@ final class PaperPathModel: ObservableObject {
             undo: PageMutationUndo
         )? in
             guard let record = record(id: id),
-                  let undo = pageMutationUndos[id]
+                  let undo = pageMutationUndos[id],
+                  record.contentRevisionID
+                    == undo.expectedRevisionID,
+                  FileManager.default.fileExists(
+                      atPath: undo.backupURL.path
+                  )
             else { return nil }
             return (record, undo)
         }
-        guard entries.count == orderedIDs.count,
-              let operationTokens =
-                acquireExclusiveDocumentOperations(
-                    recordIDs: orderedIDs
-                )
+        guard entries.count == orderedIDs.count else {
+            for id in orderedIDs
+            where !entries.contains(where: { $0.record.id == id }) {
+                discardPageMutationUndo(recordID: id)
+            }
+            noticeMessage =
+                "One or more PDFs changed after that recovery point. No changes were undone."
+                    .localizedUI
+            return false
+        }
+        guard let operationTokens =
+            acquireExclusiveDocumentOperations(
+                recordIDs: orderedIDs
+            )
         else { return false }
         defer {
             finishExclusiveDocumentOperations(operationTokens)
@@ -7917,12 +12641,19 @@ final class PaperPathModel: ObservableObject {
 
         do {
             for entry in entries {
-                _ = try await store.createVersionSnapshot(
-                    for: entry.record,
-                    label: AppLocalization.format(
-                        "Undo %@",
-                        entry.undo.label.localizedUI
+                let store = self.store
+                let snapshotTask = Task {
+                    try await store.createVersionSnapshot(
+                        for: entry.record,
+                        label: AppLocalization.format(
+                            "Undo %@",
+                            entry.undo.label.localizedUI
+                        )
                     )
+                }
+                _ = try await valuePropagatingExclusiveCancellation(
+                    from: snapshotTask,
+                    operationTokens: operationTokens
                 )
             }
             let prepared = entries.map {
@@ -7930,25 +12661,60 @@ final class PaperPathModel: ObservableObject {
                     recordID: $0.record.id,
                     sourceRevisionID:
                         $0.record.contentRevisionID,
-                    preparedURL: $0.undo.backupURL
+                    preparedURL: $0.undo.backupURL,
+                    restoredBookmarkedPages:
+                        $0.undo.bookmarkedPages,
+                    restoredBookmarkNames:
+                        $0.undo.bookmarkNames,
+                    restoredLastPageIndex:
+                        $0.undo.lastPageIndex,
+                    restoredTaskCheckpoint:
+                        $0.undo.taskCheckpoint,
+                    restoresNavigationState: true
                 )
             }
-            let restored = try await store.replaceWorkingCopies(
-                with: prepared,
-                invalidateAnalysis: false
-            )
+            let store = self.store
+            let restoreTask = Task {
+                try await store.replaceWorkingCopies(
+                    with: prepared,
+                    invalidateAnalysis: true
+                )
+            }
+            let restored =
+                try await valueCompletingAtomicExclusiveCommit(
+                    from: restoreTask,
+                    operationTokens: operationTokens
+                )
             for record in restored {
                 replace(record)
+                textIndices[record.id] = nil
+                setOCRResult(nil, for: record.id)
                 deliveryPreflightCache[record.id] = nil
                 refreshTokens[record.id, default: 0] += 1
                 if let undo = pageMutationUndos.removeValue(
                     forKey: record.id
                 ) {
-                    try? FileManager.default.removeItem(
-                        at: undo.backupURL
+                    removePageMutationTemporaryItem(
+                        containing: undo.backupURL
                     )
                 }
             }
+            guard operationTokens.allSatisfy({
+                exclusiveDocumentOperationIsCurrent(
+                    recordID: $0.key,
+                    token: $0.value
+                )
+            }) else { return true }
+            for record in restored {
+                guard !Task.isCancelled else { break }
+                await analyzeDocument(recordID: record.id)
+            }
+            guard operationTokens.allSatisfy({
+                exclusiveDocumentOperationIsCurrent(
+                    recordID: $0.key,
+                    token: $0.value
+                )
+            }) else { return true }
             noticeMessage = AppLocalization.format(
                 "%lld PDFs restored",
                 restored.count
@@ -7982,65 +12748,64 @@ final class PaperPathModel: ObservableObject {
     func annotationInventory(
         recordID: UUID
     ) async -> PDFAnnotationInventory {
-        guard let record = record(id: recordID),
-              let url = documentURLs[recordID]
-        else { return .empty }
         do {
-            let displayLimit = 10_000
-            let mutationService = self.mutationService
-            let structureService = documentStructureService
-            let task = Task.detached(priority: .utility) {
-                let editable = try mutationService.annotations(
-                    in: url,
-                    limit: displayLimit + 1
-                )
-                try Task.checkCancellation()
-                if editable.count > displayLimit {
-                    return PDFAnnotationInventory(
-                        annotations: Array(
-                            editable.prefix(displayLimit)
-                        ),
-                        isTruncated: true,
-                        displayLimit: displayLimit
-                    )
-                }
-                let remaining = displayLimit - editable.count
-                let preserved = try structureService
-                    .unsupportedReviewAnnotations(
-                        in: url,
-                        resultLimit: remaining + 1
-                    )
-                let combined = (editable + preserved).sorted {
-                    if $0.pageIndex != $1.pageIndex {
-                        return $0.pageIndex < $1.pageIndex
-                    }
-                    if $0.canRemove != $1.canRemove {
-                        return $0.canRemove
-                    }
-                    return $0.annotationIndex < $1.annotationIndex
-                }
-                return PDFAnnotationInventory(
-                    annotations: Array(
-                        combined.prefix(displayLimit)
-                    ),
-                    isTruncated: combined.count > displayLimit,
-                    displayLimit: displayLimit
-                )
-            }
-            let inventory = try await valuePropagatingCancellation(
-                from: task
-            )
-            try Task.checkCancellation()
-            guard self.record(id: recordID)?.contentRevisionID
-                    == record.contentRevisionID
-            else { return .empty }
-            return inventory
+            return try await inspectAnnotationInventory(recordID: recordID)
         } catch is CancellationError {
             return .empty
         } catch {
             present(error)
             return .empty
         }
+    }
+
+    func inspectAnnotationInventory(
+        recordID: UUID
+    ) async throws -> PDFAnnotationInventory {
+        try Task.checkCancellation()
+        guard let record = record(id: recordID),
+              let url = documentURLs[recordID]
+        else { throw PaperPathError.unreadablePDF }
+        let displayLimit = 10_000
+        let mutationService = self.mutationService
+        let structureService = documentStructureService
+        let task = Task.detached(priority: .utility) {
+            let editable = try mutationService.annotations(
+                in: url,
+                limit: displayLimit + 1
+            )
+            try Task.checkCancellation()
+            if editable.count > displayLimit {
+                return PDFAnnotationInventory(
+                    annotations: Array(
+                        editable.prefix(displayLimit)
+                    ),
+                    isTruncated: true,
+                    displayLimit: displayLimit
+                )
+            }
+            let remaining = displayLimit - editable.count
+            let preserved = try structureService.unsupportedReviewAnnotations(
+                in: url,
+                resultLimit: remaining + 1
+            )
+            let combined = (editable + preserved).sorted {
+                if $0.pageIndex != $1.pageIndex {
+                    return $0.pageIndex < $1.pageIndex
+                }
+                if $0.canRemove != $1.canRemove { return $0.canRemove }
+                return $0.annotationIndex < $1.annotationIndex
+            }
+            return PDFAnnotationInventory(
+                annotations: Array(combined.prefix(displayLimit)),
+                isTruncated: combined.count > displayLimit,
+                displayLimit: displayLimit
+            )
+        }
+        let inventory = try await valuePropagatingCancellation(from: task)
+        try Task.checkCancellation()
+        guard self.record(id: recordID)?.contentRevisionID == record.contentRevisionID
+        else { throw CancellationError() }
+        return inventory
     }
 
     func technicalInspection(
@@ -8080,28 +12845,32 @@ final class PaperPathModel: ObservableObject {
     func embeddedAttachments(
         recordID: UUID
     ) async -> [PDFEmbeddedAttachmentSnapshot] {
-        guard let record = record(id: recordID),
-              let url = documentURLs[recordID]
-        else { return [] }
         do {
-            let service = documentStructureService
-            let task = Task.detached(priority: .utility) {
-                try service.attachments(in: url)
-            }
-            let attachments = try await valuePropagatingCancellation(
-                from: task
-            )
-            try Task.checkCancellation()
-            guard self.record(id: recordID)?.contentRevisionID
-                    == record.contentRevisionID
-            else { return [] }
-            return attachments
+            return try await inspectEmbeddedAttachments(recordID: recordID)
         } catch is CancellationError {
             return []
         } catch {
             present(error)
             return []
         }
+    }
+
+    func inspectEmbeddedAttachments(
+        recordID: UUID
+    ) async throws -> [PDFEmbeddedAttachmentSnapshot] {
+        try Task.checkCancellation()
+        guard let record = record(id: recordID),
+              let url = documentURLs[recordID]
+        else { throw PaperPathError.unreadablePDF }
+        let service = documentStructureService
+        let task = Task.detached(priority: .utility) {
+            try service.attachments(in: url)
+        }
+        let attachments = try await valuePropagatingCancellation(from: task)
+        try Task.checkCancellation()
+        guard self.record(id: recordID)?.contentRevisionID == record.contentRevisionID
+        else { throw CancellationError() }
+        return attachments
     }
 
     func pageLabels(
@@ -8133,9 +12902,14 @@ final class PaperPathModel: ObservableObject {
 
     func makeAttachmentExportCopies(
         recordID: UUID,
-        attachmentIDs: Set<String>
+        attachmentIDs: Set<String>,
+        expectedContentRevisionID: UUID,
+        presentsFeedback: Bool = true
     ) async -> [URL] {
-        guard let sourceURL = documentURLs[recordID],
+        guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID,
+              let sourceURL = documentURLs[recordID],
               !attachmentIDs.isEmpty,
               let operationToken = acquireExclusiveDocumentOperation(
                 recordID: recordID
@@ -8163,22 +12937,34 @@ final class PaperPathModel: ObservableObject {
                     to: directory
                 )
             }
-            let urls = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
+            let urls = try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            guard self.record(id: recordID)?.contentRevisionID
+                    == expectedContentRevisionID
+            else {
+                await discardAttachmentExportCopies(at: [directory])
+                noticeMessage =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                return []
             }
-            try Task.checkCancellation()
-            noticeMessage = urls.count == 1
-                ? "Attachment extracted and byte-verified"
-                : "\(urls.count) attachments extracted and byte-verified"
+            noticeMessage = AppLocalization.format(
+                "%lld attachment%@ extracted and byte-verified",
+                urls.count,
+                urls.count == 1 ? "" : "s"
+            )
             return urls
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: directory)
+            await discardAttachmentExportCopies(at: [directory])
             return []
         } catch {
-            try? FileManager.default.removeItem(at: directory)
-            present(error)
+            await discardAttachmentExportCopies(at: [directory])
+            if presentsFeedback && !Task.isCancelled {
+                present(error)
+            }
             return []
         }
     }
@@ -8186,27 +12972,54 @@ final class PaperPathModel: ObservableObject {
     func discardAttachmentExportCopies(
         at urls: [URL]
     ) async {
-        guard let directory = urls.first?
-            .deletingLastPathComponent()
-        else { return }
-        let temporaryDirectory = FileManager.default.temporaryDirectory
-            .standardizedFileURL
-        guard directory.deletingLastPathComponent()
-                .standardizedFileURL == temporaryDirectory,
-              directory.lastPathComponent
-                .hasPrefix("PaperPath-Attachments-")
-        else { return }
+        guard let firstURL = urls.first else { return }
         await Task.detached(priority: .utility) {
-            try? FileManager.default.removeItem(at: directory)
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: firstURL,
+                allowedPrefixes: ["PaperPath-Attachments-"]
+            )
+        }.value
+    }
+
+    func discardTemporaryExportCopies(
+        at urls: [URL]
+    ) async {
+        guard !urls.isEmpty else { return }
+        await Task.detached(priority: .utility) {
+            let allowedPrefixes = [
+                "PaperPath-Images-",
+                "PaperPath-EmbeddedImages-",
+                "PaperPath-Office-Batch-",
+                "PaperPath-Office-Export-",
+                PaperPathTemporaryArtifact.officeSharePrefix,
+                "PaperPath-DocumentExport-",
+                "PaperPath-Bates-",
+                "PaperPath-Delivery-Match-",
+                "PaperPath-FilesExport-"
+            ]
+            let items = Set(urls.compactMap {
+                PaperPathTemporaryArtifact.managedTopLevelItem(
+                    containing: $0,
+                    allowedPrefixes: allowedPrefixes
+                )
+            })
+            for item in items {
+                PaperPathTemporaryArtifact.removeManagedItem(
+                    containing: item,
+                    allowedPrefixes: allowedPrefixes
+                )
+            }
         }.value
     }
 
     func editAnnotation(
         recordID: UUID,
-        payload: PDFAnnotationEditPayload
+        payload: PDFAnnotationEditPayload,
+        expectedContentRevisionID: UUID
     ) async -> Bool {
         let succeeded = await performPageMutation(
             recordID: recordID,
+            expectedContentRevisionID: expectedContentRevisionID,
             label: "Edit annotation".localizedUI,
             invalidatesAnalysis: false
         ) {
@@ -8223,18 +13036,21 @@ final class PaperPathModel: ObservableObject {
     @discardableResult
     func removeAnnotation(
         recordID: UUID,
-        annotation: PDFAnnotationSnapshot
+        annotation: PDFAnnotationSnapshot,
+        expectedContentRevisionID: UUID
     ) async -> Bool {
         await removeAnnotations(
             recordID: recordID,
-            annotations: [annotation]
+            annotations: [annotation],
+            expectedContentRevisionID: expectedContentRevisionID
         )
     }
 
     @discardableResult
     func removeAnnotations(
         recordID: UUID,
-        annotations: [PDFAnnotationSnapshot]
+        annotations: [PDFAnnotationSnapshot],
+        expectedContentRevisionID: UUID
     ) async -> Bool {
         let removable = annotations.filter(\.canRemove)
         guard removable.count == annotations.count,
@@ -8258,6 +13074,7 @@ final class PaperPathModel: ObservableObject {
         )
         let succeeded = await performPageMutation(
             recordID: recordID,
+            expectedContentRevisionID: expectedContentRevisionID,
             label: label,
             invalidatesAnalysis: false
         ) {
@@ -8277,38 +13094,58 @@ final class PaperPathModel: ObservableObject {
     func setActionCompletion(
         recordID: UUID,
         action: DocumentAction,
-        completed: Bool
+        completed: Bool,
+        expectedContentRevisionID: UUID? = nil
     ) async {
         guard let record = record(id: recordID),
+              expectedContentRevisionID == nil || record.contentRevisionID == expectedContentRevisionID,
               record.completedActions.contains(action) != completed
         else { return }
         do {
             let updated = try await store.setActionCompletion(
                 record,
                 action: action,
-                completed: completed
+                completed: completed,
+                expectedContentRevisionID: expectedContentRevisionID
             )
             replace(updated)
+        } catch is CancellationError {
+            return
         } catch {
             present(error)
         }
     }
 
+    @discardableResult
     func updateTaskCheckpoint(
         recordID: UUID,
-        checkpoint: DocumentTaskCheckpoint?
-    ) async {
+        checkpoint: DocumentTaskCheckpoint?,
+        presentsFeedback: Bool = true,
+        expectedContentRevisionID: UUID? = nil
+    ) async -> Bool {
+        guard expectedContentRevisionID == nil
+                || record(id: recordID)?.contentRevisionID == expectedContentRevisionID,
+              !Task.isCancelled
+        else { return false }
         guard let record = record(id: recordID),
               record.taskCheckpoint != checkpoint
-        else { return }
+        else {
+            return record(id: recordID) != nil
+        }
         do {
             let updated = try await store.updateTaskCheckpoint(
                 record,
                 checkpoint: checkpoint
             )
             replace(updated, schedulesMetadataSync: false)
+            return true
+        } catch is CancellationError {
+            return false
         } catch {
-            present(error)
+            if presentsFeedback {
+                present(error)
+            }
+            return false
         }
     }
 
@@ -8319,17 +13156,11 @@ final class PaperPathModel: ObservableObject {
         let mutationService = self.mutationService
         do {
             let task = Task.detached(priority: .utility) {
-                let annotations = try mutationService.annotations(in: url)
+                let hasSignature = try mutationService
+                    .containsSignature(in: url)
                 try Task.checkCancellation()
-                let hasSignature = annotations.contains {
-                    $0.type.caseInsensitiveCompare("ink") == .orderedSame
-                        && $0.contents == "Signature"
-                }
                 let report = try PDFFormInspectionService().inspect(url: url)
-                return (
-                    hasSignature,
-                    report.isReadyForVerifiedOutput
-                )
+                return (hasSignature, report)
             }
             let state = try await valuePropagatingCancellation(
                 from: task
@@ -8343,13 +13174,103 @@ final class PaperPathModel: ObservableObject {
                 action: .sign,
                 completed: state.0
             )
-            if record.profile.formFieldCount > 0 {
+            if record.profile.formFieldCount > 0
+                || !state.1.fields.isEmpty {
                 await setActionCompletion(
                     recordID: recordID,
                     action: .reviewForm,
-                    completed: state.1
+                    completed: state.1.isReadyForVerifiedOutput
                 )
             }
+            guard let currentRecord = self.record(id: recordID),
+                  currentRecord.contentRevisionID
+                    == record.contentRevisionID
+            else { return }
+            let currentCheckpoint = currentRecord.taskCheckpoint
+            let incompleteRequiredFields =
+                state.1.incompleteRequiredFields
+            let resumableCheckpoint = currentCheckpoint.flatMap {
+                checkpoint -> DocumentTaskCheckpoint? in
+                guard checkpoint.contentRevisionID
+                        == currentRecord.contentRevisionID,
+                      checkpoint.stage != .verify,
+                      checkpoint.pageIndex != nil
+                        || checkpoint.fieldName != nil
+                else { return nil }
+                let targetIsStillIncomplete =
+                    incompleteRequiredFields.contains { field in
+                        let fieldStage: DocumentTaskStage =
+                            field.kind == .signature
+                                ? .sign
+                                : .fillForm
+                        guard fieldStage == checkpoint.stage else {
+                            return false
+                        }
+                        if let pageIndex = checkpoint.pageIndex,
+                           pageIndex != field.pageIndex {
+                            return false
+                        }
+                        if let fieldName = checkpoint.fieldName,
+                           fieldName != field.name {
+                            return false
+                        }
+                        if let normalizedBounds =
+                            checkpoint.normalizedBounds,
+                           normalizedBounds != field.normalizedBounds {
+                            return false
+                        }
+                        return true
+                    }
+                return targetIsStillIncomplete ? checkpoint : nil
+            }
+            let nextCheckpoint: DocumentTaskCheckpoint?
+            if let resumableCheckpoint {
+                nextCheckpoint = resumableCheckpoint
+            } else if let nextField = incompleteRequiredFields.first {
+                nextCheckpoint = DocumentTaskCheckpoint(
+                    stage: nextField.kind == .signature
+                        ? .sign
+                        : .fillForm,
+                    pageIndex: nextField.pageIndex,
+                    fieldName: nextField.name,
+                    normalizedBounds:
+                        nextField.kind == .signature
+                            ? nextField.normalizedBounds
+                            : nil,
+                    contentRevisionID:
+                        currentRecord.contentRevisionID
+                )
+            } else if state.1.hasXFA {
+                nextCheckpoint = DocumentTaskCheckpoint(
+                    stage: .fillForm,
+                    contentRevisionID:
+                        currentRecord.contentRevisionID
+                )
+            } else if (
+                (
+                    currentRecord.profile.formFieldCount > 0
+                        || !state.1.fields.isEmpty
+                )
+                    && state.1.isReadyForVerifiedOutput
+            ) || state.0 {
+                nextCheckpoint = DocumentTaskCheckpoint(
+                    stage: .verify,
+                    pageIndex: currentCheckpoint?.pageIndex,
+                    contentRevisionID:
+                        currentRecord.contentRevisionID
+                )
+            } else if let currentCheckpoint {
+                nextCheckpoint = currentCheckpoint.rebased(
+                    to: currentRecord.contentRevisionID
+                )
+            } else {
+                nextCheckpoint = nil
+            }
+            await updateTaskCheckpoint(
+                recordID: recordID,
+                checkpoint: nextCheckpoint,
+                presentsFeedback: false
+            )
         } catch {
             return
         }
@@ -8367,6 +13288,10 @@ final class PaperPathModel: ObservableObject {
         deliveryOutputCache
     }
 
+    var verifiedDeliveryOutputCount: Int {
+        verifiedDeliveryOutputCountCache
+    }
+
     func duplicateFingerprintCount(
         for record: DocumentRecord
     ) -> Int {
@@ -8380,6 +13305,12 @@ final class PaperPathModel: ObservableObject {
         for sourceDocumentID: UUID
     ) -> [DocumentRecord] {
         verifiedOutputsBySourceID[sourceDocumentID] ?? []
+    }
+
+    func deliveryHistoryOutputs(
+        for sourceDocumentID: UUID
+    ) -> [DocumentRecord] {
+        deliveryHistoryBySourceID[sourceDocumentID] ?? []
     }
 
     func sourceRecord(
@@ -8403,7 +13334,52 @@ final class PaperPathModel: ObservableObject {
 
     func comparePDFs(
         sourceRecordID: UUID,
-        revisedRecordID: UUID
+        revisedRecordID: UUID,
+        manualMatches: [PDFManualPageMatch]? = nil,
+        progress: @escaping @MainActor @Sendable (
+            PDFComparisonProgress
+        ) -> Void = { _ in }
+    ) async throws -> PDFChangeReview {
+        guard !isClearingPageMatches,
+              !isErasingAllLocalData
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Local storage is being updated. Try the comparison again when it finishes."
+            )
+        }
+        let recordIDs = Set([
+            sourceRecordID,
+            revisedRecordID
+        ])
+        guard recordIDs.allSatisfy({
+            !isProcessing($0)
+        }) else {
+            throw PaperPathError.insufficientSelection(
+                "Another operation is already using one of these PDFs. Wait for it to finish or stop it before trying again."
+            )
+        }
+        return try await performTrackedComparison(
+            recordIDs: recordIDs
+        ) {
+            workGeneration in
+            try await self.comparePDFsCore(
+                sourceRecordID: sourceRecordID,
+                revisedRecordID: revisedRecordID,
+                manualMatches: manualMatches,
+                workGeneration: workGeneration,
+                progress: progress
+            )
+        }
+    }
+
+    private func comparePDFsCore(
+        sourceRecordID: UUID,
+        revisedRecordID: UUID,
+        manualMatches: [PDFManualPageMatch]?,
+        workGeneration: UUID,
+        progress: @escaping @MainActor @Sendable (
+            PDFComparisonProgress
+        ) -> Void
     ) async throws -> PDFChangeReview {
         guard sourceRecordID != revisedRecordID,
               let sourceRecord = record(id: sourceRecordID),
@@ -8421,36 +13397,135 @@ final class PaperPathModel: ObservableObject {
             revisedRecordID: revisedRecordID,
             revisedRevisionID: revisedRecord.contentRevisionID
         )
-        if let cached = comparisonCache[key] {
+        if manualMatches == nil,
+           let cached = comparisonCache[key] {
             touchComparisonCache(key)
+            progress(
+                PDFComparisonProgress(
+                    stage: .complete,
+                    completedPageCount: cached.comparedPageCount,
+                    totalPageCount: cached.comparedPageCount,
+                    fractionCompleted: 1
+                )
+            )
             return cached
         }
-        let service = deliveryAuditService
-        let task = Task.detached(priority: .userInitiated) {
-            try service.compare(
-                sourceURL: sourceURL,
-                revisedURL: revisedURL
-            )
-        }
-        let review = try await withTaskCancellationHandler {
-            try await task.value
-        } onCancel: {
-            task.cancel()
+        let correctionLookup:
+            PDFManualPageMatchCorrectionLookup =
+            if manualMatches == nil {
+                try await store.pageMatchCorrection(
+                    context: .documentPair,
+                    sourceDocumentID: sourceRecordID,
+                    sourceRevisionID:
+                        sourceRecord.contentRevisionID,
+                    revisedDocumentID: revisedRecordID,
+                    revisedRevisionID:
+                        revisedRecord.contentRevisionID,
+                    versionSnapshotID: nil,
+                    sourcePageCount:
+                        sourceRecord.profile.pageCount,
+                    revisedPageCount:
+                        revisedRecord.profile.pageCount
+                )
+            } else {
+                .none
+            }
+        let restoredCorrection = correctionLookup.correction
+        let resolvedManualMatches =
+            manualMatches
+                ?? restoredCorrection?.matches
+                ?? []
+        let comparedReview = try await comparisonCoordinator.compare(
+            sourceURL: sourceURL,
+            revisedURL: revisedURL,
+            manualMatches: resolvedManualMatches
+        ) { update in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      self.activeComparisonTasks[workGeneration]
+                        != nil
+                else { return }
+                progress(update)
+            }
         }
         try Task.checkCancellation()
-        guard record(id: sourceRecordID)?.contentRevisionID
+        guard activeComparisonTasks[workGeneration] != nil,
+              record(id: sourceRecordID)?.contentRevisionID
                 == sourceRecord.contentRevisionID,
               record(id: revisedRecordID)?.contentRevisionID
                 == revisedRecord.contentRevisionID
         else {
             throw CancellationError()
         }
+        let persistence:
+            PDFManualPageMatchPersistence?
+        if manualMatches != nil {
+            if comparedReview.resolvedManualPageMatches.isEmpty {
+                try await store.removePageMatchCorrection(
+                    context: .documentPair,
+                    sourceDocumentID: sourceRecordID,
+                    revisedDocumentID: revisedRecordID,
+                    versionSnapshotID: nil
+                )
+                persistence = nil
+            } else {
+                let evictedCount =
+                    try await store.savePageMatchCorrection(
+                        PDFManualPageMatchCorrection(
+                            context: .documentPair,
+                            sourceDocumentID: sourceRecordID,
+                            sourceRevisionID:
+                                sourceRecord.contentRevisionID,
+                            revisedDocumentID: revisedRecordID,
+                            revisedRevisionID:
+                                revisedRecord.contentRevisionID,
+                            versionSnapshotID: nil,
+                            sourcePageCount:
+                                sourceRecord.profile.pageCount,
+                            revisedPageCount:
+                                revisedRecord.profile.pageCount,
+                            matches: comparedReview
+                                .resolvedManualPageMatches,
+                            updatedAt: Date()
+                        )
+                    )
+                if evictedCount > 0 {
+                    noticeMessage = AppLocalization.format(
+                        "%lld older saved comparison record%@ removed to stay within the local limit",
+                        evictedCount,
+                        evictedCount == 1 ? "" : "s"
+                    )
+                }
+                persistence = .savedOnDevice
+            }
+        } else {
+            persistence = restoredCorrection == nil
+                ? nil
+                : .restoredFromDevice
+            if correctionLookup.discardedStaleCorrection {
+                noticeMessage =
+                    "Saved page matches were reset because one of the compared PDFs changed."
+                        .localizedUI
+            }
+        }
+        try Task.checkCancellation()
+        guard activeComparisonTasks[workGeneration] != nil else {
+            throw CancellationError()
+        }
+        let review = comparedReview
+            .markingManualPageMatchPersistence(persistence)
+        if manualMatches != nil {
+            invalidateComparisonCaches(
+                between: Set([
+                    sourceRecordID,
+                    revisedRecordID
+                ]),
+                preserving: key
+            )
+        }
         comparisonCache[key] = review
         touchComparisonCache(key)
-        while comparisonCacheOrder.count > 6 {
-            let oldest = comparisonCacheOrder.removeFirst()
-            comparisonCache[oldest] = nil
-        }
+        trimComparisonCache()
         return review
     }
 
@@ -8461,60 +13536,625 @@ final class PaperPathModel: ObservableObject {
         comparisonCacheOrder.append(key)
     }
 
-    func makeFilesExportCopy(recordID: UUID) async -> URL? {
-        guard let record = record(id: recordID),
-              let sourceURL = documentURLs[recordID]
-        else { return nil }
+    private func invalidateComparisonCaches(
+        between recordIDs: Set<UUID>,
+        preserving retainedKey: PDFComparisonCacheKey? = nil
+    ) {
+        guard recordIDs.count == 2 else { return }
+        let keys = comparisonCache.keys.filter { key in
+            key != retainedKey
+                && Set([
+                    key.sourceRecordID,
+                    key.revisedRecordID
+                ]) == recordIDs
+        }
+        for key in keys {
+            comparisonCache[key] = nil
+        }
+        let keySet = Set(keys)
+        comparisonCacheOrder.removeAll {
+            keySet.contains($0)
+        }
+    }
+
+    private func trimComparisonCache() {
+        var estimatedBytes = comparisonCache.values.reduce(
+            Int64.zero
+        ) {
+            saturatedCacheCost(
+                $0,
+                $1.estimatedCacheByteCount
+            )
+        }
+        while comparisonCacheOrder.count > 1 {
+            let exceedsCount = comparisonCacheOrder.count > 6
+            let exceedsBytes =
+                estimatedBytes > Self.maximumComparisonCacheBytes
+            guard exceedsCount || exceedsBytes else { break }
+            let oldest = comparisonCacheOrder.removeFirst()
+            if let removed = comparisonCache.removeValue(
+                forKey: oldest
+            ) {
+                estimatedBytes = max(
+                    0,
+                    estimatedBytes
+                        - removed.estimatedCacheByteCount
+                )
+            }
+        }
+    }
+
+    private func saturatedCacheCost(
+        _ lhs: Int64,
+        _ rhs: Int64
+    ) -> Int64 {
+        let (sum, overflow) = lhs.addingReportingOverflow(max(0, rhs))
+        return overflow ? .max : sum
+    }
+
+    func makeChangeReport(
+        review: PDFChangeReview,
+        descriptor: PDFChangeReportDescriptor,
+        validatingRevisions: [UUID: UUID],
+        localLink: PDFRetainedChangeReportLocalLink? = nil
+    ) async -> URL? {
+        guard validatingRevisions.allSatisfy({
+            record(id: $0.key)?.contentRevisionID == $0.value
+        }) else {
+            present(
+                PaperPathError.outputVerificationFailed(
+                    "a compared PDF changed before the report was created"
+                )
+            )
+            return nil
+        }
+        let generatedAt: Date
+        do {
+            generatedAt = try await store
+                .trustedEvidenceIssuanceDate()
+        } catch {
+            present(error)
+            return nil
+        }
+        let trustedDescriptor = PDFChangeReportDescriptor(
+            reportID: descriptor.reportID,
+            scope: descriptor.scope,
+            sourceName: descriptor.sourceName,
+            revisedName: descriptor.revisedName,
+            sourceRevisionID: descriptor.sourceRevisionID,
+            revisedRevisionID: descriptor.revisedRevisionID,
+            sourceFingerprint: descriptor.sourceFingerprint,
+            revisedFingerprint: descriptor.revisedFingerprint,
+            deliveryReceiptID: descriptor.deliveryReceiptID,
+            generatedAt: generatedAt
+        )
 
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
-                "PaperPath-FilesExport-\(UUID().uuidString)",
+                "PaperPath-ChangeReport-\(UUID().uuidString)",
                 isDirectory: true
             )
+        let reportName = safeExportName(descriptor.revisedName)
+            + "-changes.md"
+        do {
+            let signerKeyID = try await store
+                .officeDeliverySigningKeyID()
+            try Task.checkCancellation()
+            let renderTask = Task.detached(priority: .utility) {
+                let service = PDFChangeReportService()
+                let body = try service.render(
+                    review: review,
+                    descriptor: trustedDescriptor,
+                    signerKeyID: signerKeyID
+                )
+                let payload = try service.signaturePayload(
+                    body: body,
+                    review: review,
+                    descriptor: trustedDescriptor
+                )
+                return (body, payload)
+            }
+            let (body, payload) = try await valuePropagatingCancellation(
+                from: renderTask
+            )
+            try Task.checkCancellation()
+            let envelope = try await store.signChangeReportPayload(
+                payload
+            )
+            try Task.checkCancellation()
+            let writeReferenceDate = await store
+                .trustedDeliveryDate()
+            let writeTask = Task.detached(priority: .utility) {
+                try PDFChangeReportService().create(
+                    body: body,
+                    envelope: envelope,
+                    directory: directory,
+                    fileName: reportName,
+                    referenceDate: writeReferenceDate
+                )
+            }
+            let url = try await valuePropagatingCancellation(
+                from: writeTask
+            )
+            try Task.checkCancellation()
+            guard validatingRevisions.allSatisfy({
+                record(id: $0.key)?.contentRevisionID == $0.value
+            }) else {
+                await discardChangeReport(at: url)
+                throw PaperPathError.outputVerificationFailed(
+                    "a compared PDF changed while the report was being created"
+                )
+            }
+            do {
+                _ = try await store.retainChangeReport(
+                    at: url,
+                    localLink: localLink
+                )
+                retainedEvidenceRevision &+= 1
+                noticeMessage =
+                    "Signed change report retained and ready".localizedUI
+            } catch is CancellationError {
+                await discardChangeReport(at: url)
+                return nil
+            } catch {
+                noticeMessage = AppLocalization.format(
+                    "Signed report ready, but it was not retained. %@",
+                    AppLocalization
+                        .userFacingErrorDescription(error)
+                )
+            }
+            return url
+        } catch is CancellationError {
+            await discardChangeReport(at: directory)
+            return nil
+        } catch {
+            await discardChangeReport(at: directory)
+            present(error)
+            return nil
+        }
+    }
+
+    func discardChangeReport(at url: URL) async {
+        await Task.detached(priority: .utility) {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: ["PaperPath-ChangeReport-"]
+            )
+        }.value
+    }
+
+    func retainedChangeReports() async
+        -> [PDFRetainedChangeReport] {
+        do {
+            return try await store.retainedChangeReports()
+        } catch is CancellationError {
+            return []
+        } catch {
+            present(error)
+            return []
+        }
+    }
+
+    func retainedChangeReportInventory() async
+        -> PDFRetainedChangeReportInventory {
+        do {
+            return try await store
+                .retainedChangeReportInventory()
+        } catch is CancellationError {
+            return PDFRetainedChangeReportInventory(
+                reports: [],
+                linkHealthByReportID: [:]
+            )
+        } catch {
+            present(error)
+            return PDFRetainedChangeReportInventory(
+                reports: [],
+                linkHealthByReportID: [:]
+            )
+        }
+    }
+
+    func retainedChangeReports(
+        matching lookup: PDFRetainedChangeReportLookup
+    ) async -> [PDFRetainedChangeReport] {
+        do {
+            return try await loadLinkedChangeReports(matching: lookup)
+        } catch is CancellationError {
+            return []
+        } catch {
+            present(error)
+            return []
+        }
+    }
+
+    func loadLinkedChangeReports(
+        matching lookup: PDFRetainedChangeReportLookup
+    ) async throws -> [PDFRetainedChangeReport] {
+        try Task.checkCancellation()
+        let reports = try await store.retainedChangeReports()
+        try Task.checkCancellation()
+        return reports.filter { lookup.matches($0.localLink) }
+    }
+
+    func retainedChangeReportDestination(
+        for report: PDFRetainedChangeReport
+    ) async -> PDFRetainedChangeReportDestination? {
+        do {
+            try Task.checkCancellation()
+            guard let link = report.localLink,
+                  link.isStructurallyValid
+            else {
+                return unavailableRetainedChangeReportDestination()
+            }
+            let verification = try await store
+                .verifyRetainedChangeReport(id: report.id)
+            try Task.checkCancellation()
+            guard verification.reportID == report.id,
+                  link.matches(verification)
+            else {
+                return unavailableRetainedChangeReportDestination()
+            }
+
+            switch link.context {
+            case .documentPair:
+                guard let sourceRecordID = link.sourceDocumentID,
+                      let sourceRevisionID = link.sourceRevisionID,
+                      let sourceFingerprint = link.sourceFingerprint,
+                      let revisedRevisionID = link.revisedRevisionID,
+                      let revisedFingerprint = link.revisedFingerprint,
+                      let source = record(id: sourceRecordID),
+                      source.deletedAt == nil,
+                      source.contentRevisionID == sourceRevisionID,
+                      source.contentFingerprint?
+                        .caseInsensitiveCompare(sourceFingerprint)
+                            == .orderedSame,
+                      let revised = record(
+                          id: link.revisedDocumentID
+                      ),
+                      revised.deletedAt == nil,
+                      revised.contentRevisionID == revisedRevisionID,
+                      revised.contentFingerprint?
+                        .caseInsensitiveCompare(revisedFingerprint)
+                            == .orderedSame,
+                      try await store.currentDocumentMatches(
+                          recordID: sourceRecordID,
+                          revisionID: sourceRevisionID,
+                          sha256: sourceFingerprint
+                      ),
+                      try await store.currentDocumentMatches(
+                          recordID: link.revisedDocumentID,
+                          revisionID: revisedRevisionID,
+                          sha256: revisedFingerprint
+                      )
+                else {
+                    return unavailableRetainedChangeReportDestination()
+                }
+                return .documentPair(
+                    sourceRecordID: sourceRecordID,
+                    sourceRevisionID: sourceRevisionID,
+                    revisedRecordID: link.revisedDocumentID,
+                    revisedRevisionID: revisedRevisionID
+                )
+
+            case .versionSnapshot:
+                guard let recordID = link.sourceDocumentID,
+                      recordID == link.revisedDocumentID,
+                      let snapshotID = link.versionSnapshotID,
+                      let sourceRevisionID = link.sourceRevisionID,
+                      let sourceFingerprint = link.sourceFingerprint,
+                      let revisedRevisionID = link.revisedRevisionID,
+                      let revisedFingerprint = link.revisedFingerprint,
+                      let current = record(id: recordID),
+                      current.deletedAt == nil,
+                      current.contentRevisionID == revisedRevisionID,
+                      current.contentFingerprint?
+                        .caseInsensitiveCompare(revisedFingerprint)
+                            == .orderedSame,
+                      try await store.currentDocumentMatches(
+                          recordID: recordID,
+                          revisionID: revisedRevisionID,
+                          sha256: revisedFingerprint
+                      ),
+                      let snapshot = try await store.versions(
+                          for: recordID
+                      ).first(
+                          where: {
+                              $0.id == snapshotID
+                                  && $0.contentRevisionID
+                                      == sourceRevisionID
+                                  && $0.contentFingerprint
+                                      .caseInsensitiveCompare(
+                                          sourceFingerprint
+                                      ) == .orderedSame
+                          }
+                      )
+                else {
+                    return unavailableRetainedChangeReportDestination()
+                }
+                _ = try await store.versionFileURL(
+                    snapshotID: snapshot.id,
+                    recordID: recordID
+                )
+                try Task.checkCancellation()
+                return .versionSnapshot(snapshot)
+
+            case .deliveryReceipt:
+                guard let receiptID = link.deliveryReceiptID,
+                      let revisedFingerprint = link.revisedFingerprint,
+                      let output = record(
+                          id: link.revisedDocumentID
+                      ),
+                      output.deletedAt == nil,
+                      let receipt = output.deliveryReceipt,
+                      receipt.id == receiptID,
+                      output.hasCurrentDeliveryReceipt,
+                      output.contentFingerprint?
+                        .caseInsensitiveCompare(revisedFingerprint)
+                            == .orderedSame
+                else {
+                    return unavailableRetainedChangeReportDestination()
+                }
+                let currentRevisionID = output.contentRevisionID
+                if let revisedRevisionID = link.revisedRevisionID,
+                   revisedRevisionID != currentRevisionID {
+                    return unavailableRetainedChangeReportDestination()
+                }
+                guard try await store.currentDocumentMatches(
+                    recordID: output.id,
+                    revisionID: currentRevisionID,
+                    sha256: revisedFingerprint
+                ) else {
+                    return unavailableRetainedChangeReportDestination()
+                }
+                return .deliveryReceipt(
+                    recordID: output.id,
+                    receipt: receipt
+                )
+            }
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    private func unavailableRetainedChangeReportDestination()
+        -> PDFRetainedChangeReportDestination? {
+        noticeMessage =
+            "The linked local evidence is unavailable or has changed."
+                .localizedUI
+        return nil
+    }
+
+    func verifyRetainedChangeReport(
+        id: UUID
+    ) async -> PDFChangeReportVerificationResult? {
+        do {
+            return try await checkRetainedChangeReport(id: id)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    func checkRetainedChangeReport(
+        id: UUID
+    ) async throws -> PDFChangeReportVerificationResult {
+        try Task.checkCancellation()
+        let result = try await store.verifyRetainedChangeReport(id: id)
+        try Task.checkCancellation()
+        return result
+    }
+
+    func prepareRetainedChangeReportShareCopy(
+        _ report: PDFRetainedChangeReport
+    ) async -> URL? {
+        let fileName =
+            "\(safeExportName(report.revisedName))-changes.md"
+        do {
+            let url = try await store
+                .prepareRetainedChangeReportShareCopy(
+                    id: report.id,
+                    fileName: fileName
+                )
+            noticeMessage =
+                "Signed change report reverified for sharing".localizedUI
+            return url
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    @discardableResult
+    func removeRetainedChangeReport(
+        id: UUID
+    ) async -> Bool {
+        do {
+            let removed = try await store.removeRetainedChangeReport(
+                id: id
+            )
+            if removed {
+                retainedEvidenceRevision &+= 1
+                noticeMessage =
+                    "Signed change report deleted from this device"
+                        .localizedUI
+            }
+            return removed
+        } catch is CancellationError {
+            return false
+        } catch {
+            present(error)
+            return false
+        }
+    }
+
+    func verifyChangeReport(
+        at url: URL
+    ) async -> PDFChangeReportVerificationResult? {
+        do {
+            return try await store.verifyChangeReport(at: url)
+        } catch is CancellationError {
+            return nil
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    func trustChangeReportSigner(
+        _ report: PDFChangeReportVerificationResult
+    ) async -> PDFChangeReportVerificationResult? {
+        do {
+            let updated = try await store.trustChangeReportSigner(
+                report
+            )
+            officeTrustedSigners = (
+                try? await store.loadOfficeTrustedSigners()
+            ) ?? officeTrustedSigners
+            noticeMessage = "Signer trusted on this device".localizedUI
+            return updated
+        } catch {
+            present(error)
+            return nil
+        }
+    }
+
+    func makeFilesExportCopy(
+        recordID: UUID,
+        presentsFeedback: Bool = true,
+        progress: @escaping @MainActor @Sendable (
+            PDFByteProgressUpdate
+        ) -> Void = { _ in }
+    ) async -> URL? {
+#if DEBUG
+        // #region debug-point F:files-export-model-start
+        reportFrequentUIFreezeDebugEvent(
+            hypothesisID: "F",
+            location: "PaperPathModel.makeFilesExportCopy",
+            message: "Files export requested",
+            data: [
+                "recordID": recordID.uuidString,
+                "hasRecord": String(record(id: recordID) != nil),
+                "hasURL": String(documentURLs[recordID] != nil),
+                "isProcessing": String(isProcessing(recordID))
+            ]
+        )
+        // #endregion
+#endif
+        guard let record = record(id: recordID),
+              documentURLs[recordID] != nil,
+              let operationToken = acquireExclusiveDocumentOperation(
+                recordID: recordID
+              )
+        else { return nil }
+        let requestedRevision = record.contentRevisionID
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
+
         let displayName = record.displayName.lowercased()
             .hasSuffix(".pdf")
             ? String(record.displayName.dropLast(4))
             : record.displayName
-        let destination = directory
-            .appendingPathComponent(
-                safeExportName(displayName)
-            )
-            .appendingPathExtension("pdf")
+        let fileName = "\(safeExportName(displayName)).pdf"
 
         do {
-            let task = Task.detached(priority: .userInitiated) {
-                let fileManager = FileManager.default
-                try fileManager.createDirectory(
-                    at: directory,
-                    withIntermediateDirectories: true,
-                    attributes: nil
-                )
-                LocalFileSecurity.applyCompleteProtection(
-                    to: directory,
-                    fileManager: fileManager
-                )
-                do {
-                    try fileManager.copyItem(
-                        at: sourceURL,
-                        to: destination
-                    )
-                    LocalFileSecurity.applyCompleteProtection(
-                        to: destination,
-                        fileManager: fileManager
-                    )
-                } catch {
-                    try? fileManager.removeItem(at: directory)
-                    throw error
+            let store = self.store
+            let exportTask = Task {
+                try await store.prepareFilesExportCopy(
+                    recordID: recordID,
+                    expectedRevisionID: requestedRevision,
+                    fileName: fileName
+                ) { update in
+                    Task { @MainActor in
+                        progress(update)
+                    }
                 }
             }
-            try await valuePropagatingCancellation(from: task)
-            try Task.checkCancellation()
+            let destination = try await valuePropagatingExclusiveCancellation(
+                from: exportTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
+            guard self.record(id: recordID)?.contentRevisionID
+                    == requestedRevision
+            else {
+                await discardFilesExportCopy(at: destination)
+                throw PaperPathError.outputVerificationFailed(
+                    "the working copy changed during Files export"
+                )
+            }
+#if DEBUG
+            // #region debug-point F:files-export-model-succeeded
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "F",
+                location: "PaperPathModel.makeFilesExportCopy",
+                message: "Files export prepared",
+                data: [
+                    "recordID": recordID.uuidString,
+                    "fileExists": String(
+                        FileManager.default.fileExists(
+                            atPath: destination.path
+                        )
+                    )
+                ]
+            )
+            // #endregion
+#endif
             return destination
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: directory)
+#if DEBUG
+            // #region debug-point F:files-export-model-cancelled
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "F",
+                location: "PaperPathModel.makeFilesExportCopy",
+                message: "Files export cancelled",
+                data: ["recordID": recordID.uuidString]
+            )
+            // #endregion
+#endif
             return nil
         } catch {
-            present(error)
+#if DEBUG
+            // #region debug-point F:files-export-model-failed
+            let nsError = error as NSError
+            let underlying = nsError.userInfo[
+                NSUnderlyingErrorKey
+            ] as? NSError
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "F",
+                location: "PaperPathModel.makeFilesExportCopy",
+                message: "Files export failed",
+                data: [
+                    "recordID": recordID.uuidString,
+                    "domain": nsError.domain,
+                    "code": String(nsError.code),
+                    "description": nsError.localizedDescription,
+                    "underlyingDomain": underlying?.domain ?? "nil",
+                    "underlyingCode": String(underlying?.code ?? 0),
+                    "underlyingDescription":
+                        underlying?.localizedDescription ?? "nil",
+                    "mappedAsStorage": String(
+                        LocalFileSecurity.isInsufficientStorageError(
+                            error
+                        )
+                    )
+                ]
+            )
+            // #endregion
+#endif
+            if presentsFeedback {
+                present(error)
+            }
             return nil
         }
     }
@@ -8576,21 +14216,24 @@ final class PaperPathModel: ObservableObject {
         let verificationProgress: PDFByteProgressHandler = {
             [weak self] update in
             Task { @MainActor [weak self] in
-                guard self?.exclusiveDocumentOperations[recordID]
-                    == operationToken,
-                      self?.operationProgress[recordID]?.label
+                guard let self,
+                      self.exclusiveDocumentOperationIsCurrent(
+                        recordID: recordID,
+                        token: operationToken
+                      ),
+                      self.operationProgress[recordID]?.label
                         == operationLabel
                 else { return }
                 let fraction = update.totalBytes > 0
                     ? Double(update.processedBytes)
                         / Double(update.totalBytes)
                     : 0
-                self?.updateOperationFraction(
+                self.updateOperationFraction(
                     recordID: recordID,
                     label: operationLabel,
                     fractionCompleted: min(0.24, max(0, fraction) * 0.24)
                 )
-                self?.publishOperationByteProgress(
+                self.publishOperationByteProgress(
                     recordID: recordID,
                     label: operationLabel,
                     update: update
@@ -8600,9 +14243,12 @@ final class PaperPathModel: ObservableObject {
         let archiveProgress: PDFByteProgressHandler = {
             [weak self] update in
             Task { @MainActor [weak self] in
-                guard self?.exclusiveDocumentOperations[recordID]
-                    == operationToken,
-                      self?.operationProgress[recordID]?.label
+                guard let self,
+                      self.exclusiveDocumentOperationIsCurrent(
+                        recordID: recordID,
+                        token: operationToken
+                      ),
+                      self.operationProgress[recordID]?.label
                         == operationLabel
                 else { return }
                 let fraction = update.totalBytes > 0
@@ -8621,12 +14267,12 @@ final class PaperPathModel: ObservableObject {
                     completed = 0.24
                         + min(1, max(0, fraction)) * 0.74
                 }
-                self?.updateOperationFraction(
+                self.updateOperationFraction(
                     recordID: recordID,
                     label: operationLabel,
                     fractionCompleted: completed
                 )
-                self?.publishOperationByteProgress(
+                self.publishOperationByteProgress(
                     recordID: recordID,
                     label: operationLabel,
                     update: update
@@ -8635,15 +14281,22 @@ final class PaperPathModel: ObservableObject {
         }
 
         do {
-            let signedManifest = try await store
-                .signedDeliveryPackageManifest(
+            let store = self.store
+            let manifestTask = Task {
+                try await store.signedDeliveryPackageManifest(
                     for: record,
                     artifactFileName: artifactName,
                     progress: verificationProgress
                 )
+            }
+            let signedManifest =
+                try await valuePropagatingExclusiveCancellation(
+                    from: manifestTask,
+                    recordID: recordID,
+                    operationToken: operationToken
+                )
             officeDeliverySigningKeyID =
                 signedManifest.signature.keyID
-            try Task.checkCancellation()
             guard self.record(id: recordID)?.contentRevisionID
                     == record.contentRevisionID,
                   self.record(id: recordID)?
@@ -8698,12 +14351,11 @@ final class PaperPathModel: ObservableObject {
                     throw error
                 }
             }
-            try await withTaskCancellationHandler {
-                try await archiveTask.value
-            } onCancel: {
-                archiveTask.cancel()
-            }
-            try Task.checkCancellation()
+            try await valuePropagatingExclusiveCancellation(
+                from: archiveTask,
+                recordID: recordID,
+                operationToken: operationToken
+            )
             updateOperationFraction(
                 recordID: recordID,
                 label: operationLabel,
@@ -8722,52 +14374,35 @@ final class PaperPathModel: ObservableObject {
     }
 
     func discardFilesExportCopy(at url: URL) async {
-        let fileManager = FileManager.default
-        let directory = url.deletingLastPathComponent()
-        let temporaryDirectory = fileManager.temporaryDirectory
-            .standardizedFileURL
-        guard directory.deletingLastPathComponent().standardizedFileURL
-                == temporaryDirectory,
-              directory.lastPathComponent
-                .hasPrefix("PaperPath-FilesExport-")
-        else { return }
-
         await Task.detached(priority: .utility) {
-            try? FileManager.default.removeItem(at: directory)
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: ["PaperPath-FilesExport-"]
+            )
         }.value
     }
 
     func discardDeliveryPackage(at url: URL) async {
-        let fileManager = FileManager.default
-        let directory = url.deletingLastPathComponent()
-        let temporaryDirectory = fileManager.temporaryDirectory
-            .standardizedFileURL
-        guard directory.deletingLastPathComponent().standardizedFileURL
-                == temporaryDirectory,
-              directory.lastPathComponent
-                .hasPrefix("PaperPath-DeliveryPackage-")
-        else { return }
-
         await Task.detached(priority: .utility) {
-            try? FileManager.default.removeItem(at: directory)
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: url,
+                allowedPrefixes: ["PaperPath-DeliveryPackage-"]
+            )
         }.value
     }
 
-    private func discardInterruptedTemporaryFiles() async {
-        await Task.detached(priority: .utility) {
-            let fileManager = FileManager.default
-            let temporaryDirectory = fileManager.temporaryDirectory
-            guard let contents = try? fileManager.contentsOfDirectory(
-                at: temporaryDirectory,
-                includingPropertiesForKeys: nil,
-                options: [.skipsHiddenFiles]
-            ) else { return }
-            for url in contents {
-                guard url.lastPathComponent.hasPrefix("PaperPath-")
-                else { continue }
-                try? fileManager.removeItem(at: url)
-            }
-        }.value
+    private func discardInterruptedTemporaryFiles() async throws {
+        let task = Task.detached(priority: .utility) {
+            try PaperPathTemporaryArtifact
+                .discardInterruptedItems()
+        }
+        do {
+            _ = try await valuePropagatingCancellation(from: task)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            // Temporary cleanup must not block access to the library.
+        }
     }
 
     func refreshToken(for recordID: UUID) -> Int {
@@ -8777,6 +14412,116 @@ final class PaperPathModel: ObservableObject {
     func isProcessing(_ recordID: UUID) -> Bool {
         processingDocumentIDs.contains(recordID)
             || operationProgress[recordID] != nil
+            || comparingDocumentIDs.contains(recordID)
+    }
+
+    func isComparing(_ recordID: UUID) -> Bool {
+        comparingDocumentIDs.contains(recordID)
+    }
+
+    func stopComparisons(recordID: UUID) {
+        let stopped = cancelActiveComparisonWork(
+            referencing: Set([recordID])
+        )
+        guard !stopped.isEmpty else { return }
+        noticeMessage = "Stopping PDF comparison".localizedUI
+    }
+
+    func isAnalyzing(_ recordID: UUID) -> Bool {
+        analyzingDocumentIDs.contains(recordID)
+    }
+
+    var hasActiveLocalDataOperations: Bool {
+        isImporting
+            || isProcessingExternalPDFs
+            || committedImportRestoreTask != nil
+            || isSynchronizingMetadata
+            || !processingDocumentIDs.isEmpty
+            || !deliveryProcessingDocumentIDs.isEmpty
+            || !batchDeliveryPendingDocumentIDs.isEmpty
+            || !operationProgress.isEmpty
+            || isBatesBatchMutationActive
+            || isBatesReceiptVerificationActive
+            || officeIntegrityProgress != nil
+            || officeProductionTask != nil
+            || !exclusiveDocumentOperations.isEmpty
+            || !activeComparisonTasks.isEmpty
+            || isClearingPageMatches
+            || isUpdatingVersionStorage
+            || isErasingAllLocalData
+    }
+
+    private func performTrackedComparison(
+        recordIDs: Set<UUID>,
+        operation: @escaping @MainActor @Sendable (
+            UUID
+        ) async throws -> PDFChangeReview
+    ) async throws -> PDFChangeReview {
+        let token = UUID()
+        let task = Task { @MainActor in
+            try await operation(token)
+        }
+        activeComparisonTasks[token] = ActivePDFComparison(
+            recordIDs: recordIDs,
+            task: task
+        )
+        rebuildComparingDocumentIDs()
+        defer {
+            activeComparisonTasks.removeValue(forKey: token)
+            rebuildComparingDocumentIDs()
+        }
+        return try await withTaskCancellationHandler {
+            let review = try await task.value
+            try Task.checkCancellation()
+            guard activeComparisonTasks[token] != nil else {
+                throw CancellationError()
+            }
+            return review
+        } onCancel: {
+            task.cancel()
+        }
+    }
+
+    @discardableResult
+    private func cancelActiveComparisonWork()
+        -> [Task<PDFChangeReview, Error>] {
+        let tasks = activeComparisonTasks.values.map(\.task)
+        activeComparisonTasks.removeAll(keepingCapacity: false)
+        rebuildComparingDocumentIDs()
+        for task in tasks {
+            task.cancel()
+        }
+        return tasks
+    }
+
+    @discardableResult
+    private func cancelActiveComparisonWork(
+        referencing recordIDs: Set<UUID>
+    ) -> [Task<PDFChangeReview, Error>] {
+        guard !recordIDs.isEmpty else { return [] }
+        let tokens = activeComparisonTasks.compactMap {
+            token,
+            comparison in
+            comparison.recordIDs.isDisjoint(with: recordIDs)
+                ? nil
+                : token
+        }
+        let tasks = tokens.compactMap {
+            activeComparisonTasks.removeValue(forKey: $0)?.task
+        }
+        rebuildComparingDocumentIDs()
+        for task in tasks {
+            task.cancel()
+        }
+        return tasks
+    }
+
+    private func rebuildComparingDocumentIDs() {
+        comparingDocumentIDs = activeComparisonTasks.values.reduce(
+            into: Set<UUID>()
+        ) {
+            $0.formUnion($1.recordIDs)
+        }
     }
 
     private func acquireExclusiveDocumentOperation(
@@ -8814,7 +14559,9 @@ final class PaperPathModel: ObservableObject {
         recordID: UUID
     ) throws -> UUID {
         guard !processingDocumentIDs.contains(recordID),
-              exclusiveDocumentOperations[recordID] == nil
+              exclusiveDocumentOperations[recordID] == nil,
+              !comparingDocumentIDs.contains(recordID),
+              !isUpdatingVersionStorage
         else {
             throw PaperPathError.insufficientSelection(
                 "Another operation is already using this PDF. Wait for it to finish or stop it before trying again."
@@ -8826,10 +14573,73 @@ final class PaperPathModel: ObservableObject {
         return token
     }
 
+    private func markExclusiveDocumentOperationBackgroundCancellable(
+        recordID: UUID,
+        token: UUID
+    ) throws {
+        try ensureExclusiveDocumentOperationIsCurrent(
+            recordID: recordID,
+            token: token
+        )
+        backgroundCancellableDocumentOperations[recordID] = token
+    }
+
+    private func ensureExclusiveDocumentOperationIsCurrent(
+        recordID: UUID,
+        token: UUID
+    ) throws {
+        try Task.checkCancellation()
+        guard exclusiveDocumentOperationIsCurrent(
+            recordID: recordID,
+            token: token
+        ) else {
+            throw CancellationError()
+        }
+    }
+
+    private func exclusiveDocumentOperationIsCurrent(
+        recordID: UUID,
+        token: UUID
+    ) -> Bool {
+        !Task.isCancelled
+            && exclusiveDocumentOperations[recordID] == token
+            && !cancelledExclusiveDocumentOperationTokens.contains(token)
+    }
+
+    private func cancelBackgroundCancellableDocumentOperations() {
+        let operations = backgroundCancellableDocumentOperations
+        cancelledExclusiveDocumentOperationTokens.formUnion(
+            operations.values
+        )
+        let cancellations = operations.compactMap {
+            recordID,
+            token -> (@Sendable () -> Void)? in
+            guard let worker =
+                    activeExclusiveDocumentWorkers[recordID],
+                  worker.operationToken == token
+            else { return nil }
+            return worker.cancel
+        }
+        for cancel in cancellations {
+            cancel()
+        }
+        // Keep each document locked until its worker has actually exited.
+        // Atomic storage commits may finish after cancellation is requested.
+    }
+
     private func finishExclusiveDocumentOperation(
         recordID: UUID,
         token: UUID
     ) {
+        if activeExclusiveDocumentWorkers[recordID]?
+            .operationToken == token {
+            activeExclusiveDocumentWorkers[recordID]?.cancel()
+            activeExclusiveDocumentWorkers[recordID] = nil
+        }
+        if backgroundCancellableDocumentOperations[recordID] == token {
+            backgroundCancellableDocumentOperations[recordID] = nil
+        }
+        cancelledExclusiveDocumentOperationTokens.remove(token)
         guard exclusiveDocumentOperations[recordID] == token else {
             return
         }
@@ -8851,17 +14661,12 @@ final class PaperPathModel: ObservableObject {
     private func cleanupOfficeExportContainer(
         for artifactURL: URL
     ) {
-        let fileManager = FileManager.default
-        let parent = artifactURL.deletingLastPathComponent()
-            .standardizedFileURL
-        let temporaryRoot = fileManager.temporaryDirectory
-            .standardizedFileURL
-        guard parent.deletingLastPathComponent() == temporaryRoot,
-              parent.lastPathComponent.hasPrefix(
-                "PaperPath-Office-Export-"
-              )
-        else { return }
-        try? fileManager.removeItem(at: parent)
+        Task.detached(priority: .utility) {
+            PaperPathTemporaryArtifact.removeManagedItem(
+                containing: artifactURL,
+                allowedPrefixes: ["PaperPath-Office-Export-"]
+            )
+        }
     }
 
     func progress(for recordID: UUID) -> PDFOperationProgress? {
@@ -8876,9 +14681,15 @@ final class PaperPathModel: ObservableObject {
         guard let current = operationProgress[recordID],
               current.label == label
         else { return }
+        let boundedFraction = fractionCompleted.isFinite
+            ? min(1, max(0, fractionCompleted))
+            : current.fractionCompleted
         operationProgress[recordID] = PDFOperationProgress(
             label: label,
-            fractionCompleted: min(1, max(0, fractionCompleted)),
+            fractionCompleted: max(
+                current.fractionCompleted,
+                boundedFraction
+            ),
             byteStage: current.byteStage,
             processedBytes: current.processedBytes,
             totalBytes: current.totalBytes,
@@ -8898,31 +14709,33 @@ final class PaperPathModel: ObservableObject {
         guard let current = operationProgress[recordID],
               current.label == label
         else { return }
+        let totalBytes = max(0, update.totalBytes)
+        let processedBytes = totalBytes > 0
+            ? min(max(0, update.processedBytes), totalBytes)
+            : max(0, update.processedBytes)
         if current.byteStage == update.stage,
-           update.processedBytes < current.processedBytes {
+           processedBytes < current.processedBytes {
             return
         }
         var window = operationRateWindows[recordID]
             ?? ByteRateWindow()
         let didAdvance =
             current.byteStage != update.stage
-            || update.processedBytes > current.processedBytes
+            || processedBytes > current.processedBytes
         let rate = window.update(
             stage: update.stage,
-            processedBytes: update.processedBytes
+            processedBytes: processedBytes
         )
         operationRateWindows[recordID] = window
-        let remaining = rate > 0 && update.totalBytes > 0
-            ? Double(
-                max(0, update.totalBytes - update.processedBytes)
-            ) / rate
+        let remaining = rate > 0 && totalBytes > 0
+            ? Double(totalBytes - processedBytes) / rate
             : nil
         operationProgress[recordID] = PDFOperationProgress(
             label: label,
             fractionCompleted: current.fractionCompleted,
             byteStage: update.stage,
-            processedBytes: max(0, update.processedBytes),
-            totalBytes: max(0, update.totalBytes),
+            processedBytes: processedBytes,
+            totalBytes: totalBytes,
             bytesPerSecond: rate,
             estimatedRemainingSeconds: remaining,
             throughputHistory: window.history,
@@ -8947,7 +14760,7 @@ final class PaperPathModel: ObservableObject {
             to: Calendar.current.startOfDay(for: Date())
         ) ?? Date()
         var scoreTotal = 0
-        var attention = 0
+        let attention = attentionCountCache
         var verified = 0
         var stale = 0
         var officeReview = 0
@@ -8967,9 +14780,6 @@ final class PaperPathModel: ObservableObject {
             scoreTotal += profile.score
             if profile.readiness == .ready {
                 ready += 1
-            }
-            if needsAttention(record) {
-                attention += 1
             }
             if verifiedShareTarget(for: record.id) != nil {
                 verified += 1
@@ -9160,24 +14970,20 @@ final class PaperPathModel: ObservableObject {
             symbol: office.routeConfidence.symbol,
             readiness: officeReadiness
         )
-        let textPercent = min(
-            100,
-            max(0, Int((record.profile.textCoverage * 100).rounded()))
+        let textState = DocumentTextAvailability(
+            isLocked: record.profile.isLocked,
+            hasRecognizedText: hasRecognizedText,
+            textCoverage: record.profile.textCoverage,
+            imagePageCount: record.profile.imageDominantPageCount
         )
         let structureSignal = DocumentCommandSignal(
-            id: "structure",
-            title: "Structure",
-            value: "\(textPercent)%",
-            detail: AppLocalization.format(
-                "%lld page%@ · %lld image-heavy",
-                record.profile.pageCount,
-                record.profile.pageCount == 1 ? "" : "s",
-                record.profile.imageDominantPageCount
-            ),
+            id: "text",
+            title: "Text",
+            value: textState.title,
+            detail: textState.detail,
             symbol: "text.magnifyingglass",
-            readiness: textPercent >= 60
-                ? .ready
-                : textPercent >= 30 ? .review : .blocked
+            readiness: record.profile.isLocked ? .blocked
+                : textState.needsRecognition ? .review : .ready
         )
         let privacySignal = DocumentCommandSignal(
             id: "privacy",
@@ -9280,13 +15086,7 @@ final class PaperPathModel: ObservableObject {
     }
 
     private func hasUsefulRecognizedText(recordID: UUID) -> Bool {
-        guard let result = ocrResults[recordID] else { return false }
-        return result.pages.contains { page in
-            !page.text
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .isEmpty
-                || !page.blocks.isEmpty
-        }
+        recordsWithRecognizedText.contains(recordID)
     }
 
     func matchingDocuments(
@@ -9294,9 +15094,7 @@ final class PaperPathModel: ObservableObject {
         status: DocumentWorkflowStatus?,
         category: DocumentCategory?
     ) -> [DocumentRecord] {
-        let terms = query
-            .split(whereSeparator: \.isWhitespace)
-            .map { $0.lowercased() }
+        let terms = DocumentSearchNormalization.terms(in: query)
 
         var matches: [DocumentRecord] = []
         matches.reserveCapacity(documents.count)
@@ -9345,14 +15143,19 @@ final class PaperPathModel: ObservableObject {
               record.workflowStatus != .ready,
               record.workflowStatus != .archived
         else { return false }
-        if record.profile.kind == .scan && ocrResults[record.id] == nil {
+        if record.profile.kind == .scan
+            && !hasUsefulRecognizedText(recordID: record.id) {
             return true
         }
         return !(record.brief?.suggestedSteps.isEmpty ?? true)
     }
 
+    func hasRecognizedText(recordID: UUID) -> Bool {
+        hasUsefulRecognizedText(recordID: recordID)
+    }
+
     var attentionCount: Int {
-        workingDocuments.filter(needsAttention).count
+        attentionCountCache
     }
 
     private func commandReadiness(
@@ -9366,55 +15169,124 @@ final class PaperPathModel: ObservableObject {
     }
 
     func present(_ error: Error) {
-        actionNotice = nil
-        errorOffersSettings = false
-        errorMessage = (error as? LocalizedError)?.errorDescription
-            ?? "PaperPath could not complete that action."
+        present(
+            error,
+            targetSceneID: AppFeedbackContext.targetSceneID
+        )
+    }
+
+    func present(_ error: Error, in sceneID: UUID?) {
+        present(error, targetSceneID: sceneID)
+    }
+
+    private func present(
+        _ error: Error,
+        targetSceneID: UUID?
+    ) {
+        let targetSceneID = resolvedFeedbackTarget(targetSceneID)
+        clearActionNotice(for: targetSceneID)
+        if LocalFileSecurity.isInsufficientStorageError(error) {
+            setPresentationError(
+                PaperPathError.insufficientStorage.errorDescription,
+                offersSettings: false,
+                targetSceneID: targetSceneID
+            )
+            return
+        }
+        setPresentationError(
+            AppLocalization.userFacingErrorDescription(error),
+            offersSettings: false,
+            targetSceneID: targetSceneID
+        )
     }
 
     func presentCameraPermissionDenied() {
-        actionNotice = nil
-        errorOffersSettings = true
-        errorMessage = "Camera access is off. You can continue by importing PDFs, or enable Camera in Settings to scan paper."
-            .localizedUI
+        presentCameraPermissionDenied(
+            in: AppFeedbackContext.targetSceneID
+        )
     }
 
-    func clearError() {
-        errorMessage = nil
-        errorOffersSettings = false
+    func presentCameraPermissionDenied(in sceneID: UUID?) {
+        let sceneID = resolvedFeedbackTarget(sceneID)
+        clearActionNotice(for: sceneID)
+        setPresentationError(
+            "Camera access is off. You can continue by importing PDFs, or enable Camera in Settings to scan paper."
+                .localizedUI,
+            offersSettings: true,
+            targetSceneID: sceneID
+        )
     }
 
     @discardableResult
     private func performPageMutation(
         recordID: UUID,
+        expectedContentRevisionID: UUID? = nil,
         label: String,
         invalidatesAnalysis: Bool = true,
+        navigationTransform: ((Int) -> Int?)? = nil,
+        clearingTaskCheckpointAt replacedPageIndex: Int? = nil,
         operation: @escaping @Sendable (
             PDFMutationService,
             URL
         ) throws -> Void
     ) async -> Bool {
+        if let expectedContentRevisionID,
+           record(id: recordID)?.contentRevisionID != expectedContentRevisionID {
+            noticeMessage =
+                "The PDF changed before this action started. Review the updated PDF.".localizedUI
+            return false
+        }
         guard let record = record(id: recordID),
-              let sourceURL = documentURLs[recordID]
+              let sourceURL = documentURLs[recordID],
+              let operationToken = acquireExclusiveDocumentOperation(
+                recordID: recordID
+              )
         else { return false }
-        let backupURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent(
-                "PaperPath-PageUndo-\(UUID().uuidString).pdf"
+        let navigationState: PageMutationNavigationState?
+        if navigationTransform != nil || replacedPageIndex != nil {
+            navigationState = pageMutationNavigationState(
+                for: record,
+                transform: navigationTransform,
+                clearingTaskCheckpointAt: replacedPageIndex
             )
+        } else {
+            navigationState = nil
+        }
+        defer {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+        }
+        let backupArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-PageUndo-"
+        )
+        let backupURL = backupArtifact.fileURL
         do {
+            try await store.ensureTemporaryWorkingCapacity(
+                for: [sourceURL],
+                copyMultiplier: 6
+            )
             let task = Task.detached(priority: .utility) {
+                try backupArtifact.prepare()
                 try FileManager.default.copyItem(
                     at: sourceURL,
                     to: backupURL
                 )
-                LocalFileSecurity.applyCompleteProtection(to: backupURL)
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: backupURL
+                )
             }
-            try await valuePropagatingCancellation(from: task)
-            try Task.checkCancellation()
+            try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: backupURL)
+            backupArtifact.remove()
             return false
         } catch {
+            backupArtifact.remove()
             present(
                 PaperPathError.storageFailure(
                     "A recovery snapshot could not be created."
@@ -9422,26 +15294,40 @@ final class PaperPathModel: ObservableObject {
             )
             return false
         }
-        let succeeded = await mutate(
-            recordID: recordID,
-            invalidatesAnalysis: invalidatesAnalysis,
-            snapshotLabel: label,
-            operation: operation
-        )
-        guard succeeded else {
-            try? FileManager.default.removeItem(at: backupURL)
+        let refreshed: DocumentRecord
+        do {
+            refreshed = try await commitPreparedMutation(
+                record: record,
+                sourceURL: sourceURL,
+                invalidatesAnalysis: invalidatesAnalysis,
+                snapshotLabel: label,
+                operationToken: operationToken,
+                navigationState: navigationState,
+                operation: operation
+            )
+        } catch is CancellationError {
+            backupArtifact.remove()
+            noticeMessage = "Operation cancelled".localizedUI
+            return false
+        } catch {
+            backupArtifact.remove()
+            present(error)
             return false
         }
         if let previous = pageMutationUndos[recordID] {
-            try? FileManager.default.removeItem(
-                at: previous.backupURL
+            removePageMutationTemporaryItem(
+                containing: previous.backupURL
             )
         }
         pageMutationUndos[recordID] = PageMutationUndo(
             backupURL: backupURL,
+            expectedRevisionID: refreshed.contentRevisionID,
             bookmarkedPages: record.bookmarkedPages,
+            bookmarkNames: record.bookmarkNames,
+            lastPageIndex: record.lastPageIndex,
             taskCheckpoint: record.taskCheckpoint,
-            label: label
+            label: label,
+            sourceRevisionID: record.contentRevisionID
         )
         presentActionNotice(
             message: AppLocalization.format(
@@ -9461,24 +15347,38 @@ final class PaperPathModel: ObservableObject {
         kind: AppNoticeKind,
         action: AppNoticeAction
     ) {
-        noticeMessage = nil
-        actionNotice = AppActionNotice(
+        let targetSceneID = resolvedFeedbackTarget(
+            AppFeedbackContext.targetSceneID
+        )
+        dismissTransientNotice(from: targetSceneID)
+        let notice = AppActionNotice(
             message: message.localizedUI,
             detail: detail?.localizedUI,
             kind: kind,
-            action: action
+            action: action,
+            targetSceneID: targetSceneID
         )
+        if let targetSceneID = notice.targetSceneID {
+            actionNoticesBySceneID[targetSceneID] = notice
+        } else {
+            unscopedActionNotice = notice
+        }
     }
 
     @discardableResult
     private func mutate(
         recordID: UUID,
+        expectedContentRevisionID: UUID? = nil,
         invalidatesAnalysis: Bool = true,
         snapshotLabel: String = "Document edit".localizedUI,
+        presentsFeedback: Bool = true,
         operation: @escaping @Sendable (PDFMutationService, URL) throws -> Void
     ) async -> Bool {
         guard let record = record(id: recordID),
-              let url = documentURLs[recordID],
+              expectedContentRevisionID == nil
+                || record.contentRevisionID
+                    == expectedContentRevisionID,
+              let sourceURL = documentURLs[recordID],
               let operationToken = acquireExclusiveDocumentOperation(
                 recordID: recordID
               )
@@ -9491,104 +15391,206 @@ final class PaperPathModel: ObservableObject {
             )
         }
         do {
-            _ = try await store.createVersionSnapshot(
-                for: record,
-                label: snapshotLabel
+            _ = try await commitPreparedMutation(
+                record: record,
+                sourceURL: sourceURL,
+                invalidatesAnalysis: invalidatesAnalysis,
+                snapshotLabel: snapshotLabel,
+                operationToken: operationToken,
+                operation: operation
             )
-            let mutationService = self.mutationService
-            let task = Task.detached(priority: .userInitiated) {
-                try operation(mutationService, url)
-            }
-            try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-            }
-            let refreshed = try await store.refresh(
-                record,
-                invalidateAnalysis: invalidatesAnalysis
-            )
-            if invalidatesAnalysis {
-                textIndices[recordID] = nil
-                ocrResults[recordID] = nil
-            }
-            replace(refreshed)
-            refreshTokens[recordID, default: 0] += 1
-            if invalidatesAnalysis {
-                await analyzeDocument(recordID: recordID)
-            }
             noticeMessage = "Working copy updated".localizedUI
             return true
         } catch is CancellationError {
-            noticeMessage = "Operation cancelled".localizedUI
+            if presentsFeedback {
+                noticeMessage = "Operation cancelled".localizedUI
+            }
             return false
         } catch {
-            present(error)
+            if presentsFeedback {
+                present(error)
+            }
             return false
         }
     }
 
-    private func remapTaskCheckpoint(
-        recordID: UUID,
-        checkpoint: DocumentTaskCheckpoint?,
-        transform: (Int) -> Int?
-    ) async {
-        guard let checkpoint,
-              let pageIndex = checkpoint.pageIndex
-        else { return }
-        guard let mappedPage = transform(pageIndex) else {
-            await updateTaskCheckpoint(
-                recordID: recordID,
-                checkpoint: nil
-            )
-            return
-        }
-        guard mappedPage != pageIndex else { return }
-        await updateTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: DocumentTaskCheckpoint(
-                stage: checkpoint.stage,
-                pageIndex: mappedPage,
-                fieldName: checkpoint.fieldName,
-                normalizedBounds: checkpoint.normalizedBounds
-            )
+    private func commitPreparedMutation(
+        record: DocumentRecord,
+        sourceURL: URL,
+        invalidatesAnalysis: Bool,
+        snapshotLabel: String,
+        operationToken: UUID,
+        navigationState: PageMutationNavigationState? = nil,
+        operation: @escaping @Sendable (
+            PDFMutationService,
+            URL
+        ) throws -> Void
+    ) async throws -> DocumentRecord {
+        try markExclusiveDocumentOperationBackgroundCancellable(
+            recordID: record.id,
+            token: operationToken
         )
+        try await store.ensureTemporaryWorkingCapacity(
+            for: [sourceURL],
+            copyMultiplier: 5
+        )
+        try ensureExclusiveDocumentOperationIsCurrent(
+            recordID: record.id,
+            token: operationToken
+        )
+        let preparedArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-Mutation-"
+        )
+        let preparedURL = preparedArtifact.fileURL
+        defer {
+            preparedArtifact.remove()
+        }
+
+        let mutationService = self.mutationService
+        let task = Task.detached(priority: .userInitiated) {
+            do {
+                try Task.checkCancellation()
+                try preparedArtifact.prepare()
+                try FileManager.default.copyItem(
+                    at: sourceURL,
+                    to: preparedURL
+                )
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: preparedURL
+                )
+                try Task.checkCancellation()
+                try operation(mutationService, preparedURL)
+                try Task.checkCancellation()
+            } catch {
+                preparedArtifact.remove()
+                throw error
+            }
+        }
+        try await valuePropagatingExclusiveCancellation(
+            from: task,
+            recordID: record.id,
+            operationToken: operationToken
+        )
+        let store = self.store
+        let snapshotTask = Task {
+            try await store.createVersionSnapshot(
+                for: record,
+                label: snapshotLabel
+            )
+        }
+        _ = try await valuePropagatingExclusiveCancellation(
+            from: snapshotTask,
+            recordID: record.id,
+            operationToken: operationToken
+        )
+        let commitTask = Task {
+            try await store.replaceWorkingCopies(
+                with: [
+                    PreparedPDFWorkingCopy(
+                        recordID: record.id,
+                        sourceRevisionID: record.contentRevisionID,
+                        preparedURL: preparedURL,
+                        restoredBookmarkedPages:
+                            navigationState?.bookmarkedPages,
+                        restoredBookmarkNames:
+                            navigationState?.bookmarkNames,
+                        restoredLastPageIndex:
+                            navigationState?.lastPageIndex,
+                        restoredTaskCheckpoint:
+                            navigationState?.taskCheckpoint,
+                        restoresNavigationState:
+                            navigationState != nil
+                    )
+                ],
+                invalidateAnalysis: invalidatesAnalysis
+            )
+        }
+        let committed =
+            try await valueCompletingAtomicExclusiveCommit(
+                from: commitTask,
+                recordID: record.id,
+                operationToken: operationToken
+            )
+        guard let refreshed = committed.first(
+            where: { $0.id == record.id }
+        ) else {
+            throw PaperPathError.storageFailure(
+                "The prepared document change did not commit."
+            )
+        }
+
+        if invalidatesAnalysis {
+            textIndices[record.id] = nil
+            setOCRResult(nil, for: record.id)
+        }
+        replace(refreshed)
+        refreshTokens[record.id, default: 0] += 1
+        guard exclusiveDocumentOperationIsCurrent(
+            recordID: record.id,
+            token: operationToken
+        ) else { return refreshed }
+        if invalidatesAnalysis {
+            await analyzeDocument(recordID: record.id)
+        }
+        guard exclusiveDocumentOperationIsCurrent(
+            recordID: record.id,
+            token: operationToken
+        ) else { return refreshed }
+        return refreshed
     }
 
-    private func clearTaskCheckpointIfReplaced(
-        recordID: UUID,
-        pageIndex: Int,
-        checkpoint: DocumentTaskCheckpoint?
-    ) async {
-        guard let checkpoint,
-              checkpoint.stage != .verify,
-              checkpoint.pageIndex == pageIndex
-        else { return }
-        await updateTaskCheckpoint(
-            recordID: recordID,
-            checkpoint: nil
-        )
-    }
-
-    private func replaceBookmarks(
-        recordID: UUID,
-        pages: [Int]
-    ) async {
-        guard let record = record(id: recordID) else { return }
-        do {
-            let updated = try await store.updateBookmarks(
-                record,
-                pages: pages
-            )
-            replace(updated)
-        } catch {
-            present(error)
+    private func pageMutationNavigationState(
+        for record: DocumentRecord,
+        transform: ((Int) -> Int?)?,
+        clearingTaskCheckpointAt replacedPageIndex: Int?
+    ) -> PageMutationNavigationState {
+        let mapPage: (Int) -> Int? = transform ?? { $0 }
+        var mappedNames: [Int: String] = [:]
+        let mappedBookmarks = record.bookmarkedPages.compactMap {
+            page -> Int? in
+            guard let mappedPage = mapPage(page) else { return nil }
+            if let name = record.bookmarkNames[page],
+               mappedNames[mappedPage] == nil {
+                mappedNames[mappedPage] = name
+            }
+            return mappedPage
         }
+        let mappedCheckpoint: DocumentTaskCheckpoint?
+        if let replacedPageIndex,
+           let checkpoint = record.taskCheckpoint,
+           checkpoint.stage != .verify,
+           checkpoint.pageIndex == replacedPageIndex {
+            mappedCheckpoint = nil
+        } else if let checkpoint = record.taskCheckpoint,
+                  let pageIndex = checkpoint.pageIndex {
+            if let mappedPage = mapPage(pageIndex) {
+                mappedCheckpoint = DocumentTaskCheckpoint(
+                    stage: checkpoint.stage,
+                    pageIndex: mappedPage,
+                    fieldName: checkpoint.fieldName,
+                    normalizedBounds: checkpoint.normalizedBounds,
+                    contentRevisionID: checkpoint.contentRevisionID
+                )
+            } else {
+                mappedCheckpoint = nil
+            }
+        } else {
+            mappedCheckpoint = record.taskCheckpoint
+        }
+        return PageMutationNavigationState(
+            bookmarkedPages: Array(Set(mappedBookmarks)).sorted(),
+            bookmarkNames: mappedNames,
+            lastPageIndex:
+                mapPage(record.lastPageIndex)
+                    ?? record.lastPageIndex,
+            taskCheckpoint: mappedCheckpoint
+        )
     }
 
     private func createOutputCopy(
         recordID: UUID,
-        outputName: String,
+        expectedContentRevisionID: UUID,
+        outputNameKey: String,
         notice: String,
         operationKind: PDFDeliveryOperation,
         unlockPassword: String? = nil,
@@ -9603,9 +15605,18 @@ final class PaperPathModel: ObservableObject {
         ) throws -> Void
     ) async -> DocumentRecord? {
         guard let record = record(id: recordID),
+              record.contentRevisionID
+                == expectedContentRevisionID,
               let sourceURL = documentURLs[recordID]
         else {
-            onFailure?(.sourceUnavailable())
+            let issue: PDFBatchDeliveryIssue =
+                record(id: recordID) == nil
+                    ? .sourceUnavailable()
+                    : .sourceChanged
+            onFailure?(issue)
+            if presentsFeedback {
+                present(issue)
+            }
             return nil
         }
         let operationToken: UUID
@@ -9615,7 +15626,7 @@ final class PaperPathModel: ObservableObject {
             )
         } catch {
             let issue = PDFBatchDeliveryIssue.preflightFailed(
-                error.localizedDescription
+                AppLocalization.userFacingErrorDescription(error)
             )
             onFailure?(issue)
             if presentsFeedback {
@@ -9623,7 +15634,23 @@ final class PaperPathModel: ObservableObject {
             }
             return nil
         }
-        let operationLabel = "Creating \(operationKind.title.lowercased())"
+        let operationLabel = AppLocalization.format(
+            "Creating %@",
+            operationKind.title.localizedUI
+        )
+        do {
+            try markExclusiveDocumentOperationBackgroundCancellable(
+                recordID: recordID,
+                token: operationToken
+            )
+        } catch {
+            finishExclusiveDocumentOperation(
+                recordID: recordID,
+                token: operationToken
+            )
+            onFailure?(.cancelled)
+            return nil
+        }
         deliveryProcessingDocumentIDs.insert(recordID)
         operationProgress[recordID] = PDFOperationProgress(
             label: operationLabel,
@@ -9637,21 +15664,40 @@ final class PaperPathModel: ObservableObject {
             deliveryProcessingDocumentIDs.remove(recordID)
             operationProgress[recordID] = nil
         }
-        let destination = temporaryPDFURL(prefix: outputName.capitalized)
-        defer { try? FileManager.default.removeItem(at: destination) }
+        let temporaryArtifact = ProtectedTemporaryPDF(
+            prefix: "PaperPath-DocumentExport-"
+        )
+        let destination = temporaryArtifact.fileURL
+        defer { temporaryArtifact.remove() }
         let auditService = deliveryAuditService
+        let deliveryTimeAnchor = await store.deliveryTimeAnchor()
+        do {
+            try ensureExclusiveDocumentOperationIsCurrent(
+                recordID: recordID,
+                token: operationToken
+            )
+        } catch {
+            onFailure?(.cancelled)
+            return nil
+        }
         let reportProgress: PDFProgressHandler = { [weak self] value in
             Task { @MainActor [weak self] in
-                guard self?.exclusiveDocumentOperations[recordID]
-                    == operationToken
+                guard let self,
+                      self.exclusiveDocumentOperationIsCurrent(
+                        recordID: recordID,
+                        token: operationToken
+                      )
                 else { return }
-                self?.operationProgress[recordID] = PDFOperationProgress(
+                self.updateOperationFraction(
+                    recordID: recordID,
                     label: operationLabel,
                     fractionCompleted: min(0.98, max(0, value))
                 )
             }
         }
+        let outputRevisionID = UUID()
         let task = Task.detached(priority: .userInitiated) {
+            try temporaryArtifact.prepare()
             do {
                 try operation(sourceURL, destination) { value in
                     reportProgress(value * 0.78)
@@ -9660,7 +15706,7 @@ final class PaperPathModel: ObservableObject {
                 throw CancellationError()
             } catch {
                 throw PDFBatchDeliveryIssue.renderingFailed(
-                    error.localizedDescription
+                    AppLocalization.userFacingErrorDescription(error)
                 )
             }
             reportProgress(0.82)
@@ -9670,25 +15716,25 @@ final class PaperPathModel: ObservableObject {
                     sourceURL: sourceURL,
                     outputURL: destination,
                     operation: operationKind,
-                    unlockPassword: unlockPassword
+                    unlockPassword: unlockPassword,
+                    timeAnchor: deliveryTimeAnchor
                 )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 throw PDFBatchDeliveryIssue.verificationFailed(
-                    error.localizedDescription
+                    AppLocalization.userFacingErrorDescription(error)
                 )
             }
             reportProgress(0.96)
             return receipt
         }
         do {
-            var receipt = try await withTaskCancellationHandler {
-                try await task.value
-            } onCancel: {
-                task.cancel()
-            }
-            try Task.checkCancellation()
+            var receipt = try await valuePropagatingExclusiveCancellation(
+                from: task,
+                recordID: recordID,
+                operationToken: operationToken
+            )
             guard self.record(id: recordID)?.contentRevisionID
                 == record.contentRevisionID
             else {
@@ -9697,24 +15743,33 @@ final class PaperPathModel: ObservableObject {
                 )
             }
             receipt.sourceRevisionID = record.contentRevisionID
-            let outputRevisionID = UUID()
             receipt.outputRevisionID = outputRevisionID
             let created: DocumentRecord
             do {
-                try Task.checkCancellation()
-                created = try await importSinglePDF(
-                    from: destination,
-                    preferredName: "\(record.displayName) - \(outputName)",
-                    deliveryReceipt: receipt,
-                    sourceDocumentID: recordID,
-                    contentRevisionID: outputRevisionID,
-                    analyzeAfterImport: false
+                let importTask = Task { @MainActor in
+                    try await self.importSinglePDF(
+                        from: destination,
+                        preferredName: AppLocalization.format(
+                            "%@ - %@",
+                            record.displayName,
+                            outputNameKey.localizedUI
+                        ),
+                        deliveryReceipt: receipt,
+                        sourceDocumentID: recordID,
+                        contentRevisionID: outputRevisionID,
+                        analyzeAfterImport: false
+                    )
+                }
+                created = try await valuePropagatingExclusiveCancellation(
+                    from: importTask,
+                    recordID: recordID,
+                    operationToken: operationToken
                 )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 throw PDFBatchDeliveryIssue.savingFailed(
-                    error.localizedDescription
+                    AppLocalization.userFacingErrorDescription(error)
                 )
             }
             operationProgress[recordID] = PDFOperationProgress(
@@ -9727,12 +15782,26 @@ final class PaperPathModel: ObservableObject {
                     action: completesAction,
                     marksReady: marksSourceReady
                 )
+                try ensureExclusiveDocumentOperationIsCurrent(
+                    recordID: recordID,
+                    token: operationToken
+                )
             }
             if presentsFeedback {
                 noticeMessage = notice
             }
             return created
         } catch is CancellationError {
+            if let committed = documents.first(where: {
+                $0.contentRevisionID == outputRevisionID
+            }) {
+                if presentsFeedback {
+                    noticeMessage =
+                        "Copy finished before stopping · copy kept in Library"
+                            .localizedUI
+                }
+                return committed
+            }
             onFailure?(.cancelled)
             if presentsFeedback {
                 noticeMessage = "Operation cancelled".localizedUI
@@ -9746,7 +15815,7 @@ final class PaperPathModel: ObservableObject {
             return nil
         } catch {
             let issue = PDFBatchDeliveryIssue.renderingFailed(
-                error.localizedDescription
+                AppLocalization.userFacingErrorDescription(error)
             )
             onFailure?(issue)
             if presentsFeedback {
@@ -9792,52 +15861,380 @@ final class PaperPathModel: ObservableObject {
     }
 
     private func removeRecordState(_ recordID: UUID) {
-        documents.removeAll { $0.id == recordID }
-        documentURLs[recordID] = nil
-        refreshTokens[recordID] = nil
-        ocrResults[recordID] = nil
-        textIndices[recordID] = nil
-        searchMetadataCorpora[recordID] = nil
-        removeSearchTextCorpus(recordID: recordID)
-        deliveryPreflightCache[recordID] = nil
-        officeBatchRuns[recordID] = nil
-        deliveryProcessingDocumentIDs.remove(recordID)
-        batchDeliveryPendingDocumentIDs.remove(recordID)
-        if let undo = pageMutationUndos.removeValue(
-            forKey: recordID
-        ) {
-            try? FileManager.default.removeItem(at: undo.backupURL)
+        removeRecordsState(Set([recordID]))
+    }
+
+    private func removeRecordsState(
+        _ recordIDs: Set<UUID>
+    ) {
+        guard !recordIDs.isEmpty else { return }
+        invalidateEvidenceCaches(
+            referencing: recordIDs,
+            cancelsActiveComparisons: true
+        )
+        documents.removeAll { recordIDs.contains($0.id) }
+        documentURLs = documentURLs.filter {
+            !recordIDs.contains($0.key)
         }
+        refreshTokens = refreshTokens.filter {
+            !recordIDs.contains($0.key)
+        }
+        ocrResults = ocrResults.filter {
+            !recordIDs.contains($0.key)
+        }
+        recordsWithRecognizedText.subtract(recordIDs)
+        rebuildAttentionCount()
+        textIndices = textIndices.filter {
+            !recordIDs.contains($0.key)
+        }
+        residentAnalysisOrder.removeAll {
+            recordIDs.contains($0)
+        }
+        for recordID in recordIDs {
+            cancelDocumentAnalysis(for: recordID)
+            searchMetadataCorpora[recordID] = nil
+            removeSearchTextCorpus(recordID: recordID)
+            deliveryPreflightCache[recordID] = nil
+            officeBatchRuns[recordID] = nil
+            deliveryProcessingDocumentIDs.remove(recordID)
+            batchDeliveryPendingDocumentIDs.remove(recordID)
+            discardPageMutationUndo(recordID: recordID)
+        }
+        clearActionNotice(referencing: recordIDs)
+    }
+
+    @discardableResult
+    private func replaceMetadataRecordIfCurrent(
+        _ updated: DocumentRecord,
+        schedulesMetadataSync: Bool = true
+    ) -> Bool {
+        guard let resident = record(id: updated.id),
+              resident.contentRevisionID
+                == updated.contentRevisionID,
+              resident.modifiedAt <= updated.modifiedAt,
+              (resident.lastViewedAt ?? .distantPast)
+                <= (updated.lastViewedAt ?? .distantPast)
+        else { return false }
+        replace(
+            updated,
+            schedulesMetadataSync: schedulesMetadataSync,
+            invalidatesSearchText: false
+        )
+        return true
+    }
+
+    @discardableResult
+    private func replaceMetadataRecordsIfCurrent(
+        _ updatedRecords: [DocumentRecord],
+        schedulesMetadataSync: Bool = true
+    ) -> Int {
+        let currentRecords = updatedRecords.filter { updated in
+            guard let resident = record(id: updated.id) else {
+                return false
+            }
+            return resident.contentRevisionID
+                    == updated.contentRevisionID
+                && resident.modifiedAt <= updated.modifiedAt
+                && (resident.lastViewedAt ?? .distantPast)
+                    <= (updated.lastViewedAt ?? .distantPast)
+        }
+        replace(
+            currentRecords,
+            schedulesMetadataSync: schedulesMetadataSync,
+            invalidatesSearchText: false
+        )
+        return currentRecords.count
     }
 
     private func replace(
         _ record: DocumentRecord,
-        schedulesMetadataSync: Bool = true
+        schedulesMetadataSync: Bool = true,
+        invalidatesSearchText: Bool = true
     ) {
+        replace(
+            [record],
+            schedulesMetadataSync: schedulesMetadataSync,
+            invalidatesSearchText: invalidatesSearchText
+        )
+    }
+
+    private func replace(
+        _ records: [DocumentRecord],
+        schedulesMetadataSync: Bool = true,
+        invalidatesSearchText: Bool = true
+    ) {
+        guard !records.isEmpty else { return }
         var updatedDocuments = documents
-        if let index = updatedDocuments.firstIndex(
-            where: { $0.id == record.id }
-        ) {
-            if updatedDocuments[index].contentRevisionID
-                != record.contentRevisionID {
-                deliveryPreflightCache[record.id] = nil
+        var changedRecordIDs = Set<UUID>()
+        for record in records {
+            if let index = updatedDocuments.firstIndex(
+                where: { $0.id == record.id }
+            ) {
+                if updatedDocuments[index].contentRevisionID
+                    != record.contentRevisionID {
+                    deliveryPreflightCache[record.id] = nil
+                    changedRecordIDs.insert(record.id)
+                    discardPageMutationUndoIfStale(
+                        recordID: record.id,
+                        currentRevisionID: record.contentRevisionID
+                    )
+                }
+                updatedDocuments[index] = record
+            } else {
+                updatedDocuments.append(record)
             }
-            updatedDocuments[index] = record
-        } else {
-            updatedDocuments.append(record)
         }
-        updatedDocuments.sort {
-            if $0.isPinned != $1.isPinned {
-                return $0.isPinned
-            }
-            return $0.modifiedAt > $1.modifiedAt
-        }
+        invalidateEvidenceCaches(
+            referencing: changedRecordIDs,
+            cancelsActiveComparisons: true
+        )
+        updatedDocuments.sort(by: documentSortsBefore)
         documents = updatedDocuments
-        searchMetadataCorpora[record.id] =
-            searchMetadataCorpus(for: record)
-        removeSearchTextCorpus(recordID: record.id)
+        if !changedRecordIDs.isEmpty {
+            retainedEvidenceRevision &+= 1
+        }
+        for record in records {
+            if let run = officeBatchRuns[record.id] {
+                let reconciled = run.reconcilingArtifacts(
+                    currentRevisionID: record.contentRevisionID,
+                    availableReceiptIDs:
+                        availableOfficeBatchReceiptIDs(
+                            in: record,
+                            for: run
+                        )
+                )
+                if reconciled != run {
+                    officeBatchRuns[record.id] = reconciled
+                }
+            }
+            searchMetadataCorpora[record.id] =
+                searchMetadataCorpus(for: record)
+            if invalidatesSearchText {
+                removeSearchTextCorpus(recordID: record.id)
+            }
+        }
         if schedulesMetadataSync {
             scheduleMetadataSync()
+        }
+    }
+
+    private func discardPageMutationUndoIfStale(
+        recordID: UUID,
+        currentRevisionID: UUID
+    ) {
+        guard let undo = pageMutationUndos[recordID],
+              undo.expectedRevisionID != currentRevisionID
+        else { return }
+        discardPageMutationUndo(recordID: recordID)
+        clearActionNotice(referencing: Set([recordID]))
+    }
+
+    private func discardPageMutationUndo(recordID: UUID) {
+        guard let undo = pageMutationUndos.removeValue(
+            forKey: recordID
+        ) else { return }
+        removePageMutationTemporaryItem(
+            containing: undo.backupURL
+        )
+    }
+
+    private func clearActionNotice(
+        referencing recordIDs: Set<UUID>
+    ) {
+        actionNoticesBySceneID = actionNoticesBySceneID.filter {
+            actionNoticeRecordIDs($0.value)
+                .isDisjoint(with: recordIDs)
+        }
+        if let notice = unscopedActionNotice,
+           !actionNoticeRecordIDs(notice)
+                .isDisjoint(with: recordIDs) {
+            unscopedActionNotice = nil
+        }
+    }
+
+    private func clearActionNotice(for sceneID: UUID?) {
+        if let sceneID {
+            actionNoticesBySceneID[sceneID] = nil
+        } else {
+            unscopedActionNotice = nil
+        }
+    }
+
+    private var preferredActiveFeedbackSceneID: UUID? {
+        activeFeedbackSceneIDs.max {
+            feedbackSceneRecency[$0, default: 0]
+                < feedbackSceneRecency[$1, default: 0]
+        }
+    }
+
+    private func resolvedFeedbackTarget(
+        _ explicitSceneID: UUID?
+    ) -> UUID? {
+        explicitSceneID ?? preferredActiveFeedbackSceneID
+    }
+
+    private func unscopedTransientNoticeForScene(
+        _ sceneID: UUID
+    ) -> AppTransientNotice? {
+        guard preferredActiveFeedbackSceneID == sceneID
+        else { return nil }
+        return unscopedTransientNotice
+    }
+
+    private func unscopedActionNoticeForScene(
+        _ sceneID: UUID
+    ) -> AppActionNotice? {
+        guard preferredActiveFeedbackSceneID == sceneID
+        else { return nil }
+        return unscopedActionNotice
+    }
+
+    private func adoptUnscopedFeedback(into sceneID: UUID) {
+        if transientNoticesBySceneID[sceneID] == nil,
+           let notice = unscopedTransientNotice {
+            transientNoticesBySceneID[sceneID] =
+                notice.targetingScene(sceneID)
+            unscopedTransientNotice = nil
+        }
+        if actionNoticesBySceneID[sceneID] == nil,
+           let notice = unscopedActionNotice {
+            actionNoticesBySceneID[sceneID] =
+                notice.targetingScene(sceneID)
+            unscopedActionNotice = nil
+        }
+        if presentationErrorsBySceneID[sceneID] == nil,
+           let error = unscopedPresentationError {
+            presentationErrorsBySceneID[sceneID] =
+                error.targetingScene(sceneID)
+            unscopedPresentationError = nil
+        }
+        if fullUnlockContextsBySceneID[sceneID] == nil,
+           let context = unscopedFullUnlockContext {
+            fullUnlockContextsBySceneID[sceneID] = context
+            unscopedFullUnlockContext = nil
+        }
+        if hasUnscopedSettingsPresentationRequest {
+            settingsPresentationSceneIDs.insert(sceneID)
+            hasUnscopedSettingsPresentationRequest = false
+        }
+    }
+
+    private func requestSettingsPresentation(in sceneID: UUID?) {
+        if let sceneID = resolvedFeedbackTarget(sceneID) {
+            settingsPresentationSceneIDs.insert(sceneID)
+        } else {
+            hasUnscopedSettingsPresentationRequest = true
+        }
+    }
+
+    private func setTransientNotice(
+        _ message: String?,
+        targetSceneID: UUID?
+    ) {
+        let targetSceneID = message == nil
+            ? targetSceneID
+            : resolvedFeedbackTarget(targetSceneID)
+        if let targetSceneID {
+            transientNoticesBySceneID[targetSceneID] = message.map {
+                AppTransientNotice(
+                    message: $0,
+                    targetSceneID: targetSceneID
+                )
+            }
+        } else {
+            unscopedTransientNotice = message.map {
+                AppTransientNotice(message: $0)
+            }
+        }
+    }
+
+    private func setPresentationError(
+        _ message: String?,
+        offersSettings: Bool,
+        targetSceneID: UUID?
+    ) {
+        let targetSceneID = message == nil
+            ? targetSceneID
+            : resolvedFeedbackTarget(targetSceneID)
+        if let targetSceneID {
+            presentationErrorsBySceneID[targetSceneID] = message.map {
+                AppPresentationError(
+                    message: $0,
+                    offersSettings: offersSettings,
+                    targetSceneID: targetSceneID
+                )
+            }
+        } else {
+            unscopedPresentationError = message.map {
+                AppPresentationError(
+                    message: $0,
+                    offersSettings: offersSettings
+                )
+            }
+        }
+    }
+
+    private func actionNoticeRecordIDs(
+        _ notice: AppActionNotice
+    ) -> Set<UUID> {
+        switch notice.action {
+        case .restoreTrash(let ids):
+            return Set(ids)
+        case .undoPageChange(let id):
+            return Set([id])
+        case .undoPageChanges(let ids):
+            return Set(ids)
+        }
+    }
+
+    private func invalidateEvidenceCaches(
+        referencing recordIDs: Set<UUID>,
+        cancelsActiveComparisons: Bool
+    ) {
+        guard !recordIDs.isEmpty else { return }
+        if cancelsActiveComparisons {
+            cancelActiveComparisonWork(referencing: recordIDs)
+        }
+
+        let comparisonKeys = comparisonCache.keys.filter {
+            recordIDs.contains($0.sourceRecordID)
+                || recordIDs.contains($0.revisedRecordID)
+        }
+        for key in comparisonKeys {
+            comparisonCache[key] = nil
+        }
+        let comparisonKeySet = Set(comparisonKeys)
+        comparisonCacheOrder.removeAll {
+            comparisonKeySet.contains($0)
+        }
+
+        invalidateVersionComparisonCaches(for: recordIDs)
+
+        let assessmentKeys = pageAssessmentCache.keys.filter {
+            recordIDs.contains($0.recordID)
+        }
+        for key in assessmentKeys {
+            pageAssessmentCache[key] = nil
+        }
+        let assessmentKeySet = Set(assessmentKeys)
+        pageAssessmentCacheOrder.removeAll {
+            assessmentKeySet.contains($0)
+        }
+    }
+
+    private func invalidateVersionComparisonCaches(
+        for recordIDs: Set<UUID>
+    ) {
+        guard !recordIDs.isEmpty else { return }
+        let versionKeys = versionComparisonCache.keys.filter {
+            recordIDs.contains($0.recordID)
+        }
+        for key in versionKeys {
+            versionComparisonCache[key] = nil
+        }
+        let versionKeySet = Set(versionKeys)
+        versionComparisonCacheOrder.removeAll {
+            versionKeySet.contains($0)
         }
     }
 
@@ -9863,22 +16260,35 @@ final class PaperPathModel: ObservableObject {
         )
     }
 
-    private func scheduleMetadataSync() {
+    private func scheduleMetadataSync(
+        delay: Duration = .seconds(1)
+    ) {
         guard didBootstrap,
               !isRunningAutomatedTests,
               UserDefaults.standard.bool(
                 forKey: AppPreferences.metadataSyncEnabledKey
               ),
-              !isApplyingMetadataSync
+              !metadataSyncAutomaticRetryBlocked
         else { return }
+        if isSynchronizingMetadata {
+            requestMetadataSyncFollowUp(showNotice: false)
+            return
+        }
+        let scheduleGeneration = UUID()
+        metadataSyncScheduleGeneration = scheduleGeneration
         metadataSyncTask?.cancel()
         metadataSyncTask = Task { [weak self] in
             do {
-                try await Task.sleep(for: .seconds(1))
+                try await Task.sleep(for: delay)
             } catch {
                 return
             }
-            guard let self, !Task.isCancelled else { return }
+            guard let self,
+                  !Task.isCancelled,
+                  self.metadataSyncScheduleGeneration
+                    == scheduleGeneration
+            else { return }
+            self.metadataSyncTask = nil
             await self.synchronizeMetadata(showNotice: false)
         }
     }
@@ -9894,20 +16304,130 @@ final class PaperPathModel: ObservableObject {
                 .didChangeExternallyNotification,
             object: NSUbiquitousKeyValueStore.default,
             queue: .main
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            let reason = (
+                notification.userInfo?[
+                    NSUbiquitousKeyValueStoreChangeReasonKey
+                ] as? NSNumber
+            )?.intValue
+            let changedKeys = notification.userInfo?[
+                NSUbiquitousKeyValueStoreChangedKeysKey
+            ] as? [String]
             Task { @MainActor [weak self] in
-                await self?.synchronizeMetadata(showNotice: false)
+                self?.handleMetadataSyncExternalChange(
+                    reason: reason,
+                    changedKeys: changedKeys
+                )
             }
         }
     }
 
-    private func sortDocuments() {
-        documents.sort {
-            if $0.isPinned != $1.isPinned {
-                return $0.isPinned
-            }
-            return $0.modifiedAt > $1.modifiedAt
+    private func handleMetadataSyncExternalChange(
+        reason: Int?,
+        changedKeys: [String]?
+    ) {
+        guard UserDefaults.standard.bool(
+            forKey: AppPreferences.metadataSyncEnabledKey
+        ) else { return }
+        let changesMetadataPayload =
+            changedKeys?.contains(
+                PDFMetadataSyncService.cloudStorageKey
+            ) ?? true
+
+        switch reason {
+        case NSUbiquitousKeyValueStoreQuotaViolationChange:
+            invalidateMetadataSyncWork()
+            metadataSyncAutomaticRetryBlocked = true
+            metadataSyncStatus = PDFMetadataSyncStatus(
+                state: .failed,
+                documentCount: metadataSyncStatus.documentCount,
+                updatedAt: metadataSyncStatus.updatedAt,
+                detail:
+                    "iCloud metadata quota was exceeded. PDFs and local metadata remain on this device."
+            )
+        case NSUbiquitousKeyValueStoreAccountChange:
+            invalidateMetadataSyncWork()
+            metadataSyncAutomaticRetryBlocked = false
+            metadataSyncStatus = PDFMetadataSyncStatus(
+                state: .idle,
+                documentCount: 0,
+                updatedAt: nil,
+                detail:
+                    "The iCloud account changed. PaperPath will rebuild lightweight metadata sync."
+            )
+            scheduleMetadataSync(delay: .milliseconds(350))
+        case NSUbiquitousKeyValueStoreServerChange,
+             NSUbiquitousKeyValueStoreInitialSyncChange:
+            guard changesMetadataPayload else { return }
+            guard !isApplyingMetadataSync else { return }
+            scheduleMetadataSync(delay: .milliseconds(180))
+        default:
+            guard changesMetadataPayload else { return }
+            guard !isApplyingMetadataSync else { return }
+            scheduleMetadataSync(delay: .milliseconds(350))
         }
+    }
+
+    private func invalidateMetadataSyncWork() {
+        metadataSyncGeneration = UUID()
+        metadataSyncScheduleGeneration = UUID()
+        isSynchronizingMetadata = false
+        metadataSyncNeedsFollowUp = false
+        metadataSyncFollowUpShowsNotice = false
+        metadataSyncTask?.cancel()
+        metadataSyncTask = nil
+    }
+
+    private func requestMetadataSyncFollowUp(
+        showNotice: Bool
+    ) {
+        metadataSyncNeedsFollowUp = true
+        metadataSyncFollowUpShowsNotice =
+            metadataSyncFollowUpShowsNotice || showNotice
+        metadataSyncStatus = PDFMetadataSyncStatus(
+            state: .syncing,
+            documentCount: metadataSyncStatus.documentCount,
+            updatedAt: metadataSyncStatus.updatedAt,
+            detail:
+                "Finishing the current merge, then checking the latest iCloud metadata."
+        )
+    }
+
+    private func pauseMetadataSyncForBackground() {
+        let hadActiveWork =
+            isSynchronizingMetadata || metadataSyncTask != nil
+        invalidateMetadataSyncWork()
+        guard hadActiveWork,
+              UserDefaults.standard.bool(
+                  forKey: AppPreferences.metadataSyncEnabledKey
+              )
+        else { return }
+        metadataSyncStatus = PDFMetadataSyncStatus(
+            state: .idle,
+            documentCount: metadataSyncStatus.documentCount,
+            updatedAt: metadataSyncStatus.updatedAt,
+            detail:
+                "Metadata sync paused while PaperPath is in the background."
+        )
+    }
+
+    private func documentSortsBefore(
+        _ lhs: DocumentRecord,
+        _ rhs: DocumentRecord
+    ) -> Bool {
+        if lhs.isPinned != rhs.isPinned {
+            return lhs.isPinned
+        }
+        if lhs.modifiedAt != rhs.modifiedAt {
+            return lhs.modifiedAt > rhs.modifiedAt
+        }
+        let nameOrder = lhs.displayName.localizedStandardCompare(
+            rhs.displayName
+        )
+        if nameOrder != .orderedSame {
+            return nameOrder == .orderedAscending
+        }
+        return lhs.id.uuidString < rhs.id.uuidString
     }
 
     private func rebuildDocumentDerivedIndexes() {
@@ -9916,7 +16436,38 @@ final class PaperPathModel: ObservableObject {
             uniquingKeysWith: { _, newest in newest }
         )
         let working = documents.filter(\.isWorkingCopy)
-        let outputs = documents.filter(\.isDeliveryArtifact)
+        let outputs = documents
+            .filter(\.isDeliveryArtifact)
+            .sorted {
+                let lhsDate =
+                    $0.deliveryReceipt?.createdAt ?? $0.modifiedAt
+                let rhsDate =
+                    $1.deliveryReceipt?.createdAt ?? $1.modifiedAt
+                if lhsDate != rhsDate {
+                    return lhsDate > rhsDate
+                }
+                return $0.id.uuidString < $1.id.uuidString
+            }
+        let pinnedOfficeOutputs = documents.flatMap { record in
+            record.officeReceipts
+                .filter(\.isPinned)
+                .map {
+                    PDFPinnedOfficeOutput(
+                        recordID: record.id,
+                        documentName: record.displayName,
+                        receipt: $0
+                    )
+                }
+        }
+        .sorted {
+            let lhsDate = $0.receipt.pinnedAt ?? .distantPast
+            let rhsDate = $1.receipt.pinnedAt ?? .distantPast
+            if lhsDate != rhsDate {
+                return lhsDate > rhsDate
+            }
+            return $0.receipt.id.uuidString
+                < $1.receipt.id.uuidString
+        }
         var fingerprintCounts: [String: Int] = [:]
         for record in working {
             guard let fingerprint = record.contentFingerprint else {
@@ -9926,25 +16477,27 @@ final class PaperPathModel: ObservableObject {
         }
 
         var outputsBySourceID: [UUID: [DocumentRecord]] = [:]
-        for output in outputs
-        where output.hasCurrentDeliveryReceipt
-            && output.deliveryReceipt?.isDeliveryOutput == true {
+        var historyBySourceID: [UUID: [DocumentRecord]] = [:]
+        let chronologicalOutputs = outputs.sorted {
+            let lhsDate = $0.deliveryReceipt?.createdAt ?? $0.importedAt
+            let rhsDate = $1.deliveryReceipt?.createdAt ?? $1.importedAt
+            if lhsDate != rhsDate { return lhsDate > rhsDate }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        for output in chronologicalOutputs {
             var child = output
             var visited = Set<UUID>([output.id])
+            var matchesCurrentChain = output.hasCurrentDeliveryReceipt
             while let parentID = child.sourceDocumentID,
                   visited.insert(parentID).inserted,
                   let parent = recordsByID[parentID] {
-                guard child.deliveryReceipt?.sourceRevisionID
-                        == parent.contentRevisionID
-                else { break }
-                outputsBySourceID[parentID, default: []].append(output)
+                historyBySourceID[parentID, default: []].append(output)
+                matchesCurrentChain = matchesCurrentChain
+                    && child.deliveryReceipt?.sourceRevisionID == parent.contentRevisionID
+                if matchesCurrentChain {
+                    outputsBySourceID[parentID, default: []].append(output)
+                }
                 child = parent
-            }
-        }
-        for sourceID in Array(outputsBySourceID.keys) {
-            outputsBySourceID[sourceID]?.sort {
-                ($0.deliveryReceipt?.createdAt ?? $0.importedAt)
-                    > ($1.deliveryReceipt?.createdAt ?? $1.importedAt)
             }
         }
 
@@ -9965,9 +16518,143 @@ final class PaperPathModel: ObservableObject {
         documentRecordsByID = recordsByID
         workingDocumentCache = working
         deliveryOutputCache = outputs
+        verifiedDeliveryOutputCountCache = outputs.reduce(into: 0) {
+            if $1.hasCurrentDeliveryReceipt {
+                $0 += 1
+            }
+        }
+        pinnedOfficeOutputCache = pinnedOfficeOutputs
+        pinnedOfficeStorageSummaryCache =
+            PDFOfficePinnedStorageSummary.measuring(
+                pinnedOfficeOutputs
+        )
         verifiedOutputsBySourceID = outputsBySourceID
+        deliveryHistoryBySourceID = historyBySourceID
         verifiedShareTargetsByRecordID = shareTargets
         workingFingerprintCounts = fingerprintCounts
+        rebuildAttentionCount()
+    }
+
+    private func rebuildRecognizedTextAvailability() {
+        var available = Set(
+            documents.compactMap { record in
+                record.completedActions.contains(.recognizeText)
+                    ? record.id
+                    : nil
+            }
+        )
+        for (recordID, result) in ocrResults {
+            if hasUsefulRecognizedText(result) {
+                available.insert(recordID)
+            } else {
+                available.remove(recordID)
+            }
+        }
+        recordsWithRecognizedText = available
+        rebuildAttentionCount()
+    }
+
+    private func replaceOCRResults(
+        _ results: [UUID: OCRResult]
+    ) {
+        ocrResults = results
+        rebuildRecognizedTextAvailability()
+    }
+
+    private func mergeOCRResults(
+        _ results: [UUID: OCRResult]
+    ) {
+        guard !results.isEmpty else { return }
+        ocrResults.merge(results) { _, latest in latest }
+        for (recordID, result) in results {
+            if hasUsefulRecognizedText(result) {
+                recordsWithRecognizedText.insert(recordID)
+            } else {
+                recordsWithRecognizedText.remove(recordID)
+            }
+        }
+        rebuildAttentionCount()
+    }
+
+    private func setOCRResult(
+        _ result: OCRResult?,
+        for recordID: UUID
+    ) {
+        ocrResults[recordID] = result
+        if let result {
+            if hasUsefulRecognizedText(result) {
+                recordsWithRecognizedText.insert(recordID)
+            } else {
+                recordsWithRecognizedText.remove(recordID)
+            }
+            touchResidentAnalysis(recordID)
+            trimResidentAnalysisCache()
+        } else {
+            recordsWithRecognizedText.remove(recordID)
+        }
+        rebuildAttentionCount()
+    }
+
+    private func hasUsefulRecognizedText(
+        _ result: OCRResult
+    ) -> Bool {
+        result.pages.contains { page in
+            !page.text
+                .trimmingCharacters(
+                    in: .whitespacesAndNewlines
+                )
+                .isEmpty
+                || !page.blocks.isEmpty
+        }
+    }
+
+    private func touchResidentAnalysis(_ recordID: UUID) {
+        residentAnalysisOrder.removeAll { $0 == recordID }
+        residentAnalysisOrder.append(recordID)
+    }
+
+    private func trimResidentAnalysisCache(
+        retaining additionalRecordIDs: Set<UUID> = []
+    ) {
+        let maximumCount = Self.maximumResidentAnalysisRecords
+            + additionalRecordIDs.count
+        while residentAnalysisOrder.count > maximumCount {
+            let recordID = residentAnalysisOrder.removeFirst()
+            guard !additionalRecordIDs.contains(recordID) else {
+                residentAnalysisOrder.append(recordID)
+                continue
+            }
+            textIndices[recordID] = nil
+            ocrResults[recordID] = nil
+            removeSearchTextCorpus(recordID: recordID)
+        }
+    }
+
+    private func releaseResidentAnalysis(
+        retainingRecordCount: Int
+    ) {
+        let retainedIDs = Set(
+            residentAnalysisOrder.suffix(
+                max(0, retainingRecordCount)
+            )
+        )
+        textIndices = textIndices.filter {
+            retainedIDs.contains($0.key)
+        }
+        ocrResults = ocrResults.filter {
+            retainedIDs.contains($0.key)
+        }
+        residentAnalysisOrder.removeAll {
+            !retainedIDs.contains($0)
+        }
+    }
+
+    private func rebuildAttentionCount() {
+        attentionCountCache = workingDocumentCache.reduce(into: 0) {
+            if needsAttention($1) {
+                $0 += 1
+            }
+        }
     }
 
     private func refreshURLCache() async {
@@ -9985,7 +16672,12 @@ final class PaperPathModel: ObservableObject {
         sourceDocumentID: UUID? = nil,
         contentRevisionID: UUID? = nil,
         analyzeAfterImport: Bool = true,
-        preserveSourceLocation: Bool = false
+        preserveSourceLocation: Bool = false,
+        expectedSHA256: String? = nil,
+        expectedByteCount: Int64? = nil,
+        sharedImportID: UUID? = nil,
+        deferredOpenGeneration: UUID? = nil,
+        progress: @escaping PDFImportProgressHandler = { _ in }
     ) async throws -> DocumentRecord {
         let record = try await store.importPDF(
             from: url,
@@ -9993,8 +16685,38 @@ final class PaperPathModel: ObservableObject {
             deliveryReceipt: deliveryReceipt,
             sourceDocumentID: sourceDocumentID,
             contentRevisionID: contentRevisionID,
-            preserveSourceLocation: preserveSourceLocation
+            preserveSourceLocation: preserveSourceLocation,
+            expectedSHA256: expectedSHA256,
+            expectedByteCount: expectedByteCount,
+            sharedImportID: sharedImportID,
+            progress: progress
         )
+        guard !Task.isCancelled else {
+            deferredCommittedImports[record.id] = record
+            let sourceIdentity = externalPDFURLIdentity(url)
+            deferredCommittedImportSourceIdentities[record.id] =
+                sourceIdentity
+            if let deferredOpenGeneration,
+               externalPDFDeferredOpenGeneration
+                    == deferredOpenGeneration,
+               !deferredCommittedOpenRecordIDs.contains(
+                    record.id
+               ) {
+                if let targetSceneID =
+                        queuedExternalPDFTargetSceneIDs[sourceIdentity] {
+                    deferredCommittedOpenSceneIDs[record.id] =
+                        targetSceneID
+                }
+                deferredCommittedOpenRecordIDs.append(
+                    record.id
+                )
+            }
+            if let restored =
+                await restoreCommittedImportIfForeground(record) {
+                return restored
+            }
+            throw CancellationError()
+        }
         replace(record)
         documentURLs[record.id] = await store.url(for: record)
         if analyzeAfterImport {
@@ -10005,7 +16727,8 @@ final class PaperPathModel: ObservableObject {
 
     private func analyzeMissingDocuments() async {
         for record in documents
-        where record.brief == nil && record.deliveryReceipt == nil {
+        where record.deliveryReceipt == nil
+            && record.brief == nil {
             guard !Task.isCancelled else { return }
             await analyzeDocument(recordID: record.id)
             await Task.yield()
@@ -10016,6 +16739,50 @@ final class PaperPathModel: ObservableObject {
         guard let record = record(id: recordID),
               let url = documentURLs[recordID]
         else { return }
+        if let existing = documentAnalysisTasks[recordID] {
+            if existing.revisionID == record.contentRevisionID {
+                await existing.task.value
+                return
+            }
+            existing.task.cancel()
+            documentAnalysisTasks[recordID] = nil
+            analyzingDocumentIDs.remove(recordID)
+        }
+
+        let taskGeneration = UUID()
+        let residencyGeneration = residentAnalysisGeneration
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.performDocumentAnalysis(
+                record: record,
+                url: url,
+                residencyGeneration: residencyGeneration
+            )
+        }
+        documentAnalysisTasks[recordID] = DocumentAnalysisTaskEntry(
+            revisionID: record.contentRevisionID,
+            generation: taskGeneration,
+            task: task
+        )
+        analyzingDocumentIDs.insert(recordID)
+        await withTaskCancellationHandler {
+            await task.value
+        } onCancel: {
+            task.cancel()
+        }
+        guard documentAnalysisTasks[recordID]?.generation
+                == taskGeneration
+        else { return }
+        documentAnalysisTasks[recordID] = nil
+        analyzingDocumentIDs.remove(recordID)
+    }
+
+    private func performDocumentAnalysis(
+        record: DocumentRecord,
+        url: URL,
+        residencyGeneration: UUID
+    ) async {
+        let recordID = record.id
 
         do {
             let ocrResult = ocrResults[recordID]
@@ -10043,7 +16810,8 @@ final class PaperPathModel: ObservableObject {
                 from: analysisTask
             )
             try Task.checkCancellation()
-            guard let currentRecord = self.record(id: recordID),
+            guard residentAnalysisGeneration == residencyGeneration,
+                  let currentRecord = self.record(id: recordID),
                   currentRecord.contentRevisionID
                     == record.contentRevisionID,
                   documentURLs[recordID] == url
@@ -10054,24 +16822,439 @@ final class PaperPathModel: ObservableObject {
                 textIndex: index,
                 ocrResult: ocrResult
             )
-            try Task.checkCancellation()
-            guard self.record(id: recordID)?.contentRevisionID
-                    == record.contentRevisionID
+            guard let residentRecord = self.record(id: recordID),
+                  residentRecord.contentRevisionID
+                    == updated.contentRevisionID
+            else { return }
+            if residentRecord.modifiedAt <= updated.modifiedAt {
+                replace(updated)
+            }
+            guard !Task.isCancelled,
+                  residentAnalysisGeneration == residencyGeneration,
+                  self.record(id: recordID)?.contentRevisionID
+                    == updated.contentRevisionID,
+                  documentURLs[recordID] == url
             else { return }
             textIndices[recordID] = index
-            replace(updated)
+            touchResidentAnalysis(recordID)
+            trimResidentAnalysisCache()
         } catch is CancellationError {
             return
         } catch PaperPathError.lockedPDF {
             return
         } catch {
+            guard residentAnalysisGeneration == residencyGeneration,
+                  !Task.isCancelled
+            else { return }
             present(error)
         }
     }
 
-    private func temporaryPDFURL(prefix: String) -> URL {
-        FileManager.default.temporaryDirectory
-            .appendingPathComponent("\(prefix)-\(UUID().uuidString).pdf")
+    private func cancelDocumentAnalysis(for recordID: UUID) {
+        documentAnalysisTasks.removeValue(forKey: recordID)?
+            .task.cancel()
+        analyzingDocumentIDs.remove(recordID)
+    }
+
+    private func cancelAllDocumentAnalysis() {
+        residentAnalysisGeneration = UUID()
+        for entry in documentAnalysisTasks.values {
+            entry.task.cancel()
+        }
+        documentAnalysisTasks.removeAll(keepingCapacity: false)
+        analyzingDocumentIDs.removeAll(keepingCapacity: false)
+    }
+
+    private func beginImportOperation() -> UUID {
+        let token = UUID()
+        activeImportOperations.insert(token)
+        isImporting = true
+        return token
+    }
+
+    private func beginForegroundImportProgress(
+        progressID: UUID,
+        totalItemCount: Int,
+        firstURL: URL
+    ) {
+        activeForegroundImportProgressIDs.insert(progressID)
+        foregroundImportRateWindows[progressID] =
+            ByteRateWindow()
+        foregroundImportProgresses[progressID] =
+            PDFOperationProgress(
+                label: foregroundImportLabel(
+                    stage: .preparing,
+                    itemIndex: 0,
+                    totalItemCount: totalItemCount,
+                    url: firstURL
+                ),
+                fractionCompleted: 0
+            )
+    }
+
+    private func finishForegroundImportProgress(
+        _ progressID: UUID
+    ) {
+        guard activeForegroundImportProgressIDs.remove(progressID)
+            != nil
+        else { return }
+        foregroundImportRateWindows[progressID] = nil
+        foregroundImportProgresses[progressID] = nil
+    }
+
+    private func foregroundImportProgressHandler(
+        progressID: UUID,
+        itemIndex: Int,
+        totalItemCount: Int,
+        url: URL
+    ) -> PDFImportProgressHandler {
+        { [weak self] update in
+            Task { @MainActor [weak self] in
+                self?.publishForegroundImportProgress(
+                    update,
+                    progressID: progressID,
+                    itemIndex: itemIndex,
+                    totalItemCount: totalItemCount,
+                    url: url
+                )
+            }
+        }
+    }
+
+    private func publishForegroundImportProgress(
+        _ update: PDFImportProgressUpdate,
+        progressID: UUID,
+        itemIndex: Int,
+        totalItemCount: Int,
+        url: URL
+    ) {
+        guard activeForegroundImportProgressIDs.contains(progressID)
+        else { return }
+        let total = max(1, totalItemCount)
+        let boundedIndex = min(max(0, itemIndex), total - 1)
+        let itemFraction = min(
+            1,
+            max(0, update.fractionCompleted)
+        )
+        let aggregateFraction = (
+            Double(boundedIndex) + itemFraction
+        ) / Double(total)
+        let currentProgress =
+            foregroundImportProgresses[progressID]
+        let isCopying = update.stage == .copying
+            && update.totalBytes > 0
+        let now = Date()
+        let didAdvanceBytes = currentProgress?.byteStage != .copying
+            || update.processedBytes
+                > (currentProgress?.processedBytes ?? 0)
+        let bytesPerSecond: Double
+        let throughputHistory: [Double]
+        if isCopying {
+            var rateWindow = foregroundImportRateWindows[
+                progressID
+            ] ?? ByteRateWindow()
+            bytesPerSecond = rateWindow.update(
+                stage: .copying,
+                processedBytes: update.processedBytes,
+                at: now
+            )
+            throughputHistory = rateWindow.history
+            foregroundImportRateWindows[progressID] =
+                rateWindow
+        } else {
+            bytesPerSecond = 0
+            throughputHistory = []
+        }
+        foregroundImportProgresses[progressID] =
+            PDFOperationProgress(
+                label: foregroundImportLabel(
+                    stage: update.stage,
+                    itemIndex: boundedIndex,
+                    totalItemCount: total,
+                    url: url
+                ),
+                fractionCompleted: max(
+                    currentProgress?.fractionCompleted ?? 0,
+                    aggregateFraction
+                ),
+                byteStage: isCopying ? .copying : nil,
+                processedBytes: isCopying
+                    ? update.processedBytes
+                    : 0,
+                totalBytes: isCopying ? update.totalBytes : 0,
+                bytesPerSecond: bytesPerSecond,
+                estimatedRemainingSeconds:
+                    isCopying
+                        && total == 1
+                        && bytesPerSecond > 0
+                        ? Double(
+                            max(
+                                0,
+                                update.totalBytes
+                                    - update.processedBytes
+                            )
+                        ) / bytesPerSecond
+                        : nil,
+                throughputHistory: throughputHistory,
+                lastByteUpdateAt:
+                    isCopying
+                        ? didAdvanceBytes
+                            ? now
+                            : currentProgress?.lastByteUpdateAt
+                        : nil
+            )
+    }
+
+    private func foregroundImportLabel(
+        stage: PDFImportProgressStage,
+        itemIndex: Int,
+        totalItemCount: Int,
+        url: URL
+    ) -> String {
+        AppLocalization.format(
+            "%lld of %lld · %@ · %@",
+            min(max(0, itemIndex) + 1, max(1, totalItemCount)),
+            max(1, totalItemCount),
+            stage.title.localizedUI,
+            foregroundImportDisplayName(url)
+        )
+    }
+
+    private func foregroundImportDisplayName(_ url: URL) -> String {
+        let candidate = url.deletingPathExtension()
+            .lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return String(
+            (candidate.isEmpty ? "Document".localizedUI : candidate)
+                .prefix(64)
+        )
+    }
+
+    @discardableResult
+    private func enqueueExternalPDFURLs(
+        _ urls: [URL],
+        atFront: Bool = false,
+        targetSceneID: UUID? = nil
+    ) -> Int {
+        let orderedCandidates = atFront
+            ? urls + queuedExternalPDFURLs
+            : queuedExternalPDFURLs + urls
+        var seenIdentities = activeExternalPDFURLIdentities
+        var updatedQueue: [URL] = []
+        updatedQueue.reserveCapacity(
+            min(
+                Self.maximumQueuedExternalPDFCount,
+                orderedCandidates.count
+            )
+        )
+        var overflowCount = 0
+        for candidate in orderedCandidates {
+            let identity = externalPDFURLIdentity(candidate)
+            guard seenIdentities.insert(identity).inserted else {
+                continue
+            }
+            guard updatedQueue.count
+                    < Self.maximumQueuedExternalPDFCount
+            else {
+                overflowCount += 1
+                continue
+            }
+            updatedQueue.append(candidate)
+        }
+        queuedExternalPDFURLs = updatedQueue
+        let retainedIdentities = Set(
+            updatedQueue.map(externalPDFURLIdentity)
+        ).union(activeExternalPDFURLIdentities)
+        if let targetSceneID {
+            for url in urls {
+                let identity = externalPDFURLIdentity(url)
+                guard retainedIdentities.contains(identity),
+                      queuedExternalPDFTargetSceneIDs[identity] == nil
+                else { continue }
+                queuedExternalPDFTargetSceneIDs[identity] = targetSceneID
+            }
+        }
+        queuedExternalPDFTargetSceneIDs =
+            queuedExternalPDFTargetSceneIDs.filter {
+                retainedIdentities.contains($0.key)
+            }
+        return overflowCount
+    }
+
+    private func externalPDFURLIdentity(_ url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+
+    private func hasDeferredCommittedImport(from url: URL) -> Bool {
+        deferredCommittedImportSourceIdentities.values.contains(
+            externalPDFURLIdentity(url)
+        )
+    }
+
+    private func hasImportedSharedInboxItem(_ itemID: UUID) -> Bool {
+        documents.contains { $0.sharedImportID == itemID }
+            || deletedDocuments.contains {
+                $0.sharedImportID == itemID
+            }
+            || deferredCommittedImports.values.contains {
+                $0.sharedImportID == itemID
+            }
+    }
+
+    private func externalImportProgressHandler(
+        generation: UUID,
+        currentName: String,
+        completedItemCount: Int,
+        totalItemCount: Int
+    ) -> PDFImportProgressHandler {
+        { [weak self] update in
+            Task { @MainActor [weak self] in
+                self?.publishExternalImportProgress(
+                    update,
+                    generation: generation,
+                    currentName: currentName,
+                    completedItemCount: completedItemCount,
+                    totalItemCount: totalItemCount
+                )
+            }
+        }
+    }
+
+    private func publishExternalImportProgress(
+        _ update: PDFImportProgressUpdate,
+        generation: UUID,
+        currentName: String,
+        completedItemCount: Int,
+        totalItemCount: Int
+    ) {
+        guard externalPDFImportGeneration == generation else { return }
+        let total = max(1, totalItemCount)
+        let completed = min(max(0, completedItemCount), total)
+        guard total >= externalImportKnownTotalCount,
+              completed >= externalImportCompletedItemCount
+        else {
+            return
+        }
+        let itemFraction = min(
+            1,
+            max(0, update.fractionCompleted)
+        )
+        if completed > externalImportCompletedItemCount {
+            externalImportRateWindow.reset()
+            externalImportCurrentItemFraction = 0
+        } else if itemFraction < externalImportCurrentItemFraction {
+            return
+        }
+        externalImportCompletedItemCount = completed
+        externalImportCurrentItemFraction = itemFraction
+
+        let currentProgress = externalImportProgress
+        let totalChanged = externalImportKnownTotalCount != total
+        externalImportKnownTotalCount = total
+        let aggregateFraction = (
+            Double(completed) + itemFraction
+        ) / Double(total)
+        let isCopying = update.stage == .copying
+            && update.totalBytes > 0
+        let now = Date()
+        let didAdvanceBytes = currentProgress?.byteStage != .copying
+            || update.processedBytes
+                > (currentProgress?.processedBytes ?? 0)
+        let bytesPerSecond: Double
+        let throughputHistory: [Double]
+        if isCopying {
+            bytesPerSecond = externalImportRateWindow.update(
+                stage: .copying,
+                processedBytes: update.processedBytes,
+                at: now
+            )
+            throughputHistory = externalImportRateWindow.history
+        } else {
+            bytesPerSecond = 0
+            throughputHistory = []
+        }
+        externalImportProgress = PDFOperationProgress(
+            label: AppLocalization.format(
+                "%lld of %lld · %@ · %@",
+                min(completed + 1, total),
+                total,
+                update.stage.title.localizedUI,
+                externalImportDisplayName(currentName)
+            ),
+            fractionCompleted: totalChanged
+                ? aggregateFraction
+                : max(
+                    currentProgress?.fractionCompleted ?? 0,
+                    aggregateFraction
+                ),
+            byteStage: isCopying ? .copying : nil,
+            processedBytes: isCopying
+                ? update.processedBytes
+                : 0,
+            totalBytes: isCopying ? update.totalBytes : 0,
+            bytesPerSecond: bytesPerSecond,
+            estimatedRemainingSeconds:
+                isCopying
+                    && bytesPerSecond > 0
+                    ? Double(
+                        max(
+                            0,
+                            update.totalBytes
+                                - update.processedBytes
+                        )
+                    ) / bytesPerSecond
+                    : nil,
+            throughputHistory: throughputHistory,
+            lastByteUpdateAt:
+                isCopying
+                    ? didAdvanceBytes
+                        ? now
+                        : currentProgress?.lastByteUpdateAt
+                    : nil
+        )
+    }
+
+    private func externalImportDisplayName(_ value: String) -> String {
+        let sanitized = value.components(
+            separatedBy: .controlCharacters
+        ).joined()
+        let trimmed = sanitized.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        return String(
+            (trimmed.isEmpty ? "Document".localizedUI : trimmed)
+                .prefix(64)
+        )
+    }
+
+    nonisolated private static func shouldDiscardSharedInboxItem(
+        after error: Error
+    ) -> Bool {
+        guard let paperPathError = error as? PaperPathError
+        else { return false }
+        switch paperPathError {
+        case .unreadablePDF,
+             .lockedPDF,
+             .fileTooLarge:
+            return true
+        case .unreadableImage,
+             .invalidPage,
+             .cannotDeleteOnlyPage,
+             .cameraUnavailable,
+             .emptyScan,
+             .insufficientSelection,
+             .insufficientStorage,
+             .outputVerificationFailed,
+             .invalidPassword,
+             .missingRecognizedText,
+             .storageFailure:
+            return false
+        }
+    }
+
+    private func finishImportOperation(_ token: UUID) {
+        activeImportOperations.remove(token)
+        isImporting = !activeImportOperations.isEmpty
     }
 
     private func safeExportName(_ value: String) -> String {
@@ -10090,6 +17273,40 @@ final class PaperPathModel: ObservableObject {
         return String((normalized.isEmpty ? "Document" : normalized).prefix(64))
     }
 
+    private func officeShareDestinationURL(
+        for receipt: PDFOfficeExportReceipt
+    ) -> URL {
+        let fileExtension = receipt.format.fileExtension
+        let extensionSuffix = ".\(fileExtension)"
+        let sourceName = receipt.fileName
+        let stem = sourceName.lowercased().hasSuffix(
+            extensionSuffix.lowercased()
+        )
+            ? String(sourceName.dropLast(extensionSuffix.count))
+            : sourceName
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                PaperPathTemporaryArtifact.officeSharePrefix
+                    + UUID().uuidString,
+                isDirectory: true
+            )
+        return directory
+            .appendingPathComponent(safeExportName(stem))
+            .appendingPathExtension(fileExtension)
+    }
+
+    private func saturatedByteTotal<S: Sequence>(
+        _ values: S,
+        reserve: Int64 = 0
+    ) -> Int64 where S.Element == Int64 {
+        values.reduce(max(0, reserve)) { total, value in
+            let (sum, overflow) = total.addingReportingOverflow(
+                max(0, value)
+            )
+            return overflow ? .max : sum
+        }
+    }
+
     private func rebuildSearchCorpora() {
         searchMetadataCorpora = Dictionary(
             documents.map { record in
@@ -10106,15 +17323,28 @@ final class PaperPathModel: ObservableObject {
         let entityText = record.brief?.entities
             .map(\.value)
             .joined(separator: " ") ?? ""
-        return [
-            record.displayName,
-            record.tags.joined(separator: " "),
-            record.brief?.category.title ?? "",
-            record.brief?.summary ?? "",
-            entityText
-        ]
-        .joined(separator: "\n")
-        .lowercased()
+        return DocumentSearchNormalization.text(
+            [
+                record.displayName,
+                record.tags.joined(separator: " "),
+                record.brief?.category.title ?? "",
+                record.brief?.summary ?? "",
+                entityText
+            ]
+            .joined(separator: "\n")
+        )
+    }
+
+    func librarySearchMetadataCorpus(
+        for recordID: UUID
+    ) -> String {
+        if let cached = searchMetadataCorpora[recordID] {
+            return cached
+        }
+        guard let record = documentRecordsByID[recordID] else {
+            return ""
+        }
+        return searchMetadataCorpus(for: record)
     }
 
     private func matchesSearchTerms(
@@ -10146,13 +17376,15 @@ final class PaperPathModel: ObservableObject {
             return textIndex(index, containsAll: unresolved)
         }
 
-        let corpus = index.text.lowercased()
+        let corpus = DocumentSearchNormalization.text(index.text)
         let cost = corpus.utf8.count
         let maximumTotalCost = 12 * 1_024 * 1_024
-        if searchTextCorpusCost + cost <= maximumTotalCost {
+        let (nextCost, overflow) =
+            searchTextCorpusCost.addingReportingOverflow(cost)
+        if !overflow, nextCost <= maximumTotalCost {
             searchTextCorpora[record.id] = corpus
             searchTextCorpusCosts[record.id] = cost
-            searchTextCorpusCost += cost
+            searchTextCorpusCost = nextCost
         } else {
             streamingSearchTextRecordIDs.insert(record.id)
         }
@@ -10163,23 +17395,35 @@ final class PaperPathModel: ObservableObject {
         _ index: DocumentTextIndex,
         containsAll terms: [String]
     ) -> Bool {
-        terms.allSatisfy { term in
-            index.pages.contains {
-                $0.text.localizedCaseInsensitiveContains(term)
+        var remaining = Set(terms)
+        for page in index.pages {
+            let searchableText =
+                DocumentSearchNormalization.text(page.text)
+            for term in terms
+            where remaining.contains(term)
+                && searchableText.contains(term) {
+                remaining.remove(term)
+            }
+            if remaining.isEmpty {
+                return true
             }
         }
+        return false
     }
 
     private func removeSearchTextCorpus(recordID: UUID) {
         searchTextCorpora[recordID] = nil
         streamingSearchTextRecordIDs.remove(recordID)
-        searchTextCorpusCost = max(
-            0,
-            searchTextCorpusCost
-                - (searchTextCorpusCosts.removeValue(
-                    forKey: recordID
-                ) ?? 0)
-        )
+        let removedCost = searchTextCorpusCosts.removeValue(
+            forKey: recordID
+        ) ?? 0
+        let (nextCost, overflow) =
+            searchTextCorpusCost.subtractingReportingOverflow(
+                removedCost
+            )
+        searchTextCorpusCost = overflow
+            ? 0
+            : max(0, nextCost)
     }
 
     private func releaseSearchTextCorpora() {
@@ -10192,14 +17436,27 @@ final class PaperPathModel: ObservableObject {
     }
 
     private func seedDemo() async throws {
-        let fixtures: [(String, (URL) throws -> Void)] = [
+        var fixtures: [(String, (URL) throws -> Void)] = [
             ("Project handoff", DemoPDFBuilder.create),
             ("August invoice", DemoPDFBuilder.createInvoice),
             ("Site review report", DemoPDFBuilder.createReport)
         ]
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains(
+            "UITEST_OFFICE_SOAK_DEMO"
+        ) {
+            fixtures.append(
+                ("Office stress", DemoPDFBuilder.createOfficeSoak)
+            )
+        }
+#endif
         for (name, builder) in fixtures {
-            let temporaryURL = temporaryPDFURL(prefix: "Demo")
-            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+            let temporaryArtifact = ProtectedTemporaryPDF(
+                prefix: "PaperPath-DocumentExport-"
+            )
+            let temporaryURL = temporaryArtifact.fileURL
+            defer { temporaryArtifact.remove() }
+            try temporaryArtifact.prepare()
             try builder(temporaryURL)
             _ = try await store.importPDF(
                 from: temporaryURL,
@@ -10208,4 +17465,21 @@ final class PaperPathModel: ObservableObject {
             )
         }
     }
+
+#if DEBUG
+    private func prepareFindIndexForUITest() async {
+        guard let record = documents.first(where: {
+            $0.displayName == "Project handoff"
+        }),
+        let url = documentURLs[record.id] else { return }
+        let textService = textIndexService
+        let worker = Task.detached(priority: .userInitiated) {
+            try textService.extractNativeText(from: url)
+        }
+        guard let index = try? await worker.value else { return }
+        textIndices[record.id] = index
+        touchResidentAnalysis(record.id)
+        trimResidentAnalysisCache()
+    }
+#endif
 }

@@ -6,19 +6,64 @@ enum PDFTestFixtureFactory {
         let fileName: String
         let data: Data
         let declaredSize: Int?
+        let includesDeclaredSize: Bool
+        let filterName: String?
 
         init(
             fileName: String,
             data: Data,
-            declaredSize: Int? = nil
+            declaredSize: Int? = nil,
+            includesDeclaredSize: Bool = true,
+            filterName: String? = nil
         ) {
             self.fileName = fileName
             self.data = data
             self.declaredSize = declaredSize
+            self.includesDeclaredSize = includesDeclaredSize
+            self.filterName = filterName
         }
     }
 
-    private struct PDFObject {
+    static func makeSignaturePNG(seed: Int = 0) -> Data {
+        let size = CGSize(width: 32, height: 16)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = false
+        let image = UIGraphicsImageRenderer(
+            size: size,
+            format: format
+        ).image { context in
+            UIColor.clear.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            UIColor(
+                hue: CGFloat((seed * 37) % 255) / 255,
+                saturation: 0.85,
+                brightness: 0.75,
+                alpha: 1
+            ).setStroke()
+            let path = UIBezierPath()
+            path.lineWidth = 2
+            path.move(to: CGPoint(x: 2, y: 12))
+            path.addCurve(
+                to: CGPoint(x: 30, y: 4),
+                controlPoint1: CGPoint(
+                    x: CGFloat(8 + seed % 5),
+                    y: 1
+                ),
+                controlPoint2: CGPoint(
+                    x: CGFloat(18 + seed % 7),
+                    y: 15
+                )
+            )
+            path.stroke()
+        }
+        guard let data = image.pngData() else {
+            preconditionFailure("Could not encode signature fixture")
+        }
+        return data
+    }
+
+    struct PDFObject {
         let number: Int
         let dictionary: String
         let stream: Data?
@@ -121,6 +166,21 @@ enum PDFTestFixtureFactory {
 
             """
         )
+    }
+
+    static func makeTrailingPaddedPDF(
+        at url: URL,
+        paddingBytes: Int64
+    ) throws {
+        precondition(paddingBytes > 0)
+        try makeTextPDF(at: url, pageCount: 1)
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        let endOffset = try handle.seekToEnd()
+        try handle.seek(
+            toOffset: endOffset + UInt64(paddingBytes) - 1
+        )
+        try handle.write(contentsOf: Data([0]))
     }
 
     static func makeTextPDF(
@@ -229,6 +289,12 @@ enum PDFTestFixtureFactory {
         )
         let declaredSize = attachment.declaredSize
             ?? attachment.data.count
+        let params = attachment.includesDeclaredSize
+            ? "/Params << /Size \(declaredSize) >> "
+            : ""
+        let filter = attachment.filterName.map {
+            "/Filter /\($0) "
+        } ?? ""
         let fileNameHex = hexString(attachment.fileName)
         let objects = [
             PDFObject(
@@ -271,7 +337,7 @@ enum PDFTestFixtureFactory {
             PDFObject(
                 8,
                 """
-                << /Type /EmbeddedFile /Subtype /text#2Fplain /Params << /Size \(declaredSize) >> /Length \(attachment.data.count) >>
+                << /Type /EmbeddedFile /Subtype /text#2Fplain \(params)\(filter)/Length \(attachment.data.count) >>
                 """,
                 stream: attachment.data
             )
@@ -381,7 +447,7 @@ enum PDFTestFixtureFactory {
         )
     }
 
-    private static func writeClassicPDF(
+    static func writeClassicPDF(
         objects: [PDFObject],
         rootObjectNumber: Int,
         to url: URL
@@ -692,7 +758,13 @@ struct StoredZIPArchiveFixture {
             through: minimumOffset,
             by: -1
         ) {
-            if try data.fixtureUInt32(at: offset) == 0x06054b50 {
+            guard try data.fixtureUInt32(at: offset) == 0x06054b50 else {
+                continue
+            }
+            let commentLength = Int(
+                try data.fixtureUInt16(at: offset + 20)
+            )
+            if offset + 22 + commentLength == data.count {
                 return offset
             }
         }

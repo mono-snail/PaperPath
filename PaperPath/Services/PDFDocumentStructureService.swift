@@ -16,9 +16,122 @@ struct PDFStructuralPreservationSignature: Equatable, Sendable {
 }
 
 struct PDFDocumentStructureService: Sendable {
+    private static let maximumPageCount = 100_000
+    private static let maximumAnnotationsPerPage = 4_096
+    private static let maximumAnnotationsScanned = 100_000
+    private static let maximumFormFieldCount = 100_000
     private static let maximumAttachmentCount = 256
     private static let maximumAttachmentBytes = 64 * 1_024 * 1_024
     private static let maximumDecodedBytes = 192 * 1_024 * 1_024
+    private static let maximumPreservedAttachmentBytes =
+        64 * 1_024 * 1_024
+    private static let maximumSourceBytes: Int64 =
+        1_024 * 1_024 * 1_024
+
+    static func unfilteredAttachmentCopyIsBounded(
+        sourceByteCount: Int
+    ) -> Bool {
+        sourceByteCount > 0
+            && sourceByteCount <= Self.maximumAttachmentBytes
+    }
+
+    private func readableSourceByteCount(at url: URL) throws -> Int {
+        try Task.checkCancellation()
+        let values = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let byteCount = values.fileSize,
+              byteCount > 0,
+              Int64(byteCount) <= Self.maximumSourceBytes
+        else {
+            throw PaperPathError.fileTooLarge
+        }
+        return byteCount
+    }
+
+    private func requireTemporaryWriteCapacity(
+        at destinationURL: URL,
+        byteCount: Int
+    ) throws {
+        guard byteCount >= 0 else {
+            throw PaperPathError.outputVerificationFailed(
+                "an extracted attachment has an invalid size"
+            )
+        }
+        let parentURL = destinationURL.deletingLastPathComponent()
+        let values = try parentURL.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        )
+        guard let available =
+                values.volumeAvailableCapacityForImportantUsage
+        else { return }
+        let required = Int64(byteCount)
+            .addingReportingOverflow(16 * 1_024 * 1_024)
+        guard !required.overflow,
+              available >= required.partialValue
+        else {
+            throw PaperPathError.insufficientStorage
+        }
+    }
+
+    func fileSHA256(
+        at url: URL,
+        expectedByteCount: Int
+    ) throws -> String {
+        guard expectedByteCount >= 0 else {
+            throw PaperPathError.outputVerificationFailed(
+                "an extracted attachment has an invalid size"
+            )
+        }
+        let values = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              values.fileSize == expectedByteCount
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the extracted attachment size changed after writing"
+            )
+        }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var totalByteCount = 0
+        while true {
+            try Task.checkCancellation()
+            let chunk = try handle.read(upToCount: 1_048_576)
+                ?? Data()
+            guard !chunk.isEmpty else { break }
+            let (nextTotal, overflow) = totalByteCount
+                .addingReportingOverflow(chunk.count)
+            guard !overflow, nextTotal <= expectedByteCount else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the extracted attachment exceeded its expected size"
+                )
+            }
+            totalByteCount = nextTotal
+            hasher.update(data: chunk)
+        }
+        guard totalByteCount == expectedByteCount else {
+            throw PaperPathError.outputVerificationFailed(
+                "the extracted attachment ended before its expected size"
+            )
+        }
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
 
     func attachments(
         in url: URL,
@@ -26,7 +139,8 @@ struct PDFDocumentStructureService: Sendable {
     ) throws -> [PDFEmbeddedAttachmentSnapshot] {
         try decodedAttachmentPayloads(
             in: url,
-            unlockPassword: unlockPassword
+            unlockPassword: unlockPassword,
+            retainingDataFor: []
         ).map(\.snapshot)
     }
 
@@ -36,7 +150,9 @@ struct PDFDocumentStructureService: Sendable {
     ) throws -> [PDFEmbeddedAttachmentPayload] {
         try decodedAttachmentPayloads(
             in: url,
-            unlockPassword: unlockPassword
+            unlockPassword: unlockPassword,
+            maximumDecodedBytes:
+                Self.maximumPreservedAttachmentBytes
         )
     }
 
@@ -51,7 +167,8 @@ struct PDFDocumentStructureService: Sendable {
             )
         }
         let selected = try decodedAttachmentPayloads(
-            in: sourceURL
+            in: sourceURL,
+            retainingDataFor: attachmentIDs
         ).filter {
             attachmentIDs.contains($0.snapshot.id)
         }
@@ -74,7 +191,20 @@ struct PDFDocumentStructureService: Sendable {
             withIntermediateDirectories: true,
             attributes: nil
         )
-        LocalFileSecurity.applyCompleteProtection(
+        let directoryValues = try directory.resourceValues(
+            forKeys: [
+                .isDirectoryKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard directoryValues.isDirectory == true,
+              directoryValues.isSymbolicLink != true
+        else {
+            throw PaperPathError.storageFailure(
+                "The attachment export folder is invalid."
+            )
+        }
+        try LocalFileSecurity.requireCompleteProtection(
             to: directory,
             fileManager: fileManager
         )
@@ -96,19 +226,20 @@ struct PDFDocumentStructureService: Sendable {
                 )
                 let destination = directory
                     .appendingPathComponent(fileName, isDirectory: false)
+                try requireTemporaryWriteCapacity(
+                    at: destination,
+                    byteCount: data.count
+                )
                 try data.write(to: destination, options: .atomic)
-                LocalFileSecurity.applyCompleteProtection(
+                try LocalFileSecurity.requireCompleteProtection(
                     to: destination,
                     fileManager: fileManager
                 )
-                let reopened = try Data(
-                    contentsOf: destination,
-                    options: .mappedIfSafe
+                let writtenDigest = try fileSHA256(
+                    at: destination,
+                    expectedByteCount: payload.snapshot.byteCount
                 )
-                guard reopened.count == payload.snapshot.byteCount,
-                      Self.digest(reopened)
-                        == payload.snapshot.checksum
-                else {
+                guard writtenDigest == payload.snapshot.checksum else {
                     throw PaperPathError.outputVerificationFailed(
                         "the extracted file bytes did not match the PDF attachment"
                     )
@@ -147,13 +278,16 @@ struct PDFDocumentStructureService: Sendable {
         } == true
         return try (0..<document.pageCount).map { index in
             try Task.checkCancellation()
-            let value = document.page(at: index)?.label?
+            guard let page = document.page(at: index) else {
+                throw PaperPathError.invalidPage
+            }
+            let value = page.label?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             return PDFPageLabelSnapshot(
                 pageIndex: index,
-                label: value?.isEmpty == false
-                    ? value!
-                    : String(index + 1),
+                label: value.flatMap {
+                    $0.isEmpty ? nil : $0
+                } ?? String(index + 1),
                 isExplicit: hasExplicitLabels
             )
         }
@@ -178,11 +312,12 @@ struct PDFDocumentStructureService: Sendable {
             max(1, min($0, 10_001))
         }
         var results: [PDFAnnotationSnapshot] = []
+        var scannedAnnotationCount = 0
         for pageIndex in 0..<document.numberOfPages {
             try Task.checkCancellation()
             guard let page = document.page(at: pageIndex + 1),
                   let pageDictionary = page.dictionary
-            else { continue }
+            else { throw PaperPathError.invalidPage }
             var annotations: CGPDFArrayRef?
             guard CGPDFDictionaryGetArray(
                 pageDictionary,
@@ -191,8 +326,27 @@ struct PDFDocumentStructureService: Sendable {
             ),
                   let annotations
             else { continue }
-            let count = min(CGPDFArrayGetCount(annotations), 4_096)
+            let count = CGPDFArrayGetCount(annotations)
+            guard count <= Self.maximumAnnotationsPerPage else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to inspect safely."
+                )
+            }
+            let nextScannedCount = scannedAnnotationCount
+                .addingReportingOverflow(count)
+            guard !nextScannedCount.overflow,
+                  nextScannedCount.partialValue
+                    <= Self.maximumAnnotationsScanned
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This PDF contains too many annotations to inspect safely."
+                )
+            }
+            scannedAnnotationCount = nextScannedCount.partialValue
             for rawIndex in 0..<count {
+                if rawIndex.isMultiple(of: 64) {
+                    try Task.checkCancellation()
+                }
                 if let maximumResults,
                    results.count >= maximumResults {
                     return results
@@ -259,6 +413,21 @@ struct PDFDocumentStructureService: Sendable {
             at: url,
             password: unlockPassword
         )
+        var annotationCounts: [Int] = []
+        annotationCounts.reserveCapacity(document.pageCount)
+        for pageIndex in 0..<document.pageCount {
+            try Task.checkCancellation()
+            guard let page = document.page(at: pageIndex) else {
+                throw PaperPathError.invalidPage
+            }
+            let annotationCount = page.annotations.count
+            guard annotationCount <= Self.maximumAnnotationsPerPage else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to inspect safely."
+                )
+            }
+            annotationCounts.append(annotationCount)
+        }
         let attachments = try attachments(
             in: url,
             unlockPassword: unlockPassword
@@ -284,11 +453,17 @@ struct PDFDocumentStructureService: Sendable {
         }.sorted()
         var outlineEntries: [String] = []
         if let root = document.outlineRoot {
-            func walk(_ item: PDFOutline, depth: Int) {
+            func walk(_ item: PDFOutline, depth: Int) throws {
                 guard depth < 24,
                       outlineEntries.count < 2_000
                 else { return }
                 for index in 0..<item.numberOfChildren {
+                    if index.isMultiple(of: 64) {
+                        try Task.checkCancellation()
+                    }
+                    guard outlineEntries.count < 2_000 else {
+                        break
+                    }
                     guard let child = item.child(at: index) else {
                         continue
                     }
@@ -298,10 +473,10 @@ struct PDFDocumentStructureService: Sendable {
                     outlineEntries.append(
                         "\(depth)|\(child.label ?? "")|\(pageIndex)"
                     )
-                    walk(child, depth: depth + 1)
+                    try walk(child, depth: depth + 1)
                 }
             }
-            walk(root, depth: 0)
+            try walk(root, depth: 0)
         }
         let labels = includePageLabels
             ? try pageLabels(
@@ -312,9 +487,7 @@ struct PDFDocumentStructureService: Sendable {
             }
             : nil
         return PDFStructuralPreservationSignature(
-            annotationCounts: (0..<document.pageCount).map {
-                document.page(at: $0)?.annotations.count ?? 0
-            },
+            annotationCounts: annotationCounts,
             attachments: attachments,
             readOnlyReviews: reviews,
             outlineEntries: outlineEntries,
@@ -336,6 +509,7 @@ struct PDFDocumentStructureService: Sendable {
            !unlockPassword.isEmpty {
             _ = document.unlock(withPassword: unlockPassword)
         }
+        try Self.requireSupportedPageCount(document.pageCount)
 
         let byteCount = (try? url.resourceValues(
             forKeys: [.fileSizeKey]
@@ -375,22 +549,46 @@ struct PDFDocumentStructureService: Sendable {
         var formFieldCount = 0
         for index in 0..<document.pageCount {
             try Task.checkCancellation()
-            formFieldCount += document.page(at: index)?.annotations
-                .reduce(into: 0) { pageCount, annotation in
+            guard let page = document.page(at: index) else {
+                throw PaperPathError.invalidPage
+            }
+            for (annotationIndex, annotation) in
+                page.annotations.enumerated() {
+                if annotationIndex.isMultiple(of: 64) {
+                    try Task.checkCancellation()
+                }
                 let type = annotation.type?
                     .trimmingCharacters(
                         in: CharacterSet(charactersIn: "/")
                     )
                     .lowercased()
-                if type == PDFAnnotationSubtype.widget.rawValue
+                let widgetType = PDFAnnotationSubtype.widget.rawValue
+                    .trimmingCharacters(
+                        in: CharacterSet(charactersIn: "/")
+                    )
                     .lowercased()
+                if type == widgetType
                     || annotation.fieldName != nil {
-                    pageCount += 1
+                    guard formFieldCount
+                        < Self.maximumFormFieldCount
+                    else {
+                        throw PaperPathError.insufficientSelection(
+                            "This PDF contains too many form fields to inspect safely."
+                        )
+                    }
+                    formFieldCount += 1
                 }
-                } ?? 0
+            }
         }
         let hasExplicitPageLabels = signature.pageLabels?
             .contains { $0.hasSuffix("|true") } ?? false
+        let annotationCount = signature.annotationCounts.reduce(0) {
+            count, pageCount in
+            let (next, overflow) = count.addingReportingOverflow(
+                max(0, pageCount)
+            )
+            return overflow ? .max : next
+        }
 
         return PDFTechnicalInspection(
             byteCount: byteCount,
@@ -402,7 +600,7 @@ struct PDFDocumentStructureService: Sendable {
                     ? profile.imageDominantPageCount
                     : nil,
             formFieldCount: formFieldCount,
-            annotationCount: signature.annotationCounts.reduce(0, +),
+            annotationCount: annotationCount,
             attachmentCount: signature.attachments.count,
             outlineEntryCount: signature.outlineEntries.count,
             hasExplicitPageLabels: hasExplicitPageLabels,
@@ -426,18 +624,60 @@ struct PDFDocumentStructureService: Sendable {
         )
     }
 
-    private func decodedAttachmentPayloads(
+    func decodedAttachmentPayloads(
         in url: URL,
-        unlockPassword: String? = nil
+        unlockPassword: String? = nil,
+        retainingDataFor retainedAttachmentIDs: Set<String>? = nil,
+        maximumDecodedBytes: Int = Self.maximumDecodedBytes
     ) throws -> [PDFEmbeddedAttachmentPayload] {
-        _ = try unlockedPDFDocument(
-            at: url,
-            password: unlockPassword
-        )
-        let document = try unlockedCGPDFDocument(
-            at: url,
-            password: unlockPassword
-        )
+        let sourceByteCount = try readableSourceByteCount(at: url)
+        guard maximumDecodedBytes > 0,
+              maximumDecodedBytes <= Self.maximumDecodedBytes
+        else {
+            throw PaperPathError.insufficientSelection(
+                "The attachment memory budget is invalid."
+            )
+        }
+        let stableSourceData: Data?
+        if Self.unfilteredAttachmentCopyIsBounded(
+            sourceByteCount: sourceByteCount
+        ) {
+            let data = try Data(
+                contentsOf: url,
+                options: .alwaysMapped
+            )
+            guard data.count == sourceByteCount,
+                  Self.unfilteredAttachmentCopyIsBounded(
+                    sourceByteCount: data.count
+                  )
+            else {
+                throw PaperPathError.fileTooLarge
+            }
+            stableSourceData = data
+        } else {
+            stableSourceData = nil
+        }
+
+        let document: CGPDFDocument
+        if let stableSourceData {
+            _ = try unlockedPDFDocument(
+                data: stableSourceData,
+                password: unlockPassword
+            )
+            document = try unlockedCGPDFDocument(
+                data: stableSourceData,
+                password: unlockPassword
+            )
+        } else {
+            _ = try unlockedPDFDocument(
+                at: url,
+                password: unlockPassword
+            )
+            document = try unlockedCGPDFDocument(
+                at: url,
+                password: unlockPassword
+            )
+        }
         guard let catalog = document.catalog else {
             throw PaperPathError.unreadablePDF
         }
@@ -452,14 +692,17 @@ struct PDFDocumentStructureService: Sendable {
             pageIndex: Int?,
             origin: PDFEmbeddedAttachmentOrigin
         ) {
-            guard results.count < Self.maximumAttachmentCount,
+            guard !Task.isCancelled,
+                  results.count < Self.maximumAttachmentCount,
                   let payload = attachmentPayload(
                       fileSpec: fileSpec,
                       fallbackName: fallbackName,
                       fallbackDescription: description,
                       pageIndex: pageIndex,
                       origin: origin,
-                      decodedByteCount: &decodedByteCount
+                      decodedByteCount: decodedByteCount,
+                      maximumDecodedBytes: maximumDecodedBytes,
+                      sourceByteCount: sourceByteCount
                   )
             else { return }
             let duplicate = results.contains {
@@ -480,7 +723,18 @@ struct PDFDocumentStructureService: Sendable {
                     )
             }
             if !duplicate {
-                results.append(payload)
+                if let data = payload.data {
+                    decodedByteCount += data.count
+                }
+                let keepsData = retainedAttachmentIDs.map {
+                    $0.contains(payload.snapshot.id)
+                } ?? true
+                results.append(
+                    PDFEmbeddedAttachmentPayload(
+                        snapshot: payload.snapshot,
+                        data: keepsData ? payload.data : nil
+                    )
+                )
             }
         }
 
@@ -488,7 +742,7 @@ struct PDFDocumentStructureService: Sendable {
             try Task.checkCancellation()
             guard let page = document.page(at: pageIndex + 1),
                   let pageDictionary = page.dictionary
-            else { continue }
+            else { throw PaperPathError.invalidPage }
 
             if let associatedFiles = pdfArray(
                 in: pageDictionary,
@@ -506,7 +760,12 @@ struct PDFDocumentStructureService: Sendable {
                 in: pageDictionary,
                 key: "Annots"
             ) else { continue }
-            let count = min(CGPDFArrayGetCount(annotations), 4_096)
+            let count = CGPDFArrayGetCount(annotations)
+            guard count <= Self.maximumAnnotationsPerPage else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to inspect safely."
+                )
+            }
             for annotationIndex in 0..<count {
                 var annotation: CGPDFDictionaryRef?
                 guard CGPDFArrayGetDictionary(
@@ -568,6 +827,7 @@ struct PDFDocumentStructureService: Sendable {
             }
         }
 
+        try Task.checkCancellation()
         return results.sorted {
             switch ($0.snapshot.pageIndex, $1.snapshot.pageIndex) {
             case let (.some(left), .some(right)):
@@ -600,6 +860,26 @@ struct PDFDocumentStructureService: Sendable {
                 throw PaperPathError.lockedPDF
             }
         }
+        try Self.requireSupportedPageCount(document.pageCount)
+        return document
+    }
+
+    private func unlockedPDFDocument(
+        data: Data,
+        password: String?
+    ) throws -> PDFDocument {
+        guard let document = PDFDocument(data: data) else {
+            throw PaperPathError.unreadablePDF
+        }
+        if document.isLocked {
+            guard let password,
+                  !password.isEmpty,
+                  document.unlock(withPassword: password)
+            else {
+                throw PaperPathError.lockedPDF
+            }
+        }
+        try Self.requireSupportedPageCount(document.pageCount)
         return document
     }
 
@@ -620,7 +900,44 @@ struct PDFDocumentStructureService: Sendable {
                 throw PaperPathError.lockedPDF
             }
         }
+        try Self.requireSupportedPageCount(document.numberOfPages)
         return document
+    }
+
+    private func unlockedCGPDFDocument(
+        data: Data,
+        password: String?
+    ) throws -> CGPDFDocument {
+        guard let provider = CGDataProvider(data: data as CFData),
+              let document = CGPDFDocument(provider)
+        else {
+            throw PaperPathError.unreadablePDF
+        }
+        if document.isEncrypted && !document.isUnlocked {
+            guard let password,
+                  !password.isEmpty,
+                  password.withCString({
+                      document.unlockWithPassword($0)
+                  })
+            else {
+                throw PaperPathError.lockedPDF
+            }
+        }
+        try Self.requireSupportedPageCount(document.numberOfPages)
+        return document
+    }
+
+    private static func requireSupportedPageCount(
+        _ pageCount: Int
+    ) throws {
+        guard pageCount > 0 else {
+            throw PaperPathError.unreadablePDF
+        }
+        guard pageCount <= Self.maximumPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Inspect PDFs with up to 100,000 pages."
+            )
+        }
     }
 
     private func appendFileSpecs(
@@ -637,6 +954,7 @@ struct PDFDocumentStructureService: Sendable {
     ) {
         let count = min(CGPDFArrayGetCount(array), 4_096)
         for index in 0..<count {
+            guard !Task.isCancelled else { return }
             var fileSpec: CGPDFDictionaryRef?
             guard CGPDFArrayGetDictionary(
                 array,
@@ -661,13 +979,17 @@ struct PDFDocumentStructureService: Sendable {
         remainingNodeBudget: inout Int,
         visit: (String?, CGPDFDictionaryRef) -> Void
     ) {
-        guard depth < 16, remainingNodeBudget > 0 else { return }
+        guard !Task.isCancelled,
+              depth < 16,
+              remainingNodeBudget > 0
+        else { return }
         remainingNodeBudget -= 1
 
         if let names = pdfArray(in: node, key: "Names") {
             let count = min(CGPDFArrayGetCount(names), 8_192)
             var index = 0
             while index + 1 < count {
+                guard !Task.isCancelled else { return }
                 var nameValue: CGPDFStringRef?
                 var fileSpec: CGPDFDictionaryRef?
                 let hasName = CGPDFArrayGetString(
@@ -717,7 +1039,9 @@ struct PDFDocumentStructureService: Sendable {
         fallbackDescription: String?,
         pageIndex: Int?,
         origin: PDFEmbeddedAttachmentOrigin,
-        decodedByteCount: inout Int
+        decodedByteCount: Int,
+        maximumDecodedBytes: Int,
+        sourceByteCount: Int
     ) -> PDFEmbeddedAttachmentPayload? {
         guard let embeddedFiles = pdfDictionary(
             in: fileSpec,
@@ -743,6 +1067,17 @@ struct PDFDocumentStructureService: Sendable {
         }.flatMap {
             pdfInteger(in: $0, key: "Size")
         }
+        let encodedSize = streamDictionary.flatMap {
+            pdfInteger(in: $0, key: "Length")
+        }
+        var filterObject: CGPDFObjectRef?
+        let hasFilter = streamDictionary.map {
+            CGPDFDictionaryGetObject(
+                $0,
+                "Filter",
+                &filterObject
+            )
+        } ?? false
         let fileName = normalizedAttachmentName(
             pdfString(in: fileSpec, key: "UF")
                 ?? pdfString(in: fileSpec, key: "F")
@@ -755,19 +1090,115 @@ struct PDFDocumentStructureService: Sendable {
             pdfName(in: $0, key: "Subtype")
         }.map(decodePDFName)
 
-        if let declaredSize,
-           declaredSize > Self.maximumAttachmentBytes {
+        if hasFilter {
+            let limitation = declaredSize == nil
+                ? "Compressed attachment is missing a trusted decoded size"
+                : "Compressed attachments cannot be decoded within the local safety limit"
             let snapshot = attachmentSnapshot(
                 fileName: fileName,
                 contentType: contentType,
-                byteCount: declaredSize,
+                byteCount: max(0, declaredSize ?? encodedSize ?? 0),
+                checksum: "",
+                description: description,
+                pageIndex: pageIndex,
+                origin: origin,
+                isExtractable: false,
+                limitation: limitation
+            )
+            return PDFEmbeddedAttachmentPayload(
+                snapshot: snapshot,
+                data: nil
+            )
+        }
+
+        let trustedDecodedSize: Int?
+        if let declaredSize, declaredSize >= 0 {
+            trustedDecodedSize = declaredSize
+        } else if let encodedSize,
+                  encodedSize >= 0 {
+            trustedDecodedSize = encodedSize
+        } else {
+            trustedDecodedSize = nil
+        }
+        guard let trustedDecodedSize else {
+            let snapshot = attachmentSnapshot(
+                fileName: fileName,
+                contentType: contentType,
+                byteCount: max(0, encodedSize ?? 0),
                 checksum: "",
                 description: description,
                 pageIndex: pageIndex,
                 origin: origin,
                 isExtractable: false,
                 limitation:
-                    "Larger than the 64 MB local extraction limit"
+                    "Compressed attachment is missing a trusted decoded size"
+            )
+            return PDFEmbeddedAttachmentPayload(
+                snapshot: snapshot,
+                data: nil
+            )
+        }
+
+        let remainingBudget = max(
+            0,
+            maximumDecodedBytes - decodedByteCount
+        )
+        guard let encodedSize, encodedSize >= 0 else {
+            let snapshot = attachmentSnapshot(
+                fileName: fileName,
+                contentType: contentType,
+                byteCount: trustedDecodedSize,
+                checksum: "",
+                description: description,
+                pageIndex: pageIndex,
+                origin: origin,
+                isExtractable: false,
+                limitation: "Attachment stream size is unavailable"
+            )
+            return PDFEmbeddedAttachmentPayload(
+                snapshot: snapshot,
+                data: nil
+            )
+        }
+        guard Self.unfilteredAttachmentCopyIsBounded(
+            sourceByteCount: sourceByteCount
+        ) else {
+            let snapshot = attachmentSnapshot(
+                fileName: fileName,
+                contentType: contentType,
+                byteCount: trustedDecodedSize,
+                checksum: "",
+                description: description,
+                pageIndex: pageIndex,
+                origin: origin,
+                isExtractable: false,
+                limitation:
+                    "Source PDF is larger than the 64 MB safe attachment extraction limit"
+            )
+            return PDFEmbeddedAttachmentPayload(
+                snapshot: snapshot,
+                data: nil
+            )
+        }
+        if trustedDecodedSize > Self.maximumAttachmentBytes
+            || encodedSize > Self.maximumAttachmentBytes
+            || trustedDecodedSize > remainingBudget
+            || encodedSize > remainingBudget {
+            let limitation =
+                trustedDecodedSize > Self.maximumAttachmentBytes
+                    || encodedSize > Self.maximumAttachmentBytes
+                ? "Larger than the 64 MB local extraction limit"
+                : "Exceeds the local attachment memory budget"
+            let snapshot = attachmentSnapshot(
+                fileName: fileName,
+                contentType: contentType,
+                byteCount: trustedDecodedSize,
+                checksum: "",
+                description: description,
+                pageIndex: pageIndex,
+                origin: origin,
+                isExtractable: false,
+                limitation: limitation
             )
             return PDFEmbeddedAttachmentPayload(
                 snapshot: snapshot,
@@ -780,12 +1211,30 @@ struct PDFDocumentStructureService: Sendable {
             return nil
         }
         let data = copied as Data
+        guard data.count == trustedDecodedSize else {
+            let snapshot = attachmentSnapshot(
+                fileName: fileName,
+                contentType: contentType,
+                byteCount: data.count,
+                checksum: "",
+                description: description,
+                pageIndex: pageIndex,
+                origin: origin,
+                isExtractable: false,
+                limitation:
+                    "Decoded attachment size does not match its PDF declaration"
+            )
+            return PDFEmbeddedAttachmentPayload(
+                snapshot: snapshot,
+                data: nil
+            )
+        }
         let fitsPerFile = data.count <= Self.maximumAttachmentBytes
-        let fitsTotal = decodedByteCount <= Self.maximumDecodedBytes
-            - min(data.count, Self.maximumDecodedBytes)
+        let fitsTotal = decodedByteCount <= maximumDecodedBytes
+            - min(data.count, maximumDecodedBytes)
         guard fitsPerFile, fitsTotal else {
             let reason = fitsPerFile
-                ? "The PDF exceeds the 192 MB attachment review budget"
+                ? "Exceeds the local attachment memory budget"
                 : "Larger than the 64 MB local extraction limit"
             let snapshot = attachmentSnapshot(
                 fileName: fileName,
@@ -803,7 +1252,6 @@ struct PDFDocumentStructureService: Sendable {
                 data: nil
             )
         }
-        decodedByteCount += data.count
         let checksum = Self.digest(data)
         let snapshot = attachmentSnapshot(
             fileName: fileName,
@@ -881,7 +1329,7 @@ struct PDFDocumentStructureService: Sendable {
         )
     }
 
-    private func uniqueFileName(
+    func uniqueFileName(
         _ value: String,
         usedNames: inout Set<String>
     ) -> String {
@@ -900,7 +1348,7 @@ struct PDFDocumentStructureService: Sendable {
         return candidate
     }
 
-    private func annotationColor(
+    func annotationColor(
         in dictionary: CGPDFDictionaryRef
     ) -> PDFInkColor {
         guard let values = pdfArray(in: dictionary, key: "C") else {
@@ -1050,7 +1498,7 @@ private func pdfNumber(
     return Double(value)
 }
 
-private func decodePDFName(_ value: String) -> String {
+func decodePDFName(_ value: String) -> String {
     var result = ""
     var index = value.startIndex
     while index < value.endIndex {

@@ -1,7 +1,45 @@
+import Foundation
 import LocalAuthentication
+import OSLog
 import StoreKit
 import SwiftUI
 import UIKit
+
+private struct PaperPathSceneIDKey: EnvironmentKey {
+    static let defaultValue: UUID? = nil
+}
+
+extension EnvironmentValues {
+    var paperPathSceneID: UUID? {
+        get { self[PaperPathSceneIDKey.self] }
+        set { self[PaperPathSceneIDKey.self] = newValue }
+    }
+}
+
+#if DEBUG
+private let paperPathDebugLogger = Logger(
+    subsystem: Bundle.main.bundleIdentifier ?? "PaperPath",
+    category: "diagnostics"
+)
+
+func reportFrequentUIFreezeDebugEvent(
+    hypothesisID: String,
+    location: String,
+    message: String,
+    data: [String: String] = [:]
+) {
+    guard ProcessInfo.processInfo.arguments.contains(
+        "UITEST_FREEZE_TRACE"
+    ) else { return }
+    let metadata = data
+        .sorted { $0.key < $1.key }
+        .map { "\($0.key)=\($0.value)" }
+        .joined(separator: " ")
+    paperPathDebugLogger.debug(
+        "[\(hypothesisID, privacy: .public)] \(location, privacy: .public): \(message, privacy: .public) \(metadata, privacy: .private(mask: .hash))"
+    )
+}
+#endif
 
 enum AppLockDelay: Int, CaseIterable, Identifiable {
     case immediately = 0
@@ -36,10 +74,30 @@ final class AppLockController: ObservableObject {
     @Published private(set) var lockGeneration = 0
 
     private let defaults: UserDefaults
+    private let authenticationOverride:
+        (@MainActor @Sendable (String) async -> Bool)?
+    private let uptimeProvider: @Sendable () -> TimeInterval
     private var backgroundedAt: Date?
+    private var backgroundedUptime: TimeInterval?
+    private var authenticationContext: LAContext?
+    private var authenticationGeneration = 0
+    private var activeSceneIDs = Set<UUID>()
 
-    init(defaults: UserDefaults = .standard) {
+    var hasActiveScenes: Bool {
+        !activeSceneIDs.isEmpty
+    }
+
+    init(
+        defaults: UserDefaults = .standard,
+        authenticationOverride:
+            (@MainActor @Sendable (String) async -> Bool)? = nil,
+        uptimeProvider: @escaping @Sendable () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        }
+    ) {
         self.defaults = defaults
+        self.authenticationOverride = authenticationOverride
+        self.uptimeProvider = uptimeProvider
         let enabled = defaults.bool(
             forKey: Self.defaultsKey
         )
@@ -76,6 +134,7 @@ final class AppLockController: ObservableObject {
     @discardableResult
     func enable() async -> Bool {
         guard !isEnabled else { return true }
+        refreshAvailability()
         let authenticated = await authenticate(
             reason: "Enable App Lock for your private PaperPath workspace."
         )
@@ -88,12 +147,20 @@ final class AppLockController: ObservableObject {
         return true
     }
 
-    func disable() {
+    @discardableResult
+    func disable() async -> Bool {
+        guard isEnabled else { return true }
+        let authenticated = await authenticate(
+            reason: "Authenticate to disable App Lock."
+        )
+        guard authenticated else { return false }
         defaults.set(false, forKey: Self.defaultsKey)
         isEnabled = false
         isLocked = false
         backgroundedAt = nil
+        backgroundedUptime = nil
         errorMessage = nil
+        return true
     }
 
     func setDelay(_ delay: AppLockDelay) {
@@ -102,39 +169,94 @@ final class AppLockController: ObservableObject {
     }
 
     func didEnterBackground(at date: Date = Date()) {
+        cancelAuthentication()
         guard isEnabled else { return }
         backgroundedAt = date
+        backgroundedUptime = uptimeProvider()
         if delay == .immediately {
             lock()
         }
     }
 
     func didBecomeActive(at date: Date = Date()) {
+        refreshAvailability()
         guard isEnabled else {
             backgroundedAt = nil
+            backgroundedUptime = nil
             return
         }
         guard let backgroundedAt else { return }
         self.backgroundedAt = nil
-        if date.timeIntervalSince(backgroundedAt)
-            >= TimeInterval(delay.rawValue) {
+        let wallClockElapsed = max(
+            0,
+            date.timeIntervalSince(backgroundedAt)
+        )
+        let uptimeElapsed: TimeInterval
+        let currentUptime = uptimeProvider()
+        if let backgroundedUptime,
+           currentUptime >= backgroundedUptime {
+            uptimeElapsed = currentUptime - backgroundedUptime
+        } else {
+            uptimeElapsed = 0
+        }
+        self.backgroundedUptime = nil
+        let elapsed = max(wallClockElapsed, uptimeElapsed)
+        if elapsed >= TimeInterval(delay.rawValue) {
             lock()
         }
     }
 
+    @discardableResult
+    func sceneDidBecomeActive(
+        _ sceneID: UUID,
+        at date: Date = Date()
+    ) -> Bool {
+        let wasEmpty = activeSceneIDs.isEmpty
+        activeSceneIDs.insert(sceneID)
+        if wasEmpty {
+            didBecomeActive(at: date)
+        }
+        return wasEmpty
+    }
+
+    @discardableResult
+    func sceneDidEnterBackground(
+        _ sceneID: UUID,
+        at date: Date = Date()
+    ) -> Bool {
+        guard activeSceneIDs.remove(sceneID) != nil,
+              activeSceneIDs.isEmpty
+        else { return false }
+        didEnterBackground(at: date)
+        return true
+    }
+
+    @discardableResult
+    func sceneDidDisconnect(
+        _ sceneID: UUID,
+        at date: Date = Date()
+    ) -> Bool {
+        sceneDidEnterBackground(sceneID, at: date)
+    }
+
     private func lock() {
-        guard isEnabled,
-              !isAuthenticating,
-              !isLocked
-        else { return }
+        guard isEnabled else { return }
+        cancelAuthentication()
+        guard !isLocked else { return }
         isLocked = true
         lockGeneration &+= 1
     }
 
     func lockNow() {
-        guard isEnabled, !isLocked else { return }
-        isLocked = true
-        lockGeneration &+= 1
+        SecurePasteboard.clearIfOwned()
+        lock()
+    }
+
+    func protectedDataWillBecomeUnavailable() {
+        cancelAuthentication()
+        if isEnabled {
+            lock()
+        }
     }
 
     @discardableResult
@@ -158,7 +280,19 @@ final class AppLockController: ObservableObject {
         errorMessage = nil
     }
 
+    func cancelPendingAuthentication() {
+        guard isAuthenticating || authenticationContext != nil else {
+            return
+        }
+        cancelAuthentication()
+    }
+
     private func refreshAvailability() {
+        if authenticationOverride != nil {
+            isAvailable = true
+            biometryType = .none
+            return
+        }
         let context = LAContext()
         var error: NSError?
         isAvailable = context.canEvaluatePolicy(
@@ -174,8 +308,24 @@ final class AppLockController: ObservableObject {
 
     private func authenticate(reason: String) async -> Bool {
         guard !isAuthenticating else { return false }
+        errorMessage = nil
+        if let authenticationOverride {
+            authenticationGeneration &+= 1
+            let generation = authenticationGeneration
+            isAuthenticating = true
+            defer {
+                if authenticationGeneration == generation {
+                    isAuthenticating = false
+                }
+            }
+            let authenticated = await authenticationOverride(reason)
+            guard authenticationGeneration == generation,
+                  !Task.isCancelled
+            else { return false }
+            return authenticated
+        }
         let context = LAContext()
-        context.localizedCancelTitle = "Cancel"
+        context.localizedCancelTitle = "Cancel".localizedUI
 
         var evaluationError: NSError?
         guard context.canEvaluatePolicy(
@@ -183,102 +333,295 @@ final class AppLockController: ObservableObject {
             error: &evaluationError
         ) else {
             isAvailable = false
-            errorMessage = evaluationError?.localizedDescription
-                ?? "Device authentication is unavailable."
+            errorMessage = evaluationError.map {
+                AppLocalization.userFacingErrorDescription(
+                    $0,
+                    fallback:
+                        "Device authentication is unavailable."
+                )
+            } ?? "Device authentication is unavailable.".localizedUI
             return false
         }
+        isAvailable = true
+        _ = context.canEvaluatePolicy(
+            .deviceOwnerAuthenticationWithBiometrics,
+            error: nil
+        )
+        biometryType = context.biometryType
 
+        authenticationGeneration &+= 1
+        let generation = authenticationGeneration
+        authenticationContext = context
         isAuthenticating = true
-        defer { isAuthenticating = false }
+        defer {
+            if authenticationGeneration == generation {
+                authenticationContext = nil
+                isAuthenticating = false
+            }
+        }
         do {
-            return try await context.evaluatePolicy(
+            let authenticated = try await context.evaluatePolicy(
                 .deviceOwnerAuthentication,
-                localizedReason: reason
+                localizedReason: reason.localizedUI
             )
+            guard authenticationGeneration == generation,
+                  !Task.isCancelled
+            else { return false }
+            return authenticated
         } catch let error as LAError {
+            guard authenticationGeneration == generation else {
+                return false
+            }
             switch error.code {
             case .userCancel, .appCancel, .systemCancel:
                 errorMessage = nil
             default:
-                errorMessage = error.localizedDescription
+                errorMessage = AppLocalization
+                    .userFacingErrorDescription(error)
             }
             return false
         } catch {
-            errorMessage = error.localizedDescription
+            guard authenticationGeneration == generation else {
+                return false
+            }
+            errorMessage = AppLocalization
+                .userFacingErrorDescription(error)
             return false
         }
     }
+
+    private func cancelAuthentication() {
+        authenticationGeneration &+= 1
+        authenticationContext?.invalidate()
+        authenticationContext = nil
+        isAuthenticating = false
+    }
+}
+
+private struct LibraryRestorableContext: Equatable {
+    let searchScope: LibrarySearchScope
+    let statusFilter: DocumentWorkflowStatus?
+    let categoryFilter: DocumentCategory?
+    let smartView: LibrarySmartView?
 }
 
 struct RootView: View {
+    private let initialRecordID: UUID?
+
     @EnvironmentObject private var model: PaperPathModel
     @EnvironmentObject private var appLock: AppLockController
+    @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.requestReview) private var requestReview
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityVoiceOverEnabled)
     private var voiceOverEnabled
     @AppStorage(AppPreferences.onboardingCompletedKey)
     private var onboardingCompleted = false
     @AppStorage(AppPreferences.onboardingReplayRequestedKey)
     private var onboardingReplayRequested = false
-    @AppStorage("workspace.lastRecordID")
+    @SceneStorage("workspace.lastRecordID")
     private var lastWorkspaceRecordID = ""
-    @AppStorage("workspace.comparisonPeerID")
+    @SceneStorage("workspace.deskVisible")
+    private var isDeskVisible = true
+    @SceneStorage("workspace.resolvedInitialRecordID")
+    private var savedInitialRecordID = ""
+    @SceneStorage("workspace.comparisonPeerID")
     private var lastComparisonPeerID = ""
+    @SceneStorage("workspace.splitVisibility")
+    private var savedSplitVisibility = "all"
+    @SceneStorage("workspace.readingRecordID")
+    private var sceneReadingRecordID = ""
+    @SceneStorage("workspace.readingRevisionID")
+    private var sceneReadingRevisionID = ""
+    @SceneStorage("workspace.readingPageIndex")
+    private var sceneReadingPageIndex = -1
+    @SceneStorage("library.searchScope")
+    private var savedLibrarySearchScope =
+        LibrarySearchScope.all.rawValue
+    @SceneStorage("library.statusFilter")
+    private var savedLibraryStatusFilter = ""
+    @SceneStorage("library.categoryFilter")
+    private var savedLibraryCategoryFilter = ""
+    @SceneStorage("library.smartView")
+    private var savedLibrarySmartView = ""
 
     @State private var path: [DocumentRoute] = []
     @State private var selectedWorkspaceRoute: DocumentRoute?
     @State private var comparisonSession: StudioComparisonSession?
     @State private var splitVisibility =
         NavigationSplitViewVisibility.all
-    @State private var isInspectorPresented = true
+    @State private var splitVisibilityBeforeInspector:
+        NavigationSplitViewVisibility?
+    @State private var didRestoreSplitVisibility = false
+    @SceneStorage("workspace.inspectorPresented")
+    private var isInspectorPresented = false
     @State private var noticeDismissTask: Task<Void, Never>?
     @State private var pendingExternalOpenTask: Task<Void, Never>?
+    @State private var ratingRequestTask: Task<Void, Never>?
+    @State private var activeLifecycleTask: Task<Void, Never>?
+    @State private var layoutTransitionTask: Task<Void, Never>?
+    @State private var navigationTask: Task<Void, Never>?
+    @State private var pendingFirstRunDocumentID: UUID?
+    @State private var isFirstRunPresentationActive = false
+    @State private var isFullUnlockPresentationActive = false
+    @State private var activeLifecycleGeneration = UUID()
+    @State private var navigationGeneration = UUID()
+    @State private var pendingExternalOpenGeneration = UUID()
+    @State private var pendingGlobalActivation = false
+    @State private var protectedDataAvailable =
+        UIApplication.shared.isProtectedDataAvailable
+    @State private var sceneID = UUID()
+    @State private var librarySearchText = ""
+    @State private var libraryAppliedSearchText = ""
+    @State private var librarySearchScope = LibrarySearchScope.all
+    @State private var libraryStatusFilter: DocumentWorkflowStatus?
+    @State private var libraryCategoryFilter: DocumentCategory?
+    @State private var librarySelectedTag: String?
+    @State private var librarySelectedSmartView: LibrarySmartView?
+    @State private var isSelectingLibraryDocuments = false
+    @State private var selectedLibraryDocumentIDs: Set<UUID> = []
+    @State private var didRestoreLibraryContext = false
+    @State private var didResolveInitialRecordID = false
+    @State private var isPDFDropTargeted = false
 
-    var body: some View {
-        workspaceNavigation
+    init(initialRecordID: UUID? = nil) {
+        self.initialRecordID = initialRecordID
+    }
+
+    private var navigationWithFeedback: some View {
+        ZStack {
+            workspaceNavigation
+        }
+        .environment(\.paperPathSceneID, sceneID)
         .id(appLock.lockGeneration)
         .privacySensitive()
-        .overlay(alignment: .top) {
-            if let notice = model.actionNotice {
-                NoticeBanner(
-                    message: notice.message,
-                    detail: notice.detail,
-                    kind: notice.kind,
-                    actionTitle: notice.action.title,
-                    onAction: {
-                        Task {
-                            await model.performNoticeAction(notice)
-                        }
-                    },
-                    onDismiss: {
-                        model.dismissActionNotice(id: notice.id)
-                    }
+        .dropDestination(for: URL.self) { urls, _ in
+            handleDroppedPDFURLs(urls)
+        } isTargeted: { isTargeted in
+            isPDFDropTargeted =
+                isTargeted && canAcceptDroppedPDFs
+        }
+        .onOpenURL { url in
+            Task {
+                await model.receiveExternalURL(
+                    url,
+                    targetSceneID: sceneID
                 )
-                    .padding(.top, PPSpacing.small)
-                    .padding(.horizontal, PPSpacing.regular)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(10)
-            } else if let message = model.noticeMessage {
-                NoticeBanner(
-                    message: message,
-                    detail: nil,
-                    kind: .success,
-                    actionTitle: nil,
-                    onAction: nil
-                ) {
-                    model.noticeMessage = nil
-                }
-                    .padding(.top, PPSpacing.small)
-                    .padding(.horizontal, PPSpacing.regular)
-                    .transition(.move(edge: .top).combined(with: .opacity))
-                    .zIndex(10)
             }
         }
+        .overlay(alignment: .top) {
+            VStack(spacing: PPSpacing.small) {
+                if model.isExternalPDFImportActive {
+                    ExternalImportBanner(
+                        progress: model.externalImportProgress,
+                        onStop: model.cancelExternalPDFImports
+                    )
+                    .transition(
+                        .move(edge: .top).combined(with: .opacity)
+                    )
+                    .accessibilitySortPriority(2)
+                } else if model.externalImportRetryAvailable {
+                    NoticeBanner(
+                        message: model.externalImportDeferredCount > 0
+                            ? AppLocalization.format(
+                                "%lld PDFs waiting to import",
+                                model.externalImportDeferredCount
+                            )
+                            : "Import paused",
+                        detail: model.externalImportRetryMessage
+                            ?? "Pending shared PDFs stay on this device.",
+                        kind: .warning,
+                        actionTitle: "Retry Import",
+                        onAction: {
+                            Task {
+                                await model.withFeedbackTarget(sceneID) {
+                                    await model.processPendingExternalPDFs()
+                                }
+                            }
+                        },
+                        onDismiss: model.dismissExternalImportRetry,
+                        actionAccessibilityHint:
+                            "Retries queued PDFs without duplicating completed imports.",
+                        showsFullDetail: true
+                    )
+                    .accessibilityIdentifier("externalImportRetry")
+                    .accessibilitySortPriority(2)
+                }
+
+                if pendingExternalOpenTask != nil {
+                    ExternalImportHandoffBanner(
+                        documentTitle: pendingExternalOpenTitle,
+                        onStay: {
+                            cancelPendingExternalOpen(
+                                clearsPendingDocument: true,
+                                showsNotice: true
+                            )
+                        }
+                    )
+                    .transition(
+                        .move(edge: .top).combined(with: .opacity)
+                    )
+                    .accessibilitySortPriority(3)
+                }
+
+                if let notice = sceneActionNotice {
+                    NoticeBanner(
+                        message: notice.message,
+                        detail: notice.detail,
+                        kind: notice.kind,
+                        actionTitle: notice.action.title,
+                        onAction: {
+                            Task {
+                                await model.performNoticeAction(
+                                    notice,
+                                    from: sceneID
+                                )
+                            }
+                        },
+                        onDismiss: {
+                            model.dismissActionNotice(
+                                id: notice.id,
+                                from: sceneID
+                            )
+                        }
+                    )
+                    .transition(
+                        .move(edge: .top).combined(with: .opacity)
+                    )
+                    .accessibilitySortPriority(1)
+                } else if let notice = sceneTransientNotice {
+                    NoticeBanner(
+                        message: notice.message,
+                        detail: nil,
+                        kind: .success,
+                        actionTitle: nil,
+                        onAction: nil
+                    ) {
+                        model.dismissTransientNotice(
+                            id: notice.id,
+                            from: sceneID
+                        )
+                    }
+                    .transition(
+                        .move(edge: .top).combined(with: .opacity)
+                    )
+                }
+            }
+            .padding(.top, PPSpacing.small)
+            .padding(.horizontal, PPSpacing.regular)
+            .frame(maxWidth: .infinity)
+            .zIndex(10)
+        }
         .overlay {
-            if scenePhase != .active {
+            if isPDFDropTargeted && canAcceptDroppedPDFs {
+                PDFDropTargetOverlay()
+                    .transition(.opacity)
+                    .zIndex(90)
+            }
+            if scenePhase != .active || !protectedDataAvailable {
                 PrivacyCover()
                     .zIndex(100)
             } else if appLock.isLocked {
@@ -288,97 +631,323 @@ struct RootView: View {
         }
         .animation(
             reduceMotion ? nil : .spring(response: 0.42, dampingFraction: 0.88),
-            value: model.noticeMessage
+            value: sceneTransientNotice?.id
         )
         .animation(
             reduceMotion
                 ? nil
                 : .spring(response: 0.42, dampingFraction: 0.88),
-            value: model.actionNotice?.id
+            value: sceneActionNotice?.id
         )
-        .onChange(of: model.noticeMessage) { _, newValue in
-            guard let newValue else { return }
+        .animation(
+            reduceMotion
+                ? nil
+                : .spring(response: 0.42, dampingFraction: 0.88),
+            value: model.isExternalPDFImportActive
+        )
+        .animation(
+            reduceMotion
+                ? nil
+                : .spring(response: 0.42, dampingFraction: 0.88),
+            value: pendingExternalOpenTask != nil
+        )
+        .onChange(of: sceneTransientNotice, initial: true) {
+            _, newValue in
+            guard let newValue,
+                  sceneActionNotice == nil,
+                  canPresentTransientFeedback
+            else { return }
+            if voiceOverEnabled {
+                UIAccessibility.post(
+                    notification: .announcement,
+                    argument: newValue.message.localizedUI
+                )
+            }
             scheduleMessageDismiss(newValue)
         }
-        .onChange(of: model.actionNotice) { _, newValue in
-            guard let newValue else { return }
-            scheduleActionNoticeDismiss(newValue)
-        }
-        .onChange(of: horizontalSizeClass) { _, sizeClass in
-            Task { @MainActor in
-                await Task.yield()
-                if sizeClass == .regular {
-                    if let route = path.last {
-                        selectedWorkspaceRoute = route
-                        path.removeAll()
-                    }
-                } else if let route = selectedWorkspaceRoute {
-                    path = [route]
-                    selectedWorkspaceRoute = nil
+        .onChange(of: sceneActionNotice, initial: true) {
+            _, newValue in
+            noticeDismissTask?.cancel()
+            noticeDismissTask = nil
+            if let newValue {
+                guard canPresentTransientFeedback else { return }
+                if voiceOverEnabled {
+                    UIAccessibility.post(
+                        notification: .announcement,
+                        argument: [
+                            newValue.message.localizedUI,
+                            newValue.detail?.localizedUI
+                        ]
+                        .compactMap { $0 }
+                        .joined(separator: ". ")
+                    )
                 }
+                scheduleActionNoticeDismiss(newValue)
+            } else if sceneActionNotice == nil,
+                      let notice = sceneTransientNotice,
+                      canPresentTransientFeedback {
+                if voiceOverEnabled {
+                    UIAccessibility.post(
+                        notification: .announcement,
+                        argument: notice.message.localizedUI
+                    )
+                }
+                scheduleMessageDismiss(notice)
             }
         }
+        .onChange(of: voiceOverEnabled) { _, isEnabled in
+            noticeDismissTask?.cancel()
+            noticeDismissTask = nil
+            guard !isEnabled,
+                  canPresentTransientFeedback
+            else { return }
+            if let notice = sceneActionNotice {
+                scheduleActionNoticeDismiss(notice)
+            } else if let notice = sceneTransientNotice {
+                scheduleMessageDismiss(notice)
+            }
+        }
+    }
+
+    private var navigationWithLifecycle: some View {
+        navigationWithFeedback
+        .onChange(of: horizontalSizeClass) { _, sizeClass in
+            layoutTransitionTask?.cancel()
+            layoutTransitionTask = Task { @MainActor in
+                await Task.yield()
+                guard !Task.isCancelled,
+                      horizontalSizeClass == sizeClass
+                else { return }
+                if sizeClass == .regular {
+                    if let route = path.last {
+                        let settledRoute =
+                            settledWorkspaceRoute(route)
+                        isDeskVisible = false
+                        selectedWorkspaceRoute = settledRoute
+                        path.removeAll()
+                        restoreComparisonSessionIfPossible(
+                            baseRecordID: settledRoute.recordID
+                        )
+                    }
+                    restoreWorkspaceSplitVisibilityIfNeeded()
+                    if !model.isLoading {
+                        restoreWorkspaceSelectionIfNeeded()
+                    }
+                } else if let route = selectedWorkspaceRoute {
+                    path = isDeskVisible ? [] : [settledWorkspaceRoute(route)]
+                    selectedWorkspaceRoute = nil
+                }
+                layoutTransitionTask = nil
+            }
+        }
+        .onChange(of: splitVisibility) { _, visibility in
+            persistWorkspaceSplitVisibility(visibility)
+        }
+        .onChange(of: path) { _, routes in
+            guard horizontalSizeClass == .compact else { return }
+            isDeskVisible = routes.isEmpty
+        }
+        .onChange(of: libraryRestorableContext) { _, context in
+            persistLibraryContextIfNeeded(context)
+        }
         .task {
+            protectedDataAvailable =
+                UIApplication.shared.isProtectedDataAvailable
+            restoreLibraryContextIfNeeded()
+            restoreWorkspaceSplitVisibilityIfNeeded()
             if scenePhase == .active,
-               appLock.isLocked {
-                _ = await appLock.unlock()
+               protectedDataAvailable {
+                model.feedbackSceneDidBecomeActive(sceneID)
+                let becameGloballyActive =
+                    appLock.sceneDidBecomeActive(sceneID)
+                if becameGloballyActive {
+                    model.resumeDeferredBackgroundWork()
+                    scheduleRatingRequestIfAppropriate()
+                }
+                scheduleActiveLifecycle(
+                    becameGloballyActive: becameGloballyActive
+                )
             }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
-                appLock.didBecomeActive()
-                Task {
-                    if appLock.isLocked,
-                       !appLock.isAuthenticating {
-                        _ = await appLock.unlock()
-                    }
-                    await model.processPendingExternalPDFs()
+                protectedDataAvailable =
+                    UIApplication.shared.isProtectedDataAvailable
+                guard protectedDataAvailable else { return }
+                model.feedbackSceneDidBecomeActive(sceneID)
+                let becameGloballyActive =
+                    appLock.sceneDidBecomeActive(sceneID)
+                if becameGloballyActive {
+                    model.resumeDeferredBackgroundWork()
+                    scheduleRatingRequestIfAppropriate()
                 }
+                scheduleActiveLifecycle(
+                    becameGloballyActive: becameGloballyActive
+                )
+                resumePendingRootNavigationIfPossible()
+                resumeNoticePresentationIfNeeded()
             case .background:
-                appLock.didEnterBackground()
+                isPDFDropTargeted = false
+                model.feedbackSceneDidResignActive(sceneID)
+                suspendNoticePresentation()
+                ratingRequestTask?.cancel()
+                ratingRequestTask = nil
+                cancelPendingExternalOpen()
+                if appLock.sceneDidEnterBackground(sceneID) {
+                    cancelActiveLifecycle()
+                    SecurePasteboard.clearIfOwned()
+                    model.releaseTransientResourcesForBackground()
+                }
             case .inactive:
-                break
+                isPDFDropTargeted = false
+                model.feedbackSceneDidResignActive(sceneID)
+                suspendNoticePresentation()
+                model.checkpointTrustedTime()
             @unknown default:
                 break
             }
         }
-        .onChange(
-            of: model.pendingExternalDocumentID,
-            initial: true
-        ) { _, recordID in
-            guard let recordID,
-                  model.record(id: recordID) != nil
-            else { return }
-            pendingExternalOpenTask?.cancel()
-            pendingExternalOpenTask = Task { @MainActor in
-                await Task.yield()
-                guard !Task.isCancelled,
-                      model.pendingExternalDocumentID == recordID,
-                      model.record(id: recordID) != nil
-                else { return }
-                open(DocumentRoute(recordID: recordID))
-                model.clearPendingExternalDocument(recordID)
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            isPDFDropTargeted = false
+            protectedDataAvailable = false
+            model.feedbackSceneDidResignActive(sceneID)
+            suspendNoticePresentation()
+            cancelActiveLifecycle()
+            cancelPendingExternalOpen()
+            ratingRequestTask?.cancel()
+            ratingRequestTask = nil
+            SecurePasteboard.clearIfOwned()
+            appLock.protectedDataWillBecomeUnavailable()
+            model.releaseTransientResourcesForBackground()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            protectedDataAvailable = true
+            guard scenePhase == .active else { return }
+            model.feedbackSceneDidBecomeActive(sceneID)
+            let becameGloballyActive =
+                appLock.sceneDidBecomeActive(sceneID)
+            if becameGloballyActive {
+                model.resumeDeferredBackgroundWork()
+            } else {
+                appLock.didBecomeActive()
+            }
+            resumePendingRootNavigationIfPossible()
+            resumeNoticePresentationIfNeeded()
+            scheduleActiveLifecycle(
+                becameGloballyActive: becameGloballyActive,
+                resumesInterruptedWork: true
+            )
+        }
+        .onDisappear {
+            isPDFDropTargeted = false
+            layoutTransitionTask?.cancel()
+            layoutTransitionTask = nil
+            navigationGeneration = UUID()
+            navigationTask?.cancel()
+            navigationTask = nil
+            cancelPendingExternalOpen()
+            pendingFirstRunDocumentID = nil
+            noticeDismissTask?.cancel()
+            noticeDismissTask = nil
+            ratingRequestTask?.cancel()
+            ratingRequestTask = nil
+            model.feedbackSceneDidDisconnect(sceneID)
+            model.releaseExternalDocumentTarget(for: sceneID)
+            model.releaseActionNoticeTarget(for: sceneID)
+            model.releaseTransientNoticeTarget(for: sceneID)
+            model.releasePresentationErrorTarget(for: sceneID)
+            if appLock.sceneDidDisconnect(sceneID) {
+                cancelActiveLifecycle()
+                model.releaseTransientResourcesForBackground()
             }
         }
+        .onChange(
+            of: model.pendingExternalDocumentHandoff,
+            initial: true
+        ) { _, handoff in
+            guard handoff != nil else { return }
+            resumePendingRootNavigationIfPossible()
+        }
+        .onChange(of: appLock.isLocked) { _, isLocked in
+            if isLocked {
+                isPDFDropTargeted = false
+                suspendNoticePresentation()
+            }
+            guard !isLocked else { return }
+            resumePendingRootNavigationIfPossible()
+            resumeNoticePresentationIfNeeded()
+        }
+    }
+
+    var body: some View {
+        navigationWithLifecycle
+#if DEBUG
+        // #region debug-point A:desk-launch-navigation
+        .onAppear {
+            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "desk-launch-navigation", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "A", "msg": "[DEBUG] Root appeared", "location": "RootView.body", "data": ["regular": horizontalSizeClass == .regular, "desk": isDeskVisible]]); URLSession.shared.dataTask(with: request).resume() }
+        }
+        // #endregion
+#endif
         .fullScreenCover(
-            isPresented: firstRunPresentation
+            isPresented: firstRunPresentation,
+            onDismiss: completeFirstRunPresentation
         ) {
-            FirstRunExperienceView {
-                if let recordID = await model.createSampleWorkspace() {
+            FirstRunExperienceView(
+                hasExistingDocuments: !model.workingDocuments.isEmpty
+            ) {
+                let recordID = await model.withFeedbackTarget(sceneID) {
+                    await model.createSampleWorkspace()
+                }
+                if let recordID {
+                    pendingFirstRunDocumentID = recordID
                     onboardingCompleted = true
                     onboardingReplayRequested = false
-                    open(DocumentRoute(recordID: recordID))
+                    return true
                 }
+                return false
             } onComplete: {
                 onboardingCompleted = true
                 onboardingReplayRequested = false
             }
+            .onAppear {
+                isFirstRunPresentationActive = true
+            }
         }
         .sheet(
-            isPresented: $model.isPresentingFullUnlock
+            isPresented: Binding(
+                get: {
+                    model.fullUnlockContext(for: sceneID) != nil
+                },
+                set: { isPresented in
+                    if !isPresented {
+                        model.dismissFullUnlock(from: sceneID)
+                    }
+                }
+            ),
+            onDismiss: {
+                isFullUnlockPresentationActive = false
+                model.dismissFullUnlock(from: sceneID)
+                resumePendingRootNavigationIfPossible()
+            }
         ) {
-            FullUnlockView()
+            FullUnlockView(
+                context: model.fullUnlockContext(for: sceneID)
+                    ?? .settings
+            )
+                .onAppear {
+                    isFullUnlockPresentationActive = true
+                }
         }
         .onChange(of: model.isLoading, initial: true) {
             _, isLoading in
@@ -390,70 +959,115 @@ struct RootView: View {
                 onboardingCompleted = true
             }
         }
+        .onChange(of: initialRecordID) { _, _ in
+            didResolveInitialRecordID = false
+            guard !model.isLoading else { return }
+            restoreWorkspaceSelectionIfNeeded()
+        }
         .onChange(of: model.documents.map(\.id)) { _, recordIDs in
+            let validRecordIDs = Set(recordIDs)
             if let savedID = UUID(
                 uuidString: lastWorkspaceRecordID
             ),
-               !recordIDs.contains(savedID) {
+               !validRecordIDs.contains(savedID) {
                 lastWorkspaceRecordID = ""
+                lastComparisonPeerID = ""
+            }
+            if let savedPeerID = UUID(
+                uuidString: lastComparisonPeerID
+            ),
+               !validRecordIDs.contains(savedPeerID) {
+                lastComparisonPeerID = ""
+            }
+            if let readingRecordID = UUID(
+                uuidString: sceneReadingRecordID
+            ),
+               !validRecordIDs.contains(readingRecordID) {
+                clearSceneReadingPosition()
             }
             if let selectedWorkspaceRoute,
-               !recordIDs.contains(selectedWorkspaceRoute.recordID) {
+               !validRecordIDs.contains(
+                   selectedWorkspaceRoute.recordID
+               ) {
                 self.selectedWorkspaceRoute = nil
             }
+            if let pendingFirstRunDocumentID,
+               !validRecordIDs.contains(pendingFirstRunDocumentID) {
+                self.pendingFirstRunDocumentID = nil
+            }
+            if let pendingExternalDocumentID =
+                model.pendingExternalDocumentID(for: sceneID),
+               !validRecordIDs.contains(pendingExternalDocumentID) {
+                cancelPendingExternalOpen(clearsPendingDocument: true)
+            }
+            path.removeAll {
+                !validRecordIDs.contains($0.recordID)
+            }
             if let comparisonSession,
-               !recordIDs.contains(comparisonSession.baseRecordID)
-                || !recordIDs.contains(
+               !validRecordIDs.contains(
+                   comparisonSession.baseRecordID
+               )
+                || !validRecordIDs.contains(
                     comparisonSession.revisedRecordID
                 ) {
                 self.comparisonSession = nil
                 lastComparisonPeerID = ""
             }
+            if model.workingDocuments.isEmpty {
+                isInspectorPresented = false
+                splitVisibilityBeforeInspector = nil
+                splitVisibility = .all
+                savedSplitVisibility = "all"
+            }
+            restoreWorkspaceSelectionIfNeeded()
         }
         .onChange(
             of: model.verifiedOutputSuccessCount
         ) { _, _ in
-            guard !isRunningAutomatedTests,
-                  AppEntitlement.shouldRequestRating
-            else { return }
-            Task {
-                try? await Task.sleep(for: .seconds(1.5))
-                guard AppEntitlement.shouldRequestRating else {
-                    return
-                }
-                requestReview()
-                AppEntitlement.markRatingRequested()
-            }
+            scheduleRatingRequestIfAppropriate()
         }
         .alert(
             "Couldn’t complete that",
             isPresented: Binding(
-                get: { model.errorMessage != nil },
-                set: { if !$0 { model.clearError() } }
+                get: {
+                    model.presentationError(for: sceneID) != nil
+                },
+                set: {
+                    if !$0 {
+                        model.clearError(from: sceneID)
+                    }
+                }
             )
         ) {
-            if model.errorOffersSettings {
+            if model.presentationError(for: sceneID)?
+                .offersSettings == true {
                 Button("Open Settings") {
                     if let url = URL(
                         string: UIApplication.openSettingsURLString
                     ) {
                         UIApplication.shared.open(url)
                     }
-                    model.clearError()
+                    model.clearError(from: sceneID)
                 }
             }
             Button(
                 (
-                    model.errorOffersSettings
+                    model.presentationError(for: sceneID)?
+                        .offersSettings == true
                         ? "Not Now"
                         : "OK"
                 ).localizedUI,
                 role: .cancel
             ) {
-                model.clearError()
+                model.clearError(from: sceneID)
             }
         } message: {
-            Text((model.errorMessage ?? "").localizedUI)
+            Text(
+                (
+                    model.presentationError(for: sceneID)?.message
+                        ?? ""
+                ).localizedUI
+            )
         }
     }
 
@@ -475,6 +1089,72 @@ struct RootView: View {
         )
     }
 
+    private func completeFirstRunPresentation() {
+        isFirstRunPresentationActive = false
+        resumePendingRootNavigationIfPossible()
+    }
+
+    private var pendingExternalOpenTitle: String? {
+        guard let recordID = model.pendingExternalDocumentID(
+            for: sceneID
+        ) else {
+            return nil
+        }
+        return model.record(id: recordID)?.displayName
+    }
+
+    private func resumePendingRootNavigationIfPossible() {
+        guard scenePhase == .active,
+              protectedDataAvailable,
+              !appLock.isLocked,
+              !firstRunPresentation.wrappedValue,
+              !isFirstRunPresentationActive,
+              model.fullUnlockContext(for: sceneID) == nil,
+              !isFullUnlockPresentationActive
+        else { return }
+        if let recordID = pendingFirstRunDocumentID {
+            guard model.record(id: recordID) != nil else {
+                pendingFirstRunDocumentID = nil
+                return
+            }
+            pendingFirstRunDocumentID = nil
+            open(DocumentRoute(recordID: recordID))
+            return
+        }
+        guard let recordID = model.pendingExternalDocumentID(
+                for: sceneID
+              ),
+              model.record(id: recordID) != nil
+        else { return }
+        let generation = UUID()
+        pendingExternalOpenGeneration = generation
+        pendingExternalOpenTask?.cancel()
+        pendingExternalOpenTask = Task { @MainActor in
+            defer {
+                if pendingExternalOpenGeneration == generation {
+                    pendingExternalOpenTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  pendingExternalOpenGeneration == generation,
+                  scenePhase == .active,
+                  protectedDataAvailable,
+                  !appLock.isLocked,
+                  !firstRunPresentation.wrappedValue,
+                  !isFirstRunPresentationActive,
+                  model.fullUnlockContext(for: sceneID) == nil,
+                  !isFullUnlockPresentationActive,
+                  model.pendingExternalDocumentID(
+                    for: sceneID
+                  ) == recordID,
+                  model.record(id: recordID) != nil
+            else { return }
+            open(DocumentRoute(recordID: recordID))
+            model.clearPendingExternalDocument(recordID)
+        }
+    }
+
     private var isRunningAutomatedTests: Bool {
 #if DEBUG
         ProcessInfo.processInfo.arguments.contains {
@@ -488,40 +1168,175 @@ struct RootView: View {
 #endif
     }
 
-    private func open(_ route: DocumentRoute) {
-        lastWorkspaceRecordID = route.recordID.uuidString
-        if horizontalSizeClass == .regular {
+    private func open(
+        _ route: DocumentRoute,
+        preservingComparisonState: Bool = false
+    ) {
+        guard let record = model.record(id: route.recordID) else {
+            return
+        }
+        let initialResolvedRoute = resolvedRoute(route, for: record)
+        lastWorkspaceRecordID =
+            initialResolvedRoute.recordID.uuidString
+        if let pageIndex = initialResolvedRoute.pageIndex {
+            persistSceneReadingPosition(
+                recordID: initialResolvedRoute.recordID,
+                pageIndex: pageIndex,
+                contentRevisionID: record.contentRevisionID
+            )
+        }
+        if !preservingComparisonState {
             comparisonSession = nil
-            guard selectedWorkspaceRoute != route else { return }
-            selectedWorkspaceRoute = route
-            isInspectorPresented = true
+            lastComparisonPeerID = ""
+        }
+        navigationGeneration = UUID()
+        navigationTask?.cancel()
+        navigationTask = nil
+        if horizontalSizeClass == .regular {
+            let wasShowingDesk = isDeskVisible
+            isDeskVisible = false
+            if selectedWorkspaceRoute == initialResolvedRoute {
+                if !wasShowingDesk {
+                    isInspectorPresented = true
+                }
+                return
+            }
+            selectedWorkspaceRoute = initialResolvedRoute
             return
         }
 
-        guard path.last != route else { return }
-        Task { @MainActor in
+        guard path.last != initialResolvedRoute else { return }
+        let generation = UUID()
+        navigationGeneration = generation
+        navigationTask = Task { @MainActor in
+            defer {
+                if navigationGeneration == generation {
+                    navigationTask = nil
+                }
+            }
             await Task.yield()
-            guard path.last != route else { return }
-            path.append(route)
+            guard !Task.isCancelled,
+                  navigationGeneration == generation,
+                  let currentRecord =
+                    model.record(id: initialResolvedRoute.recordID)
+            else {
+                return
+            }
+            let finalRoute = resolvedRoute(
+                initialResolvedRoute,
+                for: currentRecord
+            )
+            if horizontalSizeClass == .regular {
+                isDeskVisible = false
+                selectedWorkspaceRoute = finalRoute
+                path.removeAll()
+                if preservingComparisonState {
+                    restoreComparisonSessionIfPossible(
+                        baseRecordID: finalRoute.recordID
+                    )
+                }
+                return
+            }
+            guard navigationGeneration == generation,
+                  path.last != finalRoute
+            else { return }
+            isDeskVisible = false
+            path.append(finalRoute)
         }
+    }
+
+    private func resolvedRoute(
+        _ route: DocumentRoute,
+        for record: DocumentRecord
+    ) -> DocumentRoute {
+        if let expectedRevisionID =
+            route.expectedContentRevisionID,
+           expectedRevisionID != record.contentRevisionID {
+            model.presentNotice(
+                "Continue point refreshed for the updated PDF"
+                    .localizedUI,
+                in: sceneID
+            )
+            if let checkpoint = record.taskCheckpoint,
+               checkpoint.contentRevisionID
+                == record.contentRevisionID {
+                return DocumentRoute(
+                    recordID: record.id,
+                    pageIndex: checkpoint.pageIndex,
+                    quickTask: checkpoint.stage.quickTask,
+                    expectedContentRevisionID:
+                        record.contentRevisionID
+                )
+            }
+            return DocumentRoute(
+                recordID: record.id,
+                pageIndex: record.lastPageIndex
+            )
+        }
+        let resolvedPageIndex = route.pageIndex.map {
+            min(max(0, $0), max(0, record.profile.pageCount - 1))
+        }
+        return DocumentRoute(
+            recordID: route.recordID,
+            pageIndex: resolvedPageIndex,
+            quickTask: route.quickTask,
+            expectedContentRevisionID:
+                route.expectedContentRevisionID
+        )
     }
 
     @ViewBuilder
     private var workspaceNavigation: some View {
-        if horizontalSizeClass == .regular {
+        if horizontalSizeClass == .regular,
+           isDeskVisible || selectedWorkspaceRoute == nil {
+            NavigationStack {
+                LibraryView(
+                    searchText: $librarySearchText,
+                    appliedSearchText: $libraryAppliedSearchText,
+                    searchScope: $librarySearchScope,
+                    statusFilter: $libraryStatusFilter,
+                    categoryFilter: $libraryCategoryFilter,
+                    selectedTag: $librarySelectedTag,
+                    selectedSmartView: $librarySelectedSmartView,
+                    isSelectingDocuments: $isSelectingLibraryDocuments,
+                    selectedDocumentIDs: $selectedLibraryDocumentIDs
+                ) { route in
+                    open(route)
+                }
+            }
+        } else if horizontalSizeClass == .regular {
             NavigationSplitView(
                 columnVisibility: $splitVisibility
             ) {
                 LibraryView(
                     selectedRecordID:
-                        selectedWorkspaceRoute?.recordID
+                        selectedWorkspaceRoute?.recordID,
+                    isWorkspaceSidebar:
+                        selectedWorkspaceRoute != nil,
+                    searchText: $librarySearchText,
+                    appliedSearchText: $libraryAppliedSearchText,
+                    searchScope: $librarySearchScope,
+                    statusFilter: $libraryStatusFilter,
+                    categoryFilter: $libraryCategoryFilter,
+                    selectedTag: $librarySelectedTag,
+                    selectedSmartView: $librarySelectedSmartView,
+                    isSelectingDocuments:
+                        $isSelectingLibraryDocuments,
+                    selectedDocumentIDs:
+                        $selectedLibraryDocumentIDs
                 ) { route in
                     open(route)
                 }
                 .navigationSplitViewColumnWidth(
-                    min: 320,
-                    ideal: 410,
-                    max: 520
+                    min: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 340
+                        : 300,
+                    ideal: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 400
+                        : 360,
+                    max: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 480
+                        : 440
                 )
             } detail: {
                 if let route = selectedWorkspaceRoute,
@@ -539,11 +1354,77 @@ struct RootView: View {
                             DocumentWorkspaceView(
                                 recordID: route.recordID,
                                 initialPageIndex: route.pageIndex,
-                                initialQuickTask: route.quickTask
+                                initialQuickTask: route.quickTask,
+                                initialContentRevisionID:
+                                    route.expectedContentRevisionID,
+                                onReadingPositionChange: {
+                                    pageIndex,
+                                    contentRevisionID in
+                                    persistSceneReadingPosition(
+                                        recordID: route.recordID,
+                                        pageIndex: pageIndex,
+                                        contentRevisionID:
+                                            contentRevisionID
+                                    )
+                                }
                             ) { createdRoute in
                                 open(createdRoute)
                             }
                             .id(route)
+                        }
+                    }
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            Button {
+                                returnToDesk()
+                            } label: {
+                                Label("Document Desk".localizedUI, systemImage: "square.grid.2x2")
+                            }
+                            .keyboardShortcut("h", modifiers: [.command, .shift])
+                            .help("Document Desk".localizedUI)
+                            .accessibilityIdentifier("returnToDocumentDesk")
+                        }
+                        ToolbarItem(placement: .topBarTrailing) {
+                            Button {
+                                isInspectorPresented.toggle()
+                            } label: {
+                                Image(systemName: "sidebar.right")
+                            }
+                            .keyboardShortcut(
+                                "i",
+                                modifiers: [.command, .option]
+                            )
+                            .accessibilityLabel(
+                                (
+                                    isInspectorPresented
+                                        ? "Hide Inspector"
+                                        : "Show Inspector"
+                                ).localizedUI
+                            )
+                            .accessibilityValue(
+                                (
+                                    isInspectorPresented
+                                        ? "Shown"
+                                        : "Hidden"
+                                ).localizedUI
+                            )
+                            .accessibilityHint(
+                                (
+                                    isInspectorPresented
+                                        ? "Hides document evidence and restores the previous library layout."
+                                        : "Shows document evidence beside the PDF and temporarily hides the library."
+                                ).localizedUI
+                            )
+                            .accessibilityIdentifier(
+                                "workspaceInspectorToggle"
+                            )
+                            .help(
+                                (
+                                    isInspectorPresented
+                                        ? "Hide Inspector"
+                                        : "Show Inspector"
+                                ).localizedUI
+                            )
                         }
                     }
                     .inspector(
@@ -560,9 +1441,15 @@ struct RootView: View {
                             )
                         }
                         .inspectorColumnWidth(
-                            min: 260,
-                            ideal: 300,
-                            max: 360
+                            min: dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 300
+                                : 260,
+                            ideal: dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 360
+                                : 300,
+                            max: dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 420
+                                : 360
                         )
                     }
                 } else {
@@ -570,16 +1457,48 @@ struct RootView: View {
                 }
             }
             .navigationSplitViewStyle(.balanced)
+            .onChange(
+                of: isInspectorPresented,
+                initial: true
+            ) { _, isPresented in
+                synchronizeWorkspaceColumnsForInspector(
+                    isPresented
+                )
+            }
         } else {
             NavigationStack(path: $path) {
-                LibraryView { route in
+                LibraryView(
+                    searchText: $librarySearchText,
+                    appliedSearchText: $libraryAppliedSearchText,
+                    searchScope: $librarySearchScope,
+                    statusFilter: $libraryStatusFilter,
+                    categoryFilter: $libraryCategoryFilter,
+                    selectedTag: $librarySelectedTag,
+                    selectedSmartView: $librarySelectedSmartView,
+                    isSelectingDocuments:
+                        $isSelectingLibraryDocuments,
+                    selectedDocumentIDs:
+                        $selectedLibraryDocumentIDs
+                ) { route in
                     open(route)
                 }
                 .navigationDestination(for: DocumentRoute.self) { route in
                     DocumentWorkspaceView(
                         recordID: route.recordID,
                         initialPageIndex: route.pageIndex,
-                        initialQuickTask: route.quickTask
+                        initialQuickTask: route.quickTask,
+                        initialContentRevisionID:
+                            route.expectedContentRevisionID,
+                        onReadingPositionChange: {
+                            pageIndex,
+                            contentRevisionID in
+                            persistSceneReadingPosition(
+                                recordID: route.recordID,
+                                pageIndex: pageIndex,
+                                contentRevisionID:
+                                    contentRevisionID
+                            )
+                        }
                     ) { createdRoute in
                         open(createdRoute)
                     }
@@ -588,28 +1507,367 @@ struct RootView: View {
         }
     }
 
+    private func returnToDesk() {
+        navigationGeneration = UUID()
+        navigationTask?.cancel()
+        navigationTask = nil
+        isInspectorPresented = false
+        synchronizeWorkspaceColumnsForInspector(false)
+        isSelectingLibraryDocuments = false
+        selectedLibraryDocumentIDs = []
+        isDeskVisible = true
+    }
+
+    private func synchronizeWorkspaceColumnsForInspector(
+        _ isPresented: Bool
+    ) {
+        guard horizontalSizeClass == .regular else { return }
+        restoreWorkspaceSplitVisibilityIfNeeded()
+        if isPresented {
+            guard splitVisibilityBeforeInspector == nil else {
+                return
+            }
+            splitVisibilityBeforeInspector = splitVisibility
+            splitVisibility = .detailOnly
+        } else if let previousVisibility =
+                    splitVisibilityBeforeInspector {
+            splitVisibility = previousVisibility
+            splitVisibilityBeforeInspector = nil
+        }
+    }
+
     private func restoreWorkspaceSelectionIfNeeded() {
-        guard horizontalSizeClass == .regular,
-              selectedWorkspaceRoute == nil,
-              let recordID = UUID(uuidString: lastWorkspaceRecordID),
-              let record = model.record(id: recordID)
+        if !didResolveInitialRecordID {
+            didResolveInitialRecordID = true
+            if let initialRecordID,
+               savedInitialRecordID != initialRecordID.uuidString,
+               let record = model.record(id: initialRecordID) {
+                savedInitialRecordID = initialRecordID.uuidString
+                open(
+                    DocumentRoute(
+                        recordID: initialRecordID,
+                        pageIndex:
+                            restoredSceneReadingPageIndex(for: record)
+                                ?? record.lastPageIndex,
+                        expectedContentRevisionID:
+                            record.contentRevisionID
+                    )
+                )
+                return
+            }
+        }
+
+        let isRegularWorkspace = horizontalSizeClass == .regular
+        let canRestoreCompactPadWorkspace =
+            UIDevice.current.userInterfaceIdiom == .pad
+                && !isRegularWorkspace
+                && path.isEmpty
+                && !isDeskVisible
+        guard (isRegularWorkspace && selectedWorkspaceRoute == nil)
+                || canRestoreCompactPadWorkspace
         else { return }
+
+        if let recordID = UUID(uuidString: lastWorkspaceRecordID),
+           let record = model.record(id: recordID) {
+            let route = DocumentRoute(
+                recordID: recordID,
+                pageIndex:
+                    restoredSceneReadingPageIndex(for: record)
+                        ?? record.lastPageIndex,
+                expectedContentRevisionID:
+                    record.contentRevisionID
+            )
+            if isRegularWorkspace {
+                selectedWorkspaceRoute = route
+                restoreComparisonSessionIfPossible(
+                    baseRecordID: recordID
+                )
+            } else {
+                open(
+                    route,
+                    preservingComparisonState: true
+                )
+            }
+            return
+        }
+
+        guard isRegularWorkspace else { return }
+        guard let record = preferredInitialWorkspaceRecord else {
+            return
+        }
+        comparisonSession = nil
+        lastComparisonPeerID = ""
+        lastWorkspaceRecordID = record.id.uuidString
         selectedWorkspaceRoute = DocumentRoute(
-            recordID: recordID,
-            pageIndex: record.lastPageIndex
+            recordID: record.id,
+            pageIndex:
+                restoredSceneReadingPageIndex(for: record)
+                    ?? record.lastPageIndex,
+            expectedContentRevisionID:
+                record.contentRevisionID
         )
-        if let revisedRecordID = UUID(
-            uuidString: lastComparisonPeerID
-        ),
-           revisedRecordID != recordID,
-           let revised = model.record(id: revisedRecordID),
-           !record.profile.isLocked,
-           !revised.profile.isLocked {
-            comparisonSession = StudioComparisonSession(
-                baseRecordID: recordID,
-                revisedRecordID: revisedRecordID
+    }
+
+    private func settledWorkspaceRoute(
+        _ route: DocumentRoute
+    ) -> DocumentRoute {
+        guard let record = model.record(id: route.recordID) else {
+            return route
+        }
+        let pageIndex =
+            restoredSceneReadingPageIndex(for: record)
+                ?? route.pageIndex
+                ?? record.lastPageIndex
+        return DocumentRoute(
+            recordID: record.id,
+            pageIndex: min(
+                max(0, pageIndex),
+                max(0, record.profile.pageCount - 1)
+            ),
+            expectedContentRevisionID: record.contentRevisionID
+        )
+    }
+
+    private func restoredSceneReadingPageIndex(
+        for record: DocumentRecord
+    ) -> Int? {
+        guard sceneReadingRecordID == record.id.uuidString else {
+            return nil
+        }
+        guard sceneReadingRevisionID
+                == record.contentRevisionID.uuidString,
+              sceneReadingPageIndex >= 0,
+              record.profile.pageCount > 0
+        else {
+            clearSceneReadingPosition()
+            return nil
+        }
+        return min(
+            sceneReadingPageIndex,
+            record.profile.pageCount - 1
+        )
+    }
+
+    private func persistSceneReadingPosition(
+        recordID: UUID,
+        pageIndex: Int,
+        contentRevisionID: UUID
+    ) {
+        guard lastWorkspaceRecordID == recordID.uuidString,
+              let record = model.record(id: recordID),
+              record.contentRevisionID == contentRevisionID,
+              record.profile.pageCount > 0
+        else { return }
+        sceneReadingRecordID = recordID.uuidString
+        sceneReadingRevisionID = contentRevisionID.uuidString
+        sceneReadingPageIndex = min(
+            max(0, pageIndex),
+            record.profile.pageCount - 1
+        )
+    }
+
+    private func clearSceneReadingPosition() {
+        sceneReadingRecordID = ""
+        sceneReadingRevisionID = ""
+        sceneReadingPageIndex = -1
+    }
+
+    private func restoreLibraryContextIfNeeded() {
+        guard !didRestoreLibraryContext else { return }
+        didRestoreLibraryContext = true
+        librarySearchScope =
+            LibrarySearchScope(rawValue: savedLibrarySearchScope)
+                ?? .all
+        libraryStatusFilter = DocumentWorkflowStatus(
+            rawValue: savedLibraryStatusFilter
+        )
+        libraryCategoryFilter = DocumentCategory(
+            rawValue: savedLibraryCategoryFilter
+        )
+        librarySelectedSmartView = LibrarySmartView(
+            rawValue: savedLibrarySmartView
+        )
+        if librarySelectedSmartView != nil {
+            libraryStatusFilter = nil
+            libraryCategoryFilter = nil
+            savedLibraryStatusFilter = ""
+            savedLibraryCategoryFilter = ""
+        }
+    }
+
+    private var libraryRestorableContext:
+        LibraryRestorableContext {
+        LibraryRestorableContext(
+            searchScope: librarySearchScope,
+            statusFilter: libraryStatusFilter,
+            categoryFilter: libraryCategoryFilter,
+            smartView: librarySelectedSmartView
+        )
+    }
+
+    private func persistLibraryContextIfNeeded(
+        _ context: LibraryRestorableContext
+    ) {
+        guard didRestoreLibraryContext else { return }
+        savedLibrarySearchScope = context.searchScope.rawValue
+        savedLibraryStatusFilter =
+            context.statusFilter?.rawValue ?? ""
+        savedLibraryCategoryFilter =
+            context.categoryFilter?.rawValue ?? ""
+        savedLibrarySmartView = context.smartView?.rawValue ?? ""
+    }
+
+    private func restoreComparisonSessionIfPossible(
+        baseRecordID: UUID
+    ) {
+        guard let base = model.record(id: baseRecordID),
+              let revisedRecordID = UUID(
+                uuidString: lastComparisonPeerID
+              ),
+              revisedRecordID != baseRecordID,
+              let revised = model.record(id: revisedRecordID),
+              !base.profile.isLocked,
+              !revised.profile.isLocked
+        else {
+            comparisonSession = nil
+            lastComparisonPeerID = ""
+            return
+        }
+        comparisonSession = StudioComparisonSession(
+            baseRecordID: baseRecordID,
+            revisedRecordID: revisedRecordID
+        )
+    }
+
+    private func restoreWorkspaceSplitVisibilityIfNeeded() {
+        guard UIDevice.current.userInterfaceIdiom == .pad,
+              horizontalSizeClass == .regular,
+              !didRestoreSplitVisibility
+        else { return }
+        didRestoreSplitVisibility = true
+        let restored: NavigationSplitViewVisibility =
+            savedSplitVisibility == "detailOnly"
+                ? .detailOnly
+                : .all
+        if isInspectorPresented {
+            splitVisibilityBeforeInspector = restored
+            splitVisibility = .detailOnly
+        } else {
+            splitVisibility = restored
+        }
+    }
+
+    private func persistWorkspaceSplitVisibility(
+        _ visibility: NavigationSplitViewVisibility
+    ) {
+        guard didRestoreSplitVisibility,
+              horizontalSizeClass == .regular,
+              !isInspectorPresented,
+              splitVisibilityBeforeInspector == nil
+        else { return }
+        savedSplitVisibility = visibility == .detailOnly
+            ? "detailOnly"
+            : "all"
+    }
+
+    private var canAcceptDroppedPDFs: Bool {
+        UIDevice.current.userInterfaceIdiom == .pad
+            && scenePhase == .active
+            && protectedDataAvailable
+            && !appLock.isLocked
+            && !model.isLoading
+            && !model.isImporting
+            && !isFirstRunPresentationActive
+            && !isFullUnlockPresentationActive
+    }
+
+    private func handleDroppedPDFURLs(_ urls: [URL]) -> Bool {
+        isPDFDropTargeted = false
+        guard canAcceptDroppedPDFs,
+              !urls.isEmpty,
+              urls.allSatisfy({
+                  $0.isFileURL
+                      && $0.pathExtension.caseInsensitiveCompare("pdf")
+                          == .orderedSame
+              })
+        else {
+            if canAcceptDroppedPDFs, !urls.isEmpty {
+                model.present(
+                    ExternalPDFInboxError.invalidPDF,
+                    in: sceneID
+                )
+            }
+            return false
+        }
+
+        var seenPaths = Set<String>()
+        let uniqueURLs = urls.filter {
+            seenPaths.insert($0.standardizedFileURL.path).inserted
+        }
+        guard !uniqueURLs.isEmpty else { return false }
+        Task {
+            await model.receiveExternalURLs(
+                uniqueURLs,
+                targetSceneID: sceneID
             )
         }
+        return true
+    }
+
+    private var preferredInitialWorkspaceRecord: DocumentRecord? {
+        let startOfToday = Calendar.current.startOfDay(for: Date())
+        return model.workingDocuments.max { lhs, rhs in
+            let lhsPriority = initialWorkspacePriority(
+                lhs,
+                startOfToday: startOfToday
+            )
+            let rhsPriority = initialWorkspacePriority(
+                rhs,
+                startOfToday: startOfToday
+            )
+            if lhsPriority != rhsPriority {
+                return lhsPriority < rhsPriority
+            }
+            let lhsActivity =
+                lhs.lastViewedAt ?? lhs.modifiedAt
+            let rhsActivity =
+                rhs.lastViewedAt ?? rhs.modifiedAt
+            if lhsActivity != rhsActivity {
+                return lhsActivity < rhsActivity
+            }
+            return lhs.id.uuidString > rhs.id.uuidString
+        }
+    }
+
+    private func initialWorkspacePriority(
+        _ record: DocumentRecord,
+        startOfToday: Date
+    ) -> Int {
+        if record.deliveryReceipt != nil,
+           !record.hasCurrentDeliveryReceipt {
+            return 50
+        }
+        if record.profile.isLocked {
+            return 45
+        }
+        if record.taskCheckpoint != nil {
+            return 40
+        }
+        if let dueAt = record.dueAt {
+            return dueAt < startOfToday ? 35 : 30
+        }
+        if model.taskPackageRecommendation(for: record).map({
+            $0.task != .safeShare
+        }) ?? false {
+            return 25
+        }
+        if model.needsAttention(record) {
+            return 20
+        }
+        if record.lastViewedAt != nil && record.lastPageIndex > 0 {
+            return 15
+        }
+        return 10
     }
 
     private func beginComparison(
@@ -645,25 +1903,250 @@ struct RootView: View {
     }
 
     private func closeComparison() {
+        if let selectedWorkspaceRoute {
+            self.selectedWorkspaceRoute =
+                settledWorkspaceRoute(selectedWorkspaceRoute)
+        }
         comparisonSession = nil
         lastComparisonPeerID = ""
     }
 
+    private func scheduleActiveLifecycle(
+        becameGloballyActive: Bool,
+        resumesInterruptedWork: Bool = false
+    ) {
+        pendingGlobalActivation =
+            pendingGlobalActivation || becameGloballyActive
+        activeLifecycleTask?.cancel()
+        let generation = UUID()
+        activeLifecycleGeneration = generation
+        activeLifecycleTask = Task { @MainActor in
+            defer {
+                if activeLifecycleGeneration == generation {
+                    activeLifecycleTask = nil
+                }
+            }
+            if appLock.isLocked,
+               !appLock.isAuthenticating {
+                _ = await appLock.unlock()
+            }
+            guard !Task.isCancelled,
+                  activeLifecycleGeneration == generation,
+                  appLock.hasActiveScenes,
+                  protectedDataAvailable
+            else { return }
+            if resumesInterruptedWork {
+                await model.restoreCommittedImportsForForeground()
+                guard !Task.isCancelled,
+                      activeLifecycleGeneration == generation,
+                      appLock.hasActiveScenes,
+                      protectedDataAvailable
+                else { return }
+                await model.processPendingExternalPDFs()
+                guard !Task.isCancelled,
+                      activeLifecycleGeneration == generation,
+                      appLock.hasActiveScenes,
+                      protectedDataAvailable
+                else { return }
+                await model.restoreCommittedImportsForForeground()
+                guard !Task.isCancelled,
+                      activeLifecycleGeneration == generation,
+                      appLock.hasActiveScenes,
+                      protectedDataAvailable
+                else { return }
+                model.resumeDeferredBackgroundWork()
+                resumePendingRootNavigationIfPossible()
+            } else {
+                resumePendingRootNavigationIfPossible()
+            }
+            guard pendingGlobalActivation else { return }
+            async let purchaseRefresh: Void =
+                purchase.refreshForLaunch()
+            await model.bootstrap()
+            guard !Task.isCancelled,
+                  activeLifecycleGeneration == generation,
+                  appLock.hasActiveScenes,
+                  protectedDataAvailable
+            else { return }
+            pendingGlobalActivation = false
+#if DEBUG
+            await runDeviceGoldenPathIfRequested()
+#endif
+            _ = await purchaseRefresh
+        }
+    }
+
+    private func cancelActiveLifecycle() {
+        activeLifecycleGeneration = UUID()
+        pendingGlobalActivation = false
+        activeLifecycleTask?.cancel()
+        activeLifecycleTask = nil
+    }
+
+    private func cancelPendingExternalOpen(
+        clearsPendingDocument: Bool = false,
+        showsNotice: Bool = false
+    ) {
+        pendingExternalOpenGeneration = UUID()
+        pendingExternalOpenTask?.cancel()
+        pendingExternalOpenTask = nil
+        guard clearsPendingDocument,
+              let recordID = model.pendingExternalDocumentID(
+                for: sceneID
+              )
+        else { return }
+        model.clearPendingExternalDocument(recordID)
+        if showsNotice {
+            model.presentNotice(
+                "Private copy stayed in Library".localizedUI,
+                in: sceneID
+            )
+        }
+    }
+
+#if DEBUG
+    private func runDeviceGoldenPathIfRequested() async {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("UITEST_POLISH_OCR") {
+            guard !model.documents.contains(where: { $0.displayName == "Polish scan" }) else { return }
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+            do {
+                try LocalFileSecurity.prepareProtectedDirectory(at: directory)
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let url = directory.appendingPathComponent("Polish scan.pdf")
+                let bounds = CGRect(x: 0, y: 0, width: 612, height: 792)
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = 2
+                format.opaque = true
+                let pages = [
+                    "Delivery 4827\n\nReview the signed documents.\nKeep processing on this device.",
+                    "Invoice 2048\n\nAmount due USD 1280.\nCheck the date before sharing."
+                ]
+                try UIGraphicsPDFRenderer(bounds: bounds).writePDF(to: url) { context in
+                    for text in pages {
+                        let image = UIGraphicsImageRenderer(size: bounds.size, format: format).image { canvas in
+                            UIColor.white.setFill()
+                            canvas.fill(bounds)
+                            (text as NSString).draw(
+                                in: bounds.insetBy(dx: 48, dy: 64),
+                                withAttributes: [.font: UIFont.systemFont(ofSize: 24), .foregroundColor: UIColor.black]
+                            )
+                        }
+                        context.beginPage()
+                        image.draw(in: bounds)
+                    }
+                }
+                _ = await model.importPDF(from: url)
+            } catch {
+                model.present(error, in: sceneID)
+            }
+            return
+        }
+        if arguments.contains("DEVICE_OFFICE_CORPUS"),
+           let documents = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+           ).first {
+            await DeviceOfficeCorpusDiagnostics.run(
+                root: documents.appendingPathComponent("OfficeCorpus")
+            )
+            return
+        }
+        if arguments.contains("DEBUG_OPEN_OFFICE_EXPORT"),
+           let record = model.documents.first {
+            open(
+                DocumentRoute(
+                    recordID: record.id,
+                    quickTask: .exportText
+                )
+            )
+            return
+        }
+        guard arguments.contains("DEVICE_GOLDEN_PATH"),
+        let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first
+        else { return }
+        let reportURL = documents.appendingPathComponent(
+            "PaperPath-device-golden-path.json"
+        )
+        await Task.detached(priority: .userInitiated) {
+            await DeviceGoldenPathDiagnostics.run(
+                reportURL: reportURL
+            )
+        }.value
+    }
+#endif
+
+    private var sceneActionNotice: AppActionNotice? {
+        model.actionNotice(for: sceneID)
+    }
+
+    private var sceneTransientNotice: AppTransientNotice? {
+        model.transientNotice(for: sceneID)
+    }
+
+    private var canPresentTransientFeedback: Bool {
+        scenePhase == .active
+            && protectedDataAvailable
+            && !appLock.isLocked
+    }
+
+    private func suspendNoticePresentation() {
+        noticeDismissTask?.cancel()
+        noticeDismissTask = nil
+    }
+
+    private func resumeNoticePresentationIfNeeded() {
+        guard canPresentTransientFeedback else { return }
+        if let notice = sceneActionNotice {
+            if voiceOverEnabled {
+                UIAccessibility.post(
+                    notification: .announcement,
+                    argument: [
+                        notice.message.localizedUI,
+                        notice.detail?.localizedUI
+                    ]
+                    .compactMap { $0 }
+                    .joined(separator: ". ")
+                )
+            }
+            scheduleActionNoticeDismiss(notice)
+        } else if sceneActionNotice == nil,
+                  let notice = sceneTransientNotice {
+            if voiceOverEnabled {
+                UIAccessibility.post(
+                    notification: .announcement,
+                    argument: notice.message.localizedUI
+                )
+            }
+            scheduleMessageDismiss(notice)
+        }
+    }
+
     private func scheduleMessageDismiss(
-        _ message: String
+        _ notice: AppTransientNotice
     ) {
         noticeDismissTask?.cancel()
+        guard !voiceOverEnabled,
+              canPresentTransientFeedback
+        else { return }
         noticeDismissTask = Task {
             let visibleSeconds = min(
                 6,
-                max(2.8, Double(message.count) * 0.055)
+                max(2.8, Double(notice.message.count) * 0.055)
             )
             try? await Task.sleep(
                 for: .seconds(visibleSeconds)
             )
             if !Task.isCancelled,
-               model.noticeMessage == message {
-                model.noticeMessage = nil
+               canPresentTransientFeedback,
+               sceneTransientNotice?.id == notice.id,
+               sceneActionNotice == nil {
+                model.dismissTransientNotice(
+                    id: notice.id,
+                    from: sceneID
+                )
             }
         }
     }
@@ -672,13 +2155,52 @@ struct RootView: View {
         _ notice: AppActionNotice
     ) {
         noticeDismissTask?.cancel()
-        guard !voiceOverEnabled else { return }
+        guard !voiceOverEnabled,
+              canPresentTransientFeedback,
+              sceneActionNotice?.id == notice.id
+        else { return }
         noticeDismissTask = Task {
-            try? await Task.sleep(for: .seconds(9))
+            let readingLength = notice.message.count
+                + (notice.detail?.count ?? 0)
+                + notice.action.title.count
+            let visibleSeconds = min(
+                15,
+                max(9, Double(readingLength) * 0.06)
+            )
+            try? await Task.sleep(
+                for: .seconds(visibleSeconds)
+            )
             if !Task.isCancelled,
-               model.actionNotice?.id == notice.id {
-                model.dismissActionNotice(id: notice.id)
+               canPresentTransientFeedback,
+               sceneActionNotice?.id == notice.id {
+                model.dismissActionNotice(
+                    id: notice.id,
+                    from: sceneID
+                )
             }
+        }
+    }
+
+    private func scheduleRatingRequestIfAppropriate() {
+        ratingRequestTask?.cancel()
+        ratingRequestTask = nil
+        guard !isRunningAutomatedTests,
+              AppEntitlement.shouldRequestRating
+        else { return }
+        ratingRequestTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(7))
+            guard !Task.isCancelled,
+                  scenePhase == .active,
+                  !appLock.isLocked,
+                  model.fullUnlockContext(for: sceneID) == nil,
+                  !model.hasActiveLocalDataOperations,
+                  sceneTransientNotice == nil,
+                  sceneActionNotice == nil,
+                  AppEntitlement.shouldRequestRating
+            else { return }
+            requestReview()
+            AppEntitlement.markRatingRequested()
+            ratingRequestTask = nil
         }
     }
 }
@@ -837,13 +2359,31 @@ private struct StudioWorkspacePlaceholder: View {
 }
 
 private struct StudioDocumentInspector: View {
+    private struct VersionLoadRequest: Hashable {
+        let recordID: UUID
+        let contentRevisionID: UUID?
+        let reloadRequest: Int
+        let isActive: Bool
+    }
+
     @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @AppStorage("workspace.inspectorActions")
     private var savedInspectorActions = ""
     @AppStorage("document.favoriteTools")
     private var savedFavoriteTools = ""
     @State private var recentVersions: [PDFVersionSnapshot] = []
     @State private var isPresentingVersionHistory = false
+    @State private var initialVersionHistoryID: UUID?
+    @State private var isLoadingVersions = false
+    @State private var versionLoadGeneration = UUID()
+    @State private var versionReloadRequest = 0
+    @State private var pendingVersionRoute: DocumentRoute?
+    @State private var versionNavigationTask: Task<Void, Never>?
+    @State private var versionNavigationGeneration = UUID()
+    @State private var versionSelectionFeedback = 0
 
     let recordID: UUID
     let onOpen: (DocumentRoute) -> Void
@@ -875,27 +2415,128 @@ private struct StudioDocumentInspector: View {
                 .scrollIndicators(.hidden)
             }
         }
-        .task(id: recordID) {
-            recentVersions = Array(
-                await model.versionHistory(
-                    recordID: recordID
-                ).prefix(3)
-            )
+        .task(id: versionLoadRequest) {
+            guard scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            await loadRecentVersions()
         }
-        .sheet(isPresented: $isPresentingVersionHistory) {
+        .onChange(of: recordID) { _, _ in
+            interruptInspectorWork(clearsVersions: true)
+        }
+        .sheet(
+            isPresented: $isPresentingVersionHistory,
+            onDismiss: completeVersionHistoryPresentation
+        ) {
             PDFVersionHistoryView(
-                recordID: recordID
+                recordID: recordID,
+                initialVersionID: initialVersionHistoryID
             ) { targetRecordID, pageIndex in
+                pendingVersionRoute = DocumentRoute(
+                    recordID: targetRecordID,
+                    pageIndex: pageIndex
+                ).bindingExpectedRevision(
+                    model.record(id: targetRecordID)?
+                        .contentRevisionID
+                )
                 isPresentingVersionHistory = false
-                DispatchQueue.main.async {
-                    onOpen(
-                        DocumentRoute(
-                            recordID: targetRecordID,
-                            pageIndex: pageIndex
-                        )
-                    )
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptInspectorWork(clearsVersions: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptInspectorWork(clearsVersions: true)
+        }
+        .onDisappear {
+            interruptInspectorWork(clearsVersions: false)
+        }
+        .sensoryFeedback(
+            .selection,
+            trigger: versionSelectionFeedback
+        )
+    }
+
+    private var versionLoadRequest: VersionLoadRequest {
+        VersionLoadRequest(
+            recordID: recordID,
+            contentRevisionID: model.record(id: recordID)?
+                .contentRevisionID,
+            reloadRequest: versionReloadRequest,
+            isActive: scenePhase == .active
+        )
+    }
+
+    private func loadRecentVersions() async {
+        let generation = UUID()
+        versionLoadGeneration = generation
+        isLoadingVersions = true
+        let loaded = await model.versionHistory(recordID: recordID)
+        guard !Task.isCancelled,
+              versionLoadGeneration == generation,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        recentVersions = Array(loaded.prefix(3))
+        isLoadingVersions = false
+    }
+
+    private func presentVersionHistory(
+        initialVersionID: UUID?
+    ) {
+        initialVersionHistoryID = initialVersionID
+        versionSelectionFeedback &+= 1
+        isPresentingVersionHistory = true
+    }
+
+    private func completeVersionHistoryPresentation() {
+        initialVersionHistoryID = nil
+        versionReloadRequest &+= 1
+        guard let route = pendingVersionRoute else { return }
+        pendingVersionRoute = nil
+        versionNavigationTask?.cancel()
+        let generation = UUID()
+        versionNavigationGeneration = generation
+        versionNavigationTask = Task { @MainActor in
+            defer {
+                if versionNavigationGeneration == generation {
+                    versionNavigationTask = nil
                 }
             }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  versionNavigationGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  model.record(id: route.recordID) != nil
+            else { return }
+            onOpen(route)
+        }
+    }
+
+    private func cancelVersionNavigation() {
+        versionNavigationGeneration = UUID()
+        versionNavigationTask?.cancel()
+        versionNavigationTask = nil
+    }
+
+    private func interruptInspectorWork(
+        clearsVersions: Bool
+    ) {
+        versionLoadGeneration = UUID()
+        isLoadingVersions = false
+        cancelVersionNavigation()
+        pendingVersionRoute = nil
+        initialVersionHistoryID = nil
+        isPresentingVersionHistory = false
+        if clearsVersions {
+            recentVersions.removeAll(keepingCapacity: false)
         }
     }
 
@@ -967,7 +2608,16 @@ private struct StudioDocumentInspector: View {
     private func nextActions(
         _ record: DocumentRecord
     ) -> some View {
-        VStack(alignment: .leading, spacing: PPSpacing.small) {
+        let headerLayout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                )
+            )
+            : AnyLayout(HStackLayout(spacing: PPSpacing.small))
+
+        return VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "NEXT",
                 detail: "Open directly in the current workspace",
@@ -975,7 +2625,7 @@ private struct StudioDocumentInspector: View {
                 tint: PPColor.mint
             )
 
-            HStack(spacing: PPSpacing.small) {
+            headerLayout {
                 Text(
                     AppLocalization.format(
                         "%lld of 5 work positions",
@@ -984,7 +2634,9 @@ private struct StudioDocumentInspector: View {
                 )
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(PPColor.textSecondary)
-                Spacer(minLength: 0)
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
                 Menu {
                     ForEach(StudioInspectorAction.allCases) {
                         action in
@@ -1018,6 +2670,13 @@ private struct StudioDocumentInspector: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(PPColor.mint)
+                .hoverEffect(.highlight)
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    alignment: .leading
+                )
             }
 
             ForEach(configuredActions) { action in
@@ -1044,8 +2703,23 @@ private struct StudioDocumentInspector: View {
             )
             .padding(.bottom, PPSpacing.small)
 
+            if isLoadingVersions {
+                HStack(spacing: PPSpacing.small) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading protected versions".localizedUI)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
+                    Spacer(minLength: 0)
+                    OnDeviceBadge(compact: true)
+                }
+                .frame(minHeight: 44)
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(.updatesFrequently)
+            }
+
             Button {
-                isPresentingVersionHistory = true
+                presentVersionHistory(initialVersionID: nil)
             } label: {
                 revisionNode(
                     title: "Current working copy",
@@ -1061,13 +2735,20 @@ private struct StudioDocumentInspector: View {
                 )
             }
             .buttonStyle(.plain)
+            .hoverEffect(.highlight)
+            .accessibilityHint(
+                "Opens the complete protected version history."
+                    .localizedUI
+            )
 
             ForEach(
                 Array(recentVersions.enumerated()),
                 id: \.element.id
             ) { index, version in
                 Button {
-                    isPresentingVersionHistory = true
+                    presentVersionHistory(
+                        initialVersionID: version.id
+                    )
                 } label: {
                     revisionNode(
                         title: AppLocalization.format(
@@ -1084,6 +2765,11 @@ private struct StudioDocumentInspector: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .hoverEffect(.highlight)
+                .accessibilityHint(
+                    "Opens this saved version and compares it with the working copy."
+                        .localizedUI
+                )
             }
         }
     }
@@ -1153,6 +2839,7 @@ private struct StudioDocumentInspector: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .hoverEffect(.highlight)
                 .disabled(comparisonCandidates.isEmpty)
             } else {
                 inspectorAction(
@@ -1199,11 +2886,17 @@ private struct StudioDocumentInspector: View {
                 Image(systemName: "ellipsis")
                     .font(.caption.weight(.bold))
                     .foregroundStyle(PPColor.textSecondary)
-                    .frame(width: 24, height: 40)
+                    .frame(width: 44, height: 44)
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Arrange \(action.title)".localizedUI)
+            .hoverEffect(.highlight)
+            .accessibilityLabel(
+                AppLocalization.format(
+                    "Arrange %@",
+                    action.title.localizedUI
+                )
+            )
         }
     }
 
@@ -1219,7 +2912,7 @@ private struct StudioDocumentInspector: View {
                 )
             )
         } else if action == .versions {
-            isPresentingVersionHistory = true
+            presentVersionHistory(initialVersionID: nil)
         } else if let quickTask = action.quickTask {
             onOpen(
                 DocumentRoute(
@@ -1292,8 +2985,10 @@ private struct StudioDocumentInspector: View {
             actions.remove(at: index)
         } else {
             guard actions.count < 5 else {
-                model.noticeMessage =
-                    "The Inspector holds up to five actions."
+                model.presentNotice(
+                    "The Inspector holds up to five actions.",
+                    in: paperPathSceneID
+                )
                 return
             }
             actions.append(action)
@@ -1362,6 +3057,7 @@ private struct StudioDocumentInspector: View {
             )
         }
         .buttonStyle(.plain)
+        .hoverEffect(.highlight)
     }
 
     private func inspectorActionLabel(
@@ -1382,7 +3078,12 @@ private struct StudioDocumentInspector: View {
                 Text(detail.localizedUI)
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(2)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? nil
+                            : 2
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
             Image(systemName: "arrow.right")
@@ -1412,6 +3113,106 @@ private struct StudioDocumentInspector: View {
 }
 
 private struct StudioComparisonWorkspace: View {
+    private struct ComparisonRevisionStamp: Equatable {
+        let baseRecordID: UUID
+        let revisedRecordID: UUID
+        let baseRevisionID: UUID?
+        let revisedRevisionID: UUID?
+    }
+
+    private struct ComparisonProofPayload: Identifiable {
+        let baseRecordID: UUID
+        let baseRevisionID: UUID
+        let baseTitle: String
+        let baseURL: URL
+        let basePageCount: Int
+        let baseRefreshToken: Int
+        let revisedRecordID: UUID
+        let revisedRevisionID: UUID
+        let revisedTitle: String
+        let revisedURL: URL
+        let revisedPageCount: Int
+        let revisedRefreshToken: Int
+        let initialBasePage: Int
+        let initialRevisedPage: Int
+        let initialChangeIndex: Int?
+        let review: PDFChangeReview
+
+        var id: String {
+            [
+                baseRecordID.uuidString,
+                baseRevisionID.uuidString,
+                revisedRecordID.uuidString,
+                revisedRevisionID.uuidString
+            ].joined(separator: ":")
+        }
+    }
+
+    private struct ComparisonMetrics {
+        static let empty = ComparisonMetrics(
+            allCount: 0,
+            criticalCount: 0,
+            insertedCount: 0,
+            removedCount: 0,
+            structureCount: 0,
+            textCount: 0,
+            vectorCount: 0
+        )
+
+        let allCount: Int
+        let criticalCount: Int
+        let insertedCount: Int
+        let removedCount: Int
+        let structureCount: Int
+        let textCount: Int
+        let vectorCount: Int
+
+        static func build(
+            for review: PDFChangeReview
+        ) -> ComparisonMetrics {
+            var criticalCount = 0
+            var insertedCount = 0
+            var removedCount = 0
+            var structureCount = 0
+            var textCount = 0
+            var vectorCount = 0
+            for change in review.changes {
+                if change.severity == .critical {
+                    criticalCount += 1
+                }
+                if change.textChanged
+                    || change.hasLocatedTextDifferences {
+                    textCount += 1
+                }
+                if change.hasLocatedVectorDifferences {
+                    vectorCount += 1
+                }
+                switch change.resolvedMatchKind {
+                case .inserted:
+                    insertedCount += 1
+                    structureCount += 1
+                case .removed:
+                    removedCount += 1
+                    structureCount += 1
+                default:
+                    if change.geometryChanged {
+                        structureCount += 1
+                    }
+                    break
+                }
+            }
+            return ComparisonMetrics(
+                allCount: review.changes.count,
+                criticalCount: criticalCount,
+                insertedCount: insertedCount,
+                removedCount: removedCount,
+                structureCount: structureCount,
+                textCount: textCount,
+                vectorCount: vectorCount
+            )
+        }
+    }
+
     private enum ChangeFilter:
         String,
         CaseIterable,
@@ -1419,25 +3220,59 @@ private struct StudioComparisonWorkspace: View {
         case all
         case critical
         case structure
+        case text
+        case vector
 
         var id: String { rawValue }
-        var title: String { rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .all: return "All"
+            case .critical: return "Critical"
+            case .structure: return "Structure"
+            case .text: return "Text"
+            case .vector: return "Vector"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .all:
+                return "line.3.horizontal.decrease.circle"
+            case .critical:
+                return "exclamationmark.octagon"
+            case .structure:
+                return "doc.badge.plus"
+            case .text:
+                return "textformat"
+            case .vector:
+                return "square.dashed"
+            }
+        }
     }
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("workspace.comparisonSyncPages")
-    private var syncPages = true
-    @AppStorage("workspace.comparisonBasePage")
+    private var defaultSyncPages = true
+    @SceneStorage("workspace.sceneComparisonSyncPages")
+    private var savedSyncPages = ""
+    @SceneStorage("workspace.comparisonBasePage")
     private var savedBasePage = 0
-    @AppStorage("workspace.comparisonRevisedPage")
+    @SceneStorage("workspace.comparisonRevisedPage")
     private var savedRevisedPage = 0
-    @AppStorage("workspace.comparisonBasePageRecordID")
+    @SceneStorage("workspace.comparisonBasePageRecordID")
     private var savedBasePageRecordID = ""
-    @AppStorage("workspace.comparisonRevisedPageRecordID")
+    @SceneStorage("workspace.comparisonRevisedPageRecordID")
     private var savedRevisedPageRecordID = ""
     @AppStorage("workspace.comparisonPageEvidence")
-    private var showsPageEvidence = true
+    private var defaultShowsPageEvidence = true
+    @SceneStorage("workspace.sceneComparisonPageEvidence")
+    private var savedShowsPageEvidence = ""
+    @SceneStorage("workspace.comparisonChangeFilter")
+    private var savedChangeFilter = ChangeFilter.all.rawValue
 
     let session: StudioComparisonSession
     let onSwap: () -> Void
@@ -1448,12 +3283,25 @@ private struct StudioComparisonWorkspace: View {
     @State private var baseNavigationToken = 0
     @State private var revisedNavigationToken = 0
     @State private var review: PDFChangeReview?
+    @State private var pageMatchLookup: PDFPageMatchLookup?
     @State private var comparisonTask: Task<Void, Never>?
     @State private var isComparing = false
+    @State private var comparisonProgress =
+        PDFComparisonProgress.starting
     @State private var errorMessage: String?
     @State private var selectedChangeIndex = 0
     @State private var comparisonGeneration = 0
+    @State private var syncPages = true
+    @State private var showsPageEvidence = true
     @State private var changeFilter = ChangeFilter.all
+    @State private var compactProofSide = PDFChangePageSide.revised
+    @State private var didRestoreComparisonPresentation = false
+    @State private var filteredChanges: [PDFPageChange] = []
+    @State private var comparisonMetrics = ComparisonMetrics.empty
+    @State private var comparisonProof: ComparisonProofPayload?
+    @State private var proofIndexTask: Task<Void, Never>?
+    @State private var proofIndexGeneration = UUID()
+    @State private var proofOpenFeedback = 0
 
     var body: some View {
         ZStack {
@@ -1469,42 +3317,20 @@ private struct StudioComparisonWorkspace: View {
                         revisedRecord: revisedRecord
                     )
                     changeNavigator
-                    HStack(spacing: 0) {
-                        if let review, !review.changes.isEmpty {
-                            changeRail(review)
-                            Rectangle()
-                                .fill(PPColor.border.opacity(0.72))
-                                .frame(width: 1)
-                        }
-
-                        proofPane(
-                            side: .source,
-                            record: baseRecord,
-                            url: baseURL,
-                            page: basePage,
-                            navigationToken: baseNavigationToken
-                        ) { page in
-                            basePageChanged(page)
-                        }
-
-                        Rectangle()
-                            .fill(PPColor.border.opacity(0.72))
-                            .frame(width: 1)
-                            .overlay {
-                                Rectangle()
-                                    .fill(PPColor.amber.opacity(0.52))
-                                    .frame(width: 1, height: 72)
-                            }
-
-                        proofPane(
-                            side: .revised,
-                            record: revisedRecord,
-                            url: revisedURL,
-                            page: revisedPage,
-                            navigationToken: revisedNavigationToken
-                        ) { page in
-                            revisedPageChanged(page)
-                        }
+                    if horizontalSizeClass == .compact {
+                        compactProofWorkspace(
+                            baseRecord: baseRecord,
+                            revisedRecord: revisedRecord,
+                            baseURL: baseURL,
+                            revisedURL: revisedURL
+                        )
+                    } else {
+                        regularProofWorkspace(
+                            baseRecord: baseRecord,
+                            revisedRecord: revisedRecord,
+                            baseURL: baseURL,
+                            revisedURL: revisedURL
+                        )
                     }
                 }
             } else {
@@ -1517,15 +3343,28 @@ private struct StudioComparisonWorkspace: View {
                 )
             }
         }
-        .navigationTitle("Version proof")
+        .navigationTitle("Comparison workspace")
         .navigationBarTitleDisplayMode(.inline)
         .task(id: session) {
+            restoreComparisonPresentationIfNeeded()
             restorePages()
             startComparison()
         }
         .onDisappear {
-            comparisonTask?.cancel()
-            comparisonTask = nil
+            stopComparison()
+            interruptProofIndexRebuild()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptProtectedComparison()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtectedComparison()
         }
         .onChange(of: basePage) { _, page in
             savedBasePageRecordID =
@@ -1537,12 +3376,50 @@ private struct StudioComparisonWorkspace: View {
                 session.revisedRecordID.uuidString
             savedRevisedPage = page
         }
+        .onChange(of: syncPages) { _, isEnabled in
+            guard didRestoreComparisonPresentation else { return }
+            savedSyncPages = isEnabled ? "true" : "false"
+            defaultSyncPages = isEnabled
+        }
+        .onChange(of: showsPageEvidence) { _, isEnabled in
+            guard didRestoreComparisonPresentation else { return }
+            savedShowsPageEvidence = isEnabled ? "true" : "false"
+            defaultShowsPageEvidence = isEnabled
+        }
         .onChange(of: changeFilter) { _, _ in
+            if didRestoreComparisonPresentation {
+                savedChangeFilter = changeFilter.rawValue
+            }
             selectedChangeIndex = 0
+            rebuildFilteredChanges()
             if let first = filteredChanges.first {
                 open(first)
             }
         }
+        .onChange(of: comparisonRevisionStamp) {
+            oldStamp,
+            newStamp in
+            guard oldStamp.baseRecordID == newStamp.baseRecordID,
+                  oldStamp.revisedRecordID
+                    == newStamp.revisedRecordID,
+                  oldStamp.baseRevisionID != nil,
+                  oldStamp.revisedRevisionID != nil,
+                  oldStamp != newStamp
+            else { return }
+            invalidateComparisonEvidenceForRevisionChange()
+        }
+        .fullScreenCover(item: $comparisonProof) { payload in
+            comparisonProofView(payload)
+        }
+        .sensoryFeedback(
+            .selection,
+            trigger: selectedChangeIndex
+        )
+        .sensoryFeedback(.selection, trigger: changeFilter)
+        .sensoryFeedback(
+            .impact(weight: .light),
+            trigger: proofOpenFeedback
+        )
     }
 
     private var baseRecord: DocumentRecord? {
@@ -1561,7 +3438,180 @@ private struct StudioComparisonWorkspace: View {
         model.url(for: session.revisedRecordID)
     }
 
+    private var comparisonRevisionStamp:
+        ComparisonRevisionStamp {
+        ComparisonRevisionStamp(
+            baseRecordID: session.baseRecordID,
+            revisedRecordID: session.revisedRecordID,
+            baseRevisionID: baseRecord?.contentRevisionID,
+            revisedRevisionID: revisedRecord?.contentRevisionID
+        )
+    }
+
+    private func restoreComparisonPresentationIfNeeded() {
+        guard !didRestoreComparisonPresentation else { return }
+        syncPages = switch savedSyncPages {
+        case "true": true
+        case "false": false
+        default: defaultSyncPages
+        }
+        showsPageEvidence = switch savedShowsPageEvidence {
+        case "true": true
+        case "false": false
+        default: defaultShowsPageEvidence
+        }
+        changeFilter =
+            ChangeFilter(rawValue: savedChangeFilter) ?? .all
+        didRestoreComparisonPresentation = true
+        savedSyncPages = syncPages ? "true" : "false"
+        savedShowsPageEvidence =
+            showsPageEvidence ? "true" : "false"
+        savedChangeFilter = changeFilter.rawValue
+    }
+
+    private func regularProofWorkspace(
+        baseRecord: DocumentRecord,
+        revisedRecord: DocumentRecord,
+        baseURL: URL,
+        revisedURL: URL
+    ) -> some View {
+        HStack(spacing: 0) {
+            if let review, !review.changes.isEmpty {
+                changeRail(review)
+                Rectangle()
+                    .fill(PPColor.border.opacity(0.72))
+                    .frame(width: 1)
+            }
+
+            proofPane(
+                side: .source,
+                record: baseRecord,
+                url: baseURL,
+                page: basePage,
+                navigationToken: baseNavigationToken
+            ) { page in
+                basePageChanged(page)
+            }
+
+            Rectangle()
+                .fill(PPColor.border.opacity(0.72))
+                .frame(width: 1)
+                .overlay {
+                    Rectangle()
+                        .fill(PPColor.amber.opacity(0.52))
+                        .frame(width: 1, height: 72)
+                }
+
+            proofPane(
+                side: .revised,
+                record: revisedRecord,
+                url: revisedURL,
+                page: revisedPage,
+                navigationToken: revisedNavigationToken
+            ) { page in
+                revisedPageChanged(page)
+            }
+        }
+    }
+
+    private func compactProofWorkspace(
+        baseRecord: DocumentRecord,
+        revisedRecord: DocumentRecord,
+        baseURL: URL,
+        revisedURL: URL
+    ) -> some View {
+        VStack(spacing: 0) {
+            let picker = Picker(
+                "Comparison side",
+                selection: $compactProofSide
+            ) {
+                Text("Base".localizedUI)
+                    .tag(PDFChangePageSide.source)
+                Text("Revised".localizedUI)
+                    .tag(PDFChangePageSide.revised)
+            }
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+                    .padding(.horizontal, PPSpacing.medium)
+                    .padding(.vertical, PPSpacing.xSmall)
+                    .background(PPColor.surface.opacity(0.94))
+            } else {
+                picker
+                    .pickerStyle(.segmented)
+                    .padding(.horizontal, PPSpacing.medium)
+                    .padding(.vertical, PPSpacing.small)
+                    .background(PPColor.surface.opacity(0.94))
+            }
+
+            switch compactProofSide {
+            case .source:
+                proofPane(
+                    side: .source,
+                    record: baseRecord,
+                    url: baseURL,
+                    page: basePage,
+                    navigationToken: baseNavigationToken
+                ) { page in
+                    basePageChanged(page)
+                }
+            case .revised:
+                proofPane(
+                    side: .revised,
+                    record: revisedRecord,
+                    url: revisedURL,
+                    page: revisedPage,
+                    navigationToken: revisedNavigationToken
+                ) { page in
+                    revisedPageChanged(page)
+                }
+            }
+        }
+    }
+
     private func proofHeader(
+        baseRecord: DocumentRecord,
+        revisedRecord: DocumentRecord
+    ) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                proofIdentityPair(
+                    baseRecord: baseRecord,
+                    revisedRecord: revisedRecord
+                )
+                Spacer(minLength: PPSpacing.small)
+                proofControls
+            }
+
+            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                proofIdentityPair(
+                    baseRecord: baseRecord,
+                    revisedRecord: revisedRecord
+                )
+                HStack {
+                    Spacer(minLength: 0)
+                    proofControls
+                }
+            }
+        }
+        .font(.subheadline)
+        .padding(.horizontal, PPSpacing.medium)
+        .padding(.vertical, PPSpacing.xSmall)
+        .frame(minHeight: 52)
+        .background(PPColor.surface.opacity(0.96))
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(PPColor.border.opacity(0.68))
+                .frame(height: 0.6)
+        }
+    }
+
+    private func proofIdentityPair(
         baseRecord: DocumentRecord,
         revisedRecord: DocumentRecord
     ) -> some View {
@@ -1580,12 +3630,20 @@ private struct StudioComparisonWorkspace: View {
                 record: revisedRecord,
                 tint: PPColor.amber
             )
-            Spacer(minLength: PPSpacing.small)
+        }
+    }
 
-            Button(action: onSwap) {
+    private var proofControls: some View {
+        HStack(spacing: PPSpacing.xSmall) {
+            Button {
+                stopComparison()
+                onSwap()
+            } label: {
                 Image(systemName: "arrow.triangle.swap")
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.borderless)
+            .accessibilityLabel("Swap base and revised PDFs")
             .help("Swap base and revised PDFs")
 
             Toggle(isOn: $syncPages) {
@@ -1594,9 +3652,15 @@ private struct StudioComparisonWorkspace: View {
                         ? "link"
                         : "link.badge.plus"
                 )
+                .frame(width: 44, height: 44)
             }
             .toggleStyle(.button)
             .buttonStyle(.borderless)
+            .accessibilityLabel(
+                syncPages
+                    ? "Disable synchronized pages"
+                    : "Synchronize pages"
+            )
             .help(
                 syncPages
                     ? "Pages move together"
@@ -1609,29 +3673,40 @@ private struct StudioComparisonWorkspace: View {
                         ? "viewfinder.circle.fill"
                         : "viewfinder.circle"
                 )
+                .frame(width: 44, height: 44)
             }
             .toggleStyle(.button)
             .buttonStyle(.borderless)
+            .accessibilityLabel(
+                showsPageEvidence
+                    ? "Hide page evidence"
+                    : "Show page evidence"
+            )
             .help(
                 showsPageEvidence
                     ? "Hide page evidence"
                     : "Show page evidence"
             )
 
-            Button(action: onClose) {
-                Image(systemName: "xmark")
+            Button {
+                openFullComparisonProof()
+            } label: {
+                Image(systemName: "rectangle.split.2x1.fill")
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.borderless)
-            .help("Close version proof")
-        }
-        .font(.subheadline)
-        .padding(.horizontal, PPSpacing.medium)
-        .frame(minHeight: 52)
-        .background(PPColor.surface.opacity(0.96))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.68))
-                .frame(height: 0.6)
+            .disabled(review == nil || isComparing)
+            .accessibilityLabel("Open full comparison proof")
+            .accessibilityHint(fullProofAccessibilityHint)
+            .help("Open full comparison proof")
+
+            Button(action: onClose) {
+                Image(systemName: "xmark")
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.borderless)
+            .accessibilityLabel("Close comparison workspace")
+            .help("Close comparison workspace")
         }
     }
 
@@ -1663,85 +3738,52 @@ private struct StudioComparisonWorkspace: View {
 
     @ViewBuilder
     private var changeNavigator: some View {
-        HStack(spacing: PPSpacing.medium) {
+        Group {
             if isComparing {
-                ProgressView()
-                    .controlSize(.small)
-                    .tint(PPColor.amber)
-                Text("Comparing visible content, text, and page geometry")
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
+                HStack(spacing: PPSpacing.small) {
+                    LocalComparisonProgressView(
+                        progress: comparisonProgress,
+                        tint: PPColor.amber,
+                        compact: true
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    Button {
+                        stopComparison()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(PPColor.amber)
+                    .accessibilityLabel("Stop comparison".localizedUI)
+                    .accessibilityHint(
+                        "Keeps the current page positions".localizedUI
+                    )
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             } else if let errorMessage {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(PPColor.rose)
-                Text(errorMessage)
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
-                Spacer(minLength: 0)
-                Button("Retry") {
-                    startComparison()
-                }
-                .font(.caption.weight(.semibold))
-            } else if let review {
-                changeMetric(
-                    value: review.criticalChanges.count,
-                    label: "Critical",
-                    tint: PPColor.rose
-                )
-                changeMetric(
-                    value: review.insertedPages.count,
-                    label: "Inserted",
-                    tint: PPColor.cyan
-                )
-                changeMetric(
-                    value: review.removedPages.count,
-                    label: "Removed",
-                    tint: PPColor.amber
-                )
-                Spacer(minLength: 0)
-                Picker("Change filter", selection: $changeFilter) {
-                    ForEach(ChangeFilter.allCases) { filter in
-                        Text(filter.title.localizedUI).tag(filter)
+                HStack(spacing: PPSpacing.small) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(PPColor.rose)
+                    Text(errorMessage.localizedUI)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: PPSpacing.xSmall)
+                    Button("Retry") {
+                        startComparison()
                     }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 230)
-
-                if !filteredChanges.isEmpty {
-                    Text(
-                        "\(min(selectedChangeIndex + 1, filteredChanges.count)) / \(filteredChanges.count)"
-                    )
-                    .font(.caption2.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(PPColor.textSecondary)
-                    Button {
-                        moveToChange(offset: -1)
-                    } label: {
-                        Image(systemName: "chevron.left")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Previous change")
-                    Button {
-                        moveToChange(offset: 1)
-                    } label: {
-                        Image(systemName: "chevron.right")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Next change")
-                } else {
-                    Label(
-                        review.changes.isEmpty
-                            ? "No deterministic changes"
-                            : "No changes in this filter",
-                        systemImage: "checkmark.seal.fill"
-                    )
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(PPColor.mint)
+                    .frame(minHeight: 44)
                 }
+            } else if let review {
+                comparisonReviewNavigator(review)
             }
         }
         .padding(.horizontal, PPSpacing.medium)
-        .frame(minHeight: 40)
+        .padding(.vertical, PPSpacing.xSmall)
+        .frame(minHeight: 44)
         .background(PPColor.elevated.opacity(0.92))
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -1754,8 +3796,124 @@ private struct StudioComparisonWorkspace: View {
         )
     }
 
-    private var filteredChanges: [PDFPageChange] {
-        guard let review else { return [] }
+    private func comparisonReviewNavigator(
+        _ review: PDFChangeReview
+    ) -> some View {
+        let changes = filteredChanges
+        return Group {
+            if usesCompactChangeNavigator {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        changeMetrics
+                            .padding(.trailing, PPSpacing.small)
+                    }
+                    changeNavigationControls(
+                        review,
+                        changes: changes
+                    )
+                }
+            } else {
+                HStack(spacing: PPSpacing.medium) {
+                    changeMetrics
+                    Spacer(minLength: 0)
+                    changeNavigationControls(
+                        review,
+                        changes: changes
+                    )
+                }
+            }
+        }
+    }
+
+    private var usesCompactChangeNavigator: Bool {
+        horizontalSizeClass == .compact
+            || dynamicTypeSize.ppPrefersExpandedLayout
+    }
+
+    private var changeMetrics: some View {
+        HStack(spacing: PPSpacing.medium) {
+            changeMetric(
+                value: comparisonMetrics.criticalCount,
+                label: "Critical",
+                tint: PPColor.rose
+            )
+            changeMetric(
+                value: comparisonMetrics.insertedCount,
+                label: "Inserted",
+                tint: PPColor.cyan
+            )
+            changeMetric(
+                value: comparisonMetrics.removedCount,
+                label: "Removed",
+                tint: PPColor.amber
+            )
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func changeNavigationControls(
+        _ review: PDFChangeReview,
+        changes: [PDFPageChange]
+    ) -> some View {
+        HStack(spacing: PPSpacing.xSmall) {
+            changeFilterControl
+            Spacer(minLength: PPSpacing.xSmall)
+
+            if !changes.isEmpty {
+                Text(
+                    "\(min(selectedChangeIndex + 1, changes.count)) / \(changes.count)"
+                )
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+                .accessibilityLabel(
+                    AppLocalization.format(
+                        "Change %lld of %lld",
+                        min(selectedChangeIndex + 1, changes.count),
+                        changes.count
+                    )
+                )
+                Button {
+                    moveToChange(offset: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Previous change")
+                .help("Previous change")
+                Button {
+                    moveToChange(offset: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Next change")
+                .help("Next change")
+            } else {
+                Label(
+                    (
+                        review.changes.isEmpty
+                            ? "No deterministic changes"
+                            : "No changes in this filter"
+                    ).localizedUI,
+                    systemImage: "checkmark.seal.fill"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.mint)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func filteredChanges(
+        in review: PDFChangeReview
+    ) -> [PDFPageChange] {
         switch changeFilter {
         case .all:
             return review.changes
@@ -1767,19 +3925,92 @@ private struct StudioComparisonWorkspace: View {
                     || $0.resolvedMatchKind == .removed
                     || $0.geometryChanged
             }
+        case .text:
+            return review.changes.filter {
+                $0.textChanged || $0.hasLocatedTextDifferences
+            }
+        case .vector:
+            return review.vectorChanges
+        }
+    }
+
+    private func rebuildComparisonIndex(
+        for review: PDFChangeReview
+    ) {
+        comparisonMetrics = ComparisonMetrics.build(for: review)
+        filteredChanges = filteredChanges(in: review)
+    }
+
+    private func rebuildFilteredChanges() {
+        guard let review else {
+            filteredChanges = []
+            return
+        }
+        filteredChanges = filteredChanges(in: review)
+    }
+
+    @ViewBuilder
+    private var changeFilterControl: some View {
+        Menu {
+            ForEach(ChangeFilter.allCases) { filter in
+                Button {
+                    changeFilter = filter
+                } label: {
+                    Label(
+                        AppLocalization.format(
+                            "%@ (%lld)",
+                            filter.title.localizedUI,
+                            changeCount(for: filter)
+                        ),
+                        systemImage: filter.symbol
+                    )
+                }
+                .disabled(
+                    filter != .all
+                        && changeCount(for: filter) == 0
+                )
+            }
+        } label: {
+            Label(
+                changeFilter.title.localizedUI,
+                systemImage: changeFilter.symbol
+            )
+            .lineLimit(1)
+        }
+        .frame(minHeight: 44)
+        .accessibilityLabel("Change filter")
+        .accessibilityValue(
+            AppLocalization.format(
+                "%@, %lld changes",
+                changeFilter.title.localizedUI,
+                changeCount(for: changeFilter)
+            )
+        )
+    }
+
+    private func changeCount(
+        for filter: ChangeFilter
+    ) -> Int {
+        switch filter {
+        case .all: return comparisonMetrics.allCount
+        case .critical: return comparisonMetrics.criticalCount
+        case .structure: return comparisonMetrics.structureCount
+        case .text: return comparisonMetrics.textCount
+        case .vector: return comparisonMetrics.vectorCount
         }
     }
 
     private func changeRail(
         _ review: PDFChangeReview
     ) -> some View {
-        VStack(spacing: 0) {
+        let changes = filteredChanges
+        return VStack(spacing: 0) {
             HStack(spacing: 4) {
                 Text("CHANGE TRACK")
                     .font(.caption2.smallCaps().weight(.bold))
                     .foregroundStyle(PPColor.textSecondary)
                 Spacer(minLength: 0)
-                Text("\(filteredChanges.count)")
+                Text("\(changes.count)")
                     .font(.caption2.monospacedDigit().weight(.bold))
                     .foregroundStyle(PPColor.rose)
             }
@@ -1787,7 +4018,7 @@ private struct StudioComparisonWorkspace: View {
             .frame(minHeight: 34)
             .background(PPColor.surface.opacity(0.9))
 
-            if filteredChanges.isEmpty {
+            if changes.isEmpty {
                 VStack(spacing: PPSpacing.small) {
                     Image(systemName: "checkmark.seal")
                         .foregroundStyle(PPColor.mint)
@@ -1802,11 +4033,11 @@ private struct StudioComparisonWorkspace: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(
-                            Array(filteredChanges.enumerated()),
-                            id: \.element
-                        ) { index, change in
+                            changes.indices,
+                            id: \.self
+                        ) { index in
                             changeRailRow(
-                                change,
+                                changes[index],
                                 index: index
                             )
                         }
@@ -1826,6 +4057,13 @@ private struct StudioComparisonWorkspace: View {
         let selected = currentChange?.id == change.id
             && currentChange?.resolvedSourcePageIndex
                 == change.resolvedSourcePageIndex
+        let accessibilityDetail = [
+            change.severity.title.localizedUI,
+            change.textDifferencePreview,
+            change.hasLocatedVectorDifferences
+                ? change.localizedVectorEvidenceCountLabel
+                : nil
+        ].compactMap { $0 }.joined(separator: " · ")
         return Button {
             selectedChangeIndex = index
             open(change)
@@ -1847,6 +4085,18 @@ private struct StudioComparisonWorkspace: View {
                     .font(.caption.monospacedDigit().weight(.semibold))
                     .foregroundStyle(PPColor.textPrimary)
                 differenceMap(change)
+                if let preview = change.textDifferencePreview {
+                    Text(preview)
+                        .font(.caption2)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                } else if change.hasLocatedVectorDifferences {
+                    Text(change.localizedVectorEvidenceCountLabel)
+                        .font(.caption2)
+                        .foregroundStyle(PPColor.cyan)
+                        .lineLimit(1)
+                }
             }
             .padding(.horizontal, PPSpacing.small)
             .padding(.vertical, 7)
@@ -1872,16 +4122,31 @@ private struct StudioComparisonWorkspace: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
         .accessibilityLabel(
-            "\(change.resolvedMatchKind.title), \(pagePairLabel(change))"
-                .localizedUI
+            AppLocalization.format(
+                "%@, %@",
+                change.resolvedMatchKind.title.localizedUI,
+                pagePairLabel(change)
+            )
         )
+        .accessibilityValue(accessibilityDetail)
     }
 
     private func differenceMap(
         _ change: PDFPageChange
     ) -> some View {
         GeometryReader { proxy in
+            let textEvidence = (
+                change.sourceTextDifferences ?? []
+            ) + (
+                change.revisedTextDifferences ?? []
+            )
+            let vectorEvidence = (
+                change.sourceVectorDifferences ?? []
+            ) + (
+                change.revisedVectorDifferences ?? []
+            )
             ZStack {
                 Rectangle()
                     .fill(PPColor.surfaceMuted)
@@ -1913,7 +4178,81 @@ private struct StudioComparisonWorkspace: View {
                                 * (region.y + region.height / 2)
                         )
                 }
-                if change.differenceRegions?.isEmpty != false {
+                ForEach(
+                    Array(textEvidence.prefix(12).enumerated()),
+                    id: \.offset
+                ) { _, evidence in
+                    Rectangle()
+                        .fill(
+                            evidence.resolvedGranularity == .character
+                                ? PPColor.rose.opacity(0.72)
+                                : PPColor.cyan.opacity(0.5)
+                        )
+                        .frame(
+                            width: max(
+                                1.5,
+                                proxy.size.width
+                                    * evidence.region.width
+                            ),
+                            height: max(
+                                1.5,
+                                proxy.size.height
+                                    * evidence.region.height
+                            )
+                        )
+                        .position(
+                            x: proxy.size.width
+                                * (
+                                    evidence.region.x
+                                        + evidence.region.width / 2
+                                ),
+                            y: proxy.size.height
+                                * (
+                                    evidence.region.y
+                                        + evidence.region.height / 2
+                                )
+                        )
+                }
+                ForEach(
+                    Array(vectorEvidence.prefix(12).enumerated()),
+                    id: \.offset
+                ) { _, evidence in
+                    Rectangle()
+                        .stroke(
+                            PPColor.cyan.opacity(0.86),
+                            style: StrokeStyle(
+                                lineWidth: 1,
+                                dash: [2, 1]
+                            )
+                        )
+                        .frame(
+                            width: max(
+                                2,
+                                proxy.size.width
+                                    * evidence.region.width
+                            ),
+                            height: max(
+                                2,
+                                proxy.size.height
+                                    * evidence.region.height
+                            )
+                        )
+                        .position(
+                            x: proxy.size.width
+                                * (
+                                    evidence.region.x
+                                        + evidence.region.width / 2
+                                ),
+                            y: proxy.size.height
+                                * (
+                                    evidence.region.y
+                                        + evidence.region.height / 2
+                                )
+                        )
+                }
+                if change.differenceRegions?.isEmpty != false,
+                   textEvidence.isEmpty,
+                   vectorEvidence.isEmpty {
                     Image(systemName: changeSymbol(change))
                         .font(.caption2)
                         .foregroundStyle(changeTint(change))
@@ -2018,11 +4357,21 @@ private struct StudioComparisonWorkspace: View {
                     )
                 } label: {
                     Image(systemName: "chevron.left")
+                        .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.borderless)
                 .disabled(page <= 0)
+                .accessibilityLabel(
+                    side == .source
+                        ? "Previous base page".localizedUI
+                        : "Previous revised page".localizedUI
+                )
                 Text(
-                    "\(page + 1) / \(max(record.profile.pageCount, 1))"
+                    AppLocalization.format(
+                        "%lld / %lld",
+                        page + 1,
+                        max(record.profile.pageCount, 1)
+                    )
                 )
                 .font(.caption2.monospacedDigit().weight(.semibold))
                 .foregroundStyle(PPColor.textPrimary)
@@ -2035,12 +4384,18 @@ private struct StudioComparisonWorkspace: View {
                     )
                 } label: {
                     Image(systemName: "chevron.right")
+                        .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.borderless)
                 .disabled(page >= record.profile.pageCount - 1)
+                .accessibilityLabel(
+                    side == .source
+                        ? "Next base page".localizedUI
+                        : "Next revised page".localizedUI
+                )
             }
             .padding(.horizontal, PPSpacing.small)
-            .frame(minHeight: 34)
+            .frame(minHeight: 44)
             .background(PPColor.surface.opacity(0.9))
 
             PDFDocumentView(
@@ -2069,20 +4424,36 @@ private struct StudioComparisonWorkspace: View {
         page: Int
     ) -> PDFEvidenceOverlay? {
         guard showsPageEvidence,
-              let change = currentChange,
-              !(change.differenceRegions ?? []).isEmpty
+              let change = currentChange
         else { return nil }
         let expectedPage: Int?
+        let textEvidence: [PDFTextDifferenceEvidence]
+        let vectorEvidence: [PDFVectorDifferenceEvidence]
         switch side {
         case .source:
             expectedPage = change.resolvedSourcePageIndex
+            textEvidence = change.sourceTextDifferences ?? []
+            vectorEvidence = change.sourceVectorDifferences ?? []
         case .revised:
             expectedPage = change.resolvedRevisedPageIndex
+            textEvidence = change.revisedTextDifferences ?? []
+            vectorEvidence = change.revisedVectorDifferences ?? []
         }
-        guard expectedPage == page else { return nil }
+        guard expectedPage == page,
+              !(change.differenceRegions ?? []).isEmpty
+                || !textEvidence.isEmpty
+                || !vectorEvidence.isEmpty
+        else { return nil }
         return PDFEvidenceOverlay(
             pageIndex: page,
             regions: change.differenceRegions ?? [],
+            textRegions: textEvidence.filter {
+                $0.resolvedGranularity == .word
+            }.map(\.region),
+            characterTextRegions: textEvidence.filter {
+                $0.resolvedGranularity == .character
+            }.map(\.region),
+            vectorRegions: vectorEvidence.map(\.region),
             tone: side == .source ? .source : .revised,
             generation: comparisonGeneration
                 &+ selectedChangeIndex
@@ -2119,7 +4490,7 @@ private struct StudioComparisonWorkspace: View {
         guard syncPages,
               let revisedRecord
         else { return }
-        let peerPage = review?
+        let peerPage = pageMatchLookup?
             .revisedPage(matchingSourcePage: page)
             ?? min(
                 page,
@@ -2136,7 +4507,7 @@ private struct StudioComparisonWorkspace: View {
         guard syncPages,
               let baseRecord
         else { return }
-        let peerPage = review?
+        let peerPage = pageMatchLookup?
             .sourcePage(matchingRevisedPage: page)
             ?? min(
                 page,
@@ -2161,7 +4532,7 @@ private struct StudioComparisonWorkspace: View {
             basePage = next
             baseNavigationToken &+= 1
             if syncPages, let revisedRecord {
-                revisedPage = review?
+                revisedPage = pageMatchLookup?
                     .revisedPage(matchingSourcePage: next)
                     ?? min(
                         next,
@@ -2180,7 +4551,7 @@ private struct StudioComparisonWorkspace: View {
             revisedPage = next
             revisedNavigationToken &+= 1
             if syncPages, let baseRecord {
-                basePage = review?
+                basePage = pageMatchLookup?
                     .sourcePage(matchingRevisedPage: next)
                     ?? min(
                         next,
@@ -2200,6 +4571,9 @@ private struct StudioComparisonWorkspace: View {
     }
 
     private func open(_ change: PDFPageChange) {
+        if horizontalSizeClass == .compact {
+            compactProofSide = change.preferredOpenSide
+        }
         if let sourcePageIndex =
             change.resolvedSourcePageIndex {
             basePage = sourcePageIndex
@@ -2213,25 +4587,51 @@ private struct StudioComparisonWorkspace: View {
     }
 
     private func startComparison() {
+        guard scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else {
+            errorMessage =
+                "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+            return
+        }
         comparisonGeneration &+= 1
         let generation = comparisonGeneration
         comparisonTask?.cancel()
+        interruptProofIndexRebuild()
+        comparisonProof = nil
         review = nil
+        pageMatchLookup = nil
+        filteredChanges = []
+        comparisonMetrics = .empty
         errorMessage = nil
         isComparing = true
+        comparisonProgress = .starting
         comparisonTask = Task {
             do {
                 let result = try await model.comparePDFs(
                     sourceRecordID: session.baseRecordID,
                     revisedRecordID: session.revisedRecordID
-                )
+                ) { update in
+                    guard comparisonGeneration == generation,
+                          update.fractionCompleted
+                            >= comparisonProgress.fractionCompleted
+                    else { return }
+                    comparisonProgress = update
+                }
+                let lookup = await Task.detached(
+                    priority: .utility
+                ) {
+                    PDFPageMatchLookup(review: result)
+                }.value
                 try Task.checkCancellation()
                 guard comparisonGeneration == generation else {
                     return
                 }
                 review = result
+                pageMatchLookup = lookup
+                rebuildComparisonIndex(for: result)
                 selectedChangeIndex = 0
-                if let first = result.changes.first {
+                if let first = filteredChanges.first {
                     open(first)
                 }
             } catch is CancellationError {
@@ -2240,82 +4640,323 @@ private struct StudioComparisonWorkspace: View {
                 guard comparisonGeneration == generation else {
                     return
                 }
-                errorMessage = error.localizedDescription
+                errorMessage = AppLocalization
+                    .userFacingErrorDescription(error)
             }
             guard comparisonGeneration == generation else { return }
             isComparing = false
             comparisonTask = nil
+            comparisonProgress = .starting
         }
+    }
+
+    private func stopComparison() {
+        comparisonGeneration &+= 1
+        comparisonTask?.cancel()
+        comparisonTask = nil
+        isComparing = false
+        comparisonProgress = .starting
+    }
+
+    private func interruptProtectedComparison() {
+        guard isComparing else { return }
+        stopComparison()
+        errorMessage =
+            "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+    }
+
+    private func invalidateComparisonEvidenceForRevisionChange() {
+        let hadEvidence = review != nil
+            || comparisonProof != nil
+            || isComparing
+        stopComparison()
+        interruptProofIndexRebuild()
+        comparisonProof = nil
+        review = nil
+        pageMatchLookup = nil
+        filteredChanges = []
+        comparisonMetrics = .empty
+        guard hadEvidence else { return }
+        errorMessage =
+            "A compared PDF changed. Compare again before reviewing or exporting evidence."
+    }
+
+    private var fullProofAccessibilityHint: String {
+        if isComparing {
+            return "Wait for comparison evidence to finish.".localizedUI
+        }
+        if review == nil {
+            return "Compare both PDFs before opening the full proof."
+                .localizedUI
+        }
+        return "Opens text, character, vector, and page-match evidence."
+            .localizedUI
+    }
+
+    private func comparisonProofView(
+        _ payload: ComparisonProofPayload
+    ) -> some View {
+        PDFComparisonProofView(
+            configuration: comparisonProofConfiguration(
+                for: payload
+            ),
+            review: payload.review
+        ) { updatedReview in
+            acceptProofReview(
+                updatedReview,
+                payload: payload
+            )
+        }
+    }
+
+    private func comparisonProofConfiguration(
+        for payload: ComparisonProofPayload
+    ) -> PDFComparisonProofConfiguration {
+        PDFComparisonProofConfiguration(
+            id: "studio:\(payload.id)",
+            navigationTitle: "Comparison proof",
+            evidenceLabel: "COMPARISON EVIDENCE",
+            sourceLabel: "BASE",
+            sourceTitle: payload.baseTitle,
+            sourceURL: payload.baseURL,
+            sourcePageCount: payload.basePageCount,
+            sourceRefreshToken: payload.baseRefreshToken,
+            sourceSymbol: "doc",
+            revisedLabel: "REVISED",
+            revisedTitle: payload.revisedTitle,
+            revisedURL: payload.revisedURL,
+            revisedPageCount: payload.revisedPageCount,
+            revisedRefreshToken: payload.revisedRefreshToken,
+            revisedSymbol: "doc.fill",
+            initialSourcePageIndex: payload.initialBasePage,
+            initialRevisedPageIndex: payload.initialRevisedPage,
+            initialChangeIndex: payload.initialChangeIndex,
+            recompute: { manualMatches, progress in
+                guard model.record(
+                    id: payload.baseRecordID
+                )?.contentRevisionID == payload.baseRevisionID,
+                      model.record(
+                        id: payload.revisedRecordID
+                      )?.contentRevisionID
+                        == payload.revisedRevisionID
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "a compared PDF changed during page-pair review"
+                    )
+                }
+                return try await model.comparePDFs(
+                    sourceRecordID: payload.baseRecordID,
+                    revisedRecordID: payload.revisedRecordID,
+                    manualMatches: manualMatches,
+                    progress: progress
+                )
+            }
+        )
+    }
+
+    private func openFullComparisonProof() {
+        guard !isComparing,
+              let review,
+              let baseRecord,
+              let revisedRecord,
+              let baseURL,
+              let revisedURL
+        else { return }
+        let selectedReviewIndex = currentChange.flatMap {
+            review.changes.firstIndex(of: $0)
+        }
+        comparisonProof = ComparisonProofPayload(
+            baseRecordID: baseRecord.id,
+            baseRevisionID: baseRecord.contentRevisionID,
+            baseTitle: baseRecord.displayName,
+            baseURL: baseURL,
+            basePageCount: baseRecord.profile.pageCount,
+            baseRefreshToken: model.refreshToken(
+                for: baseRecord.id
+            ),
+            revisedRecordID: revisedRecord.id,
+            revisedRevisionID: revisedRecord.contentRevisionID,
+            revisedTitle: revisedRecord.displayName,
+            revisedURL: revisedURL,
+            revisedPageCount: revisedRecord.profile.pageCount,
+            revisedRefreshToken: model.refreshToken(
+                for: revisedRecord.id
+            ),
+            initialBasePage: basePage,
+            initialRevisedPage: revisedPage,
+            initialChangeIndex: selectedReviewIndex,
+            review: review
+        )
+        proofOpenFeedback += 1
+    }
+
+    private func acceptProofReview(
+        _ updatedReview: PDFChangeReview,
+        payload: ComparisonProofPayload
+    ) {
+        guard model.record(id: payload.baseRecordID)?
+            .contentRevisionID == payload.baseRevisionID,
+              model.record(id: payload.revisedRecordID)?
+                .contentRevisionID == payload.revisedRevisionID
+        else {
+            comparisonProof = nil
+            invalidateComparisonEvidenceForRevisionChange()
+            return
+        }
+
+        let selectedChange = currentChange
+        review = updatedReview
+        rebuildComparisonIndex(for: updatedReview)
+        if let selectedChange,
+           let updatedIndex = filteredChanges.firstIndex(
+                where: { $0.id == selectedChange.id }
+           ) {
+            selectedChangeIndex = updatedIndex
+        } else {
+            selectedChangeIndex = 0
+        }
+        if let currentChange {
+            open(currentChange)
+        }
+
+        comparisonGeneration &+= 1
+        let generation = comparisonGeneration
+        proofIndexGeneration = UUID()
+        let indexGeneration = proofIndexGeneration
+        proofIndexTask?.cancel()
+        pageMatchLookup = nil
+        proofIndexTask = Task { @MainActor in
+            defer {
+                if proofIndexGeneration == indexGeneration {
+                    proofIndexTask = nil
+                }
+            }
+            let lookup = await Task.detached(
+                priority: .utility
+            ) {
+                PDFPageMatchLookup(review: updatedReview)
+            }.value
+            guard !Task.isCancelled,
+                  comparisonGeneration == generation,
+                  proofIndexGeneration == indexGeneration,
+                  model.record(id: payload.baseRecordID)?
+                    .contentRevisionID == payload.baseRevisionID,
+                  model.record(id: payload.revisedRecordID)?
+                    .contentRevisionID
+                        == payload.revisedRevisionID
+            else { return }
+            pageMatchLookup = lookup
+        }
+    }
+
+    private func interruptProofIndexRebuild() {
+        proofIndexGeneration = UUID()
+        proofIndexTask?.cancel()
+        proofIndexTask = nil
     }
 }
 
 private struct AppLockView: View {
     @EnvironmentObject private var appLock: AppLockController
+    @Environment(\.accessibilityVoiceOverEnabled)
+    private var voiceOverEnabled
+    @AccessibilityFocusState private var unlockButtonFocused: Bool
+    @State private var errorFeedback = 0
 
     var body: some View {
         ZStack {
             PPCanvas()
                 .ignoresSafeArea()
 
-            VStack(
-                alignment: .leading,
-                spacing: PPSpacing.large
-            ) {
-                StudioSectionRule(
-                    title: "PRIVATE WORKSPACE",
-                    detail: "Document previews remain covered",
-                    symbol: "lock.shield",
-                    tint: PPColor.mint
-                )
-
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: PPSpacing.xLarge) {
-                        lockIllustration
-                        lockCopy
-                    }
-                    VStack(
-                        alignment: .leading,
-                        spacing: PPSpacing.medium
-                    ) {
-                        lockIllustration
-                        lockCopy
-                    }
+            ViewThatFits(in: .vertical) {
+                lockContent
+                    .padding(PPSpacing.xLarge)
+                ScrollView {
+                    lockContent
+                        .padding(PPSpacing.xLarge)
                 }
-
-                Button {
-                    Task {
-                        _ = await appLock.unlock()
-                    }
-                } label: {
-                    HStack(spacing: PPSpacing.small) {
-                        if appLock.isAuthenticating {
-                            ProgressView()
-                                .controlSize(.small)
-                        } else {
-                            Image(systemName: appLock.symbol)
-                        }
-                        Text("Unlock")
-                    }
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .frame(minHeight: 50)
-                }
-                .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(appLock.isAuthenticating)
-                .accessibilityIdentifier("unlockPaperPath")
-
-                if let errorMessage = appLock.errorMessage {
-                    Text(errorMessage)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity)
-                }
+                .scrollIndicators(.hidden)
             }
-            .frame(maxWidth: 560)
-            .padding(PPSpacing.xLarge)
         }
         .accessibilityElement(children: .contain)
+        .onAppear {
+            if voiceOverEnabled {
+                unlockButtonFocused = true
+            }
+        }
+        .onChange(of: appLock.errorMessage) { _, message in
+            guard let message else { return }
+            errorFeedback += 1
+            if voiceOverEnabled {
+                UIAccessibility.post(
+                    notification: .announcement,
+                    argument: message
+                )
+            }
+        }
+        .sensoryFeedback(.error, trigger: errorFeedback)
+    }
+
+    private var lockContent: some View {
+        VStack(
+            alignment: .leading,
+            spacing: PPSpacing.large
+        ) {
+            StudioSectionRule(
+                title: "PRIVATE WORKSPACE",
+                detail: "Document previews remain covered",
+                symbol: "lock.shield",
+                tint: PPColor.mint
+            )
+
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.xLarge) {
+                    lockIllustration
+                    lockCopy
+                }
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.medium
+                ) {
+                    lockIllustration
+                    lockCopy
+                }
+            }
+
+            Button {
+                Task {
+                    _ = await appLock.unlock()
+                }
+            } label: {
+                HStack(spacing: PPSpacing.small) {
+                    if appLock.isAuthenticating {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: appLock.symbol)
+                    }
+                    Text("Unlock")
+                }
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 50)
+            }
+            .buttonStyle(PPPrimaryButtonStyle())
+            .disabled(appLock.isAuthenticating)
+            .accessibilityIdentifier("unlockPaperPath")
+            .accessibilityFocused($unlockButtonFocused)
+
+            if let errorMessage = appLock.errorMessage {
+                Text(errorMessage)
+                    .font(.caption)
+                    .foregroundStyle(PPColor.rose)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: 560)
+        .frame(maxWidth: .infinity)
     }
 
     private var lockIllustration: some View {
@@ -2350,6 +4991,75 @@ private struct AppLockView: View {
     }
 }
 
+private struct PDFDropTargetOverlay: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    var body: some View {
+        ZStack {
+            Rectangle()
+                .fill(.regularMaterial)
+                .ignoresSafeArea()
+
+            VStack(spacing: PPSpacing.medium) {
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .font(.system(size: 48, weight: .semibold))
+                    .foregroundStyle(PPColor.accent)
+                    .frame(width: 76, height: 76)
+                    .background(PPColor.accent.opacity(0.1))
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: PPRadius.control,
+                            style: .continuous
+                        )
+                    )
+                    .accessibilityHidden(true)
+
+                Text("Drop PDFs to import".localizedUI)
+                    .font(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? .title2.bold()
+                            : .title.bold()
+                    )
+                    .fontDesign(.serif)
+                    .foregroundStyle(PPColor.textPrimary)
+                    .multilineTextAlignment(.center)
+
+                Text(
+                    "Private copies will be created. Originals stay unchanged."
+                        .localizedUI
+                )
+                .font(.subheadline)
+                .foregroundStyle(PPColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(PPSpacing.xLarge)
+            .frame(maxWidth: 520)
+        }
+        .overlay {
+            RoundedRectangle(
+                cornerRadius: PPRadius.document,
+                style: .continuous
+            )
+            .strokeBorder(
+                PPColor.accent,
+                style: StrokeStyle(
+                    lineWidth: 3,
+                    dash: [12, 8]
+                )
+            )
+            .padding(PPSpacing.medium)
+        }
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Drop PDFs to import".localizedUI)
+        .accessibilityHint(
+            "Private copies will be created. Originals stay unchanged."
+                .localizedUI
+        )
+    }
+}
+
 private struct PrivacyCover: View {
     var body: some View {
         ZStack {
@@ -2381,66 +5091,244 @@ private struct PrivacyCover: View {
     }
 }
 
+private struct ExternalImportBanner: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let progress: PDFOperationProgress?
+    let onStop: () -> Void
+
+    var body: some View {
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        importSymbol
+                        importTitle
+                        Spacer(minLength: PPSpacing.small)
+                        stopButton
+                    }
+                    progressDetails
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    importSymbol
+                    VStack(alignment: .leading, spacing: 4) {
+                        importTitle
+                        progressDetails
+                    }
+                    Spacer(minLength: PPSpacing.small)
+                    stopButton
+                }
+            }
+        }
+        .padding(.leading, PPSpacing.regular)
+        .padding(.trailing, PPSpacing.small)
+        .padding(.vertical, PPSpacing.small)
+        .frame(maxWidth: 560, minHeight: 64)
+        .background {
+            RoundedRectangle(
+                cornerRadius: PPRadius.control,
+                style: .continuous
+            )
+            .fill(.ultraThinMaterial)
+        }
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(PPColor.cyan)
+                .frame(width: 2)
+                .padding(.vertical, 7)
+        }
+        .accessibilityElement(children: .contain)
+    }
+
+    private var importSymbol: some View {
+        ToolSymbolPlate(
+            symbol: "tray.and.arrow.down.fill",
+            tint: PPColor.cyan,
+            size: 30
+        )
+    }
+
+    private var importTitle: some View {
+        Text("Importing shared PDFs".localizedUI)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(PPColor.textPrimary)
+    }
+
+    @ViewBuilder
+    private var progressDetails: some View {
+        if let progress {
+            LocalOperationProgressView(progress: progress)
+                .accessibilityIdentifier(
+                    "externalPDFImportProgress"
+                )
+        } else {
+            Text("Checking the local import queue".localizedUI)
+                .font(.caption2)
+                .foregroundStyle(PPColor.textSecondary)
+                .lineLimit(2)
+        }
+    }
+
+    private var stopButton: some View {
+        Button(action: onStop) {
+            Image(systemName: "stop.fill")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(PPColor.amber)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Stop import".localizedUI)
+        .accessibilityHint(
+            "Keeps private copies that already finished"
+        )
+    }
+}
+
+private struct ExternalImportHandoffBanner: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let documentTitle: String?
+    let onStay: () -> Void
+
+    var body: some View {
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        handoffSymbol
+                        handoffCopy
+                        Spacer(minLength: PPSpacing.small)
+                        stayButton
+                    }
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    handoffSymbol
+                    handoffCopy
+                    Spacer(minLength: PPSpacing.small)
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                    stayButton
+                }
+            }
+        }
+        .padding(.leading, PPSpacing.regular)
+        .padding(.trailing, PPSpacing.small)
+        .padding(.vertical, PPSpacing.small)
+        .frame(maxWidth: 560, minHeight: 64)
+        .background {
+            RoundedRectangle(
+                cornerRadius: PPRadius.control,
+                style: .continuous
+            )
+            .fill(.ultraThinMaterial)
+        }
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(PPColor.mint)
+                .frame(width: 2)
+                .padding(.vertical, 7)
+        }
+        .shadow(color: .black.opacity(0.14), radius: 12, y: 6)
+        .accessibilityElement(children: .contain)
+    }
+
+    private var handoffSymbol: some View {
+        ToolSymbolPlate(
+            symbol: "doc.text.magnifyingglass",
+            tint: PPColor.mint,
+            size: 30
+        )
+    }
+
+    private var handoffCopy: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("Opening private copy".localizedUI)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            Text(documentTitle ?? "Preparing workspace".localizedUI)
+                .font(.caption2)
+                .foregroundStyle(PPColor.textSecondary)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 3 : 1
+                )
+                .truncationMode(.middle)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var stayButton: some View {
+        Button(action: onStay) {
+            Image(systemName: "xmark")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(PPColor.textSecondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Stay in Library".localizedUI)
+        .accessibilityHint(
+            "Keep the new private copy in Library and stop automatic opening."
+                .localizedUI
+        )
+        .help("Stay in Library".localizedUI)
+    }
+}
+
 private struct NoticeBanner: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let message: String
     let detail: String?
     let kind: AppNoticeKind
     let actionTitle: String?
     let onAction: (() -> Void)?
     let onDismiss: () -> Void
+    var actionAccessibilityHint =
+        "Restores the state before this action"
+    var showsFullDetail = false
 
     var body: some View {
-        HStack(spacing: PPSpacing.small) {
-            ToolSymbolPlate(
-                symbol: noticeSymbol,
-                tint: noticeTint,
-                size: 30
-            )
-            VStack(alignment: .leading, spacing: 1) {
-                Text(message.localizedUI)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(2)
-                if let detail {
-                    Text(detail.localizedUI)
-                        .font(.caption2)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(2)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout || showsFullDetail {
+                VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                    HStack(spacing: PPSpacing.small) {
+                        noticeIcon
+                        noticeCopy
+                        Spacer(minLength: PPSpacing.small)
+                        dismissButton
+                    }
+                    noticeAction
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    noticeIcon
+                    noticeCopy
+                    Spacer(minLength: PPSpacing.small)
+                    noticeAction
+                    dismissButton
                 }
             }
-            Spacer(minLength: PPSpacing.small)
-            if let actionTitle,
-               let onAction {
-                Button(action: onAction) {
-                    Text(actionTitle.localizedUI)
-                        .font(.caption.weight(.bold))
-                        .foregroundStyle(noticeTint)
-                        .padding(.horizontal, PPSpacing.small)
-                        .frame(minHeight: 32)
-                        .overlay(alignment: .bottom) {
-                            Rectangle()
-                                .fill(noticeTint.opacity(0.72))
-                                .frame(height: 1.5)
-                        }
-                }
-                .buttonStyle(.plain)
-                .accessibilityHint(
-                    "Restores the state before this action"
-                )
-            }
-            Button(action: onDismiss) {
-                Image(systemName: "xmark")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(PPColor.textSecondary)
-                    .frame(width: 32, height: 32)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Dismiss".localizedUI)
         }
         .padding(.leading, PPSpacing.regular)
         .padding(.trailing, 6)
+        .padding(.vertical, PPSpacing.xSmall)
         .frame(minHeight: detail == nil ? 46 : 54)
+        .frame(maxWidth: 560)
         .background {
             UnevenRoundedRectangle(
                 topLeadingRadius: 2,
@@ -2469,6 +5357,79 @@ private struct NoticeBanner: View {
         }
         .shadow(color: .black.opacity(0.16), radius: 12, y: 6)
         .accessibilityElement(children: .contain)
+    }
+
+    private var noticeIcon: some View {
+        ToolSymbolPlate(
+            symbol: noticeSymbol,
+            tint: noticeTint,
+            size: 30
+        )
+    }
+
+    private var noticeCopy: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text(message.localizedUI)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(
+                    showsFullDetail ? nil
+                        : dynamicTypeSize.ppPrefersExpandedLayout ? 4 : 2
+                )
+                .fixedSize(horizontal: false, vertical: true)
+            if let detail {
+                Text(detail.localizedUI)
+                    .font(.caption2)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(
+                        showsFullDetail ? nil
+                            : dynamicTypeSize.ppPrefersExpandedLayout ? 4 : 2
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var noticeAction: some View {
+        if let actionTitle,
+           let onAction {
+            Button(action: onAction) {
+                Text(actionTitle.localizedUI)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(noticeTint)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, PPSpacing.small)
+                    .frame(
+                        maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                            ? .infinity
+                            : nil,
+                        minHeight: 44
+                    )
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(noticeTint.opacity(0.72))
+                            .frame(height: 1.5)
+                    }
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(
+                actionAccessibilityHint.localizedUI
+            )
+        }
+    }
+
+    private var dismissButton: some View {
+        Button(action: onDismiss) {
+            Image(systemName: "xmark")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(PPColor.textSecondary)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Dismiss".localizedUI)
     }
 
     private var noticeTint: Color {

@@ -5,15 +5,56 @@ struct SectionEyebrow: View {
 
     var body: some View {
         HStack(spacing: 6) {
-            Circle()
-                .fill(PPColor.amber.opacity(0.82))
-                .frame(width: 3, height: 3)
             Text(text.localizedUI)
                 .font(.caption2.smallCaps().weight(.semibold))
-                .fontDesign(.monospaced)
                 .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .dynamicTypeSize(.xSmall ... .accessibility1)
+    }
+}
+
+struct OfficeClockContinuitySection: View {
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            if hasRollback(at: context.date) {
+                OfficeClockContinuityNotice()
+            }
+        }
+    }
+
+    private func hasRollback(at wallDate: Date) -> Bool {
+        let anchor = PDFOfficeTimeAnchor.process
+        let systemUptime = ProcessInfo.processInfo.systemUptime
+        _ = anchor.trustedDate(
+            wallDate: wallDate,
+            systemUptime: systemUptime
+        )
+        return anchor.hasWallClockRollback(
+            wallDate: wallDate,
+            systemUptime: systemUptime
+        )
+    }
+}
+
+struct OfficeClockContinuityNotice: View {
+    var body: some View {
+        Label(
+            "System time moved backward. Expiry checks remain monotonic; new signed evidence is paused."
+                .localizedUI,
+            systemImage: "clock.badge.exclamationmark"
+        )
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(PPColor.amber)
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "System time moved backward. Existing signature integrity is unchanged. Expiry checks use PaperPath’s latest observed time, and new signed evidence is paused until the clock catches up."
+                .localizedUI
+        )
+        .accessibilityHint(
+            "Correct the system date and time before creating new signed evidence."
+                .localizedUI
+        )
     }
 }
 
@@ -40,7 +81,6 @@ struct DocumentKindBadge: View {
                     .fill(color.opacity(0.48))
                     .frame(height: 1)
             }
-            .dynamicTypeSize(.xSmall ... .xxxLarge)
     }
 }
 
@@ -49,7 +89,7 @@ struct PrivacyProof: View {
 
     var body: some View {
         Group {
-            if dynamicTypeSize.isAccessibilitySize {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
                 VStack(alignment: .leading, spacing: PPSpacing.medium) {
                     privacySeal
                     proof(
@@ -747,6 +787,8 @@ struct TaskPathArtwork: View {
 }
 
 struct TaskPackageButton: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let package: PDFTaskPackage
     let tint: Color
     var isFeatured = false
@@ -756,7 +798,8 @@ struct TaskPackageButton: View {
     var body: some View {
         Button(action: action) {
             Group {
-                if isGridTile {
+                if isGridTile
+                    && !dynamicTypeSize.isAccessibilitySize {
                     HStack(alignment: .top, spacing: PPSpacing.small) {
                         TaskPathArtwork(
                             package: package,
@@ -779,18 +822,26 @@ struct TaskPackageButton: View {
                                 .font(.subheadline.weight(.semibold))
                                 .fontDesign(.serif)
                                 .foregroundStyle(PPColor.textPrimary)
-                                .lineLimit(1)
+                                .lineLimit(2)
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
 
                             Text(package.detail.localizedUI)
                                 .font(.caption2)
                                 .foregroundStyle(PPColor.textSecondary)
-                                .lineLimit(1)
+                                .lineLimit(2)
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(
                         maxWidth: .infinity,
-                        minHeight: 58,
+                        minHeight: 76,
                         alignment: .topLeading
                     )
                     .padding(.horizontal, PPSpacing.small)
@@ -912,46 +963,58 @@ struct TaskPackageButton: View {
         .accessibilityLabel(package.title.localizedUI)
         .accessibilityHint(package.detail.localizedUI)
         .accessibilityValue(
-            isGridTile && isFeatured ? "Recommended" : ""
+            isFeatured ? "Recommended".localizedUI : ""
         )
         .accessibilityIdentifier("taskPackage-\(package.rawValue)")
     }
 }
 
 struct DocumentTaskShortcut: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let recommendation: PDFTaskPackagePlanner.Recommendation
     let tint: Color
     let action: () -> Void
 
     var body: some View {
         Button(action: action) {
-            HStack(spacing: PPSpacing.small) {
-                Image(systemName: recommendation.task.symbol)
-                    .font(.caption.weight(.semibold))
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(tint)
-                    .frame(width: 24)
-
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("NEXT")
-                        .font(.caption2.smallCaps().weight(.bold))
-                        .foregroundStyle(PPColor.textSecondary)
-                    Text(recommendation.title.localizedUI)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(PPColor.textPrimary)
-                        .lineLimit(1)
+            Group {
+                if dynamicTypeSize.isAccessibilitySize {
+                    HStack(
+                        alignment: .top,
+                        spacing: PPSpacing.small
+                    ) {
+                        shortcutSymbol
+                        VStack(
+                            alignment: .leading,
+                            spacing: 2
+                        ) {
+                            shortcutTitle
+                            shortcutReason
+                        }
+                        Spacer(minLength: PPSpacing.xSmall)
+                        shortcutDisclosure
+                    }
+                    .padding(.vertical, PPSpacing.xSmall)
+                } else {
+                    HStack(
+                        alignment: .top,
+                        spacing: PPSpacing.small
+                    ) {
+                        shortcutSymbol
+                        VStack(
+                            alignment: .leading,
+                            spacing: 2
+                        ) {
+                            shortcutTitle
+                            shortcutReason
+                                .lineLimit(2)
+                        }
+                        Spacer(minLength: PPSpacing.small)
+                        shortcutDisclosure
+                    }
+                    .padding(.vertical, PPSpacing.xSmall)
                 }
-
-                Spacer(minLength: PPSpacing.small)
-
-                Text(recommendation.reason.localizedUI)
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
-
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(tint)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(minHeight: 48)
@@ -969,6 +1032,45 @@ struct DocumentTaskShortcut: View {
         .accessibilityIdentifier(
             "documentTask-\(recommendation.package.rawValue)"
         )
+    }
+
+    private var shortcutSymbol: some View {
+        Image(systemName: recommendation.task.symbol)
+            .font(.caption.weight(.semibold))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(tint)
+            .frame(width: 24)
+    }
+
+    private var shortcutTitle: some View {
+        VStack(alignment: .leading, spacing: 1) {
+            Text("NEXT")
+                .font(.caption2.smallCaps().weight(.bold))
+                .foregroundStyle(PPColor.textSecondary)
+            Text(recommendation.title.localizedUI)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(
+                    dynamicTypeSize.isAccessibilitySize
+                        ? nil
+                        : 1
+                )
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var shortcutReason: some View {
+        Text(recommendation.reason.localizedUI)
+            .font(.caption)
+            .foregroundStyle(PPColor.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var shortcutDisclosure: some View {
+        Image(systemName: "chevron.right")
+            .font(.caption2.weight(.bold))
+            .foregroundStyle(tint)
+            .frame(minWidth: 20, minHeight: 44)
     }
 }
 
@@ -1030,64 +1132,91 @@ struct ByteTelemetrySparkline: View {
         .frame(width: 68, height: 20)
         .accessibilityElement()
         .accessibilityLabel(
-            isStalled
-                ? "Byte activity stalled"
-                : "Recent byte throughput"
+            (
+                isStalled
+                    ? "Byte activity stalled"
+                    : "Recent byte throughput"
+            ).localizedUI
         )
     }
 }
 
 struct LocalOperationProgressView: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+
     let progress: PDFOperationProgress
 
     var body: some View {
+        TimelineView(
+            .animation(
+                minimumInterval: 1,
+                paused: scenePhase != .active
+                    || progress.byteStage == nil
+                    || progress.fractionCompleted >= 1
+            )
+        ) { context in
+            let isStalled = progress.isStalled(at: context.date)
+            progressContent(isStalled: isStalled)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(
+                    accessibilitySummary(isStalled: isStalled)
+                )
+                .accessibilityAddTraits(.updatesFrequently)
+        }
+    }
+
+    private func progressContent(isStalled: Bool) -> some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            HStack {
-                Text(progress.label)
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
-                Spacer(minLength: PPSpacing.small)
-                Text("\(progress.percentCompleted)%")
-                    .font(.caption.weight(.semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(PPColor.cyan)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(alignment: .leading, spacing: 3) {
+                    progressTitle
+                    progressPercent
+                }
+            } else {
+                HStack {
+                    progressTitle
+                    Spacer(minLength: PPSpacing.small)
+                    progressPercent
+                }
             }
             ProgressView(value: progress.fractionCompleted)
                 .tint(PPColor.cyan)
             if progress.byteStage == nil {
-                Label("ON DEVICE", systemImage: "iphone")
+                Label("ON DEVICE".localizedUI, systemImage: "iphone")
                     .font(.caption2.smallCaps().weight(.semibold))
                     .foregroundStyle(PPColor.textSecondary)
             } else {
-                TimelineView(
-                    .periodic(from: .now, by: 1)
-                ) { context in
-                    let isStalled = progress.isStalled(
-                        at: context.date
-                    )
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: PPSpacing.small) {
-                            operationByteMetrics(
-                                isStalled: isStalled
-                            )
-                        }
-                        VStack(
-                            alignment: .leading,
-                            spacing: 3
-                        ) {
-                            operationByteMetrics(
-                                isStalled: isStalled
-                            )
-                        }
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.small) {
+                        operationByteMetrics(isStalled: isStalled)
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    VStack(
+                        alignment: .leading,
+                        spacing: 3
+                    ) {
+                        operationByteMetrics(isStalled: isStalled)
                     }
                 }
             }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(progress.label), \(progress.percentCompleted) percent"
-        )
+    }
+
+    private var progressTitle: some View {
+        Text(progress.label.localizedUI)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(PPColor.textPrimary)
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
+    }
+
+    private var progressPercent: some View {
+        Text("\(progress.percentCompleted)%")
+            .font(.caption.weight(.semibold))
+            .monospacedDigit()
+            .foregroundStyle(PPColor.cyan)
+            .fixedSize()
     }
 
     @ViewBuilder
@@ -1095,7 +1224,7 @@ struct LocalOperationProgressView: View {
         isStalled: Bool
     ) -> some View {
         Label(
-            progress.byteStage?.title ?? "ON DEVICE",
+            (progress.byteStage?.title ?? "ON DEVICE").localizedUI,
             systemImage: progress.byteStage?.symbol ?? "iphone"
         )
         .font(.caption2.smallCaps().weight(.semibold))
@@ -1114,15 +1243,143 @@ struct LocalOperationProgressView: View {
                 .font(.caption2.monospacedDigit().weight(.semibold))
                 .foregroundStyle(PPColor.cyan)
         }
+        if !isStalled,
+           let remaining = progress.remainingSummary {
+            Label(remaining, systemImage: "clock")
+                .font(.caption2.monospacedDigit().weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+        }
         ByteTelemetrySparkline(
             samples: progress.throughputHistory,
             isStalled: isStalled
         )
         if isStalled {
-            Label("Stalled", systemImage: "pause.fill")
+            Label("Stalled".localizedUI, systemImage: "pause.fill")
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(PPColor.amber)
         }
+    }
+
+    private func accessibilitySummary(isStalled: Bool) -> String {
+        var parts = [
+            progress.label.localizedUI,
+            AppLocalization.format(
+                "%lld percent",
+                progress.percentCompleted
+            )
+        ]
+        if let stage = progress.byteStage {
+            parts.append(stage.title.localizedUI)
+        } else {
+            parts.append("On device".localizedUI)
+        }
+        if let bytes = progress.byteSummary {
+            parts.append(bytes)
+        }
+        if isStalled {
+            parts.append("Stalled".localizedUI)
+            parts.append("0 B/s")
+        } else if let speed = progress.throughputSummary {
+            parts.append(speed)
+        }
+        if !isStalled, let remaining = progress.remainingSummary {
+            parts.append(
+                AppLocalization.format(
+                    "%@ remaining",
+                    remaining
+                )
+            )
+        }
+        return parts.joined(separator: ", ")
+    }
+}
+
+struct LocalComparisonProgressView: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let progress: PDFComparisonProgress
+    var tint: Color = PPColor.cyan
+    var compact = false
+
+    var body: some View {
+        VStack(
+            alignment: .leading,
+            spacing: compact ? 5 : PPSpacing.small
+        ) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.small) {
+                    stageLabel
+                    Spacer(minLength: PPSpacing.small)
+                    progressMetrics
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: PPSpacing.small) {
+                        stageLabel
+                        Spacer(minLength: PPSpacing.small)
+                        percentLabel
+                    }
+                    if let pageSummary = progress.pageSummary {
+                        Text(pageSummary)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(PPColor.textSecondary)
+                    }
+                }
+            }
+            ProgressView(value: progress.fractionCompleted)
+                .tint(tint)
+                .accessibilityHidden(true)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilitySummary)
+    }
+
+    private var stageLabel: some View {
+        Label(
+            progress.stage.title.localizedUI,
+            systemImage: progress.stage.symbol
+        )
+        .font(
+            compact
+                ? .caption.weight(.semibold)
+                : .subheadline.weight(.semibold)
+        )
+        .foregroundStyle(PPColor.textPrimary)
+        .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
+    }
+
+    private var progressMetrics: some View {
+        HStack(spacing: PPSpacing.small) {
+            if let pageSummary = progress.pageSummary {
+                Text(pageSummary)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+            percentLabel
+        }
+    }
+
+    private var percentLabel: some View {
+        Text(
+            AppLocalization.format(
+                "%lld percent",
+                progress.percentCompleted
+            )
+        )
+        .font(.caption.monospacedDigit().weight(.semibold))
+        .foregroundStyle(tint)
+        .contentTransition(.numericText())
+    }
+
+    private var accessibilitySummary: String {
+        let stageAndPercent = AppLocalization.format(
+            "%@, %lld percent",
+            progress.stage.title.localizedUI,
+            progress.percentCompleted
+        )
+        guard let pageSummary = progress.pageSummary else {
+            return stageAndPercent
+        }
+        return "\(stageAndPercent), \(pageSummary)"
     }
 }
 
@@ -1138,7 +1395,7 @@ struct DocumentRow: View {
 
     var body: some View {
         Group {
-            if dynamicTypeSize.isAccessibilitySize {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
                 accessibilityLayout
             } else if isCompact {
                 compactLayout
@@ -1148,14 +1405,19 @@ struct DocumentRow: View {
         }
         .padding(
             .vertical,
-            isCompact && !dynamicTypeSize.isAccessibilitySize
+            isCompact && !dynamicTypeSize.ppPrefersExpandedLayout
                 ? PPSpacing.xSmall
                 : PPSpacing.small
         )
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(record.displayName), \(record.profile.kind.title), \(record.subtitle), \(rowStateAccessibility)"
+            [
+                record.displayName,
+                record.profile.kind.title.localizedUI,
+                record.subtitle,
+                rowStateAccessibility
+            ].joined(separator: ", ")
         )
     }
 
@@ -1165,7 +1427,6 @@ struct DocumentRow: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 title
-                summary
                 metadata
             }
 
@@ -1178,16 +1439,15 @@ struct DocumentRow: View {
 
     private var accessibilityLayout: some View {
         VStack(alignment: .leading, spacing: PPSpacing.medium) {
-            HStack(alignment: .center, spacing: PPSpacing.medium) {
-                documentIcon
-                title
-                Spacer(minLength: PPSpacing.small)
+            title
+                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .top, spacing: PPSpacing.medium) {
+                metadata
+                Spacer(minLength: 0)
                 if showsDisclosure {
                     disclosure
                 }
             }
-            summary
-            metadata
         }
     }
 
@@ -1198,18 +1458,13 @@ struct DocumentRow: View {
             VStack(alignment: .leading, spacing: 3) {
                 title
                 HStack(spacing: PPSpacing.small) {
-                    Text(record.subtitle)
-                        .monospacedDigit()
-                    if let tag = record.tags.first {
-                        Text("#\(tag)")
-                            .fontWeight(.semibold)
-                            .foregroundStyle(PPColor.accent)
-                    }
                     if record.deliveryReceipt != nil {
                         Text(
-                            record.hasCurrentDeliveryReceipt
-                                ? "Verified"
-                                : "Recheck"
+                            (
+                                record.hasCurrentDeliveryReceipt
+                                    ? "Verified"
+                                    : "Recheck"
+                            ).localizedUI
                         )
                         .fontWeight(.semibold)
                         .foregroundStyle(
@@ -1218,10 +1473,17 @@ struct DocumentRow: View {
                                 : PPColor.amber
                         )
                     }
+                    Text(record.subtitle)
+                        .monospacedDigit()
                     if let officeReceipt = record.officeReceipts.first {
                         Text(officeReceipt.format.fileExtension.uppercased())
                             .fontWeight(.semibold)
                             .foregroundStyle(PPColor.cyan)
+                    }
+                    if let tag = record.tags.first {
+                        Text("#\(tag)")
+                            .fontWeight(.semibold)
+                            .foregroundStyle(PPColor.accent)
                     }
                     Text(record.workflowStatus.title.localizedUI)
                         .fontWeight(.semibold)
@@ -1240,17 +1502,12 @@ struct DocumentRow: View {
 
     private var documentIcon: some View {
         let usesCompactIcon = isCompact
-            && !dynamicTypeSize.isAccessibilitySize
+            && !dynamicTypeSize.ppPrefersExpandedLayout
         let width: CGFloat = usesCompactIcon ? 40 : 56
         let height = width * 1.29
 
         return ZStack(alignment: .trailing) {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(PPColor.elevated)
-                .frame(width: width, height: height)
-                .offset(x: 4, y: 3)
-
-            if let url, !hideLibraryPreviews {
+            if let url, !hideLibraryPreviews, !record.profile.isLocked {
                 PDFPageThumbnailView(
                     url: url,
                     pageIndex: 0,
@@ -1260,50 +1517,56 @@ struct DocumentRow: View {
                 .shadow(color: .black.opacity(0.1), radius: 4, y: 2)
             } else {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                        .fill(PPColor.surfaceMuted)
+                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                        .fill(PPColor.surface)
                     Image(
-                        systemName: record.brief?.category.symbol
-                            ?? record.profile.kind.symbol
+                        systemName: hideLibraryPreviews ? "eye.slash"
+                            : record.profile.isLocked ? "lock.doc" : record.profile.kind.symbol
                     )
-                    .font(.title3.weight(.medium))
-                    .foregroundStyle(kindColor)
+                    .font(.system(size: 22, weight: .regular))
+                    .foregroundStyle(PPColor.textSecondary)
                 }
                 .frame(width: width, height: height)
             }
-
-            Rectangle()
-                .fill(kindColor.opacity(0.82))
-                .frame(width: 4, height: 22)
-                .offset(x: 2)
         }
-        .frame(width: width + 6, height: height + 4)
+        .frame(width: width, height: height)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .overlay {
+            RoundedRectangle(cornerRadius: 4).stroke(PPColor.border.opacity(0.5), lineWidth: 0.5)
+        }
         .accessibilityHidden(true)
     }
 
     private var title: some View {
         Text(record.displayName)
-            .font(.headline)
-            .fontDesign(.serif)
+            .font(PPType.document)
             .foregroundStyle(PPColor.textPrimary)
-            .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
-            .dynamicTypeSize(.xSmall ... .accessibility3)
+            .lineLimit(
+                dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2
+            )
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private var summary: some View {
-        Text(record.brief?.summary ?? record.profile.summary)
+        Text((record.brief?.summary ?? record.profile.summary).localizedUI)
             .font(.caption)
             .foregroundStyle(PPColor.textSecondary)
-            .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 1)
-            .dynamicTypeSize(.xSmall ... .accessibility2)
+            .lineLimit(
+                dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+            )
+            .fixedSize(horizontal: false, vertical: true)
     }
 
+    @ViewBuilder
     private var metadata: some View {
-        ViewThatFits(in: .horizontal) {
-            metadataContent(axis: .horizontal)
+        if dynamicTypeSize.ppPrefersExpandedLayout {
             metadataContent(axis: .vertical)
+        } else {
+            ViewThatFits(in: .horizontal) {
+                metadataContent(axis: .horizontal)
+                metadataContent(axis: .vertical)
+            }
         }
-        .dynamicTypeSize(.xSmall ... .accessibility1)
     }
 
     private func metadataContent(axis: Axis) -> some View {
@@ -1314,9 +1577,8 @@ struct DocumentRow: View {
             Text(record.subtitle)
                 .monospacedDigit()
             if let category = record.brief?.category {
-                Text(category.title)
-                    .fontWeight(.semibold)
-                    .foregroundStyle(kindColor)
+                Text(category.title.localizedUI)
+                    .foregroundStyle(PPColor.textSecondary)
             }
             if let tag = record.tags.first {
                 Text("#\(tag)")
@@ -1333,9 +1595,11 @@ struct DocumentRow: View {
             }
             if record.deliveryReceipt != nil {
                 Label(
-                    record.hasCurrentDeliveryReceipt
-                        ? "Verified"
-                        : "Recheck",
+                    (
+                        record.hasCurrentDeliveryReceipt
+                            ? "Verified"
+                            : "Recheck"
+                    ).localizedUI,
                     systemImage: record.hasCurrentDeliveryReceipt
                         ? "checkmark.seal"
                         : "arrow.triangle.2.circlepath"
@@ -1365,7 +1629,7 @@ struct DocumentRow: View {
                     .foregroundStyle(PPColor.amber)
                     .accessibilityLabel("Has private note")
             }
-            Text(record.workflowStatus.title)
+            Text(record.workflowStatus.title.localizedUI)
                 .fontWeight(.semibold)
         }
         .font(.caption2)
@@ -1376,20 +1640,27 @@ struct DocumentRow: View {
         var parts: [String] = []
         if record.deliveryReceipt != nil {
             parts.append(
-                record.hasCurrentDeliveryReceipt
-                    ? "verified output is current"
-                    : "delivery receipt needs recheck"
+                (
+                    record.hasCurrentDeliveryReceipt
+                        ? "verified output is current"
+                        : "delivery receipt needs recheck"
+                ).localizedUI
             )
         }
         if let officeReceipt = record.officeReceipts.first {
             parts.append(
-                "recent Office export \(officeReceipt.format.fileExtension.uppercased())"
+                AppLocalization.format(
+                    "recent Office export %@",
+                    officeReceipt.format.fileExtension.uppercased()
+                )
             )
         }
         if record.profile.isLocked {
-            parts.append("locked PDF")
+            parts.append("locked PDF".localizedUI)
         }
-        return parts.isEmpty ? "local private copy" : parts.joined(separator: ", ")
+        return parts.isEmpty
+            ? "local private copy".localizedUI
+            : parts.joined(separator: ", ")
     }
 
     private var disclosure: some View {
@@ -1461,21 +1732,27 @@ struct ContextActionButton: View {
                 }
                 .frame(height: 20)
 
-                Text(action.title)
+                Text(action.title.localizedUI)
                     .font(.caption2.weight(.semibold))
-                    .lineLimit(1)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .foregroundStyle(
                 action == .shareCopy ? PPColor.accent : PPColor.textPrimary
             )
             .frame(maxWidth: .infinity)
-            .frame(height: 54)
+            .frame(minHeight: 54)
+            .padding(.vertical, 4)
             .contentShape(Rectangle())
-            .dynamicTypeSize(.xSmall ... .xxxLarge)
         }
         .buttonStyle(.plain)
         .disabled(isBusy)
-        .accessibilityHint(action.explanation)
+        .accessibilityLabel(action.title.localizedUI)
+        .accessibilityValue(
+            isBusy ? "In progress".localizedUI : ""
+        )
+        .accessibilityHint(action.explanation.localizedUI)
     }
 }
 
@@ -1500,11 +1777,15 @@ struct WorkspaceBarButton: View {
             )
         }
         .buttonStyle(.plain)
+        .hoverEffect(.highlight)
         .sensoryFeedback(.selection, trigger: feedback)
     }
 }
 
 struct WorkspaceBarLabel: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.isEnabled) private var isEnabled
+
     let title: String
     let symbol: String
     var tint: Color = PPColor.textPrimary
@@ -1515,24 +1796,33 @@ struct WorkspaceBarLabel: View {
             Image(systemName: symbol)
                 .font(.body.weight(.semibold))
                 .symbolRenderingMode(.hierarchical)
-                .frame(height: 21)
+                .frame(minHeight: 21)
             Text(title.localizedUI)
-                .font(.caption2.weight(.semibold))
-                .lineLimit(1)
+                .font(
+                    .caption2.weight(
+                        isProminent ? .bold : .semibold
+                    )
+                )
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                )
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .foregroundStyle(tint)
+        .opacity(isEnabled ? 1 : 0.4)
         .frame(maxWidth: .infinity)
-        .frame(height: 54)
-        .overlay(alignment: .bottom) {
+        .frame(minHeight: 54)
+        .background {
             if isProminent {
-                Capsule()
-                    .fill(tint.opacity(0.82))
-                    .frame(width: 26, height: 2)
-                    .padding(.bottom, 2)
+                RoundedRectangle(
+                    cornerRadius: PPRadius.control,
+                    style: .continuous
+                )
+                .fill(tint.opacity(0.1))
             }
         }
         .contentShape(Rectangle())
-        .dynamicTypeSize(.xSmall ... .xxxLarge)
     }
 }
 
@@ -1590,6 +1880,7 @@ struct PPIllustration: View {
             overlay
         }
         .frame(width: width, height: width * 0.82)
+        .dynamicTypeSize(.xSmall ... .large)
         .accessibilityHidden(true)
     }
 
@@ -1601,11 +1892,6 @@ struct PPIllustration: View {
                 .blur(radius: width * 0.055)
                 .offset(y: width * 0.33)
 
-            Circle()
-                .fill(primaryTint.opacity(colorScheme == .dark ? 0.14 : 0.09))
-                .frame(width: width * 0.62)
-                .blur(radius: width * 0.12)
-                .offset(x: -width * 0.16, y: -width * 0.16)
         }
     }
 
@@ -1911,26 +2197,12 @@ struct ToolSymbolPlate: View {
         ZStack {
             Circle()
                 .fill(tint.opacity(0.09))
-            Circle()
-                .stroke(tint.opacity(0.3), lineWidth: 0.7)
-            Circle()
-                .trim(from: 0.07, to: 0.34)
-                .stroke(
-                    tint.opacity(0.82),
-                    style: StrokeStyle(
-                        lineWidth: 1.4,
-                        lineCap: .round
-                    )
-                )
-                .rotationEffect(.degrees(-36))
-                .padding(size * 0.09)
             Image(systemName: symbol)
                 .font(.system(size: size * 0.42, weight: .semibold))
                 .symbolRenderingMode(.hierarchical)
                 .foregroundStyle(tint)
         }
         .frame(width: size, height: size)
-        .shadow(color: tint.opacity(0.08), radius: 2, y: 1)
         .accessibilityHidden(true)
     }
 }
@@ -1967,7 +2239,7 @@ struct WorkflowCommandHeader: View {
     let symbol: String
     let tint: Color
     let metrics: [WorkflowMetric]
-    var showsOnDevice = true
+    var showsOnDevice = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
@@ -1984,7 +2256,7 @@ struct WorkflowCommandHeader: View {
                             SectionEyebrow(text: eyebrow)
                             Spacer(minLength: PPSpacing.xSmall)
                             if showsOnDevice,
-                               !dynamicTypeSize.isAccessibilitySize {
+                               !dynamicTypeSize.ppPrefersExpandedLayout {
                                 OnDeviceBadge(compact: true)
                             }
                         }
@@ -1996,27 +2268,25 @@ struct WorkflowCommandHeader: View {
                         .fontDesign(.serif)
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(
-                            usesCompactHeader
-                                || dynamicTypeSize.isAccessibilitySize
-                                ? 2
-                                : 1
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : usesCompactHeader ? 2 : 1
                         )
                         .fixedSize(horizontal: false, vertical: true)
                     Text(detail.localizedUI)
                         .font(.caption)
                         .foregroundStyle(PPColor.textSecondary)
                         .lineLimit(
-                            usesCompactHeader
-                                || dynamicTypeSize.isAccessibilitySize
-                                ? 3
-                                : 1
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : usesCompactHeader ? 3 : 1
                         )
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
                 if showsOnDevice,
-                   !dynamicTypeSize.isAccessibilitySize,
+                   !dynamicTypeSize.ppPrefersExpandedLayout,
                    !usesCompactHeader {
                     OnDeviceBadge(compact: true)
                 }
@@ -2024,19 +2294,7 @@ struct WorkflowCommandHeader: View {
 
             if !metrics.isEmpty {
                 LazyVGrid(
-                    columns: [
-                        GridItem(
-                            .adaptive(
-                                minimum: dynamicTypeSize.isAccessibilitySize
-                                    ? 176
-                                    : usesCompactHeader
-                                        ? 136
-                                        : 104,
-                                maximum: 220
-                            ),
-                            spacing: PPSpacing.medium
-                        )
-                    ],
+                    columns: metricColumns,
                     spacing: PPSpacing.medium
                 ) {
                     ForEach(metrics) { metric in
@@ -2056,15 +2314,36 @@ struct WorkflowCommandHeader: View {
                 .fill(PPColor.border.opacity(0.68))
                 .frame(height: 0.6)
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
     }
 
     private var usesCompactHeader: Bool {
         horizontalSizeClass == .compact
     }
+
+    private var metricColumns: [GridItem] {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            return [
+                GridItem(
+                    .flexible(),
+                    spacing: PPSpacing.medium
+                )
+            ]
+        }
+        return [
+            GridItem(
+                .adaptive(
+                    minimum: usesCompactHeader ? 136 : 104,
+                    maximum: 220
+                ),
+                spacing: PPSpacing.medium
+            )
+        ]
+    }
 }
 
 struct StudioMetricCell: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let value: String
     let label: String
     let symbol: String
@@ -2085,20 +2364,27 @@ struct StudioMetricCell: View {
                     .fontDesign(.monospaced)
                     .monospacedDigit()
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
                     .contentTransition(.numericText())
                 Text(label.localizedUI.uppercased())
                     .font(.caption2.smallCaps().weight(.semibold))
                     .fontDesign(.monospaced)
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
                 if let detail {
                     Text(detail.localizedUI)
                         .font(.caption2)
                         .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
             Spacer(minLength: 0)
@@ -2116,6 +2402,8 @@ struct StudioMetricCell: View {
 }
 
 struct StudioSectionRule: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
     let title: String
     var detail: String?
     var symbol: String?
@@ -2123,39 +2411,69 @@ struct StudioSectionRule: View {
     var tint = PPColor.accent
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(
-                alignment: .firstTextBaseline,
-                spacing: PPSpacing.small
-            ) {
-                sectionIdentity
-                    .fixedSize(horizontal: true, vertical: false)
-                if let detail {
-                    Text(detail.localizedUI)
-                        .font(.caption2)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
-                        .fixedSize(horizontal: true, vertical: false)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(
+                        alignment: .firstTextBaseline,
+                        spacing: PPSpacing.small
+                    ) {
+                        sectionIdentity
+                        Spacer(minLength: PPSpacing.small)
+                        sectionCount
+                    }
+                    if let detail {
+                        Text(detail.localizedUI)
+                            .font(.caption2)
+                            .foregroundStyle(PPColor.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
-                sectionRule
-                sectionCount
-            }
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(
+                        alignment: .firstTextBaseline,
+                        spacing: PPSpacing.small
+                    ) {
+                        sectionIdentity
+                            .fixedSize(horizontal: true, vertical: false)
+                        if let detail {
+                            Text(detail.localizedUI)
+                                .font(.caption2)
+                                .foregroundStyle(PPColor.textSecondary)
+                                .lineLimit(1)
+                                .fixedSize(
+                                    horizontal: true,
+                                    vertical: false
+                                )
+                        }
+                        sectionRule
+                        sectionCount
+                    }
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(
-                    alignment: .firstTextBaseline,
-                    spacing: PPSpacing.small
-                ) {
-                    sectionIdentity
-                        .fixedSize(horizontal: true, vertical: false)
-                    sectionRule
-                    sectionCount
-                }
-                if let detail {
-                    Text(detail.localizedUI)
-                        .font(.caption2)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(
+                            alignment: .firstTextBaseline,
+                            spacing: PPSpacing.small
+                        ) {
+                            sectionIdentity
+                                .fixedSize(
+                                    horizontal: true,
+                                    vertical: false
+                                )
+                            sectionRule
+                            sectionCount
+                        }
+                        if let detail {
+                            Text(detail.localizedUI)
+                                .font(.caption2)
+                                .foregroundStyle(PPColor.textSecondary)
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
+                        }
+                    }
                 }
             }
         }
@@ -2297,14 +2615,42 @@ struct PrecisionPlacementRail: View {
         case bottom
     }
 
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Binding var bounds: PDFNormalizedRect
 
     var tint = PPColor.accent
     var title = "Position"
     var margin = 0.04
     var showsDimensions = true
+    @State private var placementFeedback = 0
 
     var body: some View {
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    placementIdentity
+                    placementControls
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    placementIdentity
+                    Spacer(minLength: 0)
+                    placementControls
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, minHeight: 44)
+        .accessibilityElement(children: .contain)
+        .sensoryFeedback(
+            .selection,
+            trigger: placementFeedback
+        )
+    }
+
+    private var placementIdentity: some View {
         HStack(spacing: PPSpacing.small) {
             Text(title.localizedUI)
                 .font(.caption.weight(.semibold))
@@ -2318,9 +2664,12 @@ struct PrecisionPlacementRail: View {
                 .foregroundStyle(tint)
                 .contentTransition(.numericText())
             }
+        }
+        .accessibilityElement(children: .combine)
+    }
 
-            Spacer(minLength: 0)
-
+    private var placementControls: some View {
+        HStack(spacing: PPSpacing.xSmall) {
             anchorButton(
                 "Top left",
                 symbol: "arrow.up.left",
@@ -2352,8 +2701,12 @@ struct PrecisionPlacementRail: View {
                 vertical: .bottom
             )
         }
-        .frame(minHeight: 34)
-        .accessibilityElement(children: .contain)
+        .frame(
+            maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                ? .infinity
+                : nil,
+            alignment: .trailing
+        )
     }
 
     private func anchorButton(
@@ -2364,11 +2717,12 @@ struct PrecisionPlacementRail: View {
     ) -> some View {
         Button {
             place(horizontal: horizontal, vertical: vertical)
+            placementFeedback &+= 1
         } label: {
             Image(systemName: symbol)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(tint)
-                .frame(width: 32, height: 30)
+                .frame(width: 44, height: 44)
                 .background(PPColor.surfaceMuted.opacity(0.72))
                 .clipShape(
                     RoundedRectangle(
@@ -2415,62 +2769,151 @@ struct PrecisionPlacementRail: View {
 }
 
 struct PPEmptyState: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     let kind: PPIllustrationKind
     let title: String
     let message: String
     var maxWidth: CGFloat = 420
 
     var body: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: PPSpacing.large) {
+        Group {
+            if dynamicTypeSize.isAccessibilitySize {
+                VStack(alignment: .leading, spacing: PPSpacing.medium) {
+                    emptyIllustration
+                    emptyCopy
+                }
+            } else {
+                HStack(alignment: .top, spacing: PPSpacing.regular) {
                 emptyIllustration
                 emptyCopy
                     .multilineTextAlignment(.leading)
-            }
-
-            VStack(spacing: PPSpacing.medium) {
-                emptyIllustration
-                emptyCopy
-                    .multilineTextAlignment(.center)
+                }
             }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, PPSpacing.large)
         .padding(.horizontal, PPSpacing.regular)
-        .overlay(alignment: .leading) {
-            Rectangle()
-                .fill(PPColor.rose.opacity(0.48))
-                .frame(width: 2)
-                .padding(.vertical, PPSpacing.medium)
-        }
         .accessibilityElement(children: .combine)
     }
 
     private var emptyIllustration: some View {
-        PPIllustration(kind: kind, width: 116)
-            .frame(width: 126, height: 104)
-            .overlay {
-                StudioStageMarks(
-                    tint: PPColor.textSecondary,
-                    inset: 2,
-                    arm: 8
-                )
-            }
+        Image(systemName: emptySymbol)
+            .font(.system(size: 28, weight: .regular))
+            .foregroundStyle(PPColor.textSecondary)
+            .frame(width: 44, height: 44)
+            .accessibilityHidden(true)
+    }
+
+    private var emptySymbol: String {
+        switch kind {
+        case .intake: return "tray.and.arrow.down"
+        case .search: return "magnifyingglass"
+        case .tools: return "wrench.and.screwdriver"
+        case .locked: return "lock.doc"
+        case .privacy: return "lock.shield"
+        case .processing: return "hourglass"
+        case .workspace: return "folder"
+        }
     }
 
     private var emptyCopy: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            SectionEyebrow(text: "EMPTY WORKSPACE")
             Text(title.localizedUI)
                 .font(.headline)
-                .fontDesign(.serif)
                 .foregroundStyle(PPColor.textPrimary)
             Text(message.localizedUI)
                 .font(.subheadline)
                 .foregroundStyle(PPColor.textSecondary)
-                .multilineTextAlignment(.center)
+                .multilineTextAlignment(.leading)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: maxWidth)
         }
+    }
+}
+
+private struct DeskToolNamesKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var deskToolNamesVisible: Bool {
+        get { self[DeskToolNamesKey.self] }
+        set { self[DeskToolNamesKey.self] = newValue }
+    }
+}
+
+struct DeskToolLabel: View {
+    @Environment(\.deskToolNamesVisible) private var showsToolName
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @ScaledMetric(relativeTo: .caption2) private var captionHeight = 30
+    let title: String
+    let symbol: String
+    var tint: Color = PPColor.accent
+    var isProminent = false
+
+    var body: some View {
+        VStack(spacing: PPSpacing.xSmall) {
+            Image(systemName: symbol)
+                .font(.system(size: 18, weight: .semibold))
+                .symbolRenderingMode(.hierarchical)
+                .frame(
+                    width: PPDeskLayout.touchTarget,
+                    height: PPDeskLayout.touchTarget
+                )
+                .foregroundStyle(isProminent ? PPColor.onAccent : tint)
+                .background(isProminent ? tint : Color.clear)
+                .clipShape(Circle())
+            if showsToolName {
+                Text(title.localizedUI)
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(PPColor.textPrimary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(width: 88, alignment: .top)
+                    .frame(minHeight: captionHeight, alignment: .top)
+            }
+        }
+        .frame(width: showsToolName ? 88 : PPDeskLayout.touchTarget)
+        .contentShape(Rectangle())
+    }
+}
+
+struct DeskIconButton: View {
+    @Environment(\.isEnabled) private var isEnabled
+    let title: String
+    let symbol: String
+    var tint: Color = PPColor.accent
+    var isProminent = false
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            DeskToolLabel(
+                title: title, symbol: symbol, tint: tint,
+                isProminent: isProminent
+            )
+            .opacity(isEnabled ? 1 : 0.4)
+        }
+        .buttonStyle(DeskPressButtonStyle())
+        .hoverEffect(.highlight)
+        .accessibilityLabel(title.localizedUI)
+        .accessibilityShowsLargeContentViewer {
+            Label(title.localizedUI, systemImage: symbol)
+        }
+        .help(title.localizedUI)
+    }
+}
+
+private struct DeskPressButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.94 : 1)
+            .animation(
+                reduceMotion ? nil : PPMotion.press,
+                value: configuration.isPressed
+            )
     }
 }

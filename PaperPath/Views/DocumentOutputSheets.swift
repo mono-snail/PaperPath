@@ -1,3 +1,4 @@
+import QuickLook
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -13,11 +14,38 @@ private struct CompressionTaskResult: Identifiable {
     var id: UUID { sourceID }
 }
 
+private struct CompressionQualityPicker: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Binding var selection: PDFCompressionQuality
+
+    var body: some View {
+        let picker = Picker("Output quality", selection: $selection) {
+            ForEach(PDFCompressionQuality.allCases) { option in
+                Text(option.title.localizedUI)
+                    .tag(option)
+            }
+        }
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            picker
+                .pickerStyle(.menu)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+        } else {
+            picker.pickerStyle(.segmented)
+        }
+    }
+}
+
 struct BatchCompressionView: View {
     @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("privacy.hideLibraryPreviews")
     private var hideLibraryPreviews = false
 
@@ -26,11 +54,18 @@ struct BatchCompressionView: View {
     @State private var selectedIDs: [UUID] = []
     @State private var quality = PDFCompressionQuality.balanced
     @State private var isAddingFiles = false
+    @State private var importTask: Task<Void, Never>?
     @State private var operationTask: Task<Void, Never>?
+    @State private var importGeneration = UUID()
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
     @State private var currentRecordID: UUID?
     @State private var completedCount = 0
+    @State private var activeCompressionCount = 0
     @State private var results: [CompressionTaskResult] = []
     @State private var hasCompletedBatch = false
+    @State private var importErrorMessage: String?
+    @State private var failureFeedback = 0
 
     var body: some View {
         NavigationStack {
@@ -57,17 +92,23 @@ struct BatchCompressionView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            operationTask == nil
+                            !hasActiveTask
                                 ? (hasCompletedBatch ? "Done" : "Cancel")
-                                : "Stop"
+                                : operationStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                         ).localizedUI
                     ) {
-                        if let operationTask {
-                            operationTask.cancel()
+                        if operationTask != nil {
+                            interruptBatchCompression()
+                        } else if importTask != nil {
+                            cancelImport()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -81,31 +122,66 @@ struct BatchCompressionView: View {
         ) { result in
             guard case .success(let urls) = result, !urls.isEmpty else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
+                    presentImportError(
+                        "The selected PDFs could not be imported. Try again."
+                            .localizedUI
+                    )
                 }
                 return
             }
-            Task {
-                let imported = await model.importPDFs(from: urls)
+            cancelImport()
+            importErrorMessage = nil
+            let generation = UUID()
+            importGeneration = generation
+            importTask = Task { @MainActor in
+                let imported = await model.importPDFs(
+                    from: urls,
+                    progressID: generation
+                )
+                guard !Task.isCancelled,
+                      importGeneration == generation
+                else { return }
+                let previousSelectionCount = selectedIDs.count
                 for record in imported
                 where PDFQuickTask.compressPDF.supports(record)
                     && !selectedIDs.contains(record.id) {
                     selectedIDs.append(record.id)
                 }
+                if selectedIDs.count == previousSelectionCount {
+                    presentImportError(
+                        "No supported unlocked PDFs were added."
+                            .localizedUI
+                    )
+                } else {
+                    importErrorMessage = nil
+                }
+                importTask = nil
             }
         }
         .onDisappear {
-            operationTask?.cancel()
+            cancelImport()
+            interruptBatchCompression(invalidateResult: true)
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            cancelImport()
+            interruptBatchCompression(invalidateResult: true)
+        }
+        .interactiveDismissDisabled(hasActiveTask)
         .sensoryFeedback(.selection, trigger: selectedIDs.count)
         .sensoryFeedback(.success, trigger: hasCompletedBatch)
+        .sensoryFeedback(.error, trigger: failureFeedback)
     }
 
     private var selectionContent: some View {
         VStack(alignment: .leading, spacing: PPSpacing.large) {
             taskHeader
+            if let importErrorMessage {
+                batchImportErrorBanner(importErrorMessage)
+            }
             if horizontalSizeClass == .regular,
-               !dynamicTypeSize.isAccessibilitySize {
+               !dynamicTypeSize.ppPrefersExpandedLayout {
                 HStack(alignment: .top, spacing: PPSpacing.large) {
                     qualityControl
                         .frame(maxWidth: 320, alignment: .top)
@@ -152,18 +228,55 @@ struct BatchCompressionView: View {
     private var qualityControl: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             SectionEyebrow(text: "OUTPUT QUALITY")
-            Picker("Output quality", selection: $quality) {
-                ForEach(PDFCompressionQuality.allCases) { option in
-                    Text(option.title.localizedUI)
-                        .tag(option)
-                }
-            }
-            .pickerStyle(.segmented)
+            CompressionQualityPicker(selection: $quality)
 
             Text(quality.detail.localizedUI)
                 .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func batchImportErrorBanner(
+        _ message: String
+    ) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: PPSpacing.small) {
+                Label(
+                    message,
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: PPSpacing.small)
+                Button("Choose Again".localizedUI) {
+                    importErrorMessage = nil
+                    isAddingFiles = true
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.rose))
+            }
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                Label(
+                    message,
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                Button("Choose Again".localizedUI) {
+                    importErrorMessage = nil
+                    isAddingFiles = true
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.rose))
+            }
+        }
+        .padding(.horizontal, PPSpacing.small)
+        .padding(.vertical, PPSpacing.small)
+        .background(PPColor.rose.opacity(0.08))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(PPColor.rose)
+                .frame(width: 2)
         }
     }
 
@@ -265,7 +378,7 @@ struct BatchCompressionView: View {
                         .fontDesign(.serif)
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(
-                            dynamicTypeSize.isAccessibilitySize ? 2 : 1
+                            dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
                         )
                     Text(
                         supported
@@ -294,7 +407,23 @@ struct BatchCompressionView: View {
         .disabled(!supported || operationTask != nil)
         .opacity(supported ? 1 : 0.48)
         .accessibilityLabel(
-            "\(record.displayName), \(selected ? "selected" : "not selected")"
+            AppLocalization.format(
+                "%@, %@",
+                record.displayName,
+                selected
+                    ? "selected".localizedUI
+                    : "not selected".localizedUI
+            )
+        )
+        .accessibilityHint(
+            supported
+                ? (
+                    selected
+                        ? "Removes this PDF from the compression batch."
+                        : "Adds this PDF to the compression batch."
+                ).localizedUI
+                : "Unlock this PDF before compressing it."
+                    .localizedUI
         )
         .accessibilityIdentifier(
             "batchCompressionDocument-\(record.id.uuidString)"
@@ -410,7 +539,6 @@ struct BatchCompressionView: View {
     ) -> some View {
         Button {
             guard let outputID = result.outputID else { return }
-            dismiss()
             onOpen(DocumentRoute(recordID: outputID))
         } label: {
             HStack(spacing: PPSpacing.medium) {
@@ -451,19 +579,33 @@ struct BatchCompressionView: View {
         }
         .buttonStyle(.plain)
         .disabled(result.outputID == nil)
+        .accessibilityHint(
+            result.outputID == nil
+                ? (
+                    result.issue?.message.localizedUI
+                        ?? "Compression failed".localizedUI
+                )
+                : "Opens the compressed private copy."
+                    .localizedUI
+        )
     }
 
     @ViewBuilder
     private var actionBar: some View {
         VStack(spacing: PPSpacing.small) {
-            if let operationTask {
+            if operationTask != nil {
                 HStack {
                     Text(
-                        AppLocalization.format(
-                            "Compressing %lld of %lld",
-                            min(completedCount + 1, selectedIDs.count),
-                            selectedIDs.count
-                        )
+                        operationStopRequested
+                            ? "Finishing current file commit".localizedUI
+                            : AppLocalization.format(
+                                "Compressing %lld of %lld",
+                                min(
+                                    completedCount + 1,
+                                    activeCompressionCount
+                                ),
+                                activeCompressionCount
+                            )
                     )
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(PPColor.textSecondary)
@@ -474,12 +616,62 @@ struct BatchCompressionView: View {
                 }
 
                 Button {
-                    operationTask.cancel()
+                    interruptBatchCompression()
+                } label: {
+                    Label(
+                        operationStopRequested ? "Stopping" : "Stop",
+                        systemImage: operationStopRequested
+                            ? "hourglass"
+                            : "stop.fill"
+                    )
+                        .frame(minHeight: 44)
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+                .disabled(operationStopRequested)
+            } else if importTask != nil {
+                if let progress = model.foregroundImportProgress(
+                    for: importGeneration
+                ) {
+                    LocalOperationProgressView(progress: progress)
+                        .accessibilityIdentifier(
+                            "batchCompressionImportProgress"
+                        )
+                } else {
+                    HStack(spacing: PPSpacing.small) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text("Importing PDFs".localizedUI)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(PPColor.textSecondary)
+                        Spacer()
+                    }
+                }
+                Button {
+                    cancelImport()
                 } label: {
                     Label("Stop", systemImage: "stop.fill")
+                        .frame(minHeight: 44)
                 }
                 .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
             } else if hasCompletedBatch {
+                if !retryableCompressionIDs.isEmpty {
+                    Button {
+                        startCompression(
+                            recordIDs: retryableCompressionIDs
+                        )
+                    } label: {
+                        Label(
+                            AppLocalization.format(
+                                "Retry %lld Failed",
+                                retryableCompressionIDs.count
+                            ),
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(
+                        PPQuietButtonStyle(tint: PPColor.amber)
+                    )
+                }
                 Button {
                     dismiss()
                 } label: {
@@ -488,9 +680,7 @@ struct BatchCompressionView: View {
                 .buttonStyle(PPPrimaryButtonStyle())
             } else {
                 Button {
-                    operationTask = Task {
-                        await runCompression()
-                    }
+                    startCompression()
                 } label: {
                     Label(
                         selectedIDs.isEmpty
@@ -506,6 +696,16 @@ struct BatchCompressionView: View {
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
                 .disabled(selectedIDs.isEmpty || model.isImporting)
+                .accessibilityHint(
+                    selectedIDs.isEmpty
+                        ? "Choose at least one unlocked PDF."
+                            .localizedUI
+                        : model.isImporting
+                            ? "Wait for PDF import to finish."
+                                .localizedUI
+                            : "Creates a separate compressed copy for each selected PDF."
+                                .localizedUI
+                )
                 .accessibilityIdentifier("batchCompressionAction")
             }
         }
@@ -529,10 +729,17 @@ struct BatchCompressionView: View {
         selectedIDs.compactMap(model.record(id:))
     }
 
+    private var hasActiveTask: Bool {
+        importTask != nil || operationTask != nil
+    }
+
     private var formattedSelectedSize: String {
         ByteCountFormatter.string(
             fromByteCount: selectedRecords.reduce(0) {
-                $0 + $1.profile.byteCount
+                let (next, overflow) = $0.addingReportingOverflow(
+                    max(0, $1.profile.byteCount)
+                )
+                return overflow ? .max : next
             },
             countStyle: .file
         )
@@ -542,13 +749,31 @@ struct BatchCompressionView: View {
         results.filter { $0.outputID != nil }.count
     }
 
+    private var retryableCompressionIDs: [UUID] {
+        results.compactMap { result in
+            guard result.outputID == nil,
+                  result.issue?.isRetryable != false,
+                  model.record(id: result.sourceID) != nil
+            else { return nil }
+            return result.sourceID
+        }
+    }
+
     private var resultInputBytes: Int64 {
-        results.reduce(0) { $0 + $1.sourceByteCount }
+        results.reduce(Int64.zero) { partial, result in
+            let (next, overflow) = partial.addingReportingOverflow(
+                max(0, result.sourceByteCount)
+            )
+            return overflow ? .max : next
+        }
     }
 
     private var resultOutputBytes: Int64 {
-        results.reduce(0) {
-            $0 + ($1.outputByteCount ?? 0)
+        results.reduce(Int64.zero) { partial, result in
+            let (next, overflow) = partial.addingReportingOverflow(
+                max(0, result.outputByteCount ?? 0)
+            )
+            return overflow ? .max : next
         }
     }
 
@@ -574,10 +799,49 @@ struct BatchCompressionView: View {
     }
 
     private func toggle(_ id: UUID) {
+        importErrorMessage = nil
         if let index = selectedIDs.firstIndex(of: id) {
             selectedIDs.remove(at: index)
         } else {
             selectedIDs.append(id)
+        }
+    }
+
+    private func cancelImport() {
+        let cancelledProgressID = importGeneration
+        importGeneration = UUID()
+        importTask?.cancel()
+        importTask = nil
+        model.clearForegroundImportProgress(
+            cancelledProgressID
+        )
+    }
+
+    private func presentImportError(_ message: String) {
+        importErrorMessage = message
+        failureFeedback += 1
+    }
+
+    private func interruptBatchCompression(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            currentRecordID = nil
+            activeCompressionCount = 0
+            if !results.isEmpty {
+                hasCompletedBatch = true
+            }
         }
     }
 
@@ -616,36 +880,88 @@ struct BatchCompressionView: View {
         )
     }
 
-    private func runCompression() async {
-        let sources = selectedRecords
+    private func startCompression(
+        recordIDs: [UUID]? = nil
+    ) {
+        guard operationTask == nil,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        let sources = (recordIDs ?? selectedIDs)
+            .compactMap(model.record(id:))
+        guard !sources.isEmpty else { return }
+        let generation = UUID()
+        operationGeneration = generation
+        operationStopRequested = false
+        let requestedQuality = quality
+        if recordIDs == nil {
+            results = []
+        }
+        completedCount = 0
+        activeCompressionCount = sources.count
+        hasCompletedBatch = false
+        operationTask = Task { @MainActor in
+            await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await runCompression(
+                    generation: generation,
+                    quality: requestedQuality,
+                    sources: sources
+                )
+            }
+        }
+    }
+
+    private func runCompression(
+        generation: UUID,
+        quality: PDFCompressionQuality,
+        sources: [DocumentRecord]
+    ) async {
         guard !sources.isEmpty else {
-            operationTask = nil
+            if operationGeneration == generation {
+                operationTask = nil
+            }
             return
         }
 
-        results = []
-        completedCount = 0
-        hasCompletedBatch = false
         defer {
-            currentRecordID = nil
-            operationTask = nil
-            if !Task.isCancelled, !results.isEmpty {
-                hasCompletedBatch = true
+            if operationGeneration == generation {
+                let wasStopped =
+                    operationStopRequested || Task.isCancelled
+                currentRecordID = nil
+                activeCompressionCount = 0
+                operationTask = nil
+                operationStopRequested = false
+                if !results.isEmpty {
+                    hasCompletedBatch = true
+                }
+                if wasStopped {
+                    model[noticeFor: paperPathSceneID] = (
+                        successfulCount > 0
+                            ? "Compression stopped · finished copies kept in Library"
+                            : "Compression stopped"
+                    ).localizedUI
+                }
             }
         }
 
         for source in sources {
             if Task.isCancelled { break }
+            guard operationGeneration == generation else { return }
             currentRecordID = source.id
             var issue: PDFBatchDeliveryIssue?
             let created = await model.createCompressedCopy(
                 recordID: source.id,
                 quality: quality,
+                expectedContentRevisionID:
+                    source.contentRevisionID,
                 presentsFeedback: false
             ) {
                 issue = $0
             }
-            results.append(
+            guard operationGeneration == generation else { return }
+            replaceCompressionResult(
                 CompressionTaskResult(
                     sourceID: source.id,
                     sourceName: source.displayName,
@@ -661,24 +977,46 @@ struct BatchCompressionView: View {
         }
 
         guard !Task.isCancelled else { return }
-        model.noticeMessage = AppLocalization.format(
+        model[noticeFor: paperPathSceneID] = AppLocalization.format(
             "%lld compressed cop%@ ready",
             successfulCount,
             successfulCount == 1 ? "y" : "ies"
         )
+    }
+
+    private func replaceCompressionResult(
+        _ result: CompressionTaskResult
+    ) {
+        if let index = results.firstIndex(where: {
+            $0.sourceID == result.sourceID
+        }) {
+            results[index] = result
+        } else {
+            results.append(result)
+        }
     }
 }
 
 struct CompressionSheet: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let onCreated: (DocumentRoute) -> Void
     @State private var quality: PDFCompressionQuality = .balanced
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
     @State private var estimate: PDFCompressionEstimate?
     @State private var estimateFailed = false
+    @State private var estimateTask: Task<Void, Never>?
+    @State private var estimateGeneration = UUID()
+    @State private var operationErrorMessage: String?
+    @State private var errorFeedback = 0
+    @State private var sourceContentRevisionID: UUID?
 
     var body: some View {
         NavigationStack {
@@ -729,20 +1067,22 @@ struct CompressionSheet: View {
                                 eyebrow: "OUTPUT INTENT",
                                 title: quality.title
                             )
-                            Picker("Output quality", selection: $quality) {
-                                ForEach(
-                                    PDFCompressionQuality.allCases
-                                ) { option in
-                                    Text(option.title.localizedUI)
-                                        .tag(option)
-                                }
-                            }
-                            .pickerStyle(.segmented)
+                            CompressionQualityPicker(
+                                selection: $quality
+                            )
 
                             Text(quality.detail.localizedUI)
                                 .font(.caption)
                                 .foregroundStyle(PPColor.textSecondary)
-                                .lineLimit(2)
+                                .lineLimit(
+                                    dynamicTypeSize.ppPrefersExpandedLayout
+                                        ? nil
+                                        : 2
+                                )
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
 
                             if let estimate {
                                 Label(
@@ -751,6 +1091,39 @@ struct CompressionSheet: View {
                                 )
                                 .font(.caption)
                                 .foregroundStyle(PPColor.textSecondary)
+                            }
+                            if estimateFailed {
+                                HStack(spacing: PPSpacing.small) {
+                                    Label(
+                                        "Size estimate unavailable",
+                                        systemImage:
+                                            "exclamationmark.circle"
+                                    )
+                                    .font(.caption)
+                                    .foregroundStyle(PPColor.amber)
+                                    Spacer(minLength: PPSpacing.small)
+                                    Button("Retry".localizedUI) {
+                                        startEstimate()
+                                    }
+                                    .buttonStyle(
+                                        PPQuietButtonStyle(
+                                            tint: PPColor.amber
+                                        )
+                                    )
+                                }
+                            }
+                            if let operationErrorMessage {
+                                Label(
+                                    operationErrorMessage,
+                                    systemImage:
+                                        "exclamationmark.circle"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(PPColor.rose)
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
                             }
 
                             if let progress = model.progress(
@@ -771,21 +1144,14 @@ struct CompressionSheet: View {
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PPSpacing.small) {
                     Button {
-                        operationTask = Task {
-                            defer { operationTask = nil }
-                            if let created = await model.createCompressedCopy(
-                                recordID: recordID,
-                                quality: quality
-                            ) {
-                                dismiss()
-                                onCreated(DocumentRoute(recordID: created.id))
-                            }
-                        }
+                        startCompression()
                     } label: {
                         Label(
-                            operationTask == nil
-                                ? "Create Compressed Copy"
-                                : "Compressing",
+                            operationStopRequested
+                                ? "Finishing current file commit"
+                                : operationTask == nil
+                                    ? "Create Compressed Copy"
+                                    : "Compressing",
                             systemImage: operationTask == nil
                                 ? "arrow.down.right.and.arrow.up.left"
                                 : "hourglass"
@@ -793,6 +1159,8 @@ struct CompressionSheet: View {
                     }
                     .buttonStyle(PPPrimaryButtonStyle())
                     .disabled(operationTask != nil)
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityHint(compressionActionHint)
                 }
                 .padding(.horizontal, PPSpacing.regular)
                 .padding(.vertical, PPSpacing.small)
@@ -811,33 +1179,193 @@ struct CompressionSheet: View {
                         (
                             operationTask == nil
                                 ? "Cancel"
-                                : "Stop"
+                                : operationStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                         ).localizedUI
                     ) {
-                        operationTask?.cancel()
-                        operationTask = nil
-                        dismiss()
+                        if operationTask != nil {
+                            interruptCompressionWork()
+                        } else {
+                            dismiss()
+                        }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
             }
         }
-        .onDisappear {
-            operationTask?.cancel()
+        .onAppear {
+            sourceContentRevisionID = model.record(id: recordID)?
+                .contentRevisionID
+            startEstimate()
         }
-        .task(id: quality) {
+        .onChange(of: quality) {
+            startEstimate()
+        }
+        .onChange(
+            of: model.record(id: recordID)?
+                .contentRevisionID
+        ) { oldRevisionID, newRevisionID in
+            guard oldRevisionID != newRevisionID else { return }
+            interruptCompressionWork(invalidateResult: true)
+            sourceContentRevisionID = newRevisionID
             estimate = nil
             estimateFailed = false
+            guard newRevisionID != nil,
+                  scenePhase == .active,
+                  UIApplication.shared
+                    .isProtectedDataAvailable
+            else { return }
+            model[noticeFor: paperPathSceneID] =
+                "PDF updated · estimate refreshed".localizedUI
+            startEstimate()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active, estimate == nil {
+                startEstimate()
+            } else if phase == .background {
+                interruptCompressionWork(invalidateResult: true)
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptCompressionWork(invalidateResult: true)
+        }
+        .onDisappear {
+            interruptCompressionWork(invalidateResult: true)
+        }
+        .interactiveDismissDisabled(operationTask != nil)
+        .sensoryFeedback(.error, trigger: errorFeedback)
+    }
+
+    private func startEstimate() {
+        guard let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID
+        else { return }
+        estimateGeneration = UUID()
+        let generation = estimateGeneration
+        let requestedQuality = quality
+        estimateTask?.cancel()
+        estimate = nil
+        estimateFailed = false
+        operationErrorMessage = nil
+        estimateTask = Task { @MainActor in
+            defer {
+                if estimateGeneration == generation {
+                    estimateTask = nil
+                }
+            }
             do {
-                estimate = try await model.compressionEstimate(
-                    recordID: recordID,
-                    quality: quality
-                )
+                let loaded = try await model.withFeedbackTarget(
+                    paperPathSceneID
+                ) {
+                    try await model.compressionEstimate(
+                        recordID: recordID,
+                        quality: requestedQuality,
+                        expectedContentRevisionID:
+                            sourceContentRevisionID
+                    )
+                }
+                guard !Task.isCancelled,
+                      estimateGeneration == generation,
+                      quality == requestedQuality,
+                      model.record(id: recordID)?
+                        .contentRevisionID
+                        == sourceContentRevisionID
+                else { return }
+                estimate = loaded
             } catch is CancellationError {
                 return
             } catch {
+                guard estimateGeneration == generation else { return }
                 estimateFailed = true
+                errorFeedback += 1
             }
         }
+    }
+
+    private func interruptCompressionWork(
+        invalidateResult: Bool = false
+    ) {
+        estimateGeneration = UUID()
+        estimateTask?.cancel()
+        estimateTask = nil
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else if operationTask != nil {
+            guard !operationStopRequested else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            operationErrorMessage = nil
+        }
+    }
+
+    private func startCompression() {
+        guard operationTask == nil,
+              let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        operationErrorMessage = nil
+        operationStopRequested = false
+        let generation = UUID()
+        operationGeneration = generation
+        let requestedQuality = quality
+        operationTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createCompressedCopy(
+                    recordID: recordID,
+                    quality: requestedQuality,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
+            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    created == nil
+                        ? "Copy creation stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
+                return
+            }
+            guard let created else {
+                if !Task.isCancelled {
+                    operationErrorMessage =
+                        "The compressed copy could not be created. Your quality setting is unchanged."
+                            .localizedUI
+                    errorFeedback += 1
+                }
+                return
+            }
+            onCreated(DocumentRoute(recordID: created.id))
+        }
+    }
+
+    private var compressionActionHint: String {
+        if operationTask != nil {
+            return "Wait for compression to finish.".localizedUI
+        }
+        return "Creates a separate compressed private copy."
+            .localizedUI
     }
 }
 
@@ -846,13 +1374,29 @@ struct ProtectionSheet: View {
         case restricted
         case review
         case flexible
+        case custom
 
         var id: String { rawValue }
-        var title: String { rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .restricted: return "Restricted"
+            case .review: return "Review"
+            case .flexible: return "Flexible"
+            case .custom: return "Custom"
+            }
+        }
+    }
+
+    private enum PasswordField: Hashable {
+        case password
+        case confirmation
     }
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let onCreated: (DocumentRoute) -> Void
@@ -861,6 +1405,14 @@ struct ProtectionSheet: View {
     @State private var permissions = PDFProtectionPermissions.restricted
     @State private var permissionProfile = PermissionProfile.restricted
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var operationErrorMessage: String?
+    @State private var errorFeedback = 0
+    @State private var isConfirmingDiscard = false
+    @State private var sourceContentRevisionID: UUID?
+    @State private var requiresUpdatedPDFConfirmation = false
+    @FocusState private var focusedPasswordField: PasswordField?
 
     private var validationMessage: String? {
         if password.isEmpty && confirmation.isEmpty { return nil }
@@ -884,51 +1436,29 @@ struct ProtectionSheet: View {
                             detail: "The current working copy remains unchanged.",
                             symbol: "lock.doc",
                             tint: PPColor.amber,
-                            metrics: [
-                                WorkflowMetric(
-                                    value: password.count >= 8
-                                        && password == confirmation
-                                        ? "Ready"
-                                        : "Required",
-                                    label: "Password",
-                                    symbol: "key",
-                                    tint: password.count >= 8
-                                        && password == confirmation
-                                        ? PPColor.mint
-                                        : PPColor.amber
-                                ),
-                                WorkflowMetric(
-                                    value: "\(allowedPermissionCount)",
-                                    label: "Allowed",
-                                    symbol: "checkmark.circle",
-                                    tint: PPColor.cyan
-                                ),
-                                WorkflowMetric(
-                                    value: permissionProfile.title,
-                                    label: "Profile",
-                                    symbol: "slider.horizontal.3",
-                                    tint: PPColor.accent
-                                )
-                            ]
+                            metrics: [],
+                            showsOnDevice: true
                         )
 
                         WorkflowSectionHeader(
                             eyebrow: "OPEN PASSWORD",
                             title: "Required to open"
                         )
-                    SecureField("Password", text: $password)
-                        .textContentType(.newPassword)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    SecureField("Confirm password", text: $confirmation)
-                        .textContentType(.newPassword)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                    if let validationMessage {
-                        Text(validationMessage.localizedUI)
-                            .font(.caption)
-                            .foregroundStyle(PPColor.amber)
-                    }
+                        securePasteField(
+                            "Password",
+                            text: $password,
+                            field: .password
+                        )
+                        securePasteField(
+                            "Confirm password",
+                            text: $confirmation,
+                            field: .confirmation
+                        )
+                        if let validationMessage {
+                            Text(validationMessage.localizedUI)
+                                .font(.caption)
+                                .foregroundStyle(PPColor.amber)
+                        }
                         Text(
                             "PaperPath does not store this password. Losing it can make the new copy inaccessible."
                         )
@@ -941,16 +1471,7 @@ struct ProtectionSheet: View {
                             count: allowedPermissionCount,
                             tint: PPColor.cyan
                         )
-                        Picker(
-                            "Permission profile",
-                            selection: $permissionProfile
-                        ) {
-                            ForEach(PermissionProfile.allCases) { profile in
-                                Text(profile.title.localizedUI)
-                                    .tag(profile)
-                            }
-                        }
-                        .pickerStyle(.segmented)
+                        permissionProfilePicker
 
                     Toggle(
                         "Print",
@@ -979,6 +1500,13 @@ struct ProtectionSheet: View {
                         isOn: $permissions.allowsFormFilling
                     )
                     .disabled(permissions.allowsCommenting)
+                    .accessibilityHint(
+                        permissions.allowsCommenting
+                            ? "Form filling is required when comments are allowed."
+                                .localizedUI
+                            : "Controls whether forms can be filled after opening."
+                                .localizedUI
+                    )
                     Toggle(
                         "Insert, remove, or rotate pages",
                         isOn: $permissions.allowsPageChanges
@@ -992,33 +1520,48 @@ struct ProtectionSheet: View {
                     if let progress = model.progress(for: recordID) {
                         LocalOperationProgressView(progress: progress)
                     }
+                    if let operationErrorMessage {
+                        Label(
+                            operationErrorMessage,
+                            systemImage: "exclamationmark.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(PPColor.rose)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
                     }
                     .frame(maxWidth: 720)
                     .padding(PPSpacing.regular)
                     .padding(.bottom, 72)
                     .frame(maxWidth: .infinity)
+                    .disabled(operationTask != nil)
                 }
+                .scrollDismissesKeyboard(.interactively)
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                     Button {
-                        operationTask = Task {
-                            defer { operationTask = nil }
-                            if let created = await model.createProtectedCopy(
-                                recordID: recordID,
-                                password: password,
-                                permissions: permissions
-                            ) {
-                                dismiss()
-                                onCreated(DocumentRoute(recordID: created.id))
-                            }
+                        if requiresUpdatedPDFConfirmation {
+                            confirmUpdatedPDFForProtection()
+                        } else {
+                            startProtection()
                         }
                     } label: {
                         Label(
-                            operationTask == nil
-                                ? "Create Protected Copy"
-                                : "Protecting Copy",
+                            operationStopRequested
+                                ? "Finishing current file commit"
+                                : operationTask == nil
+                                    ? (
+                                        requiresUpdatedPDFConfirmation
+                                            ? "Confirm Updated PDF"
+                                            : "Create Protected Copy"
+                                    )
+                                    : "Protecting Copy",
                             systemImage: operationTask == nil
-                                ? "lock.doc"
+                                ? (
+                                    requiresUpdatedPDFConfirmation
+                                        ? "arrow.clockwise"
+                                        : "lock.doc"
+                                )
                                 : "hourglass"
                         )
                     }
@@ -1027,7 +1570,10 @@ struct ProtectionSheet: View {
                         validationMessage != nil
                             || password.isEmpty
                             || operationTask != nil
+                            || sourceContentRevisionID == nil
                     )
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityHint(protectionActionHint)
                     .padding(.horizontal, PPSpacing.regular)
                     .padding(.vertical, PPSpacing.small)
                     .background(.bar)
@@ -1045,35 +1591,187 @@ struct ProtectionSheet: View {
                         (
                             operationTask == nil
                                 ? "Cancel"
-                                : "Stop"
+                                : operationStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                         ).localizedUI
                     ) {
-                        if let operationTask {
-                            operationTask.cancel()
-                            self.operationTask = nil
+                        if operationTask != nil {
+                            interruptProtection()
                         } else {
-                            dismiss()
+                            requestProtectionDismissal()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
             }
             .onChange(of: password) { _, value in
                 if value.count > 128 {
                     password = String(value.prefix(128))
                 }
+                operationErrorMessage = nil
             }
             .onChange(of: confirmation) { _, value in
                 if value.count > 128 {
                     confirmation = String(value.prefix(128))
                 }
+                operationErrorMessage = nil
             }
             .onChange(of: permissionProfile) { _, profile in
                 applyPermissionProfile(profile)
             }
+            .onChange(of: permissions) { _, permissions in
+                let resolved = profile(for: permissions)
+                if permissionProfile != resolved {
+                    permissionProfile = resolved
+                }
+                operationErrorMessage = nil
+            }
+        }
+        .onAppear {
+            sourceContentRevisionID = model.record(id: recordID)?
+                .contentRevisionID
+        }
+        .confirmationDialog(
+            "Discard protection setup?".localizedUI,
+            isPresented: $isConfirmingDiscard,
+            titleVisibility: .visible
+        ) {
+            Button(
+                "Discard Setup".localizedUI,
+                role: .destructive
+            ) {
+                password = ""
+                confirmation = ""
+                dismiss()
+            }
+            Button("Keep Editing".localizedUI, role: .cancel) {}
+        } message: {
+            Text(
+                "The password and permission changes have not been used to create a copy."
+                    .localizedUI
+            )
         }
         .onDisappear {
-            operationTask?.cancel()
+            interruptProtection(invalidateResult: true)
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptProtection(invalidateResult: true)
+        }
+        .onChange(
+            of: model.record(id: recordID)?
+                .contentRevisionID
+        ) { oldRevisionID, newRevisionID in
+            guard oldRevisionID != newRevisionID else { return }
+            invalidateProtectionOperationForSourceChange()
+            sourceContentRevisionID = newRevisionID
+            requiresUpdatedPDFConfirmation = newRevisionID != nil
+            operationErrorMessage =
+                "The PDF changed. Confirm these settings for the updated PDF before creating a copy."
+                    .localizedUI
+            errorFeedback += 1
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtection(invalidateResult: true)
+        }
+        .interactiveDismissDisabled(
+            operationTask != nil || hasProtectionDraft
+        )
+        .sensoryFeedback(.error, trigger: errorFeedback)
+    }
+
+    @ViewBuilder
+    private var permissionProfilePicker: some View {
+        let picker = Picker(
+            "Permission profile",
+            selection: $permissionProfile
+        ) {
+            ForEach(
+                PermissionProfile.allCases.filter { $0 != .custom }
+            ) { profile in
+                Text(profile.title.localizedUI)
+                    .tag(profile)
+            }
+            if permissionProfile == .custom {
+                Text(PermissionProfile.custom.title.localizedUI)
+                    .tag(PermissionProfile.custom)
+                    .disabled(true)
+            }
+        }
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            picker
+                .pickerStyle(.menu)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+        } else {
+            picker.pickerStyle(.segmented)
+        }
+    }
+
+    @ViewBuilder
+    private func securePasteField(
+        _ title: LocalizedStringKey,
+        text: Binding<String>,
+        field: PasswordField
+    ) -> some View {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            VStack(alignment: .trailing, spacing: PPSpacing.small) {
+                secureField(title, text: text, field: field)
+                passwordPasteButton(text: text)
+            }
+        } else {
+            HStack(spacing: PPSpacing.small) {
+                secureField(title, text: text, field: field)
+                passwordPasteButton(text: text)
+            }
+        }
+    }
+
+    private func secureField(
+        _ title: LocalizedStringKey,
+        text: Binding<String>,
+        field: PasswordField
+    ) -> some View {
+        SecureField(title, text: text)
+            .textContentType(.newPassword)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .focused($focusedPasswordField, equals: field)
+            .submitLabel(
+                field == .password ? .next : .done
+            )
+            .onSubmit {
+                if field == .password {
+                    focusedPasswordField = .confirmation
+                } else if validationMessage == nil,
+                          !password.isEmpty {
+                    startProtection()
+                }
+            }
+            .frame(minHeight: 44)
+    }
+
+    private func passwordPasteButton(
+        text: Binding<String>
+    ) -> some View {
+        PasteButton(payloadType: String.self) { values in
+            guard let value = values.first else { return }
+            text.wrappedValue = String(value.prefix(128))
+        }
+        .frame(minWidth: 44, minHeight: 44)
+        .accessibilityHint(
+            "Pastes the password without storing it in PaperPath"
+        )
     }
 
     private var allowedPermissionCount: Int {
@@ -1084,6 +1782,32 @@ struct ProtectionSheet: View {
             permissions.allowsFormFilling,
             permissions.allowsPageChanges
         ].filter { $0 }.count
+    }
+
+    private var hasProtectionDraft: Bool {
+        !password.isEmpty
+            || !confirmation.isEmpty
+            || permissions != .restricted
+    }
+
+    private var protectionActionHint: String {
+        if operationTask != nil {
+            return "Wait for the protected copy to finish."
+                .localizedUI
+        }
+        if password.isEmpty {
+            return "Enter and confirm a password first."
+                .localizedUI
+        }
+        if requiresUpdatedPDFConfirmation {
+            return "Confirms these password settings for the updated PDF without creating a copy yet."
+                .localizedUI
+        }
+        if let validationMessage {
+            return validationMessage.localizedUI
+        }
+        return "Creates a separate password-protected PDF."
+            .localizedUI
     }
 
     private func applyPermissionProfile(
@@ -1108,6 +1832,136 @@ struct ProtectionSheet: View {
                 allowsFormFilling: true,
                 allowsPageChanges: true
             )
+        case .custom:
+            break
+        }
+    }
+
+    private func profile(
+        for permissions: PDFProtectionPermissions
+    ) -> PermissionProfile {
+        if permissions == .restricted {
+            return .restricted
+        }
+        if permissions == PDFProtectionPermissions(
+            allowsPrinting: false,
+            allowsCopying: false,
+            allowsCommenting: true,
+            allowsFormFilling: true,
+            allowsPageChanges: false
+        ) {
+            return .review
+        }
+        if permissions == PDFProtectionPermissions(
+            allowsPrinting: true,
+            allowsCopying: true,
+            allowsCommenting: true,
+            allowsFormFilling: true,
+            allowsPageChanges: true
+        ) {
+            return .flexible
+        }
+        return .custom
+    }
+
+    private func startProtection() {
+        guard operationTask == nil,
+              !requiresUpdatedPDFConfirmation,
+              let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        operationErrorMessage = nil
+        operationStopRequested = false
+        focusedPasswordField = nil
+        let generation = UUID()
+        operationGeneration = generation
+        let requestedPassword = password
+        let requestedPermissions = permissions
+        operationTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createProtectedCopy(
+                    recordID: recordID,
+                    password: requestedPassword,
+                    permissions: requestedPermissions,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
+            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    created == nil
+                        ? "Copy creation stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
+                return
+            }
+            guard let created else {
+                if !Task.isCancelled {
+                    operationErrorMessage =
+                        "The protected copy could not be created. Your password and permissions are unchanged."
+                            .localizedUI
+                    errorFeedback += 1
+                }
+                return
+            }
+            onCreated(DocumentRoute(recordID: created.id))
+        }
+    }
+
+    private func confirmUpdatedPDFForProtection() {
+        guard let revisionID =
+                model.record(id: recordID)?.contentRevisionID
+        else { return }
+        sourceContentRevisionID = revisionID
+        requiresUpdatedPDFConfirmation = false
+        operationErrorMessage = nil
+    }
+
+    private func invalidateProtectionOperationForSourceChange() {
+        operationGeneration = UUID()
+        operationStopRequested = false
+        operationTask?.cancel()
+        operationTask = nil
+        isConfirmingDiscard = false
+        focusedPasswordField = nil
+    }
+
+    private func interruptProtection(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else if operationTask != nil {
+            guard !operationStopRequested else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            operationErrorMessage = nil
+            isConfirmingDiscard = false
+        }
+        focusedPasswordField = nil
+        password = ""
+        confirmation = ""
+    }
+
+    private func requestProtectionDismissal() {
+        if hasProtectionDraft {
+            isConfirmingDiscard = true
+        } else {
+            dismiss()
         }
     }
 }
@@ -1121,13 +1975,23 @@ struct RedactionReviewSheet: View {
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     @Binding var marks: [PDFRedactionMark]
+    let onReviewPage: (Int) -> Void
     let onCreated: (DocumentRoute) -> Void
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
     @State private var pageGroups: [PageGroup] = []
-    @State private var totalCoverage = 0.0
+    @State private var isConfirmingClearMarks = false
+    @State private var operationErrorMessage: String?
+    @State private var errorFeedback = 0
+    @State private var markFeedback = 0
+    @State private var sourceContentRevisionID: UUID?
+    @State private var sourceWasUpdated = false
 
     var body: some View {
         NavigationStack {
@@ -1137,7 +2001,7 @@ struct RedactionReviewSheet: View {
                         WorkflowCommandHeader(
                             eyebrow: "REDACTION WORKFLOW",
                             title: "Review marked areas",
-                            detail: "Covered content is removed from a separate rasterized copy.",
+                            detail: "Marked content is permanently removed from a new copy.",
                             symbol: "eye.slash.fill",
                             tint: PPColor.amber,
                             metrics: [
@@ -1152,24 +2016,36 @@ struct RedactionReviewSheet: View {
                                     label: "Pages",
                                     symbol: "doc.on.doc",
                                     tint: PPColor.accent
-                                ),
-                                WorkflowMetric(
-                                    value: "Removed",
-                                    label: "Text layer",
-                                    symbol: "text.badge.xmark",
-                                    tint: PPColor.mint
-                                ),
-                                WorkflowMetric(
-                                    value:
-                                        "\(Int(totalCoverage * 100))%",
-                                    label: "Marked area",
-                                    symbol: "percent",
-                                    tint: PPColor.cyan
                                 )
-                            ]
+                            ],
+                            showsOnDevice: true
                         )
 
-                        VStack(spacing: 0) {
+                        if marks.isEmpty {
+                            VStack(spacing: PPSpacing.medium) {
+                                PPEmptyState(
+                                    kind: .workspace,
+                                    title: "No marked areas",
+                                    message:
+                                        "Return to the PDF and mark at least one area before creating a redacted copy."
+                                )
+                                Button {
+                                    dismiss()
+                                } label: {
+                                    Label(
+                                        "Mark Another Area",
+                                        systemImage: "selection.pin.in.out"
+                                    )
+                                }
+                                .buttonStyle(
+                                    PPQuietButtonStyle(
+                                        tint: PPColor.amber
+                                    )
+                                )
+                            }
+                            .padding(.vertical, PPSpacing.large)
+                        } else {
+                            VStack(spacing: 0) {
                             ForEach(pageGroups) { group in
                                 HStack {
                                     Label(
@@ -1179,7 +2055,11 @@ struct RedactionReviewSheet: View {
                                     .font(.subheadline.weight(.semibold))
                                     Spacer()
                                     Text(
-                                        "\(group.marks.count) area\(group.marks.count == 1 ? "" : "s")"
+                                        AppLocalization.format(
+                                            "%@ area%@",
+                                            "\(group.marks.count)",
+                                            group.marks.count == 1 ? "" : "s"
+                                        )
                                     )
                                     .font(.caption.monospacedDigit())
                                     .foregroundStyle(
@@ -1200,36 +2080,58 @@ struct RedactionReviewSheet: View {
                                     id: \.offset
                                 ) { localIndex, mark in
                                     HStack(spacing: PPSpacing.medium) {
-                                        Image(
-                                            systemName:
-                                                "selection.pin.in.out"
-                                        )
-                                        .foregroundStyle(
-                                            PPColor.textSecondary
-                                        )
-                                        .frame(width: 28)
-                                        VStack(
-                                            alignment: .leading,
-                                            spacing: 3
-                                        ) {
-                                            Text(
-                                                "Area \(localIndex + 1)"
+                                        Button {
+                                            onReviewPage(mark.pageIndex)
+                                        } label: {
+                                            HStack(
+                                                spacing: PPSpacing.medium
+                                            ) {
+                                                Image(
+                                                    systemName:
+                                                        "selection.pin.in.out"
+                                                )
+                                                .foregroundStyle(
+                                                    PPColor.textSecondary
+                                                )
+                                                .frame(width: 28)
+                                                Text(
+                                                    AppLocalization.format(
+                                                        "Area %@",
+                                                        "\(localIndex + 1)"
+                                                    )
+                                                )
+                                                .font(
+                                                    .body.weight(.semibold)
+                                                )
+                                                .foregroundStyle(
+                                                    PPColor.textPrimary
+                                                )
+                                                Spacer(minLength: 0)
+                                                Image(
+                                                    systemName: "eye"
+                                                )
+                                                .font(.caption)
+                                                .foregroundStyle(
+                                                    PPColor.cyan
+                                                )
+                                            }
+                                            .frame(
+                                                maxWidth: .infinity,
+                                                minHeight: 44,
+                                                alignment: .leading
                                             )
-                                            .font(
-                                                .body.weight(.semibold)
-                                            )
-                                            Text(
-                                                "\(Int(mark.normalizedWidth * 100))×\(Int(mark.normalizedHeight * 100))% · x\(Int(mark.normalizedX * 100)) y\(Int(mark.normalizedY * 100))"
-                                            )
-                                            .font(
-                                                .caption2
-                                                    .monospacedDigit()
-                                            )
-                                            .foregroundStyle(
-                                                PPColor.textSecondary
-                                            )
+                                            .contentShape(Rectangle())
                                         }
-                                        Spacer()
+                                        .buttonStyle(.plain)
+                                        .disabled(operationTask != nil)
+                                        .accessibilityLabel(
+                                            AppLocalization.format(
+                                                "Review marked area %lld on page %lld",
+                                                localIndex + 1,
+                                                mark.pageIndex + 1
+                                            )
+                                        )
+
                                         Button {
                                             if let index =
                                                 marks.firstIndex(
@@ -1245,10 +2147,15 @@ struct RedactionReviewSheet: View {
                                             .foregroundStyle(
                                                 PPColor.textSecondary
                                             )
+                                            .frame(width: 44, height: 44)
                                         }
                                         .buttonStyle(.plain)
+                                        .disabled(operationTask != nil)
                                         .accessibilityLabel(
-                                            "Remove marked area \(localIndex + 1)"
+                                            AppLocalization.format(
+                                                "Remove marked area %lld",
+                                                localIndex + 1
+                                            )
                                         )
                                     }
                                     .padding(.vertical, PPSpacing.small)
@@ -1264,31 +2171,50 @@ struct RedactionReviewSheet: View {
                                     }
                                 }
                             }
-                        }
-                        .padding(.horizontal, PPSpacing.small)
-                        .background(PPColor.surface.opacity(0.72))
-                        .overlay(alignment: .top) {
-                            Rectangle()
-                                .fill(PPColor.border.opacity(0.62))
-                                .frame(height: 0.6)
-                        }
-                        .overlay(alignment: .bottom) {
-                            Rectangle()
-                                .fill(PPColor.border.opacity(0.62))
-                                .frame(height: 0.6)
+                            }
+                            .padding(.horizontal, PPSpacing.small)
+                            .background(PPColor.surface.opacity(0.72))
+                            .overlay(alignment: .top) {
+                                Rectangle()
+                                    .fill(PPColor.border.opacity(0.62))
+                                    .frame(height: 0.6)
+                            }
+                            .overlay(alignment: .bottom) {
+                                Rectangle()
+                                    .fill(PPColor.border.opacity(0.62))
+                                    .frame(height: 0.6)
+                            }
+
+                            HStack(spacing: PPSpacing.medium) {
+                                Button("Add Another Area") {
+                                    dismiss()
+                                }
+                                .buttonStyle(PPQuietButtonStyle())
+                                .disabled(operationTask != nil)
+                                Spacer()
+                                Button(
+                                    "Clear Marks",
+                                    role: .destructive
+                                ) {
+                                    isConfirmingClearMarks = true
+                                }
+                                .buttonStyle(.plain)
+                                .foregroundStyle(.red)
+                                .disabled(operationTask != nil)
+                            }
                         }
 
-                        HStack(spacing: PPSpacing.medium) {
-                            Button("Mark Another Area") {
-                                dismiss()
-                            }
-                            .buttonStyle(PPQuietButtonStyle())
-                            Spacer()
-                            Button("Clear Marks", role: .destructive) {
-                                marks.removeAll()
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.red)
+                        if let operationErrorMessage {
+                            Label(
+                                operationErrorMessage,
+                                systemImage: "exclamationmark.circle"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(PPColor.rose)
+                            .fixedSize(
+                                horizontal: false,
+                                vertical: true
+                            )
                         }
                     }
                     .frame(maxWidth: 720)
@@ -1297,26 +2223,26 @@ struct RedactionReviewSheet: View {
                 }
 
                 Button {
-                    operationTask = Task {
-                        defer { operationTask = nil }
-                        if let created = await model.createRedactedCopy(
-                            recordID: recordID,
-                            marks: marks
-                        ) {
-                            guard !Task.isCancelled else { return }
-                            dismiss()
-                            onCreated(DocumentRoute(recordID: created.id))
-                        }
-                    }
+                    startRedaction()
                 } label: {
                     if operationTask == nil {
-                        Label("Create Secure Redacted Copy", systemImage: "checkmark.shield")
+                        Label(
+                            "Create Redacted Copy",
+                            systemImage: "checkmark.shield"
+                        )
                     } else {
-                        Label("Applying Redactions", systemImage: "hourglass")
+                        Label(
+                            operationStopRequested
+                                ? "Finishing current file commit"
+                                : "Creating Redacted Copy",
+                            systemImage: "hourglass"
+                        )
                     }
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
                 .disabled(marks.isEmpty || operationTask != nil)
+                .keyboardShortcut(.defaultAction)
+                .accessibilityHint(redactionActionHint)
                 .padding(.horizontal, PPSpacing.regular)
                 .padding(.vertical, PPSpacing.small)
                 .background(.bar)
@@ -1336,28 +2262,77 @@ struct RedactionReviewSheet: View {
                         (
                             operationTask == nil
                                 ? "Cancel"
-                                : "Stop"
+                                : operationStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                         ).localizedUI
                     ) {
                         if operationTask != nil {
-                            operationTask?.cancel()
-                            operationTask = nil
+                            interruptRedaction()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
             }
         }
         .onAppear {
+            sourceContentRevisionID = model.record(id: recordID)?
+                .contentRevisionID
             refreshMarkGroups()
         }
         .onChange(of: marks) {
+            markFeedback += 1
+            if !sourceWasUpdated {
+                operationErrorMessage = nil
+            }
             refreshMarkGroups()
         }
-        .onDisappear {
-            operationTask?.cancel()
+        .onChange(
+            of: model.record(id: recordID)?
+                .contentRevisionID
+        ) { oldRevisionID, newRevisionID in
+            guard oldRevisionID != newRevisionID else { return }
+            interruptRedaction(invalidateResult: true)
+            sourceContentRevisionID = newRevisionID
+            sourceWasUpdated = true
+            marks.removeAll(keepingCapacity: false)
+            operationErrorMessage =
+                "The PDF changed. Mark the updated pages again before creating a redacted copy."
+                    .localizedUI
+            errorFeedback += 1
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptRedaction(invalidateResult: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptRedaction(invalidateResult: true)
+        }
+        .onDisappear {
+            interruptRedaction(invalidateResult: true)
+        }
+        .alert(
+            "Clear all marked areas?",
+            isPresented: $isConfirmingClearMarks
+        ) {
+            Button("Clear Marks", role: .destructive) {
+                marks.removeAll()
+            }
+            Button("Keep Marks", role: .cancel) {}
+        } message: {
+            Text("This only clears the review list. No PDF has been changed.")
+        }
+        .interactiveDismissDisabled(operationTask != nil)
+        .sensoryFeedback(.selection, trigger: markFeedback)
+        .sensoryFeedback(.error, trigger: errorFeedback)
     }
 
     private func refreshMarkGroups() {
@@ -1375,14 +2350,87 @@ struct RedactionReviewSheet: View {
                 marks: grouped[$0] ?? []
             )
         }
-        totalCoverage = min(
-            1,
-            cleaned.reduce(0) {
-                $0
-                    + $1.normalizedWidth
-                    * $1.normalizedHeight
+    }
+
+    private func startRedaction() {
+        guard operationTask == nil,
+              let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID,
+              !sourceWasUpdated,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        operationErrorMessage = nil
+        operationStopRequested = false
+        let generation = UUID()
+        operationGeneration = generation
+        let requestedMarks = marks
+        operationTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createRedactedCopy(
+                    recordID: recordID,
+                    marks: requestedMarks,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
             }
-        )
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    created == nil
+                        ? "Copy creation stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
+                return
+            }
+            guard let created else {
+                if !Task.isCancelled {
+                    operationErrorMessage =
+                        "The redacted copy could not be created. Your marked areas are unchanged."
+                            .localizedUI
+                    errorFeedback += 1
+                }
+                return
+            }
+            onCreated(DocumentRoute(recordID: created.id))
+        }
+    }
+
+    private var redactionActionHint: String {
+        if operationTask != nil {
+            return "Wait for the redacted copy to finish."
+                .localizedUI
+        }
+        if marks.isEmpty {
+            return "Mark at least one area before creating a redacted copy."
+                .localizedUI
+        }
+        return "Creates a separate PDF with the marked content permanently removed."
+            .localizedUI
+    }
+
+    private func interruptRedaction(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else if operationTask != nil {
+            guard !operationStopRequested else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            operationErrorMessage = nil
+        }
     }
 }
 
@@ -1410,6 +2458,8 @@ private struct BookletPreparationSheet: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let onCreated: (DocumentRoute) -> Void
@@ -1422,8 +2472,14 @@ private struct BookletPreparationSheet: View {
     @State private var assessmentTask: Task<Void, Never>?
     @State private var creationTask: Task<Void, Never>?
     @State private var assessmentGeneration = 0
+    @State private var creationGeneration = UUID()
+    @State private var creationStopRequested = false
     @State private var optionFeedback = 0
     @State private var successFeedback = 0
+    @State private var errorFeedback = 0
+    @State private var assessmentErrorMessage: String?
+    @State private var creationErrorMessage: String?
+    @State private var isConfirmingDiscard = false
 
     init(
         recordID: UUID,
@@ -1470,14 +2526,21 @@ private struct BookletPreparationSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
-                        (isBusy ? "Stop" : "Cancel").localizedUI
+                        (
+                            creationStopRequested
+                                ? "Stopping"
+                                : creationTask != nil
+                                    ? "Stop"
+                                    : "Cancel"
+                        ).localizedUI
                     ) {
-                        if isBusy {
+                        if creationTask != nil {
                             stopWork()
                         } else {
-                            dismiss()
+                            requestDismissal()
                         }
                     }
+                    .disabled(creationStopRequested)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Reset".localizedUI) {
@@ -1490,7 +2553,10 @@ private struct BookletPreparationSheet: View {
                             reviewMode = .all
                         }
                     }
-                    .disabled(isBusy || options == defaultOptions)
+                    .disabled(
+                        creationTask != nil
+                            || options == defaultOptions
+                    )
                 }
             }
         }
@@ -1499,16 +2565,71 @@ private struct BookletPreparationSheet: View {
         }
         .onChange(of: options) { _, _ in
             optionFeedback += 1
+            assessmentErrorMessage = nil
+            creationErrorMessage = nil
             startAssessment(debounced: true)
         }
-        .onDisappear {
-            assessmentGeneration += 1
-            assessmentTask?.cancel()
-            creationTask?.cancel()
+        .onChange(
+            of: model.record(id: recordID)?
+                .contentRevisionID
+        ) { oldRevisionID, newRevisionID in
+            guard oldRevisionID != newRevisionID else { return }
+            interruptBookletWork()
+            assessment = nil
+            assessmentErrorMessage = nil
+            creationErrorMessage = nil
+            guard newRevisionID != nil,
+                  scenePhase == .active,
+                  UIApplication.shared
+                    .isProtectedDataAvailable
+            else { return }
+            startAssessment(debounced: false)
         }
-        .interactiveDismissDisabled(creationTask != nil)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active,
+               assessment == nil,
+               assessmentTask == nil,
+               creationTask == nil {
+                startAssessment(debounced: false)
+            } else if phase == .background {
+                interruptBookletWork()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptBookletWork()
+        }
+        .onDisappear {
+            interruptBookletWork()
+        }
+        .confirmationDialog(
+            "Discard booklet setup?".localizedUI,
+            isPresented: $isConfirmingDiscard,
+            titleVisibility: .visible
+        ) {
+            Button(
+                "Discard Setup".localizedUI,
+                role: .destructive
+            ) {
+                dismiss()
+            }
+            Button("Keep Editing".localizedUI, role: .cancel) {}
+        } message: {
+            Text(
+                "The booklet options have not been used to create a copy."
+                    .localizedUI
+            )
+        }
+        .interactiveDismissDisabled(
+            creationTask != nil || options != defaultOptions
+        )
         .sensoryFeedback(.selection, trigger: optionFeedback)
         .sensoryFeedback(.success, trigger: successFeedback)
+        .sensoryFeedback(.error, trigger: errorFeedback)
     }
 
     private var bookletHeader: some View {
@@ -1650,7 +2771,10 @@ private struct BookletPreparationSheet: View {
     private var paperControl: some View {
         VStack(alignment: .leading, spacing: 4) {
             SectionEyebrow(text: "SHEET")
-            Picker("Sheet", selection: $options.paperTarget) {
+            let picker = Picker(
+                "Sheet",
+                selection: $options.paperTarget
+            ) {
                 ForEach(
                     [
                         PDFPrintPaperTarget.a4,
@@ -1661,15 +2785,29 @@ private struct BookletPreparationSheet: View {
                     Text(target.title.localizedUI).tag(target)
                 }
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
         }
-        .frame(minWidth: 260)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 260,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
     }
 
     private var bindingControl: some View {
         VStack(alignment: .leading, spacing: 4) {
             SectionEyebrow(text: "BINDING")
-            Picker(
+            let picker = Picker(
                 "Binding",
                 selection: $options.bindingEdge
             ) {
@@ -1677,9 +2815,23 @@ private struct BookletPreparationSheet: View {
                     Text(edge.title.localizedUI).tag(edge)
                 }
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
         }
-        .frame(minWidth: 260)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 260,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
     }
 
     private var signatureControl: some View {
@@ -1699,7 +2851,7 @@ private struct BookletPreparationSheet: View {
                     .foregroundStyle(PPColor.textSecondary)
                 }
             }
-            Picker(
+            let picker = Picker(
                 "Signature",
                 selection: $options.signatureSheetLimit
             ) {
@@ -1708,9 +2860,23 @@ private struct BookletPreparationSheet: View {
                 Text("8 sheets".localizedUI).tag(8)
                 Text("12 sheets".localizedUI).tag(12)
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
         }
-        .frame(minWidth: 280)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 280,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
     }
 
     private var creepControl: some View {
@@ -1842,11 +3008,19 @@ private struct BookletPreparationSheet: View {
                 Text(title.localizedUI)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? 2
+                            : 1
+                    )
                 Text(detail.localizedUI)
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? 3
+                            : 1
+                    )
             }
         }
     }
@@ -1893,11 +3067,24 @@ private struct BookletPreparationSheet: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, PPSpacing.xLarge)
             } else {
-                PPEmptyState(
-                    kind: .workspace,
-                    title: "Booklet evidence unavailable",
-                    message: "Reset or change an option to recalculate."
-                )
+                VStack(spacing: PPSpacing.medium) {
+                    PPEmptyState(
+                        kind: .workspace,
+                        title: "Booklet evidence unavailable",
+                        message: assessmentErrorMessage
+                            ?? "Reset or change an option to recalculate."
+                                .localizedUI
+                    )
+                    Button {
+                        startAssessment(debounced: false)
+                    } label: {
+                        Label(
+                            "Retry Booklet Assessment",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+                }
                 .padding(.vertical, PPSpacing.xLarge)
             }
         }
@@ -1912,18 +3099,29 @@ private struct BookletPreparationSheet: View {
         )
     }
 
+    @ViewBuilder
     private var reviewPicker: some View {
-        Picker("Review", selection: $reviewMode) {
+        let picker = Picker("Review", selection: $reviewMode) {
             ForEach(ReviewMode.allCases) { mode in
                 Text(mode.title.localizedUI).tag(mode)
             }
         }
-        .pickerStyle(.segmented)
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            picker
+                .pickerStyle(.menu)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+        } else {
+            picker.pickerStyle(.segmented)
+        }
     }
 
     private var spreadColumns: [GridItem] {
         let count = horizontalSizeClass == .regular
-            && !dynamicTypeSize.isAccessibilitySize
+            && !dynamicTypeSize.ppPrefersExpandedLayout
             ? 2
             : 1
         return Array(
@@ -1938,7 +3136,17 @@ private struct BookletPreparationSheet: View {
     private func spreadRow(
         _ spread: PDFBookletSpread
     ) -> some View {
-        HStack(spacing: PPSpacing.medium) {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.medium)
+            )
+        return layout {
             BookletSpreadDiagram(spread: spread)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -1964,26 +3172,22 @@ private struct BookletPreparationSheet: View {
                 Text(spreadOrderLabel(spread))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(PPColor.textPrimary)
-                HStack(spacing: PPSpacing.large) {
-                    slotEvidence(spread.left, label: "left")
-                    slotEvidence(spread.right, label: "right")
-                    if spread.left.creepOffsetPoints != 0
-                        || spread.right.creepOffsetPoints != 0 {
-                        evidence(
-                            AppLocalization.format(
-                                "%.0f pt",
-                                max(
-                                    abs(spread.left.creepOffsetPoints),
-                                    abs(spread.right.creepOffsetPoints)
-                                )
-                            ),
-                            label: "creep"
-                        )
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.large) {
+                        spreadEvidence(spread)
+                    }
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.xSmall
+                    ) {
+                        spreadEvidence(spread)
                     }
                 }
             }
 
-            Spacer(minLength: PPSpacing.small)
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                Spacer(minLength: PPSpacing.small)
+            }
 
             if spread.hasBlankSlot {
                 Image(systemName: "rectangle.dashed")
@@ -2007,7 +3211,28 @@ private struct BookletPreparationSheet: View {
                 )
                 .frame(height: spread.hasBlankSlot ? 1 : 0.6)
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private func spreadEvidence(
+        _ spread: PDFBookletSpread
+    ) -> some View {
+        slotEvidence(spread.left, label: "left")
+        slotEvidence(spread.right, label: "right")
+        if spread.left.creepOffsetPoints != 0
+            || spread.right.creepOffsetPoints != 0 {
+            evidence(
+                AppLocalization.format(
+                    "%.0f pt",
+                    max(
+                        abs(spread.left.creepOffsetPoints),
+                        abs(spread.right.creepOffsetPoints)
+                    )
+                ),
+                label: "creep"
+            )
+        }
     }
 
     private func slotEvidence(
@@ -2060,6 +3285,16 @@ private struct BookletPreparationSheet: View {
                let progress = model.progress(for: recordID) {
                 LocalOperationProgressView(progress: progress)
             }
+            if let creationErrorMessage {
+                Label(
+                    creationErrorMessage,
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: PPSpacing.medium) {
@@ -2091,7 +3326,10 @@ private struct BookletPreparationSheet: View {
             )
             .font(.caption)
             .foregroundStyle(PPColor.textSecondary)
-            .lineLimit(1)
+            .lineLimit(
+                dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+            )
+            .fixedSize(horizontal: false, vertical: true)
         } icon: {
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(PPColor.mint)
@@ -2104,9 +3342,11 @@ private struct BookletPreparationSheet: View {
             createBooklet()
         } label: {
             Label(
-                creationTask == nil
-                    ? "Create Booklet Copy".localizedUI
-                    : "Creating Booklet Copy".localizedUI,
+                creationStopRequested
+                    ? "Finishing current file commit".localizedUI
+                    : creationTask == nil
+                        ? "Create Booklet Copy".localizedUI
+                        : "Creating Booklet Copy".localizedUI,
                 systemImage: creationTask == nil
                     ? "book.pages.fill"
                     : "hourglass"
@@ -2120,6 +3360,8 @@ private struct BookletPreparationSheet: View {
                 || assessmentTask != nil
                 || creationTask != nil
         )
+        .keyboardShortcut(.defaultAction)
+        .accessibilityHint(bookletCreationHint)
     }
 
     private var filteredSpreads: [PDFBookletSpread] {
@@ -2136,8 +3378,21 @@ private struct BookletPreparationSheet: View {
         }
     }
 
-    private var isBusy: Bool {
-        assessmentTask != nil || creationTask != nil
+    private var bookletCreationHint: String {
+        if creationTask != nil {
+            return "Wait for the booklet copy to finish."
+                .localizedUI
+        }
+        if assessmentTask != nil {
+            return "Wait for booklet evidence to finish."
+                .localizedUI
+        }
+        if assessment == nil || assessment?.options != options {
+            return "Retry booklet assessment before creating the copy."
+                .localizedUI
+        }
+        return "Creates a separate two-up booklet PDF."
+            .localizedUI
     }
 
     private func startAssessment(
@@ -2146,6 +3401,7 @@ private struct BookletPreparationSheet: View {
         assessmentGeneration += 1
         let generation = assessmentGeneration
         assessmentTask?.cancel()
+        assessmentErrorMessage = nil
         let requestedOptions = options
         assessmentTask = Task {
             if debounced {
@@ -2157,18 +3413,30 @@ private struct BookletPreparationSheet: View {
                 }
                 return
             }
-            let loaded = await model.bookletAssessment(
-                recordID: recordID,
-                options: requestedOptions
-            )
+            let loaded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.bookletAssessment(
+                    recordID: recordID,
+                    options: requestedOptions
+                )
+            }
             guard !Task.isCancelled,
                   generation == assessmentGeneration,
-                  options == requestedOptions,
-                  let loaded
+                  options == requestedOptions
             else {
                 if generation == assessmentGeneration {
                     assessmentTask = nil
                 }
+                return
+            }
+            guard let loaded else {
+                assessment = nil
+                assessmentTask = nil
+                assessmentErrorMessage =
+                    "Booklet evidence could not be calculated. Try again."
+                        .localizedUI
+                errorFeedback += 1
                 return
             }
             withAnimation(
@@ -2181,6 +3449,9 @@ private struct BookletPreparationSheet: View {
     }
 
     private func createBooklet() {
+        guard scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         guard let assessment,
               assessment.options == options,
               model.record(id: recordID)?.contentRevisionID
@@ -2190,28 +3461,72 @@ private struct BookletPreparationSheet: View {
             return
         }
         let requestedOptions = options
-        creationTask = Task {
-            let created = await model.createBookletCopy(
-                recordID: recordID,
-                options: requestedOptions
-            )
-            guard !Task.isCancelled else {
-                creationTask = nil
+        creationErrorMessage = nil
+        creationStopRequested = false
+        let generation = UUID()
+        creationGeneration = generation
+        creationTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createBookletCopy(
+                    recordID: recordID,
+                    options: requestedOptions,
+                    expectedContentRevisionID:
+                        assessment.revisionID
+                )
+            }
+            guard creationGeneration == generation else { return }
+            let wasStopped =
+                creationStopRequested || Task.isCancelled
+            creationTask = nil
+            creationStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    created == nil
+                        ? "Copy creation stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
                 return
             }
-            creationTask = nil
-            guard let created else { return }
+            guard let created else {
+                if !Task.isCancelled {
+                    creationErrorMessage =
+                        "The booklet copy could not be created. Your options are unchanged."
+                            .localizedUI
+                    errorFeedback += 1
+                }
+                return
+            }
             successFeedback += 1
-            dismiss()
             onCreated(DocumentRoute(recordID: created.id))
         }
     }
 
     private func stopWork() {
+        guard creationTask != nil,
+              !creationStopRequested
+        else { return }
+        creationStopRequested = true
+        creationTask?.cancel()
+    }
+
+    private func requestDismissal() {
+        if options != defaultOptions {
+            isConfirmingDiscard = true
+        } else {
+            dismiss()
+        }
+    }
+
+    private func interruptBookletWork() {
         assessmentGeneration += 1
+        creationGeneration = UUID()
+        creationStopRequested = false
         assessmentTask?.cancel()
         assessmentTask = nil
         creationTask?.cancel()
+        creationTask = nil
     }
 }
 
@@ -2308,6 +3623,8 @@ private struct PrintPreparationSheet: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let onCreated: (DocumentRoute) -> Void
@@ -2320,8 +3637,14 @@ private struct PrintPreparationSheet: View {
     @State private var assessmentTask: Task<Void, Never>?
     @State private var creationTask: Task<Void, Never>?
     @State private var assessmentGeneration = 0
+    @State private var creationGeneration = UUID()
+    @State private var creationStopRequested = false
     @State private var optionFeedback = 0
     @State private var successFeedback = 0
+    @State private var errorFeedback = 0
+    @State private var assessmentErrorMessage: String?
+    @State private var creationErrorMessage: String?
+    @State private var isConfirmingDiscard = false
 
     init(
         recordID: UUID,
@@ -2367,15 +3690,20 @@ private struct PrintPreparationSheet: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            isBusy ? "Stop" : "Cancel"
+                            creationStopRequested
+                                ? "Stopping"
+                                : creationTask != nil
+                                    ? "Stop"
+                                    : "Cancel"
                         ).localizedUI
                     ) {
-                        if isBusy {
+                        if creationTask != nil {
                             stopWork()
                         } else {
-                            dismiss()
+                            requestDismissal()
                         }
                     }
+                    .disabled(creationStopRequested)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Reset".localizedUI) {
@@ -2388,7 +3716,10 @@ private struct PrintPreparationSheet: View {
                             reviewMode = .all
                         }
                     }
-                    .disabled(isBusy || options == defaultOptions)
+                    .disabled(
+                        creationTask != nil
+                            || options == defaultOptions
+                    )
                 }
             }
         }
@@ -2397,16 +3728,71 @@ private struct PrintPreparationSheet: View {
         }
         .onChange(of: options) { _, _ in
             optionFeedback += 1
+            assessmentErrorMessage = nil
+            creationErrorMessage = nil
             startAssessment(debounced: true)
         }
-        .onDisappear {
-            assessmentGeneration += 1
-            assessmentTask?.cancel()
-            creationTask?.cancel()
+        .onChange(
+            of: model.record(id: recordID)?
+                .contentRevisionID
+        ) { oldRevisionID, newRevisionID in
+            guard oldRevisionID != newRevisionID else { return }
+            interruptPrintPreparationWork()
+            assessment = nil
+            assessmentErrorMessage = nil
+            creationErrorMessage = nil
+            guard newRevisionID != nil,
+                  scenePhase == .active,
+                  UIApplication.shared
+                    .isProtectedDataAvailable
+            else { return }
+            startAssessment(debounced: false)
         }
-        .interactiveDismissDisabled(creationTask != nil)
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active,
+               assessment == nil,
+               assessmentTask == nil,
+               creationTask == nil {
+                startAssessment(debounced: false)
+            } else if phase == .background {
+                interruptPrintPreparationWork()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptPrintPreparationWork()
+        }
+        .onDisappear {
+            interruptPrintPreparationWork()
+        }
+        .confirmationDialog(
+            "Discard print setup?".localizedUI,
+            isPresented: $isConfirmingDiscard,
+            titleVisibility: .visible
+        ) {
+            Button(
+                "Discard Setup".localizedUI,
+                role: .destructive
+            ) {
+                dismiss()
+            }
+            Button("Keep Editing".localizedUI, role: .cancel) {}
+        } message: {
+            Text(
+                "The print options have not been used to create a copy."
+                    .localizedUI
+            )
+        }
+        .interactiveDismissDisabled(
+            creationTask != nil || options != defaultOptions
+        )
         .sensoryFeedback(.selection, trigger: optionFeedback)
         .sensoryFeedback(.success, trigger: successFeedback)
+        .sensoryFeedback(.error, trigger: errorFeedback)
     }
 
     private var printHeader: some View {
@@ -2525,7 +3911,7 @@ private struct PrintPreparationSheet: View {
     private var paperTargetControl: some View {
         VStack(alignment: .leading, spacing: 4) {
             SectionEyebrow(text: "PAPER")
-            Picker(
+            let picker = Picker(
                 "Paper",
                 selection: $options.paperTarget
             ) {
@@ -2533,15 +3919,29 @@ private struct PrintPreparationSheet: View {
                     Text(target.title.localizedUI).tag(target)
                 }
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
         }
-        .frame(minWidth: 280)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 280,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
     }
 
     private var orientationControl: some View {
         VStack(alignment: .leading, spacing: 4) {
             SectionEyebrow(text: "ORIENTATION")
-            Picker(
+            let picker = Picker(
                 "Orientation",
                 selection: $options.orientation
             ) {
@@ -2552,17 +3952,33 @@ private struct PrintPreparationSheet: View {
                         .tag(orientation)
                 }
             }
-            .pickerStyle(.segmented)
-            .disabled(options.paperTarget == .original)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+                    .disabled(options.paperTarget == .original)
+            } else {
+                picker
+                    .pickerStyle(.segmented)
+                    .disabled(options.paperTarget == .original)
+            }
         }
-        .frame(minWidth: 260)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 260,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
         .opacity(options.paperTarget == .original ? 0.58 : 1)
     }
 
     private var scaleModeControl: some View {
         VStack(alignment: .leading, spacing: 4) {
             SectionEyebrow(text: "PLACEMENT")
-            Picker(
+            let picker = Picker(
                 "Placement",
                 selection: $options.scaleMode
             ) {
@@ -2574,9 +3990,23 @@ private struct PrintPreparationSheet: View {
                     .tag(mode)
                 }
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
         }
-        .frame(minWidth: 280)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 280,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
     }
 
     private var marginControl: some View {
@@ -2820,11 +4250,24 @@ private struct PrintPreparationSheet: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, PPSpacing.xLarge)
             } else {
-                PPEmptyState(
-                    kind: .workspace,
-                    title: "Print evidence unavailable",
-                    message: "Reset or change a print option to recalculate."
-                )
+                VStack(spacing: PPSpacing.medium) {
+                    PPEmptyState(
+                        kind: .workspace,
+                        title: "Print evidence unavailable",
+                        message: assessmentErrorMessage
+                            ?? "Reset or change a print option to recalculate."
+                                .localizedUI
+                    )
+                    Button {
+                        startAssessment(debounced: false)
+                    } label: {
+                        Label(
+                            "Retry Print Assessment",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+                }
                 .padding(.vertical, PPSpacing.xLarge)
             }
         }
@@ -2839,18 +4282,29 @@ private struct PrintPreparationSheet: View {
         )
     }
 
+    @ViewBuilder
     private var reviewPicker: some View {
-        Picker("Review", selection: $reviewMode) {
+        let picker = Picker("Review", selection: $reviewMode) {
             ForEach(ReviewMode.allCases) { mode in
                 Text(mode.title.localizedUI).tag(mode)
             }
         }
-        .pickerStyle(.segmented)
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            picker
+                .pickerStyle(.menu)
+                .frame(
+                    maxWidth: .infinity,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+        } else {
+            picker.pickerStyle(.segmented)
+        }
     }
 
     private var pageColumns: [GridItem] {
         let count = horizontalSizeClass == .regular
-            && !dynamicTypeSize.isAccessibilitySize
+            && !dynamicTypeSize.ppPrefersExpandedLayout
             ? 2
             : 1
         return Array(
@@ -2865,7 +4319,17 @@ private struct PrintPreparationSheet: View {
     private func printPageRow(
         _ page: PDFPrintPreparationPage
     ) -> some View {
-        HStack(spacing: PPSpacing.medium) {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.medium)
+            )
+        return layout {
             PrintPageGeometryDiagram(page: page)
 
             VStack(alignment: .leading, spacing: 4) {
@@ -2888,47 +4352,33 @@ private struct PrintPreparationSheet: View {
                 )
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(1)
-                HStack(spacing: PPSpacing.large) {
-                    evidence(
-                        "\(page.scalePercent)%",
-                        label: "scale"
-                    )
-                    evidence(
-                        "\(page.visiblePercent)%",
-                        label: "visible"
-                    )
-                    evidence(
-                        page.hasPadding ? "Yes" : "No",
-                        label: "padding"
-                    )
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 2
+                        : 1
+                )
+                let evidenceLayout =
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? AnyLayout(
+                            VStackLayout(
+                                alignment: .leading,
+                                spacing: PPSpacing.xSmall
+                            )
+                        )
+                        : AnyLayout(
+                            HStackLayout(spacing: PPSpacing.large)
+                        )
+                evidenceLayout {
+                    printPlacementEvidence(page)
                 }
-                HStack(spacing: PPSpacing.medium) {
-                    evidence(
-                        page.productionEvidence.trimSummary,
-                        label: "trim",
-                        tint: riskColor(
-                            page.productionEvidence.overallRisk
-                        )
-                    )
-                    evidence(
-                        page.productionEvidence.bleedSummary,
-                        label: "bleed",
-                        tint: riskColor(
-                            page.productionEvidence.bleedRisk
-                        )
-                    )
-                    evidence(
-                        page.productionEvidence.safeAreaSummary,
-                        label: "safe",
-                        tint: riskColor(
-                            page.productionEvidence.safeAreaRisk
-                        )
-                    )
+                evidenceLayout {
+                    printProductionEvidence(page)
                 }
             }
 
-            Spacer(minLength: PPSpacing.small)
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                Spacer(minLength: PPSpacing.small)
+            }
 
             Image(
                 systemName: page.hasClipping
@@ -2951,6 +4401,51 @@ private struct PrintPreparationSheet: View {
                 .frame(height: page.hasClipping ? 1 : 0.6)
         }
         .accessibilityElement(children: .combine)
+    }
+
+    @ViewBuilder
+    private func printPlacementEvidence(
+        _ page: PDFPrintPreparationPage
+    ) -> some View {
+        evidence(
+            "\(page.scalePercent)%",
+            label: "scale"
+        )
+        evidence(
+            "\(page.visiblePercent)%",
+            label: "visible"
+        )
+        evidence(
+            page.hasPadding ? "Yes" : "No",
+            label: "padding"
+        )
+    }
+
+    @ViewBuilder
+    private func printProductionEvidence(
+        _ page: PDFPrintPreparationPage
+    ) -> some View {
+        evidence(
+            page.productionEvidence.trimSummary,
+            label: "trim",
+            tint: riskColor(
+                page.productionEvidence.overallRisk
+            )
+        )
+        evidence(
+            page.productionEvidence.bleedSummary,
+            label: "bleed",
+            tint: riskColor(
+                page.productionEvidence.bleedRisk
+            )
+        )
+        evidence(
+            page.productionEvidence.safeAreaSummary,
+            label: "safe",
+            tint: riskColor(
+                page.productionEvidence.safeAreaRisk
+            )
+        )
     }
 
     private func evidence(
@@ -3005,6 +4500,16 @@ private struct PrintPreparationSheet: View {
                let progress = model.progress(for: recordID) {
                 LocalOperationProgressView(progress: progress)
             }
+            if let creationErrorMessage {
+                Label(
+                    creationErrorMessage,
+                    systemImage: "exclamationmark.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: PPSpacing.medium) {
@@ -3036,7 +4541,10 @@ private struct PrintPreparationSheet: View {
             )
             .font(.caption)
             .foregroundStyle(PPColor.textSecondary)
-            .lineLimit(1)
+            .lineLimit(
+                dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+            )
+            .fixedSize(horizontal: false, vertical: true)
         } icon: {
             Image(systemName: "checkmark.shield")
                 .foregroundStyle(PPColor.mint)
@@ -3049,9 +4557,11 @@ private struct PrintPreparationSheet: View {
             createPrintReadyCopy()
         } label: {
             Label(
-                creationTask == nil
-                    ? "Create Print-Ready Copy".localizedUI
-                    : "Creating Print-Ready Copy".localizedUI,
+                creationStopRequested
+                    ? "Finishing current file commit".localizedUI
+                    : creationTask == nil
+                        ? "Create Print-Ready Copy".localizedUI
+                        : "Creating Print-Ready Copy".localizedUI,
                 systemImage: creationTask == nil
                     ? "printer.fill"
                     : "hourglass"
@@ -3065,6 +4575,8 @@ private struct PrintPreparationSheet: View {
                 || assessmentTask != nil
                 || creationTask != nil
         )
+        .keyboardShortcut(.defaultAction)
+        .accessibilityHint(printCreationHint)
     }
 
     private var filteredPages: [PDFPrintPreparationPage] {
@@ -3093,8 +4605,21 @@ private struct PrintPreparationSheet: View {
         }
     }
 
-    private var isBusy: Bool {
-        assessmentTask != nil || creationTask != nil
+    private var printCreationHint: String {
+        if creationTask != nil {
+            return "Wait for the print-ready copy to finish."
+                .localizedUI
+        }
+        if assessmentTask != nil {
+            return "Wait for print evidence to finish."
+                .localizedUI
+        }
+        if assessment == nil || assessment?.options != options {
+            return "Retry print assessment before creating the copy."
+                .localizedUI
+        }
+        return "Creates a separate print-ready PDF."
+            .localizedUI
     }
 
     private func startAssessment(
@@ -3103,6 +4628,7 @@ private struct PrintPreparationSheet: View {
         assessmentGeneration += 1
         let generation = assessmentGeneration
         assessmentTask?.cancel()
+        assessmentErrorMessage = nil
         let requestedOptions = options
         assessmentTask = Task {
             if debounced {
@@ -3114,18 +4640,30 @@ private struct PrintPreparationSheet: View {
                 }
                 return
             }
-            let loaded = await model.printPreparationAssessment(
-                recordID: recordID,
-                options: requestedOptions
-            )
+            let loaded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.printPreparationAssessment(
+                    recordID: recordID,
+                    options: requestedOptions
+                )
+            }
             guard !Task.isCancelled,
                   generation == assessmentGeneration,
-                  options == requestedOptions,
-                  let loaded
+                  options == requestedOptions
             else {
                 if generation == assessmentGeneration {
                     assessmentTask = nil
                 }
+                return
+            }
+            guard let loaded else {
+                assessment = nil
+                assessmentTask = nil
+                assessmentErrorMessage =
+                    "Print evidence could not be calculated. Try again."
+                        .localizedUI
+                errorFeedback += 1
                 return
             }
             withAnimation(
@@ -3138,6 +4676,9 @@ private struct PrintPreparationSheet: View {
     }
 
     private func createPrintReadyCopy() {
+        guard scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         guard let assessment,
               assessment.options == options,
               model.record(id: recordID)?.contentRevisionID
@@ -3147,28 +4688,72 @@ private struct PrintPreparationSheet: View {
             return
         }
         let requestedOptions = options
-        creationTask = Task {
-            let created = await model.createPrintReadyCopy(
-                recordID: recordID,
-                options: requestedOptions
-            )
-            guard !Task.isCancelled else {
-                creationTask = nil
+        creationErrorMessage = nil
+        creationStopRequested = false
+        let generation = UUID()
+        creationGeneration = generation
+        creationTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createPrintReadyCopy(
+                    recordID: recordID,
+                    options: requestedOptions,
+                    expectedContentRevisionID:
+                        assessment.revisionID
+                )
+            }
+            guard creationGeneration == generation else { return }
+            let wasStopped =
+                creationStopRequested || Task.isCancelled
+            creationTask = nil
+            creationStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    created == nil
+                        ? "Copy creation stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
                 return
             }
-            creationTask = nil
-            guard let created else { return }
+            guard let created else {
+                if !Task.isCancelled {
+                    creationErrorMessage =
+                        "The print-ready copy could not be created. Your options are unchanged."
+                            .localizedUI
+                    errorFeedback += 1
+                }
+                return
+            }
             successFeedback += 1
-            dismiss()
             onCreated(DocumentRoute(recordID: created.id))
         }
     }
 
     private func stopWork() {
+        guard creationTask != nil,
+              !creationStopRequested
+        else { return }
+        creationStopRequested = true
+        creationTask?.cancel()
+    }
+
+    private func requestDismissal() {
+        if options != defaultOptions {
+            isConfirmingDiscard = true
+        } else {
+            dismiss()
+        }
+    }
+
+    private func interruptPrintPreparationWork() {
         assessmentGeneration += 1
+        creationGeneration = UUID()
+        creationStopRequested = false
         assessmentTask?.cancel()
         assessmentTask = nil
         creationTask?.cancel()
+        creationTask = nil
     }
 }
 
@@ -3276,23 +4861,59 @@ private enum ExportCatalogMode:
 
 struct DocumentExportSheet: View {
     @EnvironmentObject private var model: PaperPathModel
+    @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
-    let focus: PDFExportFocus?
+    let initialFocus: PDFExportFocus?
+    let initialOfficeReceiptID: UUID?
     let onCreated: (DocumentRoute) -> Void
-    let onReviewPage: (Int) -> Void
+    let onReviewPage: (Int, Bool) -> Void
+    let onRepairPreflightItem:
+        (PDFDeliveryPreflightRepairAction, Int?, Bool) -> Void
+    @State private var activeFocus: PDFExportFocus?
     @State private var shareItems: [Any] = []
+    @State private var preservesSharedTemporaryResult = false
     @State private var isSharing = false
     @State private var temporaryShareURLs: [URL] = []
     @State private var exportTask: Task<Void, Never>?
+    @State private var exportGeneration = UUID()
     @State private var exportLabel: String?
+    @State private var exportStopRequested = false
+    @State private var pdfShareProgress: PDFOperationProgress?
+    @State private var pdfShareRateWindow = ByteRateWindow()
+    @State private var pdfShareGeneration = UUID()
+    @State private var officeShareProgress: PDFOperationProgress?
+    @State private var officeShareRateWindow = ByteRateWindow()
+    @State private var officeShareGeneration = UUID()
     @State private var preflight: PDFDeliveryPreflightAssessment?
+    @State private var preflightRevisionID: UUID?
     @State private var preflightError: String?
+    @State private var preflightTask: Task<Void, Never>?
+    @State private var preflightGeneration = UUID()
+    @State private var preflightPaused = false
+    @State private var preflightSuccessFeedback = 0
+    @State private var preflightErrorFeedback = 0
+    @State private var focusTransitionFeedback = 0
+    @State private var preflightReviewTask: Task<Void, Never>?
+    @State private var preflightReviewGeneration = UUID()
+    @State private var openingPreflightItemID: String?
+    @State private var preflightReviewErrorFeedback = 0
+    @State private var deliveryPreviewPage = 0
+    @State private var deliveryPageInput = ""
+    @State private var showsDeliveryPagePicker = false
     @State private var isPreparingPrint = false
     @State private var isPreparingBooklet = false
+    @State private var pendingPreparedRoute: DocumentRoute?
+    @State private var transitioningPreparedRoute: DocumentRoute?
+    @State private var preparedOutputTransitionTask:
+        Task<Void, Never>?
+    @State private var preparedOutputTransitionGeneration = UUID()
+    @State private var preparedOutputTransitionFeedback = 0
     @State private var officeReceipt: PDFOfficeExportReceipt?
     @State private var activeOfficeFormat: PDFTextExportFormat?
     @State private var officeFailure: PDFOfficeExportFailure?
@@ -3300,13 +4921,36 @@ struct DocumentExportSheet: View {
     @State private var officeReceiptFeedback = 0
     @State private var officeFailureFeedback = 0
     @State private var officePinFeedback = 0
+    @State private var officeGovernanceTask: Task<Void, Never>?
     @State private var inspectedOfficeReceipt:
         PDFOfficeExportReceipt?
     @State private var selectedBatchRetrySegmentIDs: Set<UUID> = []
     @State private var isShowingAllOfficeBatchSegments = false
-    @State private var showsOtherOfficeFormats = false
     @State private var showsOfficeEvidence = false
+    @State private var selectedOfficeFormat: PDFTextExportFormat = .wordDocument
+    @State private var didChooseOfficeFormat = false
+    @State private var officePreviewPage = 0
+    @State private var hasWideExportViewport = false
+    @State private var temporaryOfficeResultURL: URL?
+    @State private var officePreviewFile: OfficePreviewFile?
+    @State private var officePreviewCopyURL: URL?
+    @State private var officeResultNotice: String?
+    @State private var isConfirmingTemporaryResultDiscard = false
+    @State private var showsOfficeHistory = false
+    @State private var usesOfficePageRange = false
+    @State private var officeFirstPage = 1
+    @State private var officeLastPage = 1
+    @State private var officeHistoryQuery = ""
+    @State private var officeHistoryFormat: PDFTextExportFormat?
+    @State private var officeHistoryCurrentOnly = false
+    @State private var didResolveInitialOfficeReceipt = false
+    @AppStorage("privacy.hideLibraryPreviews")
+    private var hideLibraryPreviews = false
     @State private var showsPortableTextFormats = false
+    @State private var isPresentingVerifiedOutputUnlock = false
+    @State private var resumesSafeShareAfterUnlock = false
+    @State private var unlockContinuationTask:
+        Task<Void, Never>?
     @AppStorage("export.catalogMode")
     private var savedExportCatalogMode =
         ExportCatalogMode.recommended.rawValue
@@ -3314,391 +4958,141 @@ struct DocumentExportSheet: View {
     init(
         recordID: UUID,
         focus: PDFExportFocus? = nil,
+        officeReceiptID: UUID? = nil,
         onCreated: @escaping (DocumentRoute) -> Void,
-        onReviewPage: @escaping (Int) -> Void = { _ in }
+        onReviewPage: @escaping (Int, Bool) -> Void = { _, _ in },
+        onRepairPreflightItem: @escaping (
+            PDFDeliveryPreflightRepairAction,
+            Int?,
+            Bool
+        ) -> Void = { _, _, _ in }
     ) {
         self.recordID = recordID
-        self.focus = focus
+        self.initialFocus = focus
+        self.initialOfficeReceiptID = officeReceiptID
         self.onCreated = onCreated
         self.onReviewPage = onReviewPage
+        self.onRepairPreflightItem = onRepairPreflightItem
+        self._activeFocus = State(initialValue: focus)
     }
 
-    var body: some View {
+    private var exportNavigation: some View {
         NavigationStack {
             ZStack {
                 PPCanvas()
 
-                ScrollView {
-                    LazyVStack(
-                        alignment: .leading,
-                        spacing: PPSpacing.regular
-                    ) {
-                        if let record = model.record(id: recordID) {
-                            exportContextHeader(record)
-                        }
-
-                        if focus == nil {
-                            exportCatalogPicker
-                        }
-
-                        if let record = model.record(id: recordID),
-                           record.hasCurrentDeliveryReceipt {
-                            verifiedShareButton(record)
-                        }
-
-                        if focus == nil || focus == .safeShare {
-                            if focus == .safeShare,
-                               model.record(id: recordID)?
-                                .hasCurrentDeliveryReceipt != true {
-                                preflightPanel
-                                if preflight?.status == .blocked
-                                    || preflightError != nil {
-                                    recoveryActions
-                                }
-                                safeShareButton
-                            }
-                        }
-
-                        if focus == nil,
-                           exportCatalogMode == .recommended {
-                            recommendedOutputSection
-                        }
-
-                        if focus == nil,
-                           exportCatalogMode == .pdf {
-                            outputSection(
-                                title: "PDF OUTPUTS",
-                                detail: "Preserve, flatten, print, or impose",
-                                symbol: "doc.richtext",
-                                tint: PPColor.accent
-                            ) {
-                                safeShareButton
-
-                                exportButton(
-                                    "Current PDF Copy",
-                                    detail: "Share the editable working copy",
-                                    symbol: "doc"
-                                ) {
-                                    if let url = model.url(for: recordID) {
-                                        share([url])
-                                    }
-                                }
-
-                                exportButton(
-                                    "Flattened PDF Copy",
-                                    detail: "Lock annotations into an image-based copy",
-                                    symbol: "square.stack.3d.down.right"
-                                ) {
-                                    exportTask = Task {
-                                        exportLabel = "flattened copy"
-                                        defer {
-                                            exportTask = nil
-                                            exportLabel = nil
-                                        }
-                                        if let created = await model.createFlattenedCopy(
-                                            recordID: recordID
-                                        ) {
-                                            dismiss()
-                                            onCreated(
-                                                DocumentRoute(recordID: created.id)
-                                            )
-                                        }
-                                    }
-                                }
-
-                                exportButton(
-                                    "Print-Ready PDF",
-                                    detail:
-                                        "Standardize paper with trim, bleed, and safe-area evidence",
-                                    symbol: "printer.fill",
-                                    badge: "PDF"
-                                ) {
-                                    isPreparingPrint = true
-                                }
-
-                                exportButton(
-                                    "Booklet PDF",
-                                    detail:
-                                        "Impose signatures with page order and creep evidence",
-                                    symbol: "book.pages.fill",
-                                    badge: "2-UP"
-                                ) {
-                                    isPreparingBooklet = true
-                                }
-                            }
-                        }
-
-                        if focus == .text
-                            || (
-                                focus == nil
-                                    && exportCatalogMode == .office
-                            ) {
-                            outputSection(
-                                title: "EDITABLE OFFICE",
-                                detail: "Choose by structure, not extension",
-                                symbol: "doc.badge.arrow.up",
-                                tint: PPColor.cyan
-                            ) {
-                        if let officeFailure,
-                           let record = model.record(id: recordID) {
-                            officeExportFailurePanel(
-                                officeFailure,
-                                record: record
-                            )
-                        }
-                        if let officeReceipt,
-                           let record = model.record(id: recordID) {
-                            officeReceiptPanel(
-                                officeReceipt,
-                                record: record
-                            )
-                        }
-                        if let record = model.record(id: recordID) {
-                            let portfolio = PDFOfficeExportPortfolio(
-                                profile: record.profile
-                            )
-                            if let batchRun = model.officeBatchRun(
-                                for: recordID
-                            ) {
-                                officeBatchRunPanel(
-                                    batchRun,
-                                    record: record
-                                )
-                            }
-                            officeGuidedChoice(
-                                record,
-                                portfolio: portfolio
-                            )
-                            if showsOfficeEvidence {
-                                VStack(
-                                    alignment: .leading,
-                                    spacing: PPSpacing.small
-                                ) {
-                                    officeReadinessStrip(
-                                        record,
-                                        portfolio: portfolio
-                                    )
-                                    officeDecisionStrip(portfolio)
-                                    officePreflightStrip(portfolio)
-                                    officeBudgetStrip(
-                                        portfolio.visualBudgetPlan
-                                    )
-                                    officeReceiptHistory(
-                                        record: record,
-                                        currentReceiptID:
-                                            officeReceipt?.id
-                                    )
-                                }
-                                .transition(
-                                    .move(edge: .top)
-                                        .combined(with: .opacity)
-                                )
-                            }
-                        } else {
-                            ForEach(officeFormats) { format in
-                                officeFormatButton(
-                                    format,
-                                    plan: nil,
-                                    sourcePageCount: 0,
-                                    isRecommended: false
-                                )
-                            }
-                        }
-                            }
-
-                            Button {
-                                withAnimation(
-                                    reduceMotion
-                                        ? nil
-                                        : .snappy(duration: 0.2)
-                                ) {
-                                    showsPortableTextFormats.toggle()
-                                }
-                            } label: {
-                                HStack {
-                                    Label(
-                                        showsPortableTextFormats
-                                            ? "Hide text-only formats"
-                                            : "Need RTF, Markdown, or plain text?",
-                                        systemImage: "text.alignleft"
-                                    )
-                                    Spacer()
-                                    Image(
-                                        systemName:
-                                            showsPortableTextFormats
-                                                ? "chevron.up"
-                                                : "chevron.down"
-                                    )
-                                }
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(PPColor.textSecondary)
-                                .frame(minHeight: 40)
-                                .contentShape(Rectangle())
-                            }
-                            .buttonStyle(.plain)
-
-                            if showsPortableTextFormats {
-                                outputSection(
-                                    title: "TEXT-ONLY FORMATS",
-                                    detail:
-                                        "Maximum compatibility without page layout",
-                                    symbol: "text.alignleft",
-                                    tint: PPColor.rose
-                                ) {
-                                    ForEach(portableTextFormats) { format in
-                                        exportButton(
-                                            format.title,
-                                            detail: format.detail,
-                                            symbol: format.symbol,
-                                            badge:
-                                                format.fileExtension
-                                                    .uppercased()
-                                        ) {
-                                            startTextExport(format)
-                                        }
-                                    }
-                                }
-                                .transition(
-                                    .move(edge: .top)
-                                        .combined(with: .opacity)
-                                )
-                            }
-                        }
-
-                        if focus == .images
-                            || (
-                                focus == nil
-                                    && exportCatalogMode == .images
-                            ) {
-                            outputSection(
-                                title: "PAGE IMAGES",
-                                detail: "Rendered appearance by resolution",
-                                symbol: "photo.on.rectangle.angled",
-                                tint: PPColor.amber
-                            ) {
-                                ForEach(
-                                    PDFPageImageExportPreset.allCases
-                                ) { preset in
-                                    exportButton(
-                                        preset.title,
-                                        detail: preset.detail,
-                                        symbol: preset.symbol,
-                                        badge: pageImageBadge(preset)
-                                    ) {
-                                        exportTask = Task {
-                                            exportLabel = preset.title.lowercased()
-                                            defer {
-                                                exportTask = nil
-                                                exportLabel = nil
-                                            }
-                                            let urls = await model
-                                                .makePageImageExports(
-                                                    recordID: recordID,
-                                                    preset: preset
-                                                )
-                                            if !urls.isEmpty {
-                                                share(
-                                                    urls,
-                                                    temporaryURLs: urls
-                                                )
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            outputSection(
-                                title: "EMBEDDED ASSETS",
-                                detail: "Original image streams",
-                                symbol: "photo.stack",
-                                tint: PPColor.mint
-                            ) {
-                                exportButton(
-                                    "Embedded Images",
-                                    detail: "Original JPEG/JP2 streams and lossless decoded PNGs",
-                                    symbol: "photo.stack",
-                                    badge: "ASSETS"
-                                ) {
-                                    exportTask = Task {
-                                        exportLabel = "embedded images"
-                                        defer {
-                                            exportTask = nil
-                                            exportLabel = nil
-                                        }
-                                        let urls = await model
-                                            .makeEmbeddedImageExports(
-                                                recordID: recordID
-                                            )
-                                        if !urls.isEmpty {
-                                            share(
-                                                urls,
-                                                temporaryURLs: urls
-                                            )
-                                        }
-                                    }
-                                }
-                                .accessibilityIdentifier(
-                                    "exportEmbeddedImages"
-                                )
-                            }
-                        }
-
-                        if let exportLabel {
-                            if model.officeBatchRun(for: recordID) != nil {
-                                EmptyView()
-                            } else if let activeOfficeFormat,
-                               let record = model.record(id: recordID) {
-                                officeExportProgressPanel(
-                                    exportLabel,
-                                    format: activeOfficeFormat,
-                                    record: record
-                                )
-                            } else {
-                                if let progress = model.progress(for: recordID) {
-                                    LocalOperationProgressView(progress: progress)
-                                } else {
-                                    HStack(spacing: PPSpacing.medium) {
-                                        ProgressView()
-                                        Text("Preparing \(exportLabel) on device")
-                                            .font(.subheadline)
-                                            .foregroundStyle(PPColor.textSecondary)
-                                    }
-                                    .accessibilityElement(children: .combine)
-                                }
-                            }
-                        }
-                    }
-                    .frame(maxWidth: 760)
-                    .padding(PPSpacing.regular)
-                    .frame(maxWidth: .infinity)
+                if model.record(id: recordID) == nil {
+                    ContentUnavailableView(
+                        "Document unavailable",
+                        systemImage: "doc.questionmark",
+                        description: Text(
+                            "This private working copy is no longer available for export."
+                        )
+                    )
+                } else {
+                    exportWorkspace
                 }
             }
             .navigationTitle(navigationTitle.localizedUI)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .confirmationAction) {
-                    Button(
-                        (
-                            exportTask == nil
-                                ? "Done"
-                                : "Stop"
-                        ).localizedUI
-                    ) {
-                        if let exportTask {
-                            exportTask.cancel()
-                        } else {
-                            dismiss()
+                ToolbarItem(placement: .cancellationAction) {
+                    if canReturnToExportCatalog {
+                        Button {
+                            returnToExportCatalog()
+                        } label: {
+                            Label(
+                                "Formats",
+                                systemImage: "chevron.backward"
+                            )
                         }
-                    }
                         .disabled(
-                            exportTask == nil
-                                && model.isProcessing(recordID)
+                            exportTask != nil
+                                || preflightReviewTask != nil
+                                || isPreparedOutputTransitionActive
+                                || temporaryOfficeResultURL != nil
                         )
+                        .accessibilityHint(
+                            "Returns to the output format list"
+                                .localizedUI
+                        )
+                        .accessibilityIdentifier(
+                            "returnToExportCatalog"
+                        )
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    if exportTask != nil {
+                        Button(
+                            (
+                                exportStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
+                            ).localizedUI
+                        ) {
+                            stopExportPreparation()
+                        }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(exportStopRequested)
+                        .accessibilityAddTraits(.updatesFrequently)
+                        .accessibilityIdentifier("officeExportStopAction")
+                    } else if preflightReviewTask != nil {
+                        Button("Stop".localizedUI) {
+                            stopPreflightReviewHandoff()
+                        }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityLabel(
+                            "Stop opening issue action".localizedUI
+                        )
+                        .accessibilityIdentifier(
+                            "preflightReviewStopAction"
+                        )
+                    } else if isPreparedOutputTransitionActive {
+                        Button("Stay".localizedUI) {
+                            cancelPreparedOutputTransition(
+                                showsNotice: true
+                            )
+                        }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityLabel(
+                            "Stay on this output sheet".localizedUI
+                        )
+                        .accessibilityHint(
+                            "Keeps the created copy in Library and stops automatic opening."
+                                .localizedUI
+                        )
+                        .accessibilityIdentifier(
+                            "preparedOutputStayAction"
+                        )
+                    } else {
+                        Button("Close".localizedUI) {
+                            requestExportDismissal()
+                        }
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityIdentifier("officeExportDoneAction")
+                        .disabled(model.isProcessing(recordID))
+                    }
                 }
             }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                focusedDeliveryAction
+            }
         }
-        .sheet(isPresented: $isSharing) {
-            ShareSheet(items: shareItems)
+    }
+
+    private var exportPresentations: some View {
+        AnyView(exportNavigation)
+        .sheet(
+            isPresented: $isSharing,
+            onDismiss: cleanupTemporaryExports
+        ) {
+            ShareSheet(
+                items: shareItems,
+                removesTemporaryItemsOnCompletion: !preservesSharedTemporaryResult
+            )
+        }
+        .sheet(item: $officePreviewFile, onDismiss: cleanupOfficePreview) { file in
+            OfficeOutputPreview(file: file)
         }
         .sheet(item: $inspectedOfficeReceipt) { receipt in
             OfficeEvidenceInspectorView(
@@ -3707,37 +5101,137 @@ struct DocumentExportSheet: View {
                     .contentRevisionID
             )
         }
-        .fullScreenCover(isPresented: $isPreparingPrint) {
+        .sheet(
+            isPresented: $isPresentingVerifiedOutputUnlock,
+            onDismiss: completeVerifiedOutputUnlock
+        ) {
+            FullUnlockView(context: .singleVerifiedOutput)
+        }
+        .fullScreenCover(
+            isPresented: $isPreparingPrint,
+            onDismiss: completePreparedOutputTransition
+        ) {
             PrintPreparationSheet(recordID: recordID) { route in
+                pendingPreparedRoute = route.bindingExpectedRevision(
+                    model.record(id: route.recordID)?
+                        .contentRevisionID
+                )
                 isPreparingPrint = false
-                dismiss()
-                onCreated(route)
             }
         }
-        .fullScreenCover(isPresented: $isPreparingBooklet) {
+        .fullScreenCover(
+            isPresented: $isPreparingBooklet,
+            onDismiss: completePreparedOutputTransition
+        ) {
             BookletPreparationSheet(recordID: recordID) { route in
+                pendingPreparedRoute = route.bindingExpectedRevision(
+                    model.record(id: route.recordID)?
+                        .contentRevisionID
+                )
                 isPreparingBooklet = false
-                dismiss()
-                onCreated(route)
             }
         }
-        .task(id: recordID) {
-            guard focus == .safeShare else { return }
-            await model.updateTaskCheckpoint(
-                recordID: recordID,
-                checkpoint: DocumentTaskCheckpoint(stage: .verify)
-            )
-            await loadPreflight()
+        .confirmationDialog(
+            "Discard unsaved Office output?".localizedUI,
+            isPresented: $isConfirmingTemporaryResultDiscard,
+            titleVisibility: .visible
+        ) {
+            Button("Discard and close".localizedUI, role: .destructive) {
+                cleanupTemporaryOfficeResult()
+                dismiss()
+            }
+            Button("Keep working".localizedUI, role: .cancel) {}
+        } message: {
+            Text("This output has not been saved to local history. The source PDF will stay unchanged.".localizedUI)
         }
-        .onChange(of: isSharing) { _, sharing in
-            if !sharing {
+    }
+
+    var body: some View {
+        AnyView(exportPresentations)
+        .task(id: activeFocus) {
+            if !didResolveInitialOfficeReceipt,
+               let id = initialOfficeReceiptID,
+               let receipt = model.record(id: recordID)?.officeReceipts.first(where: { $0.id == id }) {
+                didResolveInitialOfficeReceipt = true
+                officeReceipt = receipt
+                selectedOfficeFormat = receipt.format
+                didChooseOfficeFormat = true
+            }
+            guard activeFocus == .safeShare else { return }
+            startPreflightIfNeeded()
+        }
+        .onChange(of: currentContentRevisionID) { oldValue, newValue in
+            guard oldValue != newValue else { return }
+            officePreviewPage = 0
+            deliveryPreviewPage = 0
+            showsDeliveryPagePicker = false
+            usesOfficePageRange = false
+            officeFirstPage = 1
+            officeLastPage = 1
+            officePreviewFile = nil
+            inspectedOfficeReceipt = nil
+            if temporaryOfficeResultURL != nil {
+                officeResultNotice = "The source PDF changed. This output belongs to the earlier revision."
+            }
+            guard activeFocus == .safeShare else { return }
+            invalidatePreflight()
+            guard newValue != nil,
+                  model.record(id: recordID)?
+                    .hasCurrentDeliveryReceipt != true
+            else { return }
+            startPreflightIfNeeded()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            officePreviewFile = nil
+            inspectedOfficeReceipt = nil
+            cancelVerifiedOutputUnlockContinuation()
+            cancelPreparedOutputTransition()
+            if preflightTask != nil {
+                stopPreflight(showNotice: false)
+            }
+            stopPreflightReviewHandoff(showNotice: false)
+            if isSharing {
+                isSharing = false
                 cleanupTemporaryExports()
+            }
+            if exportTask != nil {
+                stopExportPreparation(invalidateResult: true)
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            officePreviewFile = nil
+            inspectedOfficeReceipt = nil
+            cancelVerifiedOutputUnlockContinuation()
+            cancelPreparedOutputTransition()
+            if preflightTask != nil {
+                stopPreflight(showNotice: false)
+            }
+            stopPreflightReviewHandoff(showNotice: false)
+            if isSharing {
+                isSharing = false
+                cleanupTemporaryExports()
+            }
+            if exportTask != nil {
+                stopExportPreparation(invalidateResult: true)
             }
         }
         .onDisappear {
-            if !isSharing {
-                exportTask?.cancel()
+            cancelVerifiedOutputUnlockContinuation()
+            cancelPreparedOutputTransition()
+            cancelPreflightTask()
+            stopPreflightReviewHandoff(showNotice: false)
+            officeGovernanceTask?.cancel()
+            officeGovernanceTask = nil
+            if !isSharing, officePreviewFile == nil, inspectedOfficeReceipt == nil {
+                stopExportPreparation(invalidateResult: true)
                 cleanupTemporaryExports()
+                cleanupTemporaryOfficeResult()
             }
         }
         .sensoryFeedback(.selection, trigger: officeRouteFeedback)
@@ -3745,23 +5239,1218 @@ struct DocumentExportSheet: View {
         .sensoryFeedback(.error, trigger: officeFailureFeedback)
         .sensoryFeedback(.selection, trigger: officePinFeedback)
         .sensoryFeedback(
+            .success,
+            trigger: preflightSuccessFeedback
+        )
+        .sensoryFeedback(
+            .error,
+            trigger: preflightErrorFeedback
+        )
+        .sensoryFeedback(
+            .error,
+            trigger: preflightReviewErrorFeedback
+        )
+        .sensoryFeedback(
+            .selection,
+            trigger: focusTransitionFeedback
+        )
+        .sensoryFeedback(
             .selection,
             trigger: savedExportCatalogMode
         )
-        .interactiveDismissDisabled(exportTask != nil)
+        .sensoryFeedback(
+            .success,
+            trigger: preparedOutputTransitionFeedback
+        )
+        .accessibilityAction(.escape) {
+            if exportTask != nil {
+                stopExportPreparation()
+            } else if preflightReviewTask != nil {
+                stopPreflightReviewHandoff()
+            } else if isPreparedOutputTransitionActive {
+                cancelPreparedOutputTransition(showsNotice: true)
+            } else if canReturnToExportCatalog {
+                returnToExportCatalog()
+            } else {
+                requestExportDismissal()
+            }
+        }
+        .interactiveDismissDisabled(
+            exportTask != nil
+                || preflightReviewTask != nil
+                || isPreparedOutputTransitionActive
+                || temporaryOfficeResultURL != nil
+        )
+        .modifier(OfficeExportPresentationSizing())
+    }
+
+    private var isOfficeWorkspace: Bool {
+        activeFocus == .text || (activeFocus == nil && exportCatalogMode == .office)
+    }
+
+    private var usesWideDeliveryLayout: Bool {
+        activeFocus == .safeShare && hasWideExportViewport
+            && !dynamicTypeSize.ppPrefersExpandedLayout
+    }
+
+    private var exportWorkspace: some View {
+        GeometryReader { geometry in
+            HStack(alignment: .top, spacing: 0) {
+                if isOfficeWorkspace, hasWideExportViewport,
+                   !dynamicTypeSize.isAccessibilitySize,
+                   let record = model.record(id: recordID) {
+                    officeSourcePreview(record)
+                        .frame(width: 280)
+                        .padding(PPSpacing.large)
+                        .frame(maxHeight: .infinity, alignment: .top)
+                        .background(PPColor.surfaceMuted.opacity(0.4))
+                } else if usesWideDeliveryLayout,
+                          let record = model.record(id: recordID) {
+                    ScrollView {
+                        deliveryDocumentHeader(record, expanded: true)
+                            .padding(PPSpacing.large)
+                    }
+                    .frame(width: 320)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .background(PPColor.documentStage)
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: PPSpacing.regular) {
+                        exportHeaderContent
+                        safeShareContent
+                        recommendedExportContent
+                        pdfExportContent
+                        officeExportContent
+                        imageExportContent
+                        exportProgressContent
+                    }
+                    .frame(maxWidth: 760)
+                    .padding(PPSpacing.regular)
+                    .frame(maxWidth: .infinity)
+                }
+                .scrollBounceBehavior(.basedOnSize)
+                .id(activeFocus)
+            }
+            .onChange(of: geometry.size.width, initial: true) { _, width in
+                let isWide = width >= 860
+                if hasWideExportViewport != isWide {
+                    hasWideExportViewport = isWide
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var exportHeaderContent: some View {
+        if let record = model.record(id: recordID) {
+            if isOfficeWorkspace {
+                if officeReceipt == nil {
+                    HStack(spacing: PPSpacing.medium) {
+                    Image(systemName: "doc.text")
+                        .font(.title2)
+                        .foregroundStyle(PPColor.cyan)
+                    VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                        Text(record.displayName)
+                            .font(.headline)
+                            .foregroundStyle(PPColor.textPrimary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Text(record.subtitle)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(PPColor.textSecondary)
+                    }
+                }
+                }
+            } else if activeFocus == .safeShare {
+                if !usesWideDeliveryLayout {
+                    deliveryDocumentHeader(record)
+                }
+            } else {
+                exportContextHeader(record)
+            }
+        }
+
+        if activeFocus == nil {
+            exportCatalogPicker
+        }
+    }
+
+    @ViewBuilder
+    private var safeShareContent: some View {
+        if let record = model.record(id: recordID),
+           record.hasCurrentDeliveryReceipt,
+           activeFocus != .safeShare {
+            verifiedShareButton(record)
+        }
+
+        if activeFocus == .safeShare,
+           model.record(id: recordID)?
+            .hasCurrentDeliveryReceipt != true {
+            preflightPanel
+            if currentPreflight?.status == .blocked
+                || preflightError != nil {
+                recoveryActions
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var focusedDeliveryAction: some View {
+        if let route = transitioningPreparedRoute ?? pendingPreparedRoute {
+            preparedOutputHandoffBar(route)
+        } else if isOfficeWorkspace, let record = model.record(id: recordID) {
+            officeActionFooter(record)
+        } else if activeFocus == .safeShare,
+           let record = model.record(id: recordID) {
+            let hasReceipt = record.hasCurrentDeliveryReceipt
+            Button {
+                if hasReceipt {
+                    preparePDFShare(
+                        recordID: record.id,
+                        label: "verified PDF"
+                    )
+                } else {
+                    startSafeShareCreation()
+                }
+            } label: {
+                Label(
+                    (hasReceipt
+                        ? "Share Verified PDF"
+                        : safeShareCreationTitle).localizedUI,
+                    systemImage: hasReceipt
+                        ? "square.and.arrow.up"
+                        : safeShareCreationSymbol
+                )
+                .frame(maxWidth: .infinity)
+                .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+            }
+            .buttonStyle(PPPrimaryButtonStyle())
+            .disabled(
+                model.isProcessing(recordID)
+                    || exportTask != nil
+                    || preflightReviewTask != nil
+                    || (
+                        !hasReceipt
+                            && (
+                                currentPreflight == nil
+                                    || currentPreflight?.status
+                                        == .blocked
+                            )
+                    )
+            )
+            .frame(maxWidth: 760)
+            .padding(PPSpacing.regular)
+            .frame(maxWidth: .infinity)
+            .background(.bar)
+            .overlay(alignment: .top) {
+                Rectangle()
+                    .fill(PPColor.border.opacity(0.62))
+                    .frame(height: 0.6)
+            }
+            .accessibilityHint(
+                hasReceipt
+                    ? "Shares this already verified PDF without creating another copy"
+                    : safeShareCreationHint.localizedUI
+            )
+            .accessibilityIdentifier(
+                hasReceipt
+                    ? "shareVerifiedPDF"
+                    : "safeShareButton"
+            )
+        }
+    }
+
+    private func preparedOutputHandoffBar(
+        _ route: DocumentRoute
+    ) -> some View {
+        let displayTitle =
+            model.record(id: route.recordID)?.displayName
+                ?? "Created copy".localizedUI
+        return ViewThatFits(in: .horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                preparedOutputHandoffIdentity(displayTitle)
+                Spacer(minLength: PPSpacing.small)
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+                preparedOutputStayButton
+            }
+
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                HStack(spacing: PPSpacing.small) {
+                    preparedOutputHandoffIdentity(displayTitle)
+                    Spacer(minLength: PPSpacing.small)
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                }
+                preparedOutputStayButton
+            }
+        }
+        .padding(.horizontal, PPSpacing.regular)
+        .padding(.vertical, PPSpacing.small)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(PPColor.border.opacity(0.62))
+                .frame(height: 0.6)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
+        .accessibilityLabel(
+            AppLocalization.format(
+                "Opening created copy %@",
+                displayTitle
+            )
+        )
+        .accessibilityIdentifier("preparedOutputHandoff")
+    }
+
+    private func preparedOutputHandoffIdentity(
+        _ displayTitle: String
+    ) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Opening created copy".localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                Text(verbatim: displayTitle)
+                    .font(.caption2)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? 3 : 1
+                    )
+                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } icon: {
+            Image(systemName: "checkmark.seal.fill")
+                .foregroundStyle(PPColor.mint)
+                .symbolEffect(
+                    .bounce,
+                    value: reduceMotion
+                        ? 0
+                        : preparedOutputTransitionFeedback
+                )
+        }
+    }
+
+    private var preparedOutputStayButton: some View {
+        Button {
+            cancelPreparedOutputTransition(showsNotice: true)
+        } label: {
+            Label("Stay here", systemImage: "xmark")
+                .labelStyle(.iconOnly)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(PPColor.textSecondary)
+        .accessibilityLabel("Stay on this output sheet".localizedUI)
+        .accessibilityHint(
+            "Keeps the created copy in Library and stops automatic opening."
+                .localizedUI
+        )
+        .help("Stay here".localizedUI)
+        .accessibilityIdentifier("preparedOutputStayInline")
+    }
+
+    @ViewBuilder
+    private var recommendedExportContent: some View {
+        if activeFocus == nil,
+           exportCatalogMode == .recommended {
+            recommendedOutputSection
+        }
+    }
+
+    @ViewBuilder
+    private var pdfExportContent: some View {
+        if activeFocus == nil,
+           exportCatalogMode == .pdf {
+            outputSection(
+                title: "PDF OUTPUTS",
+                detail: "Preserve, flatten, print, or impose",
+                symbol: "doc.richtext",
+                tint: PPColor.accent
+            ) {
+                safeShareButton
+
+                exportButton(
+                    "Current PDF Copy",
+                    detail:
+                        "Create a protected temporary copy for sharing",
+                    symbol: "doc"
+                ) {
+                    preparePDFShare(
+                        recordID: recordID,
+                        label: "current PDF copy"
+                    )
+                }
+
+                exportButton(
+                    "Flattened PDF Copy",
+                    detail: "Lock annotations into an image-based copy",
+                    symbol: "square.stack.3d.down.right"
+                ) {
+                    guard let sourceContentRevisionID =
+                            currentContentRevisionID
+                    else { return }
+                    let existingDocumentIDs = Set(
+                        model.documents.map(\.id)
+                    )
+                    let generation = beginExport(
+                        label: "flattened copy"
+                    )
+                    exportTask = Task { @MainActor in
+                        defer {
+                            finishExport(generation)
+                        }
+                        let created = await model
+                            .createFlattenedCopy(
+                                recordID: recordID,
+                                expectedContentRevisionID:
+                                    sourceContentRevisionID
+                            )
+                        guard exportGeneration == generation else {
+                            return
+                        }
+                        let committed = created
+                            ?? model.documents.first {
+                                !existingDocumentIDs.contains($0.id)
+                                    && $0.sourceDocumentID == recordID
+                                    && $0.deliveryReceipt?.operation
+                                        == .flattened
+                            }
+                        if exportStopRequested || Task.isCancelled {
+                            model[noticeFor: paperPathSceneID] = (
+                                committed == nil
+                                    ? "Flattened copy creation stopped"
+                                    : "Flattened copy finished before stopping · copy kept in Library"
+                            ).localizedUI
+                            return
+                        }
+                        guard exportIsCurrent(generation),
+                              let created
+                        else { return }
+                        onCreated(
+                            DocumentRoute(
+                                recordID: created.id
+                            )
+                        )
+                    }
+                }
+
+                exportButton(
+                    "Print-Ready PDF",
+                    detail:
+                        "Standardize paper with trim, bleed, and safe-area evidence",
+                    symbol: "printer.fill",
+                    badge: "PDF"
+                ) {
+                    isPreparingPrint = true
+                }
+
+                exportButton(
+                    "Booklet PDF",
+                    detail:
+                        "Impose signatures with page order and creep evidence",
+                    symbol: "book.pages.fill",
+                    badge: "2-UP"
+                ) {
+                    isPreparingBooklet = true
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var officeExportContent: some View {
+        if activeFocus == .text
+            || (
+                activeFocus == nil
+                    && exportCatalogMode == .office
+            ) {
+            AnyView(officeFormatContent)
+            if officeReceipt == nil {
+                portableTextFormatContent
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var officeFormatContent: some View {
+        if officeReceipt == nil, let officeResultNotice {
+            Label(officeResultNotice.localizedUI, systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        if let officeFailure,
+           let record = model.record(id: recordID) {
+            officeExportFailurePanel(
+                officeFailure,
+                record: record
+            )
+        }
+        if let officeReceipt,
+           let record = model.record(id: recordID) {
+            officeResultSummary(officeReceipt, record: record)
+        }
+        if let record = model.record(id: recordID) {
+            let portfolio = PDFOfficeExportPortfolio(
+                profile: record.profile
+            )
+            if let batchRun = model.officeBatchRun(
+                for: recordID
+            ) {
+                AnyView(officeBatchRunPanel(
+                    batchRun,
+                    record: record
+                ))
+            }
+            if officeReceipt == nil {
+                officeGuidedChoice(
+                    record,
+                    portfolio: portfolio
+                )
+            }
+            if showsOfficeEvidence, officeReceipt == nil {
+                AnyView(VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
+                    OfficeClockContinuitySection()
+                    officeReadinessStrip(
+                        record,
+                        portfolio: portfolio
+                    )
+                    officeDecisionStrip(portfolio)
+                    officePreflightStrip(portfolio)
+                    officeBudgetStrip(
+                        portfolio.visualBudgetPlan
+                    )
+                })
+                .transition(
+                    .move(edge: .top)
+                        .combined(with: .opacity)
+                )
+            }
+            officeRecentResults(record)
+        } else {
+            ForEach(officeFormats) { format in
+                officeFormatButton(
+                    format,
+                    plan: nil,
+                    sourcePageCount: 0,
+                    isRecommended: false
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var portableTextFormatContent: some View {
+        Button {
+            withAnimation(
+                reduceMotion
+                    ? nil
+                    : .snappy(duration: 0.2)
+            ) {
+                showsPortableTextFormats.toggle()
+            }
+        } label: {
+            HStack {
+                Label(
+                    (showsPortableTextFormats
+                        ? "Hide text-only formats"
+                        : "Text formats").localizedUI,
+                    systemImage: "text.alignleft"
+                )
+                Spacer()
+                Image(
+                    systemName:
+                        showsPortableTextFormats
+                            ? "chevron.up"
+                            : "chevron.down"
+                )
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(PPColor.textSecondary)
+            .frame(minHeight: 44)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if showsPortableTextFormats {
+            outputSection(
+                title: "TEXT-ONLY FORMATS",
+                detail:
+                    "Maximum compatibility without page layout",
+                symbol: "text.alignleft",
+                tint: PPColor.rose
+            ) {
+                ForEach(portableTextFormats) { format in
+                    exportButton(
+                        format.title,
+                        detail: format.detail,
+                        symbol: format.symbol,
+                        badge:
+                            format.fileExtension
+                                .uppercased()
+                    ) {
+                        startTextExport(format)
+                    }
+                }
+            }
+            .transition(
+                .move(edge: .top)
+                    .combined(with: .opacity)
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var imageExportContent: some View {
+        if activeFocus == .images
+            || (
+                activeFocus == nil
+                    && exportCatalogMode == .images
+            ) {
+            outputSection(
+                title: "PAGE IMAGES",
+                detail: "Rendered appearance by resolution",
+                symbol: "photo.on.rectangle.angled",
+                tint: PPColor.amber
+            ) {
+                ForEach(
+                    PDFPageImageExportPreset.allCases
+                ) { preset in
+                    exportButton(
+                        preset.title,
+                        detail: preset.detail,
+                        symbol: preset.symbol,
+                        badge: pageImageBadge(preset)
+                    ) {
+                        let generation = beginExport(
+                            label: preset.title.lowercased()
+                        )
+                        exportTask = Task { @MainActor in
+                            defer {
+                                finishExport(generation)
+                            }
+                            let urls = await model
+                                .makePageImageExports(
+                                    recordID: recordID,
+                                    preset: preset
+                                )
+                            guard !urls.isEmpty else {
+                                return
+                            }
+                            guard exportIsCurrent(
+                                generation
+                            ) else {
+                                await model
+                                    .discardTemporaryExportCopies(
+                                        at: urls
+                                    )
+                                return
+                            }
+                            share(
+                                urls,
+                                temporaryURLs: urls
+                            )
+                        }
+                    }
+                }
+            }
+
+            outputSection(
+                title: "EMBEDDED ASSETS",
+                detail: "Original image streams",
+                symbol: "photo.stack",
+                tint: PPColor.mint
+            ) {
+                exportButton(
+                    "Embedded Images",
+                    detail:
+                        "Original JPEG/JP2 streams and lossless decoded PNGs",
+                    symbol: "photo.stack",
+                    badge: "ASSETS"
+                ) {
+                    let generation = beginExport(
+                        label: "embedded images"
+                    )
+                    exportTask = Task { @MainActor in
+                        defer {
+                            finishExport(generation)
+                        }
+                        let urls = await model
+                            .makeEmbeddedImageExports(
+                                recordID: recordID
+                            )
+                        guard !urls.isEmpty else {
+                            return
+                        }
+                        guard exportIsCurrent(
+                            generation
+                        ) else {
+                            await model
+                                .discardTemporaryExportCopies(
+                                    at: urls
+                                )
+                            return
+                        }
+                        share(
+                            urls,
+                            temporaryURLs: urls
+                        )
+                    }
+                }
+                .accessibilityIdentifier(
+                    "exportEmbeddedImages"
+                )
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var exportProgressContent: some View {
+        if let exportLabel, !isOfficeWorkspace {
+            if let officeShareProgress {
+                LocalOperationProgressView(
+                    progress: officeShareProgress
+                )
+            } else if model.officeBatchRun(
+                for: recordID
+            ) != nil {
+                EmptyView()
+            } else if let pdfShareProgress {
+                LocalOperationProgressView(
+                    progress: pdfShareProgress
+                )
+            } else if let activeOfficeFormat,
+                      let record = model.record(id: recordID) {
+                officeExportProgressPanel(
+                    exportLabel,
+                    format: activeOfficeFormat,
+                    record: record
+                )
+            } else if let progress = model.progress(for: recordID) {
+                LocalOperationProgressView(progress: progress)
+            } else {
+                HStack(spacing: PPSpacing.medium) {
+                    ProgressView()
+                    Text(
+                        AppLocalization.format(
+                            "Preparing %@ on device",
+                            exportLabel.localizedUI
+                        )
+                    )
+                        .font(.subheadline)
+                        .foregroundStyle(PPColor.textSecondary)
+                }
+                .accessibilityElement(children: .combine)
+            }
+        }
     }
 
     private var navigationTitle: String {
-        switch focus {
-        case .safeShare: return "Verify & Share"
-        case .text: return "PDF to Office"
-        case .images: return "PDF to Images"
-        case nil: return "Export"
+        if isOfficeWorkspace { return "Convert PDF" }
+        switch activeFocus {
+        case .safeShare: return "Finish & Share"
+        case .text: return "Convert PDF"
+        case .images: return "Save as Images"
+        case nil: return "Create & Share"
+        }
+    }
+
+    private var canReturnToExportCatalog: Bool {
+        initialFocus == nil
+            && activeFocus != nil
+            && !isPreparedOutputTransitionActive
+            && temporaryOfficeResultURL == nil
+    }
+
+    private var isPreparedOutputTransitionActive: Bool {
+        pendingPreparedRoute != nil
+            || transitioningPreparedRoute != nil
+            || preparedOutputTransitionTask != nil
+    }
+
+    private func enterSafeShareFlow() {
+        guard activeFocus != .safeShare,
+              exportTask == nil,
+              preflightReviewTask == nil,
+              model.record(id: recordID) != nil
+        else { return }
+        focusTransitionFeedback &+= 1
+        withAnimation(
+            reduceMotion ? nil : .snappy(duration: 0.22)
+        ) {
+            activeFocus = .safeShare
+        }
+    }
+
+    private func returnToExportCatalog() {
+        guard canReturnToExportCatalog,
+              exportTask == nil,
+              preflightReviewTask == nil,
+              !isPreparedOutputTransitionActive,
+              temporaryOfficeResultURL == nil
+        else { return }
+        invalidatePreflight()
+        focusTransitionFeedback &+= 1
+        withAnimation(
+            reduceMotion ? nil : .snappy(duration: 0.22)
+        ) {
+            activeFocus = nil
         }
     }
 
     private var officeFormats: [PDFTextExportFormat] {
         [.wordDocument, .excelWorkbook, .powerPointPresentation]
+    }
+
+    private func officeSourcePreview(_ record: DocumentRecord) -> some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: PPSpacing.large) {
+                Text("Source PDF".localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textSecondary)
+                if !hideLibraryPreviews, !record.profile.isLocked,
+                   let url = model.url(for: recordID) {
+                    PDFPageThumbnailView(
+                        url: url,
+                        pageIndex: min(officePreviewPage, max(0, record.profile.pageCount - 1)),
+                        refreshToken: model.refreshToken(for: recordID),
+                        width: 224
+                    )
+                    .frame(maxWidth: .infinity)
+                    .shadow(color: .black.opacity(0.1), radius: 8, y: 4)
+                } else {
+                    Image(systemName: record.profile.isLocked ? "lock.doc" : "doc.text")
+                        .font(.largeTitle)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .frame(maxWidth: .infinity, minHeight: 280)
+                }
+                HStack {
+                    DeskIconButton(title: "Previous page", symbol: "chevron.left") {
+                        officePreviewPage = max(0, officePreviewPage - 1)
+                    }
+                    .disabled(officePreviewPage == 0 || record.profile.isLocked)
+                    .keyboardShortcut(.leftArrow, modifiers: .option)
+                    Text(AppLocalization.format(
+                        "Page %lld of %lld", officePreviewPage + 1, max(1, record.profile.pageCount)
+                    ))
+                    .font(.caption.monospacedDigit())
+                    .frame(maxWidth: .infinity)
+                    DeskIconButton(title: "Next page", symbol: "chevron.right") {
+                        officePreviewPage = min(record.profile.pageCount - 1, officePreviewPage + 1)
+                    }
+                    .disabled(officePreviewPage >= record.profile.pageCount - 1 || record.profile.isLocked)
+                    .keyboardShortcut(.rightArrow, modifiers: .option)
+                }
+                Text(record.displayName)
+                    .font(.subheadline.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("The source file remains unchanged.".localizedUI)
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .accessibilityIdentifier("officeSourcePreview")
+    }
+
+    private func officeFormatSelection(
+        _ plan: PDFOfficeExportFormatPlan, recommended: Bool
+    ) -> some View {
+        let selected = selectedOfficeFormat == plan.format
+        return Button {
+            if selectedOfficeFormat != plan.format {
+                officeReceipt = nil
+                officeResultNotice = nil
+            }
+            selectedOfficeFormat = plan.format
+            didChooseOfficeFormat = true
+            officeFailure = nil
+            officeRouteFeedback += 1
+        } label: {
+            HStack(alignment: .center, spacing: PPSpacing.medium) {
+                Image(systemName: plan.format.symbol)
+                    .font(.title3)
+                    .foregroundStyle(officeReadinessColor(plan.readiness))
+                    .frame(width: 32)
+                VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                    Text(plan.format.title.localizedUI)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PPColor.textPrimary)
+                    Text(officePurposeLine(plan.format).localizedUI)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if recommended {
+                        Text("Recommended".localizedUI)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(PPColor.mint)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .foregroundStyle(selected ? PPColor.accent : PPColor.textSecondary)
+            }
+            .padding(PPSpacing.medium)
+            .frame(maxWidth: .infinity, minHeight: 72, alignment: .leading)
+            .background(selected ? PPColor.accent.opacity(0.07) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .hoverEffect(.highlight)
+        .disabled(exportTask != nil || temporaryOfficeResultURL != nil)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(plan.format.title.localizedUI)
+        .accessibilityHint(officePurposeLine(plan.format).localizedUI)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityAddTraits(selected ? .isSelected : [])
+        .accessibilityIdentifier("officeFormat-\(plan.format.rawValue)")
+    }
+
+    private func officeActionFooter(_ record: DocumentRecord) -> some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            if exportTask != nil {
+                HStack(spacing: PPSpacing.medium) {
+                    if let progress = officeShareProgress ?? model.progress(for: recordID) {
+                        LocalOperationProgressView(progress: progress)
+                    } else {
+                        ProgressView()
+                        Text((exportLabel ?? "Preparing output").localizedUI)
+                            .font(.subheadline)
+                    }
+                    Spacer(minLength: 0)
+                    DeskIconButton(title: "Stop", symbol: "stop.fill", tint: PPColor.amber) {
+                        stopExportPreparation()
+                    }
+                    .disabled(exportStopRequested)
+                }
+            } else if let receipt = officeReceipt,
+                      receipt.format == selectedOfficeFormat {
+                officeResultActions(receipt, record: record)
+            } else {
+                Button {
+                    startTextExport(selectedOfficeFormat)
+                } label: {
+                    Label(
+                        AppLocalization.format("Convert to %@", selectedOfficeFormat.title.localizedUI),
+                        systemImage: "arrow.right.doc.on.clipboard"
+                    )
+                    .foregroundStyle(PPColor.onAccent)
+                    .frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(
+                    record.profile.isLocked || model.isProcessing(recordID)
+                        || temporaryOfficeResultURL != nil
+                        || officePageRangeError(record, format: selectedOfficeFormat) != nil
+                )
+                .keyboardShortcut(.return, modifiers: .command)
+                .accessibilityIdentifier("officeConvertAction")
+            }
+        }
+        .padding(PPSpacing.regular)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Rectangle().fill(PPColor.border).frame(height: 0.5)
+        }
+    }
+
+    private func officeResultSummary(
+        _ receipt: PDFOfficeExportReceipt, record: DocumentRecord
+    ) -> some View {
+        let availability = receipt.artifactAvailability(for: record.contentRevisionID)
+        let resultTitle = temporaryOfficeResultURL != nil ? "Output not saved"
+            : availability != .reusable ? availability.title
+            : receipt.batchID != nil ? "Office part saved"
+            : "Output saved locally"
+        return VStack(alignment: .leading, spacing: PPSpacing.medium) {
+            Label(
+                resultTitle.localizedUI,
+                systemImage: temporaryOfficeResultURL == nil ? "internaldrive" : "exclamationmark.circle"
+            )
+            .font(PPType.metadata)
+            .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+            .foregroundStyle(temporaryOfficeResultURL == nil ? PPColor.textSecondary : PPColor.amber)
+            Text(receipt.fileName)
+                .font(PPType.section)
+                .dynamicTypeSize(...DynamicTypeSize.accessibility2)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            Text("\(receipt.format.fileExtension.uppercased())  ·  \(receipt.formattedSize)")
+                .font(PPType.measure)
+                .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+                .foregroundStyle(PPColor.textSecondary)
+            if let sourcePages = receipt.sourcePageSummary {
+                Label(sourcePages, systemImage: "doc.on.doc")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+            if temporaryOfficeResultURL == nil, availability == .reusable {
+                OfficeInlineOutputPreview(
+                    recordID: recordID, revisionID: record.contentRevisionID, receipt: receipt
+                ) {
+                    shareRetainedOfficeExport(receipt, previewing: true)
+                }
+                .id(receipt.id)
+            }
+            if !receipt.contentNotices.isEmpty {
+                Text("Review converted content".localizedUI)
+                    .font(PPType.section)
+                    .accessibilityAddTraits(.isHeader)
+                OfficeContentNoticesView(receipt: receipt, compact: true)
+            }
+            if let officeResultNotice {
+                Text(officeResultNotice.localizedUI)
+                    .font(.caption)
+                    .foregroundStyle(PPColor.amber)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else if availability != .reusable {
+                Label(
+                    (availability == .reusable && !receipt.contentNotices.isEmpty
+                        ? "Output saved locally" : availability.title).localizedUI,
+                    systemImage: availability == .reusable && !receipt.contentNotices.isEmpty
+                        ? "internaldrive" : availability.symbol
+                )
+                    .font(.caption)
+                    .foregroundStyle(availability == .reusable ? PPColor.textSecondary : PPColor.amber)
+            }
+            Button {
+                inspectedOfficeReceipt = receipt
+            } label: {
+                Label("View conversion checks", systemImage: "checklist.checked")
+                    .font(.caption)
+                    .frame(minHeight: 44)
+            }
+            .accessibilityIdentifier("officeConversionChecks")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, PPSpacing.medium)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("officeConversionResult")
+    }
+
+    private func officeResultActions(
+        _ receipt: PDFOfficeExportReceipt, record: DocumentRecord
+    ) -> some View {
+        let reusable = receipt.artifactAvailability(for: record.contentRevisionID) == .reusable
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout && temporaryOfficeResultURL != nil
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.small))
+            : AnyLayout(HStackLayout(spacing: PPSpacing.medium))
+        return layout {
+            if temporaryOfficeResultURL != nil {
+                Button {
+                    retryRetainingOfficeResult()
+                } label: {
+                    Label("Retry saving output", systemImage: "arrow.clockwise")
+                        .frame(minHeight: 44)
+                }
+                .disabled(receipt.sourceRevisionID != record.contentRevisionID)
+                Button {
+                    if let url = temporaryOfficeResultURL {
+                        share([url], preservesTemporaryResult: true)
+                    }
+                } label: {
+                    Label("Share output", systemImage: "square.and.arrow.up")
+                        .frame(minHeight: 44)
+                }
+            } else {
+                DeskIconButton(title: "Preview output", symbol: "doc.text.magnifyingglass") {
+                    shareRetainedOfficeExport(receipt, previewing: true)
+                }
+                .disabled(!reusable)
+                Button {
+                    shareRetainedOfficeExport(receipt)
+                } label: {
+                    Label("Share output", systemImage: "square.and.arrow.up")
+                        .foregroundStyle(PPColor.onAccent)
+                        .frame(maxWidth: .infinity, minHeight: 36)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!reusable)
+                DeskIconButton(title: "Convert again", symbol: "arrow.clockwise", tint: PPColor.textSecondary) {
+                    officeReceipt = nil
+                    officeResultNotice = nil
+                }
+            }
+        }
+        .disabled(model.isProcessing(recordID) || officeGovernanceTask != nil)
+        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("officeResultActions")
+    }
+
+    private func officeRecentResults(_ record: DocumentRecord) -> some View {
+        let history = record.officeReceipts.filter { $0.id != officeReceipt?.id }
+        let query = officeHistoryQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let receipts = history.filter {
+            (officeHistoryFormat == nil || $0.format == officeHistoryFormat)
+                && (!officeHistoryCurrentOnly || $0.sourceRevisionID == record.contentRevisionID)
+                && (query.isEmpty || $0.fileName.localizedStandardContains(query)
+                    || $0.sourcePageSummary?.localizedStandardContains(query) == true)
+        }.sorted { $0.exportedAt > $1.exportedAt }
+        return VStack(alignment: .leading, spacing: PPSpacing.small) {
+            if !history.isEmpty {
+                HStack {
+                    Text("Recent Office outputs".localizedUI)
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                    if history.count > 3 {
+                        Button {
+                            showsOfficeHistory.toggle()
+                        } label: {
+                            Image(systemName: showsOfficeHistory ? "chevron.up" : "chevron.down")
+                                .frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel((showsOfficeHistory ? "Show less" : "Show all").localizedUI)
+                    }
+                }
+                if showsOfficeHistory || history.count > 3 {
+                    HStack(spacing: PPSpacing.small) {
+                        TextField("Search outputs".localizedUI, text: $officeHistoryQuery)
+                            .textFieldStyle(.roundedBorder)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                        Menu {
+                            Picker("Format".localizedUI, selection: $officeHistoryFormat) {
+                                Text("All formats".localizedUI).tag(Optional<PDFTextExportFormat>.none)
+                                ForEach(officeFormats) { format in
+                                    Text(format.title.localizedUI).tag(Optional(format))
+                                }
+                            }
+                            Toggle("Current revision only".localizedUI, isOn: $officeHistoryCurrentOnly)
+                            if officeHistoryFormat != nil || officeHistoryCurrentOnly || !query.isEmpty {
+                                Button("Clear filters".localizedUI) {
+                                    officeHistoryFormat = nil
+                                    officeHistoryCurrentOnly = false
+                                    officeHistoryQuery = ""
+                                }
+                            }
+                        } label: {
+                            Image(systemName: officeHistoryFormat != nil || officeHistoryCurrentOnly
+                                ? "line.3.horizontal.decrease.circle.fill"
+                                : "line.3.horizontal.decrease.circle")
+                                .frame(width: 44, height: 44)
+                        }
+                        .accessibilityLabel("Filter outputs".localizedUI)
+                        .help("Filter outputs".localizedUI)
+                    }
+                    .onChange(of: officeHistoryQuery) { _, value in
+                        if value.count > 256 { officeHistoryQuery = String(value.prefix(256)) }
+                    }
+                }
+                if receipts.isEmpty {
+                    Label("No matching outputs".localizedUI, systemImage: "magnifyingglass")
+                        .font(.subheadline)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .frame(minHeight: 44)
+                }
+                ForEach(Array(receipts.prefix(showsOfficeHistory ? receipts.count : 3))) { receipt in
+                    HStack(spacing: PPSpacing.small) {
+                        Button {
+                            officeReceipt = receipt
+                            selectedOfficeFormat = receipt.format
+                            didChooseOfficeFormat = true
+                            officeFailure = nil
+                            officeResultNotice = nil
+                            if receipt.sourceRevisionID == record.contentRevisionID,
+                               let first = receipt.sourcePageStartIndex,
+                               let last = receipt.sourcePageEndIndex,
+                               first >= 0, last >= first, last < record.profile.pageCount {
+                                usesOfficePageRange = true
+                                officeFirstPage = first + 1
+                                officeLastPage = last + 1
+                            } else {
+                                usesOfficePageRange = false
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                                Text(receipt.fileName)
+                                    .font(.subheadline.weight(.medium))
+                                    .foregroundStyle(PPColor.textPrimary)
+                                    .lineLimit(2)
+                                Text(receipt.artifactAvailability(for: record.contentRevisionID).title.localizedUI)
+                                    .font(.caption)
+                                    .foregroundStyle(PPColor.textSecondary)
+                                if !receipt.contentNotices.isEmpty {
+                                    Label("Review converted content".localizedUI, systemImage: "exclamationmark.triangle")
+                                        .font(.caption)
+                                        .foregroundStyle(PPColor.amber)
+                                }
+                                Text("\(receipt.format.fileExtension.uppercased()) · \(receipt.formattedSize) · \(receipt.exportedAt.formatted(date: .abbreviated, time: .shortened))")
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(PPColor.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if let sourcePages = receipt.sourcePageSummary {
+                                    Text(sourcePages)
+                                        .font(.caption2)
+                                        .foregroundStyle(PPColor.textSecondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, minHeight: 56, alignment: .leading)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        officeReceiptMenu(receipt, availability: receipt.artifactAvailability(for: record.contentRevisionID))
+                    }
+                }
+            }
+        }
+        .disabled(exportTask != nil || temporaryOfficeResultURL != nil)
+    }
+
+    private func requestExportDismissal() {
+        if temporaryOfficeResultURL != nil {
+            isConfirmingTemporaryResultDiscard = true
+        } else {
+            dismiss()
+        }
+    }
+
+    private func cleanupTemporaryOfficeResult() {
+        guard let url = temporaryOfficeResultURL else { return }
+        temporaryOfficeResultURL = nil
+        Task { await model.discardTemporaryExportCopies(at: [url]) }
+    }
+
+    private func cleanupOfficePreview() {
+        guard let url = officePreviewCopyURL else { return }
+        officePreviewCopyURL = nil
+        Task { await model.discardTemporaryExportCopies(at: [url]) }
+    }
+
+    private func retryRetainingOfficeResult() {
+        guard let receipt = officeReceipt, let url = temporaryOfficeResultURL,
+              let revision = receipt.sourceRevisionID,
+              exportTask == nil, !model.isProcessing(recordID)
+        else { return }
+        let generation = beginExport(label: "Saving Office output")
+        exportTask = Task { @MainActor in
+            defer { finishExport(generation) }
+            let retained = await model.retainOfficeExport(
+                recordID: recordID, receipt: receipt, sourceURL: url,
+                expectedContentRevisionID: revision
+            )
+            if let retained {
+                if temporaryOfficeResultURL == url {
+                    temporaryOfficeResultURL = nil
+                }
+                if exportGeneration == generation, scenePhase == .active {
+                    officeReceipt = retained.receipt
+                    officeResultNotice = exportIsCurrent(generation)
+                        ? nil : "A completed output was kept in local history."
+                }
+            } else if exportIsCurrent(generation) {
+                officeResultNotice = "The output is still available here. Free local storage, retry saving, or share it before closing."
+            }
+        }
     }
 
     private var portableTextFormats: [PDFTextExportFormat] {
@@ -3776,28 +6465,39 @@ struct DocumentExportSheet: View {
     private var exportCatalogPicker: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
-                title: "OUTPUT INSTRUMENT",
-                detail: "Choose the delivery contract first",
+                title: "CHOOSE A FORMAT",
+                detail: "Suggested options appear first",
                 symbol: "dial.medium",
                 tint: PPColor.rose
             )
 
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: 0) {
-                    ForEach(ExportCatalogMode.allCases) { mode in
-                        exportCatalogButton(mode)
-                    }
-                }
-
+            if dynamicTypeSize.ppPrefersExpandedLayout {
                 LazyVGrid(
-                    columns: [
-                        GridItem(.flexible()),
-                        GridItem(.flexible())
-                    ],
+                    columns: [GridItem(.flexible())],
                     spacing: 0
                 ) {
                     ForEach(ExportCatalogMode.allCases) { mode in
                         exportCatalogButton(mode)
+                    }
+                }
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 0) {
+                        ForEach(ExportCatalogMode.allCases) { mode in
+                            exportCatalogButton(mode)
+                        }
+                    }
+
+                    LazyVGrid(
+                        columns: [
+                            GridItem(.flexible()),
+                            GridItem(.flexible())
+                        ],
+                        spacing: 0
+                    ) {
+                        ForEach(ExportCatalogMode.allCases) { mode in
+                            exportCatalogButton(mode)
+                        }
                     }
                 }
             }
@@ -3831,11 +6531,15 @@ struct DocumentExportSheet: View {
                 Text(mode.title.localizedUI)
                     .font(.caption.weight(.semibold))
                     .fontDesign(selected ? .serif : .default)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                    )
                 Text(exportCatalogDetail(mode).localizedUI)
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                    )
             }
             .foregroundStyle(selected ? tint : PPColor.textSecondary)
             .padding(.horizontal, PPSpacing.small)
@@ -3853,6 +6557,7 @@ struct DocumentExportSheet: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(exportTask != nil || temporaryOfficeResultURL != nil)
         .accessibilityValue(selected ? "Selected" : "")
     }
 
@@ -3953,15 +6658,15 @@ struct DocumentExportSheet: View {
         let detail: String
         let symbol: String
         let tint: Color
-        switch focus {
+        switch activeFocus {
         case .safeShare:
             title = "Prepare trusted delivery"
             detail = "Review the working copy before creating a verified result."
             symbol = "checkmark.shield"
             tint = PPColor.mint
         case .text:
-            title = "What will you do with the result?"
-            detail = "PaperPath recommends a format from this PDF’s actual structure."
+            title = "Choose an editable format"
+            detail = "Start with the suggested option or choose another Office format."
             symbol = "doc.badge.arrow.up"
             tint = PPColor.accent
         case .images:
@@ -3977,7 +6682,9 @@ struct DocumentExportSheet: View {
         }
 
         return WorkflowCommandHeader(
-            eyebrow: "OUTPUT WORKFLOW",
+            eyebrow: activeFocus == .safeShare
+                ? "FINISH & SHARE"
+                : "CREATE A COPY",
             title: title,
             detail: detail,
             symbol: symbol,
@@ -3991,36 +6698,179 @@ struct DocumentExportSheet: View {
                 ),
                 WorkflowMetric(
                     value:
-                        "\(Int(record.profile.textCoverage * 100))%",
-                    label: "Text",
-                    symbol: "text.magnifyingglass",
-                    tint: record.profile.textCharacterCount > 0
-                        ? PPColor.mint
-                        : PPColor.amber
-                ),
-                WorkflowMetric(
-                    value: record.profile.formattedSize,
-                    label: "Source",
+                        record.profile.formattedSize,
+                    label: "Size",
                     symbol: "internaldrive",
                     tint: PPColor.cyan
-                ),
-                WorkflowMetric(
-                    value: "Local",
-                    label: "Conversion",
-                    symbol: "iphone",
-                    tint: PPColor.mint
                 )
-            ]
+            ],
+            showsOnDevice: activeFocus == .safeShare
         )
+    }
+
+    private func deliveryDocumentHeader(
+        _ record: DocumentRecord, expanded: Bool = false
+    ) -> some View {
+        let layout = expanded || dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.regular))
+            : AnyLayout(HStackLayout(alignment: .center, spacing: PPSpacing.regular))
+        return VStack(alignment: .leading, spacing: PPSpacing.small) {
+            layout {
+                if !dynamicTypeSize.isAccessibilitySize {
+                    Button {
+                        openDeliveryPreview(record)
+                    } label: {
+                        Group {
+                            if !hideLibraryPreviews, !record.profile.isLocked,
+                               let url = model.url(for: record.id) {
+                                PDFPageThumbnailView(
+                                    url: url, pageIndex: deliveryPreviewPage,
+                                    refreshToken: model.refreshToken(for: record.id),
+                                    width: expanded ? 240 : 104
+                                )
+                                .shadow(color: .black.opacity(0.12), radius: 6, y: 3)
+                            } else {
+                                Image(systemName: record.profile.isLocked ? "lock.doc" : "eye.slash")
+                                    .font(.title)
+                                    .foregroundStyle(PPColor.textSecondary)
+                                    .frame(width: expanded ? 240 : 104, height: expanded ? 307 : 133)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(
+                        hideLibraryPreviews || record.profile.isLocked
+                            || exportTask != nil || preflightReviewTask != nil
+                            || model.isProcessing(record.id)
+                    )
+                    .accessibilityLabel("Open page preview".localizedUI)
+                    .accessibilityIdentifier("openDeliveryPagePreview")
+                    .help("Open page preview".localizedUI)
+                    .frame(maxWidth: expanded ? .infinity : nil)
+                }
+                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                    Text(record.displayName)
+                        .font(.headline)
+                        .foregroundStyle(PPColor.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(record.subtitle.localizedUI)
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(PPColor.textSecondary)
+                    Label(
+                        (record.hasCurrentDeliveryReceipt ? "Verified copy" : "Working copy").localizedUI,
+                        systemImage: record.hasCurrentDeliveryReceipt ? "checkmark.seal" : "doc.on.doc"
+                    )
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(record.hasCurrentDeliveryReceipt ? PPColor.mint : PPColor.textSecondary)
+                    if dynamicTypeSize.isAccessibilitySize,
+                       !hideLibraryPreviews, !record.profile.isLocked {
+                        Button {
+                            openDeliveryPreview(record)
+                        } label: {
+                            Label("Open page preview".localizedUI, systemImage: "arrow.up.left.and.arrow.down.right")
+                                .font(.subheadline)
+                                .frame(minHeight: 44)
+                        }
+                        .disabled(exportTask != nil || preflightReviewTask != nil || model.isProcessing(record.id))
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .padding(PPSpacing.regular)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(PPColor.documentStage)
+
+            if !record.profile.isLocked, let url = model.url(for: record.id) {
+                PDFPageFilmstrip(
+                    url: url, pageCount: record.profile.pageCount,
+                    refreshToken: model.refreshToken(for: record.id),
+                    selectedPage: Binding(
+                        get: { deliveryPreviewPage },
+                        set: { page in
+                            guard currentContentRevisionID == record.contentRevisionID else { return }
+                            deliveryPreviewPage = page
+                        }
+                    ),
+                    showsThumbnails: !hideLibraryPreviews && !dynamicTypeSize.isAccessibilitySize
+                ) {
+                    deliveryPageInput = String(deliveryPreviewPage + 1)
+                    showsDeliveryPagePicker = true
+                }
+                .id(record.contentRevisionID)
+                .disabled(exportTask != nil || preflightReviewTask != nil)
+                .popover(isPresented: $showsDeliveryPagePicker) {
+                    deliveryPagePicker(record)
+                }
+            }
+        }
+        .accessibilityIdentifier("deliveryDocumentPreview")
+    }
+
+    private func deliveryPagePicker(_ record: DocumentRecord) -> some View {
+        VStack(alignment: .leading, spacing: PPSpacing.medium) {
+            Text("Go to page".localizedUI).font(.headline)
+            TextField("Page number".localizedUI, text: $deliveryPageInput)
+                .keyboardType(.numberPad)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { selectDeliveryPage(record) }
+            Text(AppLocalization.format(
+                "Page numbers must be between 1 and %lld.", record.profile.pageCount
+            ))
+            .font(.caption)
+            .foregroundStyle(PPColor.textSecondary)
+            Button {
+                selectDeliveryPage(record)
+            } label: {
+                Label("Go".localizedUI, systemImage: "arrow.right")
+                    .frame(maxWidth: .infinity, minHeight: 44)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(validDeliveryPage(record) == nil)
+        }
+        .padding(PPSpacing.regular)
+        .frame(minWidth: 240, maxWidth: 340)
+        .onChange(of: deliveryPageInput) { _, input in
+            if input.count > 8 { deliveryPageInput = String(input.prefix(8)) }
+        }
+    }
+
+    private func validDeliveryPage(_ record: DocumentRecord) -> Int? {
+        guard currentContentRevisionID == record.contentRevisionID,
+              let page = Int(deliveryPageInput.trimmingCharacters(in: .whitespaces)),
+              (1...max(1, record.profile.pageCount)).contains(page)
+        else { return nil }
+        return page - 1
+    }
+
+    private func selectDeliveryPage(_ record: DocumentRecord) {
+        guard let page = validDeliveryPage(record) else { return }
+        deliveryPreviewPage = page
+        showsDeliveryPagePicker = false
+    }
+
+    private func openDeliveryPreview(_ record: DocumentRecord) {
+        guard currentContentRevisionID == record.contentRevisionID,
+              !record.profile.isLocked, !hideLibraryPreviews,
+              exportTask == nil, !model.isProcessing(record.id),
+              (0..<record.profile.pageCount).contains(deliveryPreviewPage)
+        else { return }
+        openPreflightReview(PDFDeliveryPreflightItem(
+            id: "document-preview",
+            title: "Page preview",
+            detail: "",
+            status: .passed,
+            reviewPageIndex: deliveryPreviewPage
+        ))
     }
 
     private func verifiedShareButton(
         _ record: DocumentRecord
     ) -> some View {
         Button {
-            if let url = model.url(for: record.id) {
-                share([url])
-            }
+            preparePDFShare(
+                recordID: record.id,
+                label: "verified PDF"
+            )
         } label: {
             Label {
                 VStack(alignment: .leading, spacing: 3) {
@@ -4054,25 +6904,17 @@ struct DocumentExportSheet: View {
         }
         .buttonStyle(.plain)
         .accessibilityHint(
-            "Shares this already verified PDF without creating another copy"
+            "Creates a protected temporary copy of this verified PDF"
         )
         .accessibilityIdentifier("shareVerifiedPDF")
     }
 
     private var safeShareButton: some View {
         Button {
-            exportTask = Task {
-                exportLabel = "verified copy"
-                defer {
-                    exportTask = nil
-                    exportLabel = nil
-                }
-                if let created = await model.createSafeShareCopy(
-                    recordID: recordID
-                ) {
-                    dismiss()
-                    onCreated(DocumentRoute(recordID: created.id))
-                }
+            if activeFocus == .safeShare {
+                startSafeShareCreation()
+            } else {
+                enterSafeShareFlow()
             }
         } label: {
             HStack(spacing: PPSpacing.regular) {
@@ -4097,16 +6939,16 @@ struct DocumentExportSheet: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 7) {
-                        Text("Verified Copy")
+                        Text("Create Verified Copy")
                             .font(.headline)
                             .fontDesign(.serif)
                             .foregroundStyle(PPColor.textPrimary)
-                        Text("VERIFY")
+                        Text(verifiedAccessBadge.localizedUI)
                             .font(.caption2.smallCaps().weight(.bold))
-                            .foregroundStyle(PPColor.mint)
+                            .foregroundStyle(verifiedAccessTint)
                     }
                     Text(
-                        "Create, reopen, and issue a SHA-256 receipt."
+                        "Makes a separate copy, reopens it, and saves the receipt."
                     )
                     .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
@@ -4132,7 +6974,7 @@ struct DocumentExportSheet: View {
             model.isProcessing(recordID)
                 || exportTask != nil
                 || (
-                    focus == .safeShare
+                    activeFocus == .safeShare
                         && (
                             preflight == nil
                                 || preflight?.status == .blocked
@@ -4140,14 +6982,96 @@ struct DocumentExportSheet: View {
                 )
         )
         .accessibilityHint(
-            "Creates a separate image-based PDF and verifies the result"
+            verifiedAccessHint.localizedUI
         )
         .accessibilityIdentifier("safeShareButton")
     }
 
+    private var verifiedAccessBadge: String {
+        if purchase.isUnlocked {
+            return "VERIFY"
+        }
+        return model.verifiedOutputSuccessCount == 0
+            ? "FIRST FREE"
+            : "UNLOCK"
+    }
+
+    private var verifiedAccessTint: Color {
+        purchase.isUnlocked
+            || model.verifiedOutputSuccessCount == 0
+            ? PPColor.mint
+            : PPColor.amber
+    }
+
+    private var verifiedAccessHint: String {
+        if purchase.isUnlocked {
+            return "Creates a separate image-based PDF and verifies the result"
+        }
+        if model.verifiedOutputSuccessCount == 0 {
+            return "Creates your free separate PDF and verifies the result"
+        }
+        return "Opens lifetime access before creating another verified PDF"
+    }
+
+    private var safeShareCreationTitle: String {
+        guard let preflight = currentPreflight else {
+            if preflightPaused {
+                return "Check Stopped"
+            }
+            if preflightError != nil {
+                return "Check Failed"
+            }
+            return "Checking PDF"
+        }
+        switch preflight.status {
+        case .ready:
+            return "Create Verified Copy"
+        case .review:
+            return "Create Checked Copy"
+        case .blocked:
+            return "Resolve Before Creating"
+        }
+    }
+
+    private var safeShareCreationSymbol: String {
+        guard let preflight = currentPreflight else {
+            if preflightPaused {
+                return "pause.circle"
+            }
+            if preflightError != nil {
+                return "exclamationmark.circle"
+            }
+            return "hourglass"
+        }
+        switch preflight.status {
+        case .ready:
+            return "checkmark.shield"
+        case .review:
+            return "exclamationmark.shield"
+        case .blocked:
+            return "xmark.shield"
+        }
+    }
+
+    private var safeShareCreationHint: String {
+        if preflightPaused {
+            return "Retry the on-device check before creating a verified copy"
+        }
+        if preflightError != nil {
+            return "Resolve the check error or retry before creating a verified copy"
+        }
+        if currentPreflight?.status == .review {
+            return "Creates a checked copy and keeps remaining warnings in the delivery receipt"
+        }
+        if currentPreflight?.status == .blocked {
+            return "Review the blocking item before creating an output"
+        }
+        return verifiedAccessHint
+    }
+
     @ViewBuilder
     private var preflightPanel: some View {
-        if let preflight {
+        if let preflight = currentPreflight {
             VStack(alignment: .leading, spacing: PPSpacing.medium) {
                 HStack(spacing: PPSpacing.medium) {
                     Image(systemName: preflight.status.symbol)
@@ -4162,7 +7086,6 @@ struct DocumentExportSheet: View {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(preflight.status.title.localizedUI)
                             .font(.headline)
-                            .fontDesign(.serif)
                             .foregroundStyle(PPColor.textPrimary)
                         Text(
                             "\(preflight.pageCount) pages · \(preflight.formattedSize)"
@@ -4174,26 +7097,24 @@ struct DocumentExportSheet: View {
 
                     Spacer()
 
-                    if preflight.fixCount > 0 {
-                        Text("\(preflight.fixCount) FIX")
-                            .font(.caption2.smallCaps().weight(.bold))
-                            .foregroundStyle(PPColor.accent)
-                    }
                 }
 
-                VStack(spacing: 0) {
-                    ForEach(
-                        Array(preflight.items.enumerated()),
-                        id: \.element.id
-                    ) { index, item in
-                        preflightRow(item)
-                        if index < preflight.items.count - 1 {
-                            Rectangle()
-                                .fill(PPColor.border.opacity(0.55))
-                                .frame(height: 0.6)
-                                .padding(.leading, 32)
-                        }
+                preflightSummary(preflight)
+
+                if preflight.status == .ready, !usesWideDeliveryLayout {
+                    preflightItemsList(preflight.items.filter { $0.status != .passed })
+                    DisclosureGroup {
+                        preflightItemsList(preflight.items.filter { $0.status == .passed })
+                    } label: {
+                        Label(
+                            "Review checks",
+                            systemImage: "checklist"
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
                     }
+                } else {
+                    preflightItemsList(preflight.items)
                 }
             }
             .padding(.vertical, PPSpacing.small)
@@ -4205,12 +7126,283 @@ struct DocumentExportSheet: View {
             )
                 .font(.subheadline)
                 .foregroundStyle(Color.red)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("deliveryPreflightError")
+        } else if preflightPaused {
+            preflightStoppedPanel
         } else {
+            preflightLoadingPanel
+        }
+    }
+
+    private func preflightSummary(_ assessment: PDFDeliveryPreflightAssessment) -> some View {
+        let statuses: [PDFDeliveryPreflightItemStatus] = [.passed, .willFix, .review, .blocked]
+        let layout = dynamicTypeSize.isAccessibilitySize
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.small))
+            : AnyLayout(HStackLayout(alignment: .top, spacing: PPSpacing.medium))
+        return layout {
+            ForEach(statuses, id: \.rawValue) { status in
+                let count = assessment.items.filter { $0.status == status }.count
+                if count > 0 {
+                    Label {
+                        Text(AppLocalization.format(preflightCountKey(status), count))
+                            .fixedSize(horizontal: false, vertical: true)
+                    } icon: {
+                        Image(systemName: preflightItemSymbol(status))
+                    }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(preflightItemColor(status))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .padding(.vertical, PPSpacing.small)
+        .accessibilityIdentifier("deliveryCheckSummary")
+    }
+
+    private func preflightCountKey(_ status: PDFDeliveryPreflightItemStatus) -> String {
+        switch status {
+        case .passed: return "%lld passed"
+        case .willFix: return "%lld to fix"
+        case .review: return "%lld to review"
+        case .blocked: return "%lld blocked"
+        }
+    }
+
+    private var preflightLoadingPanel: some View {
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: PPSpacing.medium) {
-                ProgressView()
-                Text("Checking on device")
-                    .font(.subheadline)
+                preflightLoadingIdentity
+                Spacer(minLength: PPSpacing.small)
+                preflightStopButton
+            }
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                preflightLoadingIdentity
+                preflightStopButton
+            }
+        }
+        .padding(.vertical, PPSpacing.small)
+        .accessibilityIdentifier("deliveryPreflightLoading")
+    }
+
+    private var preflightLoadingIdentity: some View {
+        HStack(spacing: PPSpacing.small) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Checking on device".localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                Text("The private PDF stays on this device.".localizedUI)
+                    .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
+            }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
+    private var preflightStopButton: some View {
+        Button {
+            stopPreflight()
+        } label: {
+            Label("Stop checking", systemImage: "stop.fill")
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+        .disabled(preflightTask == nil)
+        .accessibilityHint(
+            "Stops this check without changing the working copy."
+                .localizedUI
+        )
+        .accessibilityIdentifier("stopDeliveryPreflight")
+    }
+
+    private var preflightStoppedPanel: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                preflightStoppedIdentity
+                Spacer(minLength: PPSpacing.small)
+                preflightRetryButton
+            }
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                preflightStoppedIdentity
+                preflightRetryButton
+            }
+        }
+        .padding(.vertical, PPSpacing.small)
+        .accessibilityIdentifier("deliveryPreflightStopped")
+    }
+
+    private var preflightStoppedIdentity: some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("PDF check stopped".localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                Text("The working copy was not changed.".localizedUI)
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+        } icon: {
+            Image(systemName: "pause.circle")
+                .foregroundStyle(PPColor.amber)
+        }
+    }
+
+    private var preflightRetryButton: some View {
+        Button {
+            retryPreflight()
+        } label: {
+            Label("Check Again", systemImage: "arrow.clockwise")
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+        .accessibilityHint(
+            "Restarts the on-device check for the current PDF."
+                .localizedUI
+        )
+        .accessibilityIdentifier("retryStoppedDeliveryPreflight")
+    }
+
+    private func startSafeShareCreation() {
+        guard let preflight = currentPreflight,
+              let preflightRevisionID,
+              preflight.status != .blocked,
+              preflightTask == nil,
+              preflightReviewTask == nil
+        else { return }
+        guard purchase.isUnlocked
+                || model.verifiedOutputSuccessCount == 0
+        else {
+            resumesSafeShareAfterUnlock = true
+            isPresentingVerifiedOutputUnlock = true
+            return
+        }
+        resumesSafeShareAfterUnlock = false
+        let previousOutputID = model.verifiedShareTarget(
+            for: recordID
+        )?.id
+        let generation = beginExport(label: "verified copy")
+        exportTask = Task { @MainActor in
+            defer {
+                finishExport(generation)
+            }
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createSafeShareCopy(
+                    recordID: recordID,
+                    expectedContentRevisionID:
+                        preflightRevisionID
+                )
+            }
+            guard exportGeneration == generation else { return }
+            let committed = created
+                ?? model.verifiedShareTarget(for: recordID)
+                    .flatMap {
+                        $0.id == previousOutputID ? nil : $0
+                    }
+            if exportStopRequested || Task.isCancelled {
+                model[noticeFor: paperPathSceneID] = (
+                    committed == nil
+                        ? "Verification stopped · no output created"
+                        : "Verification finished before stopping · output kept in Library"
+                ).localizedUI
+                return
+            }
+            guard exportIsCurrent(generation),
+                  let created
+            else { return }
+            onCreated(DocumentRoute(recordID: created.id))
+        }
+    }
+
+    private func completeVerifiedOutputUnlock() {
+        guard resumesSafeShareAfterUnlock else { return }
+        resumesSafeShareAfterUnlock = false
+        guard purchase.isUnlocked else { return }
+        unlockContinuationTask?.cancel()
+        let expectedRevisionID = currentContentRevisionID
+        unlockContinuationTask = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  activeFocus == .safeShare,
+                  currentContentRevisionID == expectedRevisionID
+            else {
+                unlockContinuationTask = nil
+                return
+            }
+            unlockContinuationTask = nil
+            startSafeShareCreation()
+        }
+    }
+
+    private func cancelVerifiedOutputUnlockContinuation() {
+        unlockContinuationTask?.cancel()
+        unlockContinuationTask = nil
+        resumesSafeShareAfterUnlock = false
+    }
+
+    private func completePreparedOutputTransition() {
+        guard let route = pendingPreparedRoute else { return }
+        pendingPreparedRoute = nil
+        transitioningPreparedRoute = route
+        preparedOutputTransitionFeedback += 1
+        preparedOutputTransitionTask?.cancel()
+        let generation = UUID()
+        preparedOutputTransitionGeneration = generation
+        preparedOutputTransitionTask = Task { @MainActor in
+            defer {
+                if preparedOutputTransitionGeneration == generation {
+                    preparedOutputTransitionTask = nil
+                    transitioningPreparedRoute = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  preparedOutputTransitionGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  model.record(id: route.recordID) != nil
+            else { return }
+            onCreated(route)
+        }
+    }
+
+    private func cancelPreparedOutputTransition(
+        showsNotice: Bool = false
+    ) {
+        preparedOutputTransitionGeneration = UUID()
+        preparedOutputTransitionTask?.cancel()
+        preparedOutputTransitionTask = nil
+        pendingPreparedRoute = nil
+        transitioningPreparedRoute = nil
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] = "Created copy stayed in Library"
+                .localizedUI
+        }
+    }
+
+    private func preflightItemsList(
+        _ items: [PDFDeliveryPreflightItem]
+    ) -> some View {
+        let priorities: [PDFDeliveryPreflightItemStatus] = [.blocked, .review, .willFix, .passed]
+        let ordered = priorities.flatMap { status in
+            items.filter { $0.status == status }
+        }
+        return VStack(spacing: 0) {
+            ForEach(
+                Array(ordered.enumerated()),
+                id: \.element.id
+            ) { index, item in
+                preflightRow(item)
+                if index < ordered.count - 1 {
+                    Rectangle()
+                        .fill(PPColor.border.opacity(0.55))
+                        .frame(height: 0.6)
+                        .padding(.leading, 32)
+                }
             }
         }
     }
@@ -4218,30 +7410,101 @@ struct DocumentExportSheet: View {
     private func preflightRow(
         _ item: PDFDeliveryPreflightItem
     ) -> some View {
-        Group {
+        let isOpening = openingPreflightItemID == item.id
+        return Group {
             if let pageIndex = item.reviewPageIndex {
-                Button {
-                    dismiss()
-                    Task {
-                        try? await Task.sleep(for: .milliseconds(180))
-                        onReviewPage(pageIndex)
+                let layout = dynamicTypeSize.ppPrefersExpandedLayout
+                    ? AnyLayout(
+                        VStackLayout(
+                            alignment: .leading,
+                            spacing: PPSpacing.xSmall
+                        )
+                    )
+                    : AnyLayout(
+                        HStackLayout(
+                            alignment: .top,
+                            spacing: PPSpacing.small
+                        )
+                    )
+                layout {
+                    Button {
+                        openPreflightReview(item)
+                    } label: {
+                        preflightRowContent(
+                            item,
+                            showsDisclosure: true,
+                            isOpening: isOpening
+                        )
                     }
-                } label: {
-                    preflightRowContent(item, showsDisclosure: true)
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .disabled(preflightReviewTask != nil)
+                    .accessibilityValue(
+                        isOpening
+                            ? "Opening issue action".localizedUI
+                            : ""
+                    )
+                    .accessibilityHint(
+                        (
+                            preflightReviewTask == nil
+                                ? AppLocalization.format(
+                                    "Opens page %lld for review",
+                                    pageIndex + 1
+                                )
+                                : "Wait for the current issue action to open."
+                                    .localizedUI
+                        )
+                    )
+
+                    if let repairAction = item.resolvedRepairAction {
+                        preflightRepairButton(
+                            item,
+                            action: repairAction,
+                            pageIndex: pageIndex
+                        )
+                    }
                 }
-                .buttonStyle(.plain)
-                .accessibilityHint(
-                    "Opens page \(pageIndex + 1) for review"
-                )
+            } else if let repairAction = item.resolvedRepairAction {
+                let layout = dynamicTypeSize.ppPrefersExpandedLayout
+                    ? AnyLayout(
+                        VStackLayout(
+                            alignment: .leading,
+                            spacing: PPSpacing.xSmall
+                        )
+                    )
+                    : AnyLayout(
+                        HStackLayout(
+                            alignment: .top,
+                            spacing: PPSpacing.small
+                        )
+                    )
+                layout {
+                    preflightRowContent(
+                        item,
+                        showsDisclosure: false,
+                        isOpening: isOpening
+                    )
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    preflightRepairButton(
+                        item,
+                        action: repairAction,
+                        pageIndex: nil
+                    )
+                }
             } else {
-                preflightRowContent(item, showsDisclosure: false)
+                preflightRowContent(
+                    item,
+                    showsDisclosure: false,
+                    isOpening: false
+                )
             }
         }
     }
 
     private func preflightRowContent(
         _ item: PDFDeliveryPreflightItem,
-        showsDisclosure: Bool
+        showsDisclosure: Bool,
+        isOpening: Bool
     ) -> some View {
         HStack(alignment: .top, spacing: PPSpacing.small) {
             Image(systemName: preflightItemSymbol(item.status))
@@ -4259,7 +7522,12 @@ struct DocumentExportSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
-            if showsDisclosure {
+            if isOpening {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.top, 4)
+                    .accessibilityHidden(true)
+            } else if showsDisclosure {
                 Image(systemName: "chevron.right")
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(PPColor.textSecondary)
@@ -4270,6 +7538,50 @@ struct DocumentExportSheet: View {
         .accessibilityElement(children: .combine)
     }
 
+    private func preflightRepairButton(
+        _ item: PDFDeliveryPreflightItem,
+        action: PDFDeliveryPreflightRepairAction,
+        pageIndex: Int?
+    ) -> some View {
+        Button {
+            openPreflightRepair(item, action: action)
+        } label: {
+            Label(
+                action.title.localizedUI,
+                systemImage: action.symbol
+            )
+            .lineLimit(2)
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+        .disabled(preflightReviewTask != nil)
+        .accessibilityHint(
+            preflightRepairHint(
+                action,
+                pageIndex: pageIndex
+            )
+        )
+        .accessibilityIdentifier("repairPreflightItem")
+    }
+
+    private func preflightRepairHint(
+        _ action: PDFDeliveryPreflightRepairAction,
+        pageIndex: Int?
+    ) -> String {
+        switch action {
+        case .organizePages:
+            guard let pageIndex else {
+                return "Opens Pages for review.".localizedUI
+            }
+            return AppLocalization.format(
+                "Opens Pages with page %lld selected",
+                pageIndex + 1
+            )
+        case .createEditableCopy:
+            return "Opens the secure password flow. The encrypted original stays unchanged."
+                .localizedUI
+        }
+    }
+
     private var recoveryActions: some View {
         outputSection(
             title: "CONTINUE SAFELY",
@@ -4278,9 +7590,10 @@ struct DocumentExportSheet: View {
             tint: PPColor.amber
         ) {
             Button {
-                if let url = model.url(for: recordID) {
-                    share([url])
-                }
+                preparePDFShare(
+                    recordID: recordID,
+                    label: "working copy"
+                )
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 3) {
@@ -4297,36 +7610,265 @@ struct DocumentExportSheet: View {
                         .foregroundStyle(PPColor.accent)
                 }
             }
+            .disabled(exportTask != nil)
+            .accessibilityHint(
+                "Create a protected temporary copy for sharing"
+            )
             .accessibilityIdentifier("shareBlockedWorkingCopy")
 
             Button {
-                Task { await loadPreflight() }
+                retryPreflight()
             } label: {
                 Label("Check this PDF again", systemImage: "arrow.clockwise")
             }
+            .disabled(
+                preflightTask != nil
+                    || preflightReviewTask != nil
+                    || exportTask != nil
+                    || model.isProcessing(recordID)
+            )
             .accessibilityIdentifier("retryDeliveryPreflight")
         }
     }
 
-    private func loadPreflight() async {
-        preflight = nil
-        preflightError = nil
-        do {
-            preflight = try await model.deliveryPreflight(
-                recordID: recordID
-            )
-        } catch is CancellationError {
+    private var currentContentRevisionID: UUID? {
+        model.record(id: recordID)?.contentRevisionID
+    }
+
+    private var currentPreflight: PDFDeliveryPreflightAssessment? {
+        guard preflightRevisionID == currentContentRevisionID else {
+            return nil
+        }
+        return preflight
+    }
+
+    private func startPreflightIfNeeded(
+        force: Bool = false
+    ) {
+        guard activeFocus == .safeShare,
+              preflightTask == nil,
+              let revisionID = currentContentRevisionID,
+              model.record(id: recordID)?
+                .hasCurrentDeliveryReceipt != true
+        else { return }
+        if !force, currentPreflight != nil {
             return
-        } catch {
-            if let paperError = error as? PaperPathError,
-               case .lockedPDF = paperError {
-                preflightError =
-                    "Unlock this PDF and create an editable private copy first."
-            } else {
-                preflightError =
-                    "PaperPath could not reopen every page. The working copy was not changed."
+        }
+        preflightPaused = false
+        preflight = nil
+        preflightRevisionID = nil
+        preflightError = nil
+        let generation = UUID()
+        preflightGeneration = generation
+        preflightTask = Task { @MainActor in
+            defer {
+                if preflightGeneration == generation {
+                    preflightTask = nil
+                }
+            }
+            do {
+                if let record = model.record(id: recordID),
+                   record.taskCheckpoint?.stage != .verify
+                    || record.taskCheckpoint?.contentRevisionID
+                        != revisionID {
+                    let checkpointSaved =
+                        await model.updateTaskCheckpoint(
+                            recordID: recordID,
+                            checkpoint: DocumentTaskCheckpoint(
+                                stage: .verify,
+                                contentRevisionID: revisionID
+                            ),
+                            presentsFeedback: false
+                        )
+                    guard !Task.isCancelled,
+                          preflightGeneration == generation,
+                          currentContentRevisionID == revisionID
+                    else { return }
+                    if !checkpointSaved {
+                        model[noticeFor: paperPathSceneID] =
+                            "Resume point could not be saved"
+                                .localizedUI
+                    }
+                }
+                let assessment = try await model.withFeedbackTarget(
+                    paperPathSceneID
+                ) {
+                    try await model.deliveryPreflight(
+                        recordID: recordID
+                    )
+                }
+                guard !Task.isCancelled,
+                      preflightGeneration == generation,
+                      currentContentRevisionID == revisionID
+                else { return }
+                preflight = assessment
+                preflightRevisionID = revisionID
+                preflightSuccessFeedback += 1
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled,
+                      preflightGeneration == generation,
+                      currentContentRevisionID == revisionID
+                else { return }
+                if let paperError = error as? PaperPathError,
+                   case .lockedPDF = paperError {
+                    preflightError =
+                        "Unlock this PDF and create an editable private copy first."
+                } else {
+                    preflightError =
+                        "PaperPath could not reopen every page. The working copy was not changed."
+                }
+                preflightErrorFeedback += 1
             }
         }
+    }
+
+    private func retryPreflight() {
+        cancelPreflightTask()
+        preflightPaused = false
+        startPreflightIfNeeded(force: true)
+    }
+
+    private func openPreflightReview(
+        _ item: PDFDeliveryPreflightItem
+    ) {
+        beginPreflightHandoff(item) {
+            pageIndex,
+            checkpointSaved in
+            onReviewPage(pageIndex, checkpointSaved)
+        }
+    }
+
+    private func openPreflightRepair(
+        _ item: PDFDeliveryPreflightItem,
+        action: PDFDeliveryPreflightRepairAction
+    ) {
+        guard item.reviewPageIndex != nil else {
+            beginPreflightHandoffWithoutPage(item) {
+                onRepairPreflightItem(action, nil, true)
+            }
+            return
+        }
+        beginPreflightHandoff(item) {
+            pageIndex,
+            checkpointSaved in
+            onRepairPreflightItem(
+                action,
+                pageIndex,
+                checkpointSaved
+            )
+        }
+    }
+
+    private func beginPreflightHandoffWithoutPage(
+        _ item: PDFDeliveryPreflightItem,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        guard preflightReviewTask == nil,
+              let revisionID = currentContentRevisionID
+        else { return }
+        let generation = UUID()
+        preflightReviewGeneration = generation
+        openingPreflightItemID = item.id
+        preflightReviewTask = Task { @MainActor in
+            defer {
+                if preflightReviewGeneration == generation {
+                    preflightReviewTask = nil
+                    openingPreflightItemID = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  preflightReviewGeneration == generation,
+                  currentContentRevisionID == revisionID
+            else { return }
+            completion()
+        }
+    }
+
+    private func beginPreflightHandoff(
+        _ item: PDFDeliveryPreflightItem,
+        completion: @escaping @MainActor (Int, Bool) -> Void
+    ) {
+        guard preflightReviewTask == nil,
+              let pageIndex = item.reviewPageIndex,
+              let revisionID = currentContentRevisionID
+        else { return }
+
+        let generation = UUID()
+        preflightReviewGeneration = generation
+        openingPreflightItemID = item.id
+        preflightReviewTask = Task { @MainActor in
+            defer {
+                if preflightReviewGeneration == generation {
+                    preflightReviewTask = nil
+                    openingPreflightItemID = nil
+                }
+            }
+            let checkpointSaved =
+                await model.updateTaskCheckpoint(
+                    recordID: recordID,
+                    checkpoint: DocumentTaskCheckpoint(
+                        stage: .verify,
+                        pageIndex: pageIndex,
+                        fieldName: item.title.localizedUI,
+                        contentRevisionID: revisionID
+                    ),
+                    presentsFeedback: false
+                )
+            guard !Task.isCancelled,
+                  preflightReviewGeneration == generation,
+                  currentContentRevisionID == revisionID
+            else { return }
+            if !checkpointSaved {
+                preflightReviewErrorFeedback += 1
+            }
+            completion(pageIndex, checkpointSaved)
+        }
+    }
+
+    private func stopPreflightReviewHandoff(
+        showNotice: Bool = true
+    ) {
+        guard preflightReviewTask != nil else { return }
+        preflightReviewGeneration = UUID()
+        preflightReviewTask?.cancel()
+        preflightReviewTask = nil
+        openingPreflightItemID = nil
+        if showNotice {
+            model[noticeFor: paperPathSceneID] =
+                "Opening issue action stopped".localizedUI
+        }
+    }
+
+    private func stopPreflight(
+        showNotice: Bool = true
+    ) {
+        guard preflightTask != nil else { return }
+        cancelPreflightTask()
+        preflight = nil
+        preflightRevisionID = nil
+        preflightError = nil
+        preflightPaused = true
+        if showNotice {
+            model[noticeFor: paperPathSceneID] = "PDF check stopped".localizedUI
+        }
+    }
+
+    private func invalidatePreflight() {
+        stopPreflightReviewHandoff(showNotice: false)
+        cancelPreflightTask()
+        preflight = nil
+        preflightRevisionID = nil
+        preflightError = nil
+        preflightPaused = false
+    }
+
+    private func cancelPreflightTask() {
+        preflightGeneration = UUID()
+        preflightTask?.cancel()
+        preflightTask = nil
     }
 
     private func preflightColor(
@@ -4382,7 +7924,9 @@ struct DocumentExportSheet: View {
                     Text(detail.localizedUI)
                         .font(.caption2)
                         .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout ? 3 : 1
+                        )
                 }
                 Spacer(minLength: PPSpacing.small)
                 if let badge {
@@ -4408,6 +7952,8 @@ struct DocumentExportSheet: View {
         .disabled(
             model.isProcessing(recordID)
                 || exportTask != nil
+                || isPreparedOutputTransitionActive
+                || temporaryOfficeResultURL != nil
         )
     }
 
@@ -4415,89 +7961,29 @@ struct DocumentExportSheet: View {
         _ record: DocumentRecord,
         portfolio: PDFOfficeExportPortfolio
     ) -> some View {
-        let recommended = portfolio.recommendedPlan
-        let alternatives = portfolio.plans.filter {
-            $0.format != recommended?.format
-        }
         let canReconstruct = !portfolio.isProtected
 
-        return VStack(alignment: .leading, spacing: PPSpacing.small) {
-            if let recommended {
-                SectionEyebrow(text: "BEST MATCH")
-                Button {
-                    startTextExport(recommended.format)
-                } label: {
-                    HStack(spacing: PPSpacing.medium) {
-                        ToolSymbolPlate(
-                            symbol: recommended.format.symbol,
-                            tint: officeReadinessColor(
-                                recommended.readiness
-                            ),
-                            size: 44
-                        )
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(
-                                AppLocalization.format(
-                                    "Export to %@",
-                                    recommended.format.title.localizedUI
-                                )
-                            )
-                            .font(.headline)
-                            .fontDesign(.serif)
-                            .foregroundStyle(PPColor.textPrimary)
-                            Text(
-                                officePurposeLine(recommended.format)
-                                    .localizedUI
-                            )
-                            .font(.caption)
-                            .foregroundStyle(PPColor.textSecondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        }
-                        Spacer(minLength: PPSpacing.small)
-                        Image(systemName: "arrow.right")
-                            .font(.caption.weight(.bold))
-                            .foregroundStyle(
-                                officeReadinessColor(
-                                    recommended.readiness
-                                )
-                            )
-                    }
-                    .padding(.vertical, PPSpacing.small)
-                    .padding(.horizontal, PPSpacing.small)
-                    .frame(minHeight: 66)
-                    .overlay(alignment: .leading) {
-                        Rectangle()
-                            .fill(
-                                officeReadinessColor(
-                                    recommended.readiness
-                                )
-                            )
-                            .frame(width: 3)
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(
-                    !canReconstruct
-                        || model.isProcessing(recordID)
-                        || exportTask != nil
-                )
-                .accessibilityHint(
-                    officeCompatibilityLine(recommended.format)
-                        .localizedUI
-                )
-                .accessibilityIdentifier("recommendedOfficeExport")
-
-                Label(
-                    officeCompatibilityLine(recommended.format)
-                        .localizedUI,
-                    systemImage: "checkmark.shield"
-                )
-                .font(.caption2)
+        return VStack(alignment: .leading, spacing: PPSpacing.medium) {
+            officePageScope(record)
+            Text("Output format".localizedUI)
+                .font(.headline)
+                .accessibilityAddTraits(.isHeader)
+            ForEach(portfolio.plans) { plan in
+                officeFormatSelection(plan, recommended: portfolio.recommendedPlan?.format == plan.format)
+            }
+            Text(officeCompatibilityLine(selectedOfficeFormat).localizedUI)
+                .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if let limit = selectedOfficeFormat.officePageLimit,
+               !usesOfficePageRange,
+               record.profile.pageCount > limit,
+               let batch = model.officeBatchPlan(recordID: recordID, format: selectedOfficeFormat) {
+                Label(batch.summary.localizedUI, systemImage: "square.stack.3d.down.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(PPColor.amber)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-
             if !canReconstruct {
                 Label(
                     "This PDF blocks editable reconstruction. Open an unlocked private copy before converting."
@@ -4509,48 +7995,16 @@ struct DocumentExportSheet: View {
                 .foregroundStyle(PPColor.amber)
                 .fixedSize(horizontal: false, vertical: true)
                 .padding(.vertical, PPSpacing.xSmall)
-            }
-
-            Button {
-                withAnimation(
-                    reduceMotion ? nil : .snappy(duration: 0.2)
-                ) {
-                    showsOtherOfficeFormats.toggle()
+                Button {
+                    onCreated(DocumentRoute(
+                        recordID: record.id,
+                        expectedContentRevisionID: record.contentRevisionID
+                    ))
+                } label: {
+                    Label("Open source PDF", systemImage: "lock.open")
+                        .frame(minHeight: 44)
                 }
-            } label: {
-                HStack {
-                    Label(
-                        showsOtherOfficeFormats
-                            ? "Hide other Office formats"
-                            : "Choose another Office format",
-                        systemImage: "square.grid.2x2"
-                    )
-                    Spacer()
-                    Image(
-                        systemName: showsOtherOfficeFormats
-                            ? "chevron.up"
-                            : "chevron.down"
-                    )
-                }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(PPColor.textSecondary)
-                .frame(minHeight: 40)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-
-            if showsOtherOfficeFormats {
-                VStack(spacing: 0) {
-                    ForEach(alternatives) { plan in
-                        officeAlternativeChoice(
-                            plan,
-                            canReconstruct: canReconstruct
-                        )
-                    }
-                }
-                .transition(
-                    .move(edge: .top).combined(with: .opacity)
-                )
+                .buttonStyle(.bordered)
             }
 
             Button {
@@ -4576,7 +8030,7 @@ struct DocumentExportSheet: View {
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
-                .frame(minHeight: 40)
+                .frame(minHeight: 44)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -4585,13 +8039,67 @@ struct DocumentExportSheet: View {
             )
         }
         .padding(.vertical, PPSpacing.xSmall)
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel(
-            AppLocalization.format(
-                "Office format guidance for %@",
-                record.displayName
+        .onAppear {
+            guard !didChooseOfficeFormat else { return }
+            selectedOfficeFormat = portfolio.recommendedPlan?.format ?? .wordDocument
+            didChooseOfficeFormat = true
+        }
+    }
+
+    private func officePageScope(_ record: DocumentRecord) -> some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            Toggle("Convert a page range".localizedUI, isOn: $usesOfficePageRange)
+                .font(.subheadline.weight(.semibold))
+            if usesOfficePageRange {
+                HStack(spacing: PPSpacing.regular) {
+                    VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                        Text("First page".localizedUI).font(.caption)
+                        TextField("First page".localizedUI, value: $officeFirstPage, format: .number.grouping(.never))
+                            .accessibilityIdentifier("officeFirstPage")
+                    }
+                    VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                        Text("Last page".localizedUI).font(.caption)
+                        TextField("Last page".localizedUI, value: $officeLastPage, format: .number.grouping(.never))
+                            .accessibilityIdentifier("officeLastPage")
+                    }
+                }
+                .keyboardType(.numberPad)
+                .textFieldStyle(.roundedBorder)
+                if let error = officePageRangeError(record, format: selectedOfficeFormat) {
+                    Label(error, systemImage: "exclamationmark.circle")
+                        .font(.caption)
+                        .foregroundStyle(PPColor.amber)
+                } else {
+                    Text(AppLocalization.format(
+                        "%lld pages selected", officeLastPage - officeFirstPage + 1
+                    ))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                }
+            } else {
+                Text(AppLocalization.format("All pages (%lld)", record.profile.pageCount))
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+        }
+        .disabled(exportTask != nil || temporaryOfficeResultURL != nil)
+    }
+
+    private func officePageRangeError(
+        _ record: DocumentRecord, format: PDFTextExportFormat
+    ) -> String? {
+        guard usesOfficePageRange else { return nil }
+        guard officeFirstPage >= 1, officeFirstPage <= officeLastPage,
+              officeLastPage <= record.profile.pageCount
+        else {
+            return AppLocalization.format(
+                "Choose a range between page 1 and %lld.", record.profile.pageCount
             )
-        )
+        }
+        if let limit = format.officePageLimit, officeLastPage - officeFirstPage + 1 > limit {
+            return AppLocalization.format("Select up to %lld pages for this format.", limit)
+        }
+        return nil
     }
 
     private func officeAlternativeChoice(
@@ -4599,7 +8107,9 @@ struct DocumentExportSheet: View {
         canReconstruct: Bool
     ) -> some View {
         Button {
-            startTextExport(plan.format)
+            selectedOfficeFormat = plan.format
+            didChooseOfficeFormat = true
+            activeFocus = .text
         } label: {
             HStack(spacing: PPSpacing.small) {
                 Image(systemName: plan.format.symbol)
@@ -4636,6 +8146,7 @@ struct DocumentExportSheet: View {
             !canReconstruct
                 || model.isProcessing(recordID)
                 || exportTask != nil
+                || temporaryOfficeResultURL != nil
         )
         .accessibilityHint(
             officeCompatibilityLine(plan.format).localizedUI
@@ -4788,8 +8299,13 @@ struct DocumentExportSheet: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                         Text(
-                            "\(plan.decisionRole) · \(plan.compactEvidence) · \(portfolio.productionSLA.window)"
-                                .localizedUI
+                            AppLocalization.format(
+                                "%@ · %@ · %@",
+                                plan.decisionRole.localizedUI,
+                                plan.compactEvidence,
+                                portfolio.productionSLA.window
+                                    .localizedUI
+                            )
                         )
                         .font(.caption2)
                         .foregroundStyle(PPColor.textSecondary)
@@ -4937,7 +8453,11 @@ struct DocumentExportSheet: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(portfolio.embeddedAuditSummary). \(portfolio.outputBoundaryLine)"
+            AppLocalization.format(
+                "%@. %@",
+                portfolio.embeddedAuditSummary,
+                portfolio.outputBoundaryLine
+            )
         )
     }
 
@@ -5017,7 +8537,10 @@ struct DocumentExportSheet: View {
                 .foregroundStyle(tint)
                 Text(
                     plan.fallbackFormat.map {
-                        "Fallback \($0.fileExtension.uppercased())"
+                        AppLocalization.format(
+                            "Fallback %@",
+                            $0.fileExtension.uppercased()
+                        )
                     } ?? plan.riskEvidence
                 )
                 .font(.caption2)
@@ -5208,7 +8731,6 @@ struct DocumentExportSheet: View {
             if let targetFormat = action.targetFormat {
                 startTextExport(targetFormat)
             } else if let targetQuickTask = action.targetQuickTask {
-                dismiss()
                 onCreated(
                     DocumentRoute(
                         recordID: recordID,
@@ -5216,7 +8738,6 @@ struct DocumentExportSheet: View {
                     )
                 )
             } else if action.id == "ocr" {
-                dismiss()
                 onCreated(
                     DocumentRoute(
                         recordID: recordID,
@@ -5224,7 +8745,7 @@ struct DocumentExportSheet: View {
                     )
                 )
             } else {
-                model.noticeMessage = action.detail
+                model[noticeFor: paperPathSceneID] = action.detail
             }
         } label: {
             HStack(spacing: 7) {
@@ -5289,7 +8810,12 @@ struct DocumentExportSheet: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: PPSpacing.small) {
-                    Text("Building \(format.fileExtension.uppercased())".localizedUI)
+                    Text(
+                        AppLocalization.format(
+                            "Building %@",
+                            format.fileExtension.uppercased()
+                        )
+                    )
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                     if let progress {
@@ -5359,7 +8885,10 @@ struct DocumentExportSheet: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Preparing \(format.title) on device"
+            AppLocalization.format(
+                "Preparing %@ on device",
+                format.title.localizedUI
+            )
         )
     }
 
@@ -5424,8 +8953,11 @@ struct DocumentExportSheet: View {
         let tint = failure.kind == .verification
             ? Color.red
             : PPColor.amber
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.small))
+            : AnyLayout(HStackLayout(alignment: .top, spacing: PPSpacing.small))
 
-        return HStack(alignment: .top, spacing: PPSpacing.small) {
+        return layout {
             Image(systemName: failure.kind.symbol)
                 .font(.caption.weight(.bold))
                 .foregroundStyle(tint)
@@ -5438,7 +8970,7 @@ struct DocumentExportSheet: View {
                 Text(failure.detail.localizedUI)
                 .font(.caption2)
                 .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
                 Text(
                     AppLocalization.format(
                         "%@ · source unchanged · %@ pages",
@@ -5457,7 +8989,7 @@ struct DocumentExportSheet: View {
                         startTextExport(format)
                     } label: {
                         Image(systemName: "arrow.clockwise")
-                            .frame(width: 28, height: 28)
+                            .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.borderless)
                     .accessibilityLabel(
@@ -5473,7 +9005,7 @@ struct DocumentExportSheet: View {
                                 ? "rectangle.split.3x1"
                                 : "text.viewfinder"
                         )
-                        .frame(width: 28, height: 28)
+                        .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.borderless)
                     .accessibilityLabel(
@@ -5481,6 +9013,7 @@ struct DocumentExportSheet: View {
                     )
                 }
             }
+            .disabled(exportTask != nil || model.isProcessing(recordID))
         }
         .padding(.vertical, 5)
         .overlay(alignment: .leading) {
@@ -5678,25 +9211,38 @@ struct DocumentExportSheet: View {
         _ signals: [PDFOfficePreflightSignal],
         summary: String
     ) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: PPSpacing.medium) {
-                ForEach(signals) { signal in
-                    officePreflightToken(signal)
-                }
-            }
-            VStack(alignment: .leading, spacing: PPSpacing.small) {
-                HStack(spacing: PPSpacing.medium) {
-                    ForEach(
-                        Array(signals.prefix(2))
-                    ) { signal in
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
+                    ForEach(signals) { signal in
                         officePreflightToken(signal)
                     }
                 }
-                HStack(spacing: PPSpacing.medium) {
-                    ForEach(
-                        Array(signals.dropFirst(2))
-                    ) { signal in
-                        officePreflightToken(signal)
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.medium) {
+                        ForEach(signals) { signal in
+                            officePreflightToken(signal)
+                        }
+                    }
+                    VStack(alignment: .leading, spacing: PPSpacing.small) {
+                        HStack(spacing: PPSpacing.medium) {
+                            ForEach(
+                                Array(signals.prefix(2))
+                            ) { signal in
+                                officePreflightToken(signal)
+                            }
+                        }
+                        HStack(spacing: PPSpacing.medium) {
+                            ForEach(
+                                Array(signals.dropFirst(2))
+                            ) { signal in
+                                officePreflightToken(signal)
+                            }
+                        }
                     }
                 }
             }
@@ -5704,7 +9250,10 @@ struct DocumentExportSheet: View {
         .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Office preflight \(summary)"
+            AppLocalization.format(
+                "Office preflight %@",
+                summary.localizedUI
+            )
         )
     }
 
@@ -5721,78 +9270,40 @@ struct DocumentExportSheet: View {
                     .font(.caption2.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(signal.title.localizedUI)
                     .font(.caption2.smallCaps())
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .frame(minWidth: 86, alignment: .leading)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                ? nil
+                : 86,
+            maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                ? .infinity
+                : nil,
+            alignment: .leading
+        )
         .help(signal.detail.localizedUI)
     }
 
     private func officeBudgetStrip(
         _ plan: PDFOfficeVisualBudgetPlan
     ) -> some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: PPSpacing.medium) {
-                officeBudgetToken(
-                    "MODE",
-                    value: plan.mode.title,
-                    symbol: plan.mode.symbol,
-                    tint: PPColor.accent
-                )
-                officeBudgetToken(
-                    "PAGE",
-                    value: plan.formattedPerPageBudget,
-                    symbol: "doc.badge.gearshape",
-                    tint: PPColor.cyan
-                )
-                officeBudgetToken(
-                    "LADDER",
-                    value: plan.compressionLadderSummary,
-                    symbol: "slider.horizontal.below.rectangle",
-                    tint: PPColor.mint
-                )
-                officeBudgetToken(
-                    "PRESSURE",
-                    value: plan.budgetPressure.title,
-                    symbol: plan.budgetPressure.symbol,
-                    tint: officeBudgetPressureColor(plan.budgetPressure)
-                )
-                officeBudgetToken(
-                    "ANCHOR",
-                    value: plan.anchorPolicy.title,
-                    symbol: plan.anchorPolicy.symbol,
-                    tint: PPColor.accent
-                )
-                officeBudgetToken(
-                    "WINDOW",
-                    value: plan.reserveWindowSummary,
-                    symbol: "rectangle.stack.badge.plus",
-                    tint: PPColor.cyan
-                )
-                officeBudgetToken(
-                    "VISUAL",
-                    value: "\(plan.estimatedVisualReferencePages)",
-                    symbol: "photo.stack",
-                    tint: plan.estimatedVisualReferencePages == 0
-                        ? PPColor.textSecondary
-                        : PPColor.amber
-                )
-                officeBudgetToken(
-                    "PACKAGE",
-                    value: plan.chunkSummary,
-                    symbol: "shippingbox",
-                    tint: plan.chunkCount <= 1
-                        ? PPColor.mint
-                        : PPColor.amber
-                )
-            }
-            VStack(alignment: .leading, spacing: PPSpacing.small) {
-                HStack(spacing: PPSpacing.medium) {
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
                     officeBudgetToken(
                         "MODE",
                         value: plan.mode.title,
@@ -5805,8 +9316,6 @@ struct DocumentExportSheet: View {
                         symbol: "doc.badge.gearshape",
                         tint: PPColor.cyan
                     )
-                }
-                HStack(spacing: PPSpacing.medium) {
                     officeBudgetToken(
                         "LADDER",
                         value: plan.compressionLadderSummary,
@@ -5821,8 +9330,6 @@ struct DocumentExportSheet: View {
                             plan.budgetPressure
                         )
                     )
-                }
-                HStack(spacing: PPSpacing.medium) {
                     officeBudgetToken(
                         "ANCHOR",
                         value: plan.anchorPolicy.title,
@@ -5835,8 +9342,6 @@ struct DocumentExportSheet: View {
                         symbol: "rectangle.stack.badge.plus",
                         tint: PPColor.cyan
                     )
-                }
-                HStack(spacing: PPSpacing.medium) {
                     officeBudgetToken(
                         "VISUAL",
                         value: "\(plan.estimatedVisualReferencePages)",
@@ -5854,12 +9359,146 @@ struct DocumentExportSheet: View {
                             : PPColor.amber
                     )
                 }
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.medium) {
+                        officeBudgetToken(
+                            "MODE",
+                            value: plan.mode.title,
+                            symbol: plan.mode.symbol,
+                            tint: PPColor.accent
+                        )
+                        officeBudgetToken(
+                            "PAGE",
+                            value: plan.formattedPerPageBudget,
+                            symbol: "doc.badge.gearshape",
+                            tint: PPColor.cyan
+                        )
+                        officeBudgetToken(
+                            "LADDER",
+                            value: plan.compressionLadderSummary,
+                            symbol: "slider.horizontal.below.rectangle",
+                            tint: PPColor.mint
+                        )
+                        officeBudgetToken(
+                            "PRESSURE",
+                            value: plan.budgetPressure.title,
+                            symbol: plan.budgetPressure.symbol,
+                            tint: officeBudgetPressureColor(
+                                plan.budgetPressure
+                            )
+                        )
+                        officeBudgetToken(
+                            "ANCHOR",
+                            value: plan.anchorPolicy.title,
+                            symbol: plan.anchorPolicy.symbol,
+                            tint: PPColor.accent
+                        )
+                        officeBudgetToken(
+                            "WINDOW",
+                            value: plan.reserveWindowSummary,
+                            symbol: "rectangle.stack.badge.plus",
+                            tint: PPColor.cyan
+                        )
+                        officeBudgetToken(
+                            "VISUAL",
+                            value: "\(plan.estimatedVisualReferencePages)",
+                            symbol: "photo.stack",
+                            tint: plan.estimatedVisualReferencePages == 0
+                                ? PPColor.textSecondary
+                                : PPColor.amber
+                        )
+                        officeBudgetToken(
+                            "PACKAGE",
+                            value: plan.chunkSummary,
+                            symbol: "shippingbox",
+                            tint: plan.chunkCount <= 1
+                                ? PPColor.mint
+                                : PPColor.amber
+                        )
+                    }
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    ) {
+                        HStack(spacing: PPSpacing.medium) {
+                            officeBudgetToken(
+                                "MODE",
+                                value: plan.mode.title,
+                                symbol: plan.mode.symbol,
+                                tint: PPColor.accent
+                            )
+                            officeBudgetToken(
+                                "PAGE",
+                                value: plan.formattedPerPageBudget,
+                                symbol: "doc.badge.gearshape",
+                                tint: PPColor.cyan
+                            )
+                        }
+                        HStack(spacing: PPSpacing.medium) {
+                            officeBudgetToken(
+                                "LADDER",
+                                value: plan.compressionLadderSummary,
+                                symbol:
+                                    "slider.horizontal.below.rectangle",
+                                tint: PPColor.mint
+                            )
+                            officeBudgetToken(
+                                "PRESSURE",
+                                value: plan.budgetPressure.title,
+                                symbol: plan.budgetPressure.symbol,
+                                tint: officeBudgetPressureColor(
+                                    plan.budgetPressure
+                                )
+                            )
+                        }
+                        HStack(spacing: PPSpacing.medium) {
+                            officeBudgetToken(
+                                "ANCHOR",
+                                value: plan.anchorPolicy.title,
+                                symbol: plan.anchorPolicy.symbol,
+                                tint: PPColor.accent
+                            )
+                            officeBudgetToken(
+                                "WINDOW",
+                                value: plan.reserveWindowSummary,
+                                symbol: "rectangle.stack.badge.plus",
+                                tint: PPColor.cyan
+                            )
+                        }
+                        HStack(spacing: PPSpacing.medium) {
+                            officeBudgetToken(
+                                "VISUAL",
+                                value:
+                                    "\(plan.estimatedVisualReferencePages)",
+                                symbol: "photo.stack",
+                                tint:
+                                    plan.estimatedVisualReferencePages == 0
+                                        ? PPColor.textSecondary
+                                        : PPColor.amber
+                            )
+                            officeBudgetToken(
+                                "PACKAGE",
+                                value: plan.chunkSummary,
+                                symbol: "shippingbox",
+                                tint: plan.chunkCount <= 1
+                                    ? PPColor.mint
+                                    : PPColor.amber
+                            )
+                        }
+                    }
+                }
             }
         }
         .padding(.vertical, 3)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "Office visual budget \(plan.mode.title), \(plan.anchorPolicy.title), \(plan.formattedPerPageBudget) per visual reference"
+            AppLocalization.format(
+                "Office visual budget %@, %@, %@ per visual reference",
+                plan.mode.title.localizedUI,
+                plan.anchorPolicy.title.localizedUI,
+                plan.formattedPerPageBudget
+            )
         )
     }
 
@@ -5879,14 +9518,28 @@ struct DocumentExportSheet: View {
                     .font(.caption2.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(label.localizedUI)
                     .font(.caption2.smallCaps())
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .frame(minWidth: 82, alignment: .leading)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                ? nil
+                : 82,
+            maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                ? .infinity
+                : nil,
+            alignment: .leading
+        )
     }
 
     private func officeBudgetPressureColor(
@@ -5950,7 +9603,10 @@ struct DocumentExportSheet: View {
                         .opacity(0.1),
                     in: Circle()
                 )
-                .symbolEffect(.bounce, value: officeReceiptFeedback)
+                .symbolEffect(
+                    .bounce,
+                    value: reduceMotion ? 0 : officeReceiptFeedback
+                )
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: PPSpacing.small) {
                     Text(receipt.fileName.localizedUI)
@@ -5988,8 +9644,12 @@ struct DocumentExportSheet: View {
                 }
                 if let evidence = receipt.runtimeEvidence {
                     Text(
-                        "\(evidence.yieldSummary) · \(evidence.primaryUnitCount) \(evidence.primaryUnitLabel)"
-                            .localizedUI
+                        AppLocalization.format(
+                            "%@ · %lld %@",
+                            evidence.yieldSummary,
+                            evidence.primaryUnitCount,
+                            evidence.primaryUnitLabel.localizedUI
+                        )
                     )
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(PPColor.textSecondary)
@@ -6102,7 +9762,12 @@ struct DocumentExportSheet: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            "Office export \(receipt.format.title), \(receipt.receiptSummary), \(receipt.embeddedEvidenceLabel)"
+            AppLocalization.format(
+                "Office export %@, %@, %@",
+                receipt.format.title.localizedUI,
+                receipt.receiptSummary.localizedUI,
+                receipt.embeddedEvidenceLabel.localizedUI
+            )
         )
     }
 
@@ -6216,7 +9881,12 @@ struct DocumentExportSheet: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            "Recent Office export \(receipt.format.title), \(receipt.receiptSummary), \(receipt.embeddedEvidenceLabel)"
+            AppLocalization.format(
+                "Recent Office export %@, %@, %@",
+                receipt.format.title.localizedUI,
+                receipt.receiptSummary.localizedUI,
+                receipt.embeddedEvidenceLabel.localizedUI
+            )
         )
     }
 
@@ -6226,10 +9896,17 @@ struct DocumentExportSheet: View {
     ) -> some View {
         Menu {
             Button {
+                shareRetainedOfficeExport(receipt, previewing: true)
+            } label: {
+                Label("Preview output", systemImage: "doc.text.magnifyingglass")
+            }
+            .disabled(availability != .reusable)
+
+            Button {
                 inspectedOfficeReceipt = receipt
             } label: {
                 Label(
-                    "Inspect production evidence",
+                    "View conversion checks",
                     systemImage: "checklist.checked"
                 )
             }
@@ -6277,22 +9954,30 @@ struct DocumentExportSheet: View {
                             : PPColor.textSecondary
                     )
             )
-            .frame(width: 30, height: 30)
+            .frame(width: 44, height: 44)
         }
         .buttonStyle(.borderless)
-        .disabled(exportTask != nil)
+        .disabled(
+            exportTask != nil
+                || officeGovernanceTask != nil
+        )
         .accessibilityLabel("Office output actions".localizedUI)
     }
 
     private func toggleOfficeExportPinned(
         _ receipt: PDFOfficeExportReceipt
     ) {
-        Task {
+        guard officeGovernanceTask == nil else { return }
+        officeGovernanceTask = Task { @MainActor in
+            defer {
+                officeGovernanceTask = nil
+            }
             await model.setOfficeExportPinned(
                 recordID: recordID,
                 receiptID: receipt.id,
                 pinned: !receipt.isPinned
             )
+            guard !Task.isCancelled else { return }
             if officeReceipt?.id == receipt.id {
                 officeReceipt = model.record(id: recordID)?
                     .officeReceipts
@@ -6324,25 +10009,57 @@ struct DocumentExportSheet: View {
         _ format: PDFTextExportFormat
     ) {
         guard exportTask == nil,
-              !model.isProcessing(recordID)
+              !model.isProcessing(recordID),
+              temporaryOfficeResultURL == nil,
+              let revision = currentContentRevisionID
         else { return }
+        selectedOfficeFormat = format
+        didChooseOfficeFormat = true
+        officeResultNotice = nil
         selectedBatchRetrySegmentIDs = []
         isShowingAllOfficeBatchSegments = false
         officeFailure = nil
         officeReceipt = nil
-        exportTask = Task {
-            exportLabel = "\(format.title.lowercased()) batch"
-            activeOfficeFormat = format
+        let generation = beginExport(
+            label: "\(format.title.lowercased()) batch",
+            officeFormat: format
+        )
+        exportTask = Task { @MainActor in
             defer {
-                exportTask = nil
-                exportLabel = nil
-                activeOfficeFormat = nil
+                finishExport(generation)
             }
             do {
+#if DEBUG
+                let usesUITestCancellationWindow =
+                    ProcessInfo.processInfo.arguments.contains(
+                        "UITEST_OFFICE_SOAK_DEMO"
+                    )
+
+                // #region debug-point H:office-export-started
+                reportFrequentUIFreezeDebugEvent(
+                    hypothesisID: "H",
+                    location: "DocumentOutputView.startOfficeBatch",
+                    message: "Office export task started",
+                    data: [
+                        "format": format.rawValue,
+                        "usesUITestCancellationWindow": String(
+                            usesUITestCancellationWindow
+                        )
+                    ]
+                )
+                // #endregion
+
+                if usesUITestCancellationWindow {
+                    try await Task.sleep(for: .seconds(20))
+                }
+#endif
+
                 guard let run = try await model.makeOfficeBatch(
                     recordID: recordID,
-                    format: format
+                    format: format,
+                    expectedSourceRevisionID: revision
                 ) else {
+                    guard exportIsCurrent(generation) else { return }
                     officeFailure = PDFOfficeExportFailure(
                         format: format,
                         kind: .unknown,
@@ -6350,6 +10067,13 @@ struct DocumentExportSheet: View {
                             "This PDF is no longer available for segmented export."
                     )
                     officeFailureFeedback += 1
+                    return
+                }
+                guard exportIsCurrent(generation) else {
+                    if exportGeneration == generation, scenePhase == .active {
+                        officeReceipt = model.record(id: recordID)?.officeReceipts.first { $0.batchID == run.id }
+                        officeResultNotice = "Conversion stopped. Completed parts remain in local history."
+                    }
                     return
                 }
                 if run.completedCount > 0 {
@@ -6369,8 +10093,24 @@ struct DocumentExportSheet: View {
                     officeFailureFeedback += 1
                 }
             } catch is CancellationError {
+#if DEBUG
+                // #region debug-point H:office-export-cancelled
+                reportFrequentUIFreezeDebugEvent(
+                    hypothesisID: "H",
+                    location: "DocumentOutputView.startOfficeBatch",
+                    message: "Office export task cancelled",
+                    data: [
+                        "format": format.rawValue,
+                        "generationIsCurrent": String(
+                            exportGeneration == generation
+                        )
+                    ]
+                )
+                // #endregion
+#endif
                 return
             } catch {
+                guard exportIsCurrent(generation) else { return }
                 officeFailure = .classify(
                     format: format,
                     error: error
@@ -6393,24 +10133,27 @@ struct DocumentExportSheet: View {
         guard !targetIDs.isEmpty else { return }
 
         officeFailure = nil
-        exportTask = Task {
-            exportLabel = AppLocalization.format(
+        let generation = beginExport(
+            label: AppLocalization.format(
                 "retrying %lld Office part%@",
                 targetIDs.count,
                 targetIDs.count == 1 ? "" : "s"
-            )
-            activeOfficeFormat = run.plan.format
+            ),
+            officeFormat: run.plan.format
+        )
+        exportTask = Task { @MainActor in
             defer {
-                exportTask = nil
-                exportLabel = nil
-                activeOfficeFormat = nil
-                selectedBatchRetrySegmentIDs = []
+                if exportGeneration == generation {
+                    selectedBatchRetrySegmentIDs = []
+                }
+                finishExport(generation)
             }
             do {
                 guard let result = try await model.resumeOfficeBatch(
                     recordID: recordID,
                     selectedSegmentIDs: targetIDs
                 ) else {
+                    guard exportIsCurrent(generation) else { return }
                     officeFailure = PDFOfficeExportFailure(
                         format: run.plan.format,
                         kind: .sourceChanged,
@@ -6420,6 +10163,7 @@ struct DocumentExportSheet: View {
                     officeFailureFeedback += 1
                     return
                 }
+                guard exportIsCurrent(generation) else { return }
                 if result.completedCount > 0 {
                     officeReceipt = model.record(id: recordID)?
                         .officeReceipts
@@ -6429,6 +10173,7 @@ struct DocumentExportSheet: View {
             } catch is CancellationError {
                 return
             } catch {
+                guard exportIsCurrent(generation) else { return }
                 officeFailure = .classify(
                     format: run.plan.format,
                     error: error
@@ -6444,8 +10189,19 @@ struct DocumentExportSheet: View {
         guard exportTask == nil,
               !model.isProcessing(recordID)
         else { return }
-        exportTask = Task {
-            defer { exportTask = nil }
+        let officeGeneration = beginOfficeSharePreparation(
+            label: "Verifying protected Office files"
+        )
+        let taskGeneration = beginExport(
+            label: "protected Office files"
+        )
+        exportTask = Task { @MainActor in
+            defer {
+                finishExport(taskGeneration)
+                finishOfficeSharePreparation(
+                    generation: officeGeneration
+                )
+            }
             let receiptIDs = Set(
                 run.segments.compactMap(\.receiptID)
             )
@@ -6456,31 +10212,68 @@ struct DocumentExportSheet: View {
                     ($0.batchSegmentIndex ?? 0)
                         < ($1.batchSegmentIndex ?? 0)
                 } ?? []
-            var urls: [URL] = []
-            for receipt in receipts {
-                guard !Task.isCancelled else { return }
-                if let url = await model.reusableOfficeExportURL(
-                    recordID: recordID,
-                    receipt: receipt
-                ) {
-                    urls.append(url)
-                }
-            }
-            guard !urls.isEmpty else {
+            guard receipts.count == run.completedCount else {
+                guard exportIsCurrent(taskGeneration) else { return }
                 officeFailure = .unavailableArtifact(
                     format: run.plan.format
                 )
                 officeFailureFeedback += 1
                 return
             }
-            if urls.count < run.completedCount {
-                model.noticeMessage = AppLocalization.format(
-                    "%lld of %lld retained parts are available",
-                    urls.count,
-                    run.completedCount
+            let receiptCount = receipts.count
+            let urls = await model
+                .prepareReusableOfficeExportShareCopies(
+                recordID: recordID,
+                receiptIDs: receipts.map(\.id)
+            ) { update in
+                guard officeShareGeneration == officeGeneration else {
+                    return
+                }
+                let completedFiles = min(
+                    receiptCount,
+                    update.completedUnitCount / 3
+                )
+                let visibleIndex = min(
+                    receiptCount,
+                    completedFiles
+                        + (completedFiles < receiptCount ? 1 : 0)
+                )
+                publishOfficeShareProgress(
+                    update,
+                    label: AppLocalization.format(
+                        "Verifying Office file %lld of %lld",
+                        visibleIndex,
+                        receiptCount
+                    ),
+                    generation: officeGeneration
                 )
             }
-            share(urls)
+            guard officeShareGeneration == officeGeneration,
+                  exportIsCurrent(taskGeneration)
+            else {
+                if let urls {
+                    await model.discardTemporaryExportCopies(
+                        at: urls
+                    )
+                }
+                return
+            }
+            guard let urls,
+                  !urls.isEmpty
+            else {
+                if let urls {
+                    await model.discardTemporaryExportCopies(
+                        at: urls
+                    )
+                }
+                guard exportIsCurrent(taskGeneration) else { return }
+                officeFailure = .unavailableArtifact(
+                    format: run.plan.format
+                )
+                officeFailureFeedback += 1
+                return
+            }
+            share(urls, temporaryURLs: urls)
         }
     }
 
@@ -6490,21 +10283,33 @@ struct DocumentExportSheet: View {
         guard exportTask == nil,
               !model.isProcessing(recordID)
         else { return }
-        exportTask = Task {
-            exportLabel = "batch ZIP"
+        let generation = beginExport(label: "signed batch ZIP")
+        exportTask = Task { @MainActor in
             defer {
-                exportTask = nil
-                exportLabel = nil
+                finishExport(generation)
             }
             do {
-                let archive = try await model.makeOfficeBatchArchive(
+                let delivery = try await model.makeOfficeBatchArchive(
                     recordID: recordID,
                     batchID: run.id
                 )
-                share([archive], temporaryURLs: [archive])
+                guard exportIsCurrent(generation) else {
+                    await model.discardTemporaryExportCopies(
+                        at: [delivery.archive, delivery.report]
+                    )
+                    return
+                }
+                share(
+                    [delivery.archive, delivery.report],
+                    temporaryURLs: [
+                        delivery.archive,
+                        delivery.report
+                    ]
+                )
             } catch is CancellationError {
                 return
             } catch {
+                guard exportIsCurrent(generation) else { return }
                 officeFailure = .classify(
                     format: run.plan.format,
                     error: error
@@ -6653,9 +10458,9 @@ struct DocumentExportSheet: View {
                         .foregroundStyle(PPColor.accent)
                         .frame(
                             maxWidth: .infinity,
+                            minHeight: 44,
                             alignment: .leading
                         )
-                        .padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
                 } else if isShowingAllOfficeBatchSegments,
@@ -6671,9 +10476,9 @@ struct DocumentExportSheet: View {
                         .foregroundStyle(PPColor.accent)
                         .frame(
                             maxWidth: .infinity,
+                            minHeight: 44,
                             alignment: .leading
                         )
-                        .padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
                 }
@@ -6704,13 +10509,13 @@ struct DocumentExportSheet: View {
                         .disabled(exportTask != nil)
                     } else {
                         Button {
-                            shareOfficeBatch(run)
+                            shareOfficeBatchArchive(run)
                         } label: {
                             Label(
                                 run.completedCount == run.segments.count
-                                    ? "Share all parts"
-                                    : "Share completed parts",
-                                systemImage: "square.and.arrow.up"
+                                    ? "Signed ZIP"
+                                    : "Signed partial ZIP",
+                                systemImage: "checkmark.shield"
                             )
                         }
                         .buttonStyle(.borderedProminent)
@@ -6718,6 +10523,10 @@ struct DocumentExportSheet: View {
                         .disabled(
                             run.completedCount == 0
                                 || exportTask != nil
+                        )
+                        .accessibilityHint(
+                            "Shares a ZIP plus an independently verifiable Ed25519 report."
+                                .localizedUI
                         )
                     }
 
@@ -6730,40 +10539,42 @@ struct DocumentExportSheet: View {
                                 systemImage: "doc.on.doc"
                             )
                         }
-                        Button {
-                            shareOfficeBatchArchive(run)
-                        } label: {
-                            Label(
-                                "Share one ZIP",
-                                systemImage: "archivebox"
-                            )
-                        }
                     } label: {
-                        Label(
-                            "Deliver",
-                            systemImage: "square.and.arrow.up"
-                        )
+                        Image(systemName: "ellipsis.circle")
+                            .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.bordered)
                     .disabled(
                         run.completedCount == 0
                             || exportTask != nil
                     )
+                    .accessibilityLabel("More delivery options")
+                    .accessibilityHint(
+                        "Shares verified Office files without the signed ZIP wrapper."
+                            .localizedUI
+                    )
 
                     Spacer(minLength: 0)
 
                     if run.isFinished {
                         Button {
-                            Task {
-                                await model.clearFinishedOfficeBatch(
-                                    recordID: recordID
-                                )
-                            }
+                            clearFinishedOfficeBatch()
                         } label: {
-                            Image(systemName: "xmark")
-                                .frame(width: 28, height: 28)
+                            Group {
+                                if officeGovernanceTask != nil {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else {
+                                    Image(systemName: "xmark")
+                                }
+                            }
+                            .frame(width: 44, height: 44)
                         }
                         .buttonStyle(.borderless)
+                        .disabled(
+                            exportTask != nil
+                                || officeGovernanceTask != nil
+                        )
                         .accessibilityLabel(
                             "Dismiss batch summary".localizedUI
                         )
@@ -6779,8 +10590,27 @@ struct DocumentExportSheet: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            "\(run.status.title), \(run.completedCount) of \(run.segments.count) parts ready"
+            AppLocalization.format(
+                "%@, %lld of %lld parts ready",
+                run.status.title.localizedUI,
+                run.completedCount,
+                run.segments.count
+            )
         )
+    }
+
+    private func clearFinishedOfficeBatch() {
+        guard officeGovernanceTask == nil,
+              exportTask == nil
+        else { return }
+        officeGovernanceTask = Task { @MainActor in
+            defer {
+                officeGovernanceTask = nil
+            }
+            await model.clearFinishedOfficeBatch(
+                recordID: recordID
+            )
+        }
     }
 
     private func officeBatchSegmentRow(
@@ -6855,7 +10685,7 @@ struct DocumentExportSheet: View {
                     .foregroundStyle(tint)
                 }
             }
-            .frame(minHeight: 28)
+            .frame(minHeight: 44)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -7052,8 +10882,11 @@ struct DocumentExportSheet: View {
                         }
                         if let plan {
                             Text(
-                                "\(plan.riskEvidence) · \(plan.compactEvidence)"
-                                    .localizedUI
+                                AppLocalization.format(
+                                    "%@ · %@",
+                                    plan.riskEvidence.localizedUI,
+                                    plan.compactEvidence
+                                )
                             )
                             .font(.caption2)
                             .foregroundStyle(PPColor.textSecondary)
@@ -7218,37 +11051,54 @@ struct DocumentExportSheet: View {
         _ format: PDFTextExportFormat
     ) {
         guard exportTask == nil,
-              !model.isProcessing(recordID)
+              !model.isProcessing(recordID),
+              temporaryOfficeResultURL == nil,
+              let record = model.record(id: recordID)
         else { return }
-        let profile = model.record(id: recordID)?.profile ?? .empty
-        if format.officePageLimit.map({
+        let profile = record.profile
+        let revision = record.contentRevisionID
+        let usesRange = format.isOfficeFormat && usesOfficePageRange
+        if usesRange, let error = officePageRangeError(record, format: format) {
+            officeResultNotice = error
+            return
+        }
+        let pageRange = usesRange ? (officeFirstPage - 1)...(officeLastPage - 1) : nil
+        if !usesRange, format.officePageLimit.map({
             profile.pageCount > $0
         }) == true {
             startOfficeBatch(format)
             return
         }
-        let portfolio = PDFOfficeExportPortfolio(profile: profile)
-        let plan = portfolio.plan(for: format)
-        let budgetPlan = portfolio.visualBudgetPlan
-        exportTask = Task {
-            exportLabel = format.title.lowercased()
-            activeOfficeFormat = format.isOfficeFormat
+        selectedOfficeFormat = format
+        didChooseOfficeFormat = true
+        officeResultNotice = nil
+        let taskGeneration = beginExport(
+            label: format.title.lowercased(),
+            officeFormat: format.isOfficeFormat
                 ? format
                 : nil
+        )
+        exportTask = Task { @MainActor in
             if format.isOfficeFormat {
                 officeReceipt = nil
                 officeFailure = nil
             }
             defer {
-                exportTask = nil
-                exportLabel = nil
-                activeOfficeFormat = nil
+                finishExport(taskGeneration)
             }
             do {
                 let artifact = try await model.makeTextExport(
                     recordID: recordID,
-                    format: format
+                    format: format,
+                    expectedContentRevisionID: revision,
+                    pageRange: pageRange
                 )
+                guard exportIsCurrent(taskGeneration) else {
+                    await model.discardTemporaryExportCopies(
+                        at: [artifact.url]
+                    )
+                    return
+                }
                 guard format.isOfficeFormat else {
                     share(
                         [artifact.url],
@@ -7261,41 +11111,70 @@ struct DocumentExportSheet: View {
                         forKeys: [.fileSizeKey]
                     ).fileSize
                 ) ?? 0
-                let receipt = PDFOfficeExportReceipt(
+                let exportStem = record.displayName
+                    .components(separatedBy: CharacterSet(charactersIn: "/\\:"))
+                    .joined(separator: "-")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ". ")
+                        .union(.whitespacesAndNewlines))
+                let portfolio = PDFOfficeExportPortfolio(profile: artifact.sourceProfile)
+                let plan = portfolio.plan(for: format)
+                let budgetPlan = portfolio.visualBudgetPlan
+                let rangeSuffix = pageRange.map { "-pages-\($0.lowerBound + 1)-\($0.upperBound + 1)" } ?? ""
+                var receipt = PDFOfficeExportReceipt(
                     format: format,
-                    fileName: artifact.url.lastPathComponent,
+                    fileName: "\(String((exportStem.isEmpty ? "Document" : exportStem).prefix(60)))\(rangeSuffix).\(format.fileExtension)",
                     fileSizeBytes: Int64(size),
                     plan: plan,
                     budgetPlan: budgetPlan,
                     portfolio: portfolio,
                     runtimeEvidence: artifact.runtimeEvidence
                 )
+                receipt.sourceRevisionID = revision
+                receipt.sourcePageStartIndex = pageRange?.lowerBound
+                receipt.sourcePageEndIndex = pageRange?.upperBound
                 let retained = await model.retainOfficeExport(
                     recordID: recordID,
                     receipt: receipt,
-                    sourceURL: artifact.url
+                    sourceURL: artifact.url,
+                    expectedContentRevisionID: revision
                 )
+                guard exportIsCurrent(taskGeneration) else {
+                    if retained == nil {
+                        await model.discardTemporaryExportCopies(
+                            at: [artifact.url]
+                        )
+                    } else if exportGeneration == taskGeneration,
+                              scenePhase == .active {
+                        officeReceipt = retained?.receipt
+                        officeResultNotice = "A completed output was kept in local history."
+                    }
+                    return
+                }
                 officeReceipt = retained?.receipt ?? receipt
                 officeReceiptFeedback += 1
-                if let retained {
-                    share([retained.url])
-                } else {
-                    share(
-                        [artifact.url],
-                        temporaryURLs: [artifact.url]
-                    )
+                if retained == nil {
+                    temporaryOfficeResultURL = artifact.url
+                    officeResultNotice = currentContentRevisionID == revision
+                        ? "The output is still available here. Free local storage, retry saving, or share it before closing."
+                        : "The source PDF changed. This output belongs to the earlier revision."
                 }
             } catch is CancellationError {
+                if exportGeneration == taskGeneration, scenePhase == .active {
+                    officeResultNotice = "Conversion stopped. The source PDF is unchanged."
+                }
                 return
             } catch {
-                guard !Task.isCancelled else { return }
+                guard exportIsCurrent(taskGeneration) else { return }
                 if format.isOfficeFormat {
                     officeFailure = .classify(
                         format: format,
                         error: error
                     )
                 } else {
-                    model.errorMessage = error.localizedDescription
+                    model.presentErrorMessage(
+                        AppLocalization.userFacingErrorDescription(error),
+                        in: paperPathSceneID
+                    )
                 }
                 officeFailureFeedback += 1
             }
@@ -7303,23 +11182,61 @@ struct DocumentExportSheet: View {
     }
 
     private func shareRetainedOfficeExport(
-        _ receipt: PDFOfficeExportReceipt
+        _ receipt: PDFOfficeExportReceipt,
+        previewing: Bool = false
     ) {
         guard exportTask == nil,
-              !model.isProcessing(recordID)
+              !model.isProcessing(recordID),
+              temporaryOfficeResultURL == nil
         else { return }
-        exportTask = Task {
-            defer { exportTask = nil }
-            if let url = await model.reusableOfficeExportURL(
+        let officeGeneration = beginOfficeSharePreparation(
+            label: "Verifying protected Office copy"
+        )
+        let taskGeneration = beginExport(
+            label: "protected Office copy"
+        )
+        exportTask = Task { @MainActor in
+            defer {
+                finishExport(taskGeneration)
+                finishOfficeSharePreparation(
+                    generation: officeGeneration
+                )
+            }
+            let url = await model
+                .prepareReusableOfficeExportShareCopy(
                 recordID: recordID,
-                receipt: receipt
-            ) {
-                share([url])
-            } else if !Task.isCancelled {
+                receiptID: receipt.id
+            ) { update in
+                publishOfficeShareProgress(
+                    update,
+                    label: "Verifying protected Office copy",
+                    generation: officeGeneration
+                )
+            }
+            guard officeShareGeneration == officeGeneration,
+                  exportIsCurrent(taskGeneration)
+            else {
+                if let url {
+                    await model.discardTemporaryExportCopies(
+                        at: [url]
+                    )
+                }
+                return
+            }
+            guard let url else {
+                guard exportIsCurrent(taskGeneration) else { return }
                 officeFailure = .unavailableArtifact(
                     format: receipt.format
                 )
                 officeFailureFeedback += 1
+                return
+            }
+            if previewing {
+                cleanupOfficePreview()
+                officePreviewCopyURL = url
+                officePreviewFile = OfficePreviewFile(url: url)
+            } else {
+                share([url], temporaryURLs: [url])
             }
         }
     }
@@ -7328,11 +11245,11 @@ struct DocumentExportSheet: View {
         _ quickTask: PDFQuickTask
     ) {
         officeFailure = nil
-        dismiss()
         onCreated(
             DocumentRoute(
                 recordID: recordID,
-                quickTask: quickTask
+                quickTask: quickTask,
+                expectedContentRevisionID: currentContentRevisionID
             )
         )
     }
@@ -7350,48 +11267,560 @@ struct DocumentExportSheet: View {
 
     private func share(
         _ items: [Any],
-        temporaryURLs: [URL] = []
+        temporaryURLs: [URL] = [],
+        preservesTemporaryResult: Bool = false
     ) {
         cleanupTemporaryExports()
         shareItems = items
+        preservesSharedTemporaryResult = preservesTemporaryResult
         temporaryShareURLs = temporaryURLs
         isSharing = true
     }
 
     private func cleanupTemporaryExports() {
-        let fileManager = FileManager.default
-        let temporaryRoot = fileManager.temporaryDirectory
-            .standardizedFileURL.path
-        let directories = Set(
-            temporaryShareURLs.compactMap { url -> URL? in
-                let standardized = url.standardizedFileURL
-                guard standardized.path.hasPrefix(temporaryRoot) else {
-                    return nil
-                }
-                let parent = standardized.deletingLastPathComponent()
-                let name = parent.lastPathComponent
-                return name.hasPrefix("PaperPath-Images-")
-                    || name.hasPrefix("PaperPath-EmbeddedImages-")
-                    || name.hasPrefix("PaperPath-Office-Batch-")
-                    || name.hasPrefix("PaperPath-Office-Export-")
-                    ? parent
-                    : nil
-            }
-        )
-        for url in temporaryShareURLs {
-            let standardized = url.standardizedFileURL
-            guard standardized.path.hasPrefix(temporaryRoot),
-                  !directories.contains(
-                    standardized.deletingLastPathComponent()
-                  )
-            else { continue }
-            try? fileManager.removeItem(at: standardized)
-        }
-        for directory in directories {
-            try? fileManager.removeItem(at: directory)
-        }
+        let urls = temporaryShareURLs
         temporaryShareURLs = []
         shareItems = []
+        guard !urls.isEmpty else { return }
+        Task {
+            await model.discardTemporaryExportCopies(at: urls)
+        }
+    }
+
+    private func beginOfficeSharePreparation(
+        label: String
+    ) -> UUID {
+        let generation = UUID()
+        officeShareGeneration = generation
+        officeShareRateWindow.reset()
+        officeShareProgress = PDFOperationProgress(
+            label: label,
+            fractionCompleted: 0,
+            byteStage: .checksumming
+        )
+        return generation
+    }
+
+    private func publishOfficeShareProgress(
+        _ update: PDFByteProgressUpdate,
+        label: String,
+        generation: UUID
+    ) {
+        guard officeShareGeneration == generation else { return }
+        if let progress = officeShareRateWindow.operationProgress(
+            label: label,
+            update: update,
+            current: officeShareProgress
+        ) {
+            officeShareProgress = progress
+        }
+    }
+
+    private func finishOfficeSharePreparation(
+        generation: UUID
+    ) {
+        guard officeShareGeneration == generation else { return }
+        officeShareGeneration = UUID()
+        officeShareProgress = nil
+        officeShareRateWindow.reset()
+    }
+
+    private func preparePDFShare(
+        recordID targetRecordID: UUID,
+        label: String
+    ) {
+        guard exportTask == nil else { return }
+        let pdfGeneration = UUID()
+        pdfShareGeneration = pdfGeneration
+        let taskGeneration = beginExport(label: label)
+        exportTask = Task { @MainActor in
+            pdfShareRateWindow.reset()
+            pdfShareProgress = PDFOperationProgress(
+                label: "Verifying protected share copy",
+                fractionCompleted: 0,
+                byteStage: .checksumming
+            )
+            defer {
+                finishExport(taskGeneration)
+                if pdfShareGeneration == pdfGeneration {
+                    pdfShareProgress = nil
+                    pdfShareRateWindow.reset()
+                }
+            }
+            let preparedURL = await model.makeFilesExportCopy(
+                recordID: targetRecordID
+            ) { update in
+                guard pdfShareGeneration == pdfGeneration else {
+                    return
+                }
+                if let progress = pdfShareRateWindow.operationProgress(
+                    label: "Verifying protected share copy",
+                    update: update,
+                    current: pdfShareProgress
+                ) {
+                    pdfShareProgress = progress
+                }
+            }
+            guard let url = preparedURL else { return }
+            guard exportIsCurrent(taskGeneration),
+                  pdfShareGeneration == pdfGeneration
+            else {
+                await model.discardFilesExportCopy(at: url)
+                return
+            }
+            share([url], temporaryURLs: [url])
+        }
+    }
+
+    private func beginExport(
+        label: String,
+        officeFormat: PDFTextExportFormat? = nil
+    ) -> UUID {
+        let generation = UUID()
+        exportGeneration = generation
+        exportLabel = label
+        activeOfficeFormat = officeFormat
+        exportStopRequested = false
+        return generation
+    }
+
+    private func exportIsCurrent(_ generation: UUID) -> Bool {
+        exportGeneration == generation
+            && !Task.isCancelled
+            && scenePhase == .active
+            && UIApplication.shared.isProtectedDataAvailable
+    }
+
+    private func finishExport(_ generation: UUID) {
+        guard exportGeneration == generation else { return }
+        exportTask = nil
+        exportLabel = nil
+        activeOfficeFormat = nil
+        exportStopRequested = false
+    }
+
+    private func stopExportPreparation(
+        invalidateResult: Bool = false
+    ) {
+#if DEBUG
+        // #region debug-point H:office-export-stop
+        reportFrequentUIFreezeDebugEvent(
+            hypothesisID: "H",
+            location: "DocumentOutputView.stopExportPreparation",
+            message: "Office export stop requested",
+            data: [
+                "hasExportTask": String(exportTask != nil),
+                "activeOfficeFormat":
+                    activeOfficeFormat?.rawValue ?? "nil"
+            ]
+        )
+        // #endregion
+#endif
+
+        guard exportTask != nil else { return }
+        if invalidateResult {
+            exportGeneration = UUID()
+            exportStopRequested = false
+        } else {
+            guard !exportStopRequested else { return }
+            exportStopRequested = true
+        }
+        exportTask?.cancel()
+        if invalidateResult {
+            pdfShareGeneration = UUID()
+            pdfShareProgress = nil
+            pdfShareRateWindow.reset()
+            officeShareGeneration = UUID()
+            officeShareProgress = nil
+            officeShareRateWindow.reset()
+            exportTask = nil
+            exportLabel = nil
+            activeOfficeFormat = nil
+        }
+    }
+}
+
+private struct OfficePreviewFile: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct OfficeExportPresentationSizing: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 18.0, *) {
+            content.presentationSizing(.page)
+        } else {
+            content
+        }
+    }
+}
+
+private struct OfficeOutputPreview: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    let file: OfficePreviewFile
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if QLPreviewController.canPreview(file.url as NSURL) {
+                    OfficeQuickLookController(url: file.url)
+                } else {
+                    ContentUnavailableView(
+                        "Preview unavailable".localizedUI,
+                        systemImage: "doc.questionmark",
+                        description: Text("The saved output is still available to share.".localizedUI)
+                    )
+                }
+            }
+            .navigationTitle("Preview output".localizedUI)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Close".localizedUI) { dismiss() }
+                }
+            }
+            .overlay {
+                if scenePhase != .active {
+                    PPColor.canvas.ignoresSafeArea()
+                }
+            }
+        }
+        .privacySensitive()
+        .modifier(OfficeExportPresentationSizing())
+    }
+}
+
+private struct OfficeQuickLookController: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator(url: url) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ controller: QLPreviewController, context: Context) {}
+
+    final class Coordinator: NSObject, QLPreviewControllerDataSource {
+        let url: URL
+        init(url: URL) { self.url = url }
+
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+
+        func previewController(
+            _ controller: QLPreviewController, previewItemAt index: Int
+        ) -> QLPreviewItem {
+            url as NSURL
+        }
+    }
+}
+
+private struct OfficeInlineOutputPreview: View {
+    @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @AppStorage("privacy.hideLibraryPreviews") private var hidesPreviews = false
+    @State private var previewURL: URL?
+    @State private var loading = false
+    @State private var protectedDataAvailable = UIApplication.shared.isProtectedDataAvailable
+    @State private var retry = 0
+
+    let recordID: UUID
+    let revisionID: UUID
+    let receipt: PDFOfficeExportReceipt
+    let onOpen: () -> Void
+
+    private var permitsPreview: Bool {
+        !hidesPreviews && scenePhase == .active && protectedDataAvailable
+    }
+
+    private var permitsAutomaticPreview: Bool {
+        receipt.fileSizeBytes > 0 && receipt.fileSizeBytes <= 32 * 1_024 * 1_024
+    }
+
+    private var previewStatus: String {
+        if hidesPreviews { return "Preview hidden" }
+        if !permitsAutomaticPreview { return "Open full preview" }
+        if loading { return "Preparing preview" }
+        if previewURL != nil && permitsPreview { return "Output preview ready" }
+        return "Preview unavailable"
+    }
+
+    private var identity: String {
+        "\(receipt.id)-\(revisionID)-\(permitsPreview)-\(retry)"
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                PPColor.documentStage
+                if permitsPreview, let previewURL {
+                    OfficeQuickLookController(url: previewURL)
+                        .id(previewURL)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                } else {
+                    VStack(spacing: PPSpacing.small) {
+                        if loading && permitsPreview {
+                            ProgressView()
+                            Text("Preparing preview".localizedUI)
+                        } else {
+                            Image(systemName: hidesPreviews ? "eye.slash" : receipt.format.symbol)
+                                .font(.system(size: 28, weight: .regular))
+                            Text(previewStatus.localizedUI)
+                        }
+                    }
+                    .font(PPType.metadata)
+                    .foregroundStyle(PPColor.textSecondary)
+                }
+            }
+            .frame(height: dynamicTypeSize.isAccessibilitySize ? 150 : 210)
+            .clipped()
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Preview output".localizedUI)
+            .accessibilityValue(
+                previewStatus.localizedUI
+            )
+            .accessibilityIdentifier("officeOutputPreview")
+            HStack {
+                Label("Output preview".localizedUI, systemImage: "doc.viewfinder")
+                    .font(PPType.metadata)
+                    .foregroundStyle(PPColor.textSecondary)
+                Spacer()
+                if previewURL == nil, permitsPreview, permitsAutomaticPreview, !loading {
+                    Button { retry += 1 } label: {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 18))
+                            .frame(width: 44, height: 44)
+                    }
+                    .accessibilityLabel("Retry preview".localizedUI)
+                }
+                Button(action: onOpen) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                        .font(.system(size: 18))
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(loading || !permitsPreview)
+                .accessibilityLabel("Preview output".localizedUI)
+                .accessibilityIdentifier("officeOpenOutputPreview")
+            }
+            .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+        }
+        .task(id: identity) { await loadPreview() }
+        .onDisappear { clear() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { clear() }
+        }
+        .onChange(of: revisionID) { _, _ in clear() }
+        .onChange(of: hidesPreviews) { _, hidden in
+            if hidden { clear() }
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.protectedDataWillBecomeUnavailableNotification
+        )) { _ in
+            protectedDataAvailable = false
+            clear()
+        }
+        .onReceive(NotificationCenter.default.publisher(
+            for: UIApplication.protectedDataDidBecomeAvailableNotification
+        )) { _ in protectedDataAvailable = true }
+        .privacySensitive()
+    }
+
+    private func clear() {
+        if let previewURL {
+            Task { await model.discardTemporaryExportCopies(at: [previewURL]) }
+        }
+        previewURL = nil
+        loading = false
+    }
+
+    @MainActor
+    private func loadPreview() async {
+        clear()
+        let generation = identity
+        guard permitsPreview, permitsAutomaticPreview,
+              model.record(id: recordID)?.contentRevisionID == revisionID
+        else { return }
+        loading = true
+        guard let url = await model.prepareReusableOfficeExportShareCopy(
+            recordID: recordID, receiptID: receipt.id
+        ) else {
+            if identity == generation { loading = false }
+            return
+        }
+        guard !Task.isCancelled, permitsPreview, identity == generation else {
+            await model.discardTemporaryExportCopies(at: [url])
+            return
+        }
+        if !Task.isCancelled, permitsPreview, identity == generation,
+           model.record(id: recordID)?.contentRevisionID == revisionID,
+           QLPreviewController.canPreview(url as NSURL) {
+            previewURL = url
+            loading = false
+            return
+        }
+        if identity == generation { loading = false }
+        await model.discardTemporaryExportCopies(at: [url])
+    }
+}
+
+private struct OfficeNoticeDisclosureStyle: DisclosureGroupStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+#if DEBUG
+                // #region debug-point A:ipad-notice-hit
+                if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "A", "msg": "[DEBUG] Notice action", "data": ["expanded": configuration.isExpanded]]); URLSession.shared.dataTask(with: request).resume() }
+                // #endregion
+#endif
+                withAnimation(reduceMotion ? nil : PPMotion.selection) {
+                    configuration.isExpanded.toggle()
+                }
+            } label: {
+                HStack(spacing: PPSpacing.small) {
+                    configuration.label.frame(maxWidth: .infinity, alignment: .leading)
+                    Image(systemName: configuration.isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(PPColor.textSecondary)
+                        .frame(width: 24)
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityValue((configuration.isExpanded ? "Expanded" : "Collapsed").localizedUI)
+#if DEBUG
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.task {
+                        // #region debug-point C:ipad-notice-hit-geometry
+                        if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "C", "msg": "[DEBUG] Button geometry", "data": ["frame": "\(geometry.frame(in: .global))"]]); URLSession.shared.dataTask(with: request).resume() }
+                        // #endregion
+                    }
+                }
+            }
+#endif
+            if configuration.isExpanded {
+                configuration.content
+            }
+        }
+#if DEBUG
+        .task {
+            // #region debug-point A:ipad-notice-hit-probe
+            if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) {
+                for _ in 0..<8 {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first(where: \.isKeyWindow)
+                    let hit = window?.hitTest(CGPoint(x: 417, y: 540), with: nil)
+                    var chain: [String] = []
+                    var view = hit
+                    while let current = view { chain.append("\(type(of: current)) \(current.frame) interactive=\(current.isUserInteractionEnabled) gestures=\((current.gestureRecognizers ?? []).map { "\(type(of: $0)):\($0.state.rawValue):\($0.isEnabled)" })"); view = current.superview }
+                    var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "F", "msg": "[DEBUG] Hit-test probe", "data": ["chain": chain, "expanded": configuration.isExpanded, "phase": "\(scenePhase)", "enabled": isEnabled, "protected": UIApplication.shared.isProtectedDataAvailable]]); URLSession.shared.dataTask(with: request).resume()
+                }
+            }
+            // #endregion
+        }
+        .onChange(of: configuration.isExpanded) { _, expanded in
+            // #region debug-point B:ipad-notice-hit
+            if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "B", "msg": "[DEBUG] Notice state", "data": ["expanded": expanded]]); URLSession.shared.dataTask(with: request).resume() }
+            // #endregion
+        }
+#endif
+    }
+}
+
+private struct OfficeContentNoticesView: View {
+    let receipt: PDFOfficeExportReceipt
+    var compact = false
+
+    private func summary(_ notice: PDFOfficeContentNotice) -> String {
+        switch notice.kind {
+        case .wordReconstruction: return "Numbering and page layout need review"
+        case .spreadsheetTextOnly: return "Charts, images and conditional formatting not included"
+        case .slideImages: return "Page images, not editable slide objects"
+        case .pagesWithoutText: return "Pages without extracted text"
+        case .missingVisualReferences: return "Page reference images not included"
+        case .inferredTableLayout: return "Table positions need review"
+        }
+    }
+
+    private func details(_ notice: PDFOfficeContentNotice) -> some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            Text(notice.kind.detail.localizedUI)
+                .font(PPType.metadata)
+                .foregroundStyle(PPColor.textSecondary)
+            if let pages = notice.pageSummary(offset: receipt.sourcePageStartIndex ?? 0) {
+                Text(pages)
+                    .font(PPType.measure)
+                    .foregroundStyle(PPColor.textPrimary)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("officeNotice-\(notice.id)")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            ForEach(receipt.contentNotices) { notice in
+                if compact {
+                    DisclosureGroup {
+                        details(notice).padding(.vertical, PPSpacing.small)
+                    } label: {
+                        HStack(alignment: .firstTextBaseline, spacing: PPSpacing.small) {
+                            Image(systemName: "exclamationmark.circle")
+                                .font(.system(size: 16))
+                                .foregroundStyle(PPColor.amber)
+                            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                                Text(summary(notice).localizedUI)
+                                    .font(.subheadline)
+                                    .foregroundStyle(PPColor.textPrimary)
+                                    .multilineTextAlignment(.leading)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                if !notice.pageIndices.isEmpty {
+                                    Text(AppLocalization.format("%lld source pages", notice.pageIndices.count))
+                                        .font(PPType.measure)
+                                        .foregroundStyle(PPColor.textSecondary)
+                                }
+                            }
+                        }
+                        .frame(minHeight: 44)
+                    }
+                    .tint(PPColor.textSecondary)
+                    .disclosureGroupStyle(OfficeNoticeDisclosureStyle())
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("officeNoticeDetails-\(notice.id)")
+                    Divider()
+                } else {
+                VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                    Label(notice.kind.title.localizedUI, systemImage: "exclamationmark.triangle")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PPColor.amber)
+                    Text(notice.kind.detail.localizedUI)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                    if let pages = notice.pageSummary(offset: receipt.sourcePageStartIndex ?? 0) {
+                        Text(pages)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(PPColor.textPrimary)
+                    }
+                }
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("officeNotice-\(notice.id)")
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
     }
 }
 
@@ -7405,23 +11834,11 @@ private struct OfficeEvidenceInspectorView: View {
     var body: some View {
         NavigationStack {
             List {
-                WorkflowCommandHeader(
-                    eyebrow: "OFFICE PRODUCTION AUDIT V31",
-                    title: receipt.format.title,
-                    detail: receipt.routeSummary,
-                    symbol: receipt.routeConfidence.symbol,
-                    tint: confidenceColor,
-                    metrics: headerMetrics
-                )
-                .listRowInsets(
-                    EdgeInsets(
-                        top: PPSpacing.small,
-                        leading: PPSpacing.regular,
-                        bottom: PPSpacing.small,
-                        trailing: PPSpacing.regular
-                    )
-                )
-                .listRowBackground(Color.clear)
+                if !receipt.contentNotices.isEmpty {
+                    Section("Review converted content".localizedUI) {
+                        OfficeContentNoticesView(receipt: receipt)
+                    }
+                }
 
                 if let evidence = receipt.runtimeEvidence {
                     Section("Runtime yield") {
@@ -7540,11 +11957,12 @@ private struct OfficeEvidenceInspectorView: View {
             }
             .scrollContentBackground(.hidden)
             .background(PPColor.canvas)
-            .navigationTitle("Production evidence")
+            .navigationTitle("Conversion details".localizedUI)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Close") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
             }
         }
@@ -7595,7 +12013,7 @@ private struct OfficeEvidenceInspectorView: View {
     ) -> some View {
         let columns = Array(
             repeating: GridItem(.flexible(), spacing: PPSpacing.small),
-            count: dynamicTypeSize.isAccessibilitySize ? 1 : 3
+            count: dynamicTypeSize.ppPrefersExpandedLayout ? 1 : 3
         )
         return LazyVGrid(
             columns: columns,
@@ -7650,7 +12068,7 @@ private struct OfficeEvidenceInspectorView: View {
     ) -> some View {
         let columns = Array(
             repeating: GridItem(.flexible(), spacing: PPSpacing.small),
-            count: dynamicTypeSize.isAccessibilitySize ? 1 : 3
+            count: dynamicTypeSize.ppPrefersExpandedLayout ? 1 : 3
         )
         return LazyVGrid(
             columns: columns,
@@ -7838,25 +12256,55 @@ struct BatchSafeShareView: View {
     }
 
     @EnvironmentObject private var model: PaperPathModel
+    @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
+    @AppStorage("privacy.hideLibraryPreviews") private var hideLibraryPreviews = false
 
+    var initialRecordIDs: Set<UUID>? = nil
     let onOpenDocument: (DocumentRoute) -> Void
 
     @State private var selectedIDs = Set<UUID>()
     @State private var items: [UUID: PDFBatchDeliveryItem] = [:]
     @State private var phase: Phase = .selecting
     @State private var batchTask: Task<Void, Never>?
+    @State private var batchGeneration = UUID()
     @State private var isSharing = false
+    @State private var preparedShareURLs: [URL] = []
+    @State private var batchShareTask: Task<Void, Never>?
+    @State private var batchShareGeneration = UUID()
+    @State private var batchShareProgress: PDFOperationProgress?
+    @State private var batchShareRateWindow = ByteRateWindow()
+    @State private var batchShareFeedback = 0
+    @State private var batchShareErrorFeedback = 0
     @State private var didInitialize = false
     @State private var wasStopped = false
+    @State private var batchStopRequested = false
+    @State private var dismissesAfterBatchStop = false
     @State private var batchRunID = UUID()
     @State private var batchStartedAt = Date()
+    @State private var batchSourceRevisionIDs: [UUID: UUID] = [:]
     @State private var batchPersistenceTask: Task<Void, Never>?
+    @State private var batchPersistenceGeneration = UUID()
     @State private var resultFilter: ResultFilter = .all
     @State private var selectedIssueItem: PDFBatchDeliveryItem?
+    @State private var pendingIssueRoute: DocumentRoute?
+    @State private var pendingIssueRetryRecordID: UUID?
+    @State private var issueTransitionTask: Task<Void, Never>?
+    @State private var issueTransitionGeneration = UUID()
     @State private var isConfirmingStopAndClose = false
+    @State private var isPresentingUnlock = false
+    @State private var pendingBatchStartIDs: [UUID]?
+    @State private var unlockContinuationTask:
+        Task<Void, Never>?
+    @State private var searchText = ""
+    @FocusState private var isSearchFocused: Bool
+    @State private var confirmsUpdatedSources = false
+    @State private var recheckRevisions: [UUID: UUID] = [:]
+    @State private var omittedInitialCount = 0
 
     private let maximumBatchCount = 64
 
@@ -7871,9 +12319,38 @@ struct BatchSafeShareView: View {
                         spacing: PPSpacing.section
                     ) {
                         batchHeader
+                        batchSearch
+
+                        if let error = model.batchDeliveryPersistenceError {
+                            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                                Label(error, systemImage: "exclamationmark.triangle")
+                                    .font(.subheadline)
+                                    .foregroundStyle(PPColor.amber)
+                                Button {
+                                    Task { await persistBatchRun() }
+                                } label: {
+                                    Label("Retry Save".localizedUI, systemImage: "arrow.clockwise")
+                                }
+                                .buttonStyle(PPQuietButtonStyle())
+                                .disabled(phase == .processing)
+                            }
+                            .accessibilityIdentifier("batchPersistenceError")
+                        }
 
                         if phase == .selecting {
                             selectionControls
+                            if omittedInitialCount > 0 {
+                                Label(
+                                    AppLocalization.format(
+                                        "%lld selected PDFs are unavailable or exceed the 64-file limit.",
+                                        omittedInitialCount
+                                    ),
+                                    systemImage: "exclamationmark.circle"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(PPColor.amber)
+                                .accessibilityIdentifier("batchOmittedSelection")
+                            }
                         } else {
                             progressSummary
                             if phase == .finished,
@@ -7900,23 +12377,35 @@ struct BatchSafeShareView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            phase == .finished
-                                ? "Done"
-                                : "Close"
+                            batchStopRequested
+                                ? "Stopping"
+                                : batchShareTask != nil
+                                    ? "Stop"
+                                    : phase == .processing
+                                        ? "Stop"
+                                        : phase == .finished
+                                            ? "Done"
+                                            : "Close"
                         ).localizedUI
                     ) {
-                        if phase == .processing {
+                        if batchShareTask != nil {
+                            stopBatchSharePreparation()
+                        } else if phase == .processing {
                             isConfirmingStopAndClose = true
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(batchStopRequested)
+                    .accessibilityAddTraits(.updatesFrequently)
                 }
                 if phase == .finished {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("New") {
                             resetBatch()
                         }
+                        .disabled(batchShareTask != nil || model.activeBatchDeliveryRunID != nil)
                     }
                 }
             }
@@ -7924,26 +12413,74 @@ struct BatchSafeShareView: View {
         .task {
             initializeSelectionIfNeeded()
         }
+        .onChange(of: searchText) { _, value in
+            if value.count > 256 { searchText = String(value.prefix(256)) }
+        }
+        .onChange(of: selectedRecords.map(\.contentRevisionID)) { _, _ in
+            guard phase != .selecting else { return }
+            for record in selectedRecords where
+                batchSourceRevisionIDs[record.id] != record.contentRevisionID {
+                items[record.id] = .changedSource(record.id)
+            }
+        }
+        .confirmationDialog(
+            "Recheck updated PDFs?",
+            isPresented: $confirmsUpdatedSources,
+            titleVisibility: .visible
+        ) {
+            Button("Check Current Versions".localizedUI) {
+                let requested = selectedRecords.map(\.id).filter { recheckRevisions[$0] != nil }
+                for id in requested { batchSourceRevisionIDs[id] = recheckRevisions[id] }
+                recheckRevisions = [:]
+                startBatch(recordIDs: requested)
+            }
+            Button("Cancel", role: .cancel) { recheckRevisions = [:] }
+        } message: {
+            Text("The updated files will be checked again. Previous outputs remain in Results.")
+        }
         .onDisappear {
-            batchTask?.cancel()
-            batchPersistenceTask?.cancel()
+            cancelBatchUnlockContinuation()
+            cancelIssueTransition()
+            if phase == .processing {
+                stopBatchProcessing(invalidateResult: true)
+            } else {
+                persistLatestBatchSnapshot()
+            }
+            cancelBatchPersistence()
+            stopBatchSharePreparation()
+            isSharing = false
+            cleanupPreparedBatchShares()
         }
-        .sheet(isPresented: $isSharing) {
-            ShareSheet(items: shareURLs.map { $0 as Any })
+        .sheet(
+            isPresented: $isSharing,
+            onDismiss: cleanupPreparedBatchShares
+        ) {
+            ShareSheet(
+                items: preparedShareURLs.map { $0 as Any }
+            )
         }
-        .sheet(item: $selectedIssueItem) { item in
+        .sheet(
+            isPresented: $isPresentingUnlock,
+            onDismiss: completeBatchUnlock
+        ) {
+            FullUnlockView(context: .batchVerifiedOutput)
+        }
+        .sheet(
+            item: $selectedIssueItem,
+            onDismiss: completeIssueTransition
+        ) { item in
             BatchDeliveryIssueView(item: item) {
+                pendingIssueRetryRecordID = item.sourceRecordID
                 selectedIssueItem = nil
-                startBatch(recordIDs: [item.sourceRecordID])
             } onOpenSource: {
+                pendingIssueRoute = DocumentRoute(
+                    recordID: item.sourceRecordID
+                ).bindingExpectedRevision(
+                    item.issue?.code == PDFBatchDeliveryIssue.sourceChanged.code
+                        ? model.record(id: item.sourceRecordID)?.contentRevisionID
+                        : batchSourceRevisionIDs[item.sourceRecordID]
+                )
                 selectedIssueItem = nil
-                dismiss()
-                Task {
-                    try? await Task.sleep(for: .milliseconds(180))
-                    onOpenDocument(
-                        DocumentRoute(recordID: item.sourceRecordID)
-                    )
-                }
             }
             .presentationDetents([.medium, .large])
             .presentationDragIndicator(.visible)
@@ -7954,9 +12491,7 @@ struct BatchSafeShareView: View {
             titleVisibility: .visible
         ) {
             Button("Stop & Close", role: .destructive) {
-                wasStopped = true
-                batchTask?.cancel()
-                dismiss()
+                stopBatchProcessing(dismissAfterCompletion: true)
             }
             Button("Keep Working", role: .cancel) {}
         } message: {
@@ -7964,50 +12499,75 @@ struct BatchSafeShareView: View {
                 "Verified outputs stay available. Unfinished PDFs can be resumed later."
             )
         }
-        .interactiveDismissDisabled(phase == .processing)
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            searchText = ""
+            recheckRevisions = [:]
+            confirmsUpdatedSources = false
+            cancelBatchUnlockContinuation()
+            cancelIssueTransition()
+            stopBatchSharePreparation()
+            isSharing = false
+            cleanupPreparedBatchShares()
+            if self.phase == .processing {
+                stopBatchProcessing()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            searchText = ""
+            recheckRevisions = [:]
+            confirmsUpdatedSources = false
+            cancelBatchUnlockContinuation()
+            cancelIssueTransition()
+            stopBatchSharePreparation()
+            isSharing = false
+            cleanupPreparedBatchShares()
+            if phase == .processing {
+                stopBatchProcessing()
+            }
+        }
+        .interactiveDismissDisabled(
+            phase == .processing || batchShareTask != nil
+        )
         .sensoryFeedback(.success, trigger: verifiedCount)
+        .sensoryFeedback(.success, trigger: batchShareFeedback)
+        .sensoryFeedback(.error, trigger: batchShareErrorFeedback)
     }
 
     private var batchHeader: some View {
-        WorkflowCommandHeader(
-            eyebrow: "LOCAL DELIVERY QUEUE",
-            title: headerTitle,
-            detail: headerDetail,
-            symbol: phase == .finished
-                ? "checkmark.shield.fill"
-                : "checkmark.shield",
-            tint: phase == .finished
-                ? PPColor.mint
-                : PPColor.accent,
-            metrics: [
-                WorkflowMetric(
-                    value: "\(selectedIDs.count)",
-                    label: "Selected",
-                    symbol: "checkmark.circle",
-                    tint: PPColor.accent
-                ),
-                WorkflowMetric(
-                    value: "\(verifiedCount)",
-                    label: "Verified",
-                    symbol: "checkmark.seal",
-                    tint: PPColor.mint
-                ),
-                WorkflowMetric(
-                    value: "\(attentionCount + failedCount)",
-                    label: "Attention",
-                    symbol: "exclamationmark.circle",
-                    tint: attentionCount + failedCount == 0
-                        ? PPColor.textSecondary
-                        : PPColor.amber
-                )
-            ]
-        )
+        HStack(alignment: .top, spacing: PPSpacing.medium) {
+            ToolSymbolPlate(
+                symbol: phase == .finished ? "checkmark.shield" : "doc.on.doc",
+                tint: attentionCount + failedCount > 0 ? PPColor.amber : PPColor.accent,
+                size: 44
+            )
+            VStack(alignment: .leading, spacing: 4) {
+                Text(headerTitle.localizedUI)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(headerDetail.localizedUI)
+                    .font(.subheadline)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
     }
 
     private var headerTitle: String {
         switch phase {
         case .selecting: return "Prepare several"
-        case .processing: return "Verifying one at a time"
+        case .processing:
+            return batchStopRequested
+                ? "Finishing current verification"
+                : "Verifying one at a time"
         case .finished:
             if wasStopped {
                 return "Batch stopped"
@@ -8026,37 +12586,60 @@ struct BatchSafeShareView: View {
             return "Checks adapt to device load. Outputs stay one at a time."
         case .finished:
             return wasStopped
-                ? "\(verifiedCount) verified copies remain available"
-                : "\(verifiedCount) verified · \(attentionCount + failedCount) need attention"
+                ? AppLocalization.format(
+                    "Verified copies still available: %lld",
+                    verifiedCount
+                )
+                : AppLocalization.format(
+                    "Verified: %lld · Need attention: %lld",
+                    verifiedCount,
+                    attentionCount + failedCount
+                )
         }
     }
 
     private var selectionControls: some View {
-        HStack {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(HStackLayout(spacing: PPSpacing.small))
+
+        return layout {
             VStack(alignment: .leading, spacing: 2) {
-                Text("\(selectedIDs.count) selected")
+                Text(
+                    AppLocalization.format(
+                        "%lld selected",
+                        selectedIDs.count
+                    )
+                )
                     .font(.headline)
                     .monospacedDigit()
                     .foregroundStyle(PPColor.textPrimary)
-                Text("Choose up to 64 source documents")
+                Text(hiddenSelectedCount > 0
+                    ? AppLocalization.format("%lld selected PDFs outside this search", hiddenSelectedCount)
+                    : "Choose up to 64 source documents".localizedUI)
                     .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
             }
-            Spacer()
+            Spacer(minLength: PPSpacing.small)
             Button(
-                selectedIDs.count == maximumSelectableCount
-                    ? "Clear"
-                    : "Select all"
+                (allMatchesSelected ? "Deselect Matches" : "Select Matches").localizedUI
             ) {
                 withAnimation(
                     reduceMotion
                         ? nil
-                        : .easeInOut(duration: 0.18)
+                        : PPMotion.selection
                 ) {
-                    if selectedIDs.count == maximumSelectableCount {
-                        selectedIDs.removeAll()
+                    if allMatchesSelected {
+                        selectedIDs.subtract(matchingRecords.map(\.id))
                     } else {
-                        selectedIDs = selectableRecordIDs
+                        selectedIDs = PDFBatchSelection.adding(
+                            matchingRecords.map(\.id), to: selectedIDs, limit: maximumBatchCount
+                        )
                     }
                 }
             }
@@ -8064,6 +12647,14 @@ struct BatchSafeShareView: View {
             .buttonStyle(.plain)
             .foregroundStyle(PPColor.accent)
             .frame(minHeight: 44)
+            .disabled(matchingRecords.isEmpty || (!allMatchesSelected && selectedIDs.count >= maximumBatchCount))
+            .accessibilityIdentifier("batchSelectMatches")
+            .frame(
+                maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? .infinity
+                    : nil,
+                alignment: .leading
+            )
         }
         .padding(.vertical, PPSpacing.small)
         .overlay(alignment: .bottom) {
@@ -8079,7 +12670,7 @@ struct BatchSafeShareView: View {
                 SectionEyebrow(
                     text: phase == .processing
                         ? "BATCH PROGRESS"
-                        : "RESULT"
+                        : "RESULTS"
                 )
                 Spacer()
                 Text("\(completedCount)/\(selectedIDs.count)")
@@ -8093,7 +12684,17 @@ struct BatchSafeShareView: View {
                         ? PPColor.mint
                         : PPColor.cyan
                 )
-            HStack(spacing: PPSpacing.large) {
+            let metricsLayout = dynamicTypeSize.ppPrefersExpandedLayout
+                ? AnyLayout(
+                    VStackLayout(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    )
+                )
+                : AnyLayout(
+                    HStackLayout(spacing: PPSpacing.large)
+                )
+            metricsLayout {
                 resultMetric(
                     value: verifiedCount,
                     label: "Verified",
@@ -8101,7 +12702,7 @@ struct BatchSafeShareView: View {
                 )
                 resultMetric(
                     value: attentionCount,
-                    label: "Review",
+                    label: "Needs attention",
                     color: PPColor.amber
                 )
                 resultMetric(
@@ -8116,7 +12717,7 @@ struct BatchSafeShareView: View {
 
     private var resultFilterControl: some View {
         Group {
-            if dynamicTypeSize.isAccessibilitySize {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
                 Menu {
                     ForEach(ResultFilter.allCases) { filter in
                         Button {
@@ -8184,14 +12785,43 @@ struct BatchSafeShareView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    @ViewBuilder
     private var documentRows: some View {
-        LazyVStack(spacing: 0) {
-            ForEach(displayedRecords) { record in
-                batchDocumentRow(record)
-                Rectangle()
-                    .fill(PPColor.border.opacity(0.52))
-                    .frame(height: 0.6)
-                    .padding(.leading, 76)
+        if !normalizedQuery.isEmpty, displayedRecords.isEmpty {
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                Text("No matching PDFs".localizedUI).font(.headline)
+                Button("Clear search".localizedUI) { searchText = "" }
+                    .buttonStyle(PPQuietButtonStyle())
+            }
+        } else if phase == .selecting, eligibleRecords.isEmpty {
+            PPEmptyState(
+                kind: .workspace,
+                title: "No eligible PDFs",
+                message: "Import or unlock a PDF before starting batch verification."
+            )
+        } else if phase == .finished,
+                  resultFilter == .attention,
+                  displayedRecords.isEmpty {
+            VStack(spacing: PPSpacing.medium) {
+                PPEmptyState(
+                    kind: .workspace,
+                    title: "No PDFs need attention",
+                    message: "Every finished item is ready in the full result list."
+                )
+                Button("Show All Results".localizedUI) {
+                    resultFilter = .all
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.mint))
+            }
+        } else {
+            LazyVStack(spacing: 0) {
+                ForEach(displayedRecords) { record in
+                    batchDocumentRow(record)
+                    Rectangle()
+                        .fill(PPColor.border.opacity(0.52))
+                        .frame(height: 0.6)
+                        .padding(.leading, 76)
+                }
             }
         }
     }
@@ -8203,35 +12833,43 @@ struct BatchSafeShareView: View {
         let canOpenReview = item?.stage == .needsReview
             && item?.reviewPageIndex != nil
         let canOpenIssue = item?.issue != nil
+        let output = item?.stage.isShareable == true
+            && batchSourceRevisionIDs[record.id] == record.contentRevisionID
+            ? item?.outputRecordID.flatMap { model.record(id: $0) }
+            : nil
 
         return Button {
             if phase == .selecting {
                 toggle(record.id)
+            } else if let output {
+                onOpenDocument(DocumentRoute(
+                    recordID: output.id,
+                    expectedContentRevisionID: output.contentRevisionID
+                ))
             } else if canOpenReview,
                       let pageIndex = item?.reviewPageIndex {
                 batchTask?.cancel()
-                dismiss()
-                Task {
-                    try? await Task.sleep(for: .milliseconds(180))
-                    onOpenDocument(
-                        DocumentRoute(
-                            recordID: record.id,
-                            pageIndex: pageIndex
-                        )
+                onOpenDocument(
+                    DocumentRoute(
+                        recordID: record.id,
+                        pageIndex: pageIndex,
+                        expectedContentRevisionID:
+                            batchSourceRevisionIDs[record.id]
                     )
-                }
+                )
             } else if canOpenIssue {
                 selectedIssueItem = item
             }
         } label: {
             HStack(spacing: PPSpacing.medium) {
                 ZStack(alignment: .bottomTrailing) {
-                    if let url = model.url(for: record.id) {
+                    if !hideLibraryPreviews,
+                       let url = model.url(for: output?.id ?? record.id) {
                         PDFPageThumbnailView(
                             url: url,
                             pageIndex: 0,
                             refreshToken: model.refreshToken(
-                                for: record.id
+                                for: output?.id ?? record.id
                             ),
                             width: 50
                         )
@@ -8242,7 +12880,7 @@ struct BatchSafeShareView: View {
                         )
                     } else {
                         ToolSymbolPlate(
-                            symbol: record.profile.kind.symbol,
+                            symbol: hideLibraryPreviews ? "eye.slash" : record.profile.kind.symbol,
                             tint: PPColor.cyan,
                             size: 50
                         )
@@ -8257,18 +12895,18 @@ struct BatchSafeShareView: View {
                         .font(.body.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(2)
-                    Text(
+                    Text((
                         phase == .selecting
                             ? record.subtitle
                             : (item?.detail ?? "Waiting")
-                    )
+                    ).localizedUI)
                     .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
                     .lineLimit(2)
 
                     if let issue = item?.issue {
                         Text(
-                            "\(issue.phase.title.uppercased()) · \(issue.code)"
+                            "\(issue.phase.title.localizedUI.uppercased()) · \(issue.code)"
                         )
                         .font(.caption2.smallCaps().weight(.semibold))
                         .foregroundStyle(stageColor(item?.stage ?? .failed))
@@ -8317,9 +12955,16 @@ struct BatchSafeShareView: View {
                             .foregroundStyle(stageColor(item.stage))
                     }
                 } else if let item {
-                    Text(item.stage.title.localizedUI)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(stageColor(item.stage))
+                    VStack(alignment: .trailing, spacing: 5) {
+                        Text(item.stage.title.localizedUI)
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(stageColor(item.stage))
+                        if output != nil {
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(PPColor.mint)
+                        }
+                    }
                 }
             }
             .frame(minHeight: 86)
@@ -8327,11 +12972,16 @@ struct BatchSafeShareView: View {
         }
         .buttonStyle(.plain)
         .allowsHitTesting(
-            phase == .selecting
-                || canOpenReview
-                || canOpenIssue
+            batchShareTask == nil
+                && (
+                    phase == .selecting
+                        || canOpenReview
+                        || canOpenIssue
+                        || output != nil
+                )
         )
         .accessibilityLabel(accessibilityLabel(record, item: item))
+        .accessibilityIdentifier("batchDocument-\(record.id)")
     }
 
     @ViewBuilder
@@ -8343,9 +12993,10 @@ struct BatchSafeShareView: View {
         } else if let item {
             Image(systemName: item.stage.symbol)
                 .font(.caption2.weight(.bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(stageColor(item.stage))
                 .frame(width: 24, height: 24)
-                .background(stageColor(item.stage), in: Circle())
+                .background(PPColor.surface, in: Circle())
+                .overlay(Circle().stroke(stageColor(item.stage), lineWidth: 1))
                 .symbolEffect(
                     .pulse,
                     options: .repeating,
@@ -8365,51 +13016,95 @@ struct BatchSafeShareView: View {
 
     private var actionFooter: some View {
         VStack(spacing: PPSpacing.small) {
+            if let batchShareProgress {
+                batchShareProgressRow(batchShareProgress)
+            }
+
             if phase == .selecting {
                 Button {
                     startBatch()
                 } label: {
                     Label(
-                        "Check & Create \(selectedIDs.count)",
-                        systemImage: "checkmark.shield"
+                        batchPrimaryTitle,
+                        systemImage: purchase.isUnlocked
+                            ? "checkmark.shield"
+                            : "lock.open"
                     )
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(selectedIDs.isEmpty)
+                .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+                .disabled(selectedIDs.isEmpty || model.activeBatchDeliveryRunID != nil)
             } else if phase == .processing {
                 Button {
-                    wasStopped = true
-                    batchTask?.cancel()
+                    stopBatchProcessing()
                 } label: {
-                    Label("Stop safely", systemImage: "stop.fill")
+                    Label(
+                        batchStopRequested
+                            ? "Stopping safely"
+                            : "Stop safely",
+                        systemImage: batchStopRequested
+                            ? "hourglass"
+                            : "stop.fill"
+                    )
                 }
                 .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+                .disabled(batchStopRequested)
             } else {
+                if !updatedSourceRecords.isEmpty {
+                    Button {
+                        recheckRevisions = Dictionary(uniqueKeysWithValues:
+                            updatedSourceRecords.map { ($0.id, $0.contentRevisionID) }
+                        )
+                        confirmsUpdatedSources = true
+                    } label: {
+                        Label(
+                            AppLocalization.format("Recheck %lld updated PDFs", updatedSourceRecords.count),
+                            systemImage: "arrow.triangle.2.circlepath"
+                        )
+                    }
+                    .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+                    .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+                    .disabled(batchShareTask != nil || model.activeBatchDeliveryRunID != nil)
+                    .accessibilityIdentifier("batchRecheckUpdated")
+                }
                 if !retryableIDs.isEmpty {
                     Button {
                         startBatch(recordIDs: retryableIDs)
                     } label: {
                         Label(
-                            "Retry \(retryableIDs.count) Unfinished",
+                            AppLocalization.format(
+                                "Retry %lld unfinished",
+                                retryableIDs.count
+                            ),
                             systemImage: "arrow.clockwise"
                         )
                     }
                     .buttonStyle(
                         PPQuietButtonStyle(tint: PPColor.amber)
                     )
+                    .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+                    .disabled(batchShareTask != nil)
                 }
 
                 if verifiedCount > 0 {
                     Button {
-                        isSharing = true
+                        prepareBatchShare()
                     } label: {
                         Label(
-                            "Share \(verifiedCount) Verified PDF\(verifiedCount == 1 ? "" : "s")",
+                            AppLocalization.format(
+                                batchShareTask == nil
+                                    ? "Share %lld Verified PDF%@"
+                                    : "Verifying %lld PDF%@",
+                                verifiedCount,
+                                verifiedCount == 1 ? "" : "s"
+                            ),
                             systemImage: "square.and.arrow.up"
                         )
                     }
                     .buttonStyle(PPPrimaryButtonStyle())
-                } else if retryableIDs.isEmpty {
+                    .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+                    .disabled(batchShareTask != nil)
+                } else if retryableIDs.isEmpty && updatedSourceRecords.isEmpty {
                     Button("Done") {
                         dismiss()
                     }
@@ -8427,47 +13122,135 @@ struct BatchSafeShareView: View {
         }
     }
 
+    private func batchShareProgressRow(
+        _ progress: PDFOperationProgress
+    ) -> some View {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .trailing,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(HStackLayout(spacing: PPSpacing.small))
+        return layout {
+            LocalOperationProgressView(progress: progress)
+                .frame(maxWidth: .infinity)
+            Button {
+                stopBatchSharePreparation()
+            } label: {
+                Image(systemName: "xmark")
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(PPColor.amber)
+            .accessibilityLabel("Stop preparing batch share")
+            .accessibilityHint(
+                "Deletes protected copies already prepared for this share"
+            )
+        }
+    }
+
     private var eligibleRecords: [DocumentRecord] {
         model.workingDocuments
             .filter {
-                !$0.profile.isLocked
+                !$0.profile.isLocked && model.url(for: $0.id) != nil
             }
-            .sorted { $0.modifiedAt > $1.modifiedAt }
+            .sorted {
+                $0.modifiedAt == $1.modifiedAt
+                    ? $0.id.uuidString < $1.id.uuidString
+                    : $0.modifiedAt > $1.modifiedAt
+            }
+    }
+
+    private var normalizedQuery: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var matchingRecords: [DocumentRecord] {
+        eligibleRecords.filter { matchesSearch($0) }
+    }
+
+    private func matchesSearch(_ record: DocumentRecord) -> Bool {
+        normalizedQuery.isEmpty
+            || record.displayName.localizedStandardContains(normalizedQuery)
+            || record.tags.contains { $0.localizedStandardContains(normalizedQuery) }
+            || (phase != .selecting && (
+                items[record.id]?.detail.localizedUI.localizedStandardContains(normalizedQuery) == true
+                || items[record.id]?.stage.title.localizedUI.localizedStandardContains(normalizedQuery) == true
+            ))
+    }
+
+    private var allMatchesSelected: Bool {
+        !matchingRecords.isEmpty && matchingRecords.allSatisfy { selectedIDs.contains($0.id) }
+    }
+
+    private var hiddenSelectedCount: Int {
+        selectedIDs.subtracting(matchingRecords.map(\.id)).count
+    }
+
+    private var updatedSourceRecords: [DocumentRecord] {
+        selectedRecords.filter {
+            items[$0.id]?.issue?.code == PDFBatchDeliveryIssue.sourceChanged.code
+        }
+    }
+
+    private var batchSearch: some View {
+        HStack(spacing: PPSpacing.small) {
+            Button { isSearchFocused = true } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 20))
+                    .frame(width: 44, height: 44)
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .accessibilityLabel("Search batch PDFs".localizedUI)
+            TextField("Search batch PDFs".localizedUI, text: $searchText)
+                .focused($isSearchFocused)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .accessibilityIdentifier("batchSearch")
+            if !searchText.isEmpty {
+                Button { searchText = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 20))
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Clear search".localizedUI)
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(PPColor.textSecondary)
+        .background(PPColor.surfaceMuted, in: RoundedRectangle(cornerRadius: 8))
+        .disabled(phase == .processing || batchShareTask != nil)
     }
 
     private var selectedRecords: [DocumentRecord] {
         eligibleRecords.filter { selectedIDs.contains($0.id) }
     }
 
-    private var selectableRecordIDs: Set<UUID> {
-        Set(
-            eligibleRecords
-                .prefix(maximumBatchCount)
-                .map(\.id)
-        )
-    }
-
-    private var maximumSelectableCount: Int {
-        min(maximumBatchCount, eligibleRecords.count)
-    }
-
     private var displayedRecords: [DocumentRecord] {
-        guard phase != .selecting else { return eligibleRecords }
+        guard phase != .selecting else { return matchingRecords }
+        let records = selectedRecords.filter { matchesSearch($0) }.sorted {
+            let left = items[$0.id]?.stage.isShareable == true
+            let right = items[$1.id]?.stage.isShareable == true
+            return left != right ? !left : $0.modifiedAt > $1.modifiedAt
+        }
         guard phase == .finished,
               resultFilter == .attention
-        else { return selectedRecords }
-        return selectedRecords.filter { record in
+        else { return records }
+        return records.filter { record in
             guard let item = items[record.id] else { return false }
             return !item.stage.isShareable
         }
     }
 
-    private var shareURLs: [URL] {
+    private var verifiedOutputRecords: [DocumentRecord] {
         selectedRecords.compactMap { record in
             guard let outputID = items[record.id]?.outputRecordID,
-                  items[record.id]?.stage.isShareable == true
+                  items[record.id]?.stage.isShareable == true,
+                  batchSourceRevisionIDs[record.id] == record.contentRevisionID
             else { return nil }
-            return model.url(for: outputID)
+            return model.record(id: outputID)
         }
     }
 
@@ -8540,8 +13323,9 @@ struct BatchSafeShareView: View {
     private func initializeSelectionIfNeeded() {
         guard !didInitialize else { return }
         didInitialize = true
-        if let run = model.recoverableBatchDeliveryRun() {
+        if initialRecordIDs == nil, let run = model.currentBatchDeliveryRun() {
             selectedIDs = Set(run.sourceRecordIDs)
+            batchSourceRevisionIDs = run.sourceRevisionIDs
             items = Dictionary(
                 run.items.map {
                     ($0.sourceRecordID, $0)
@@ -8552,10 +13336,20 @@ struct BatchSafeShareView: View {
             batchStartedAt = run.startedAt
             wasStopped = run.items.contains { $0.stage == .stopped }
             phase = .finished
-            resultFilter = .attention
+            resultFilter = run.needsAttention ? .attention : .all
             return
         }
-        selectedIDs = selectableRecordIDs
+        let requested = initialRecordIDs ?? []
+        selectedIDs = PDFBatchSelection.adding(
+            eligibleRecords.filter { requested.contains($0.id) }.map(\.id),
+            to: [], limit: maximumBatchCount
+        )
+        omittedInitialCount = requested.subtracting(selectedIDs).count
+        batchSourceRevisionIDs = Dictionary(
+            uniqueKeysWithValues: eligibleRecords.map {
+                ($0.id, $0.contentRevisionID)
+            }
+        )
         items = Dictionary(
             eligibleRecords.map {
                 (
@@ -8575,18 +13369,22 @@ struct BatchSafeShareView: View {
         withAnimation(
             reduceMotion
                 ? nil
-                : .easeInOut(duration: 0.18)
+                : PPMotion.selection
         ) {
             if selectedIDs.contains(recordID) {
                 selectedIDs.remove(recordID)
             } else {
                 guard selectedIDs.count < maximumBatchCount else {
-                    model.noticeMessage =
+                    model[noticeFor: paperPathSceneID] =
                         "A batch can include up to 64 PDFs"
                             .localizedUI
                     return
                 }
                 selectedIDs.insert(recordID)
+                if let revisionID = model.record(id: recordID)?
+                    .contentRevisionID {
+                    batchSourceRevisionIDs[recordID] = revisionID
+                }
             }
         }
     }
@@ -8595,14 +13393,52 @@ struct BatchSafeShareView: View {
         recordIDs requestedIDs: [UUID]? = nil
     ) {
         guard batchTask == nil, !selectedIDs.isEmpty else { return }
-        let sourceIDs = requestedIDs ?? selectedRecords.map(\.id)
-        guard !sourceIDs.isEmpty else { return }
+        let requestedSourceIDs =
+            requestedIDs ?? selectedRecords.map(\.id)
+        guard !requestedSourceIDs.isEmpty else { return }
+        if requestedIDs == nil {
+            batchSourceRevisionIDs = Dictionary(
+                uniqueKeysWithValues: selectedRecords.map {
+                    ($0.id, $0.contentRevisionID)
+                }
+            )
+        }
+        let staleSourceIDs = requestedSourceIDs.filter {
+            model.record(id: $0)?.contentRevisionID
+                != batchSourceRevisionIDs[$0]
+        }
+        for sourceID in staleSourceIDs {
+            items[sourceID] = .changedSource(sourceID)
+        }
+        let sourceIDs = requestedSourceIDs.filter {
+            !staleSourceIDs.contains($0)
+        }
+        guard !sourceIDs.isEmpty else {
+            phase = .finished
+            model[noticeFor: paperPathSceneID] =
+                "The PDF changed before this action started. Review the updated PDF."
+                    .localizedUI
+            persistLatestBatchSnapshot()
+            return
+        }
+        guard purchase.isUnlocked else {
+            pendingBatchStartIDs = sourceIDs
+            isPresentingUnlock = true
+            return
+        }
+        pendingBatchStartIDs = nil
+        guard model.authorizeBatchVerifiedOutput() else { return }
         if requestedIDs == nil {
             batchRunID = UUID()
             batchStartedAt = Date()
         }
+        guard model.beginBatchDeliveryRun(id: batchRunID) else { return }
         phase = .processing
+        searchText = ""
+        isSearchFocused = false
         wasStopped = false
+        batchStopRequested = false
+        dismissesAfterBatchStop = false
         resultFilter = .all
         for sourceID in sourceIDs {
             items[sourceID] = PDFBatchDeliveryItem(
@@ -8611,43 +13447,130 @@ struct BatchSafeShareView: View {
                 detail: "Waiting for local preflight"
             )
         }
+        let generation = UUID()
+        let runID = batchRunID
+        let expectedRevisions = batchSourceRevisionIDs
+        batchGeneration = generation
         batchTask = Task {
-            await persistBatchRun()
-            let results = await model.createSafeShareBatch(
-                recordIDs: sourceIDs
-            ) { update in
-                withAnimation(
-                    reduceMotion
-                        ? nil
-                        : .easeInOut(duration: 0.2)
-                ) {
-                    items[update.sourceRecordID] = update
+            defer { model.endBatchDeliveryRun(id: runID) }
+            guard await persistBatchRun() else {
+                if batchGeneration == generation {
+                    for id in sourceIDs {
+                        let issue = PDFBatchDeliveryIssue.savingFailed(
+                            "The batch recovery state could not be saved."
+                        )
+                        items[id] = PDFBatchDeliveryItem(
+                            sourceRecordID: id, stage: .failed, detail: issue.message, issue: issue
+                        )
+                    }
+                    batchTask = nil
+                    phase = .finished
                 }
-                scheduleBatchPersistence()
+                return
             }
+            guard batchGeneration == generation else { return }
+            let results = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createSafeShareBatch(
+                    recordIDs: sourceIDs,
+                    runID: runID,
+                    expectedRevisionIDs: expectedRevisions
+                ) { update in
+                    guard batchGeneration == generation,
+                          !Task.isCancelled
+                    else { return }
+                    withAnimation(
+                        reduceMotion
+                            ? nil
+                            : PPMotion.selection
+                    ) {
+                        items[update.sourceRecordID] = update
+                    }
+                    scheduleBatchPersistence()
+                }
+            }
+            guard batchGeneration == generation else { return }
             for result in results {
                 items[result.sourceRecordID] = result
             }
-            batchPersistenceTask?.cancel()
+            cancelBatchPersistence()
             await persistBatchRun()
-            if Task.isCancelled {
-                wasStopped = true
-            }
+            wasStopped =
+                batchStopRequested || Task.isCancelled
+            let shouldDismiss = dismissesAfterBatchStop
+            batchStopRequested = false
+            dismissesAfterBatchStop = false
             batchTask = nil
             phase = .finished
+            if shouldDismiss {
+                dismiss()
+            }
         }
     }
 
+    private func completeBatchUnlock() {
+        guard let pendingBatchStartIDs else { return }
+        self.pendingBatchStartIDs = nil
+        guard purchase.isUnlocked else { return }
+        unlockContinuationTask?.cancel()
+        unlockContinuationTask = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  batchTask == nil
+            else {
+                unlockContinuationTask = nil
+                return
+            }
+            unlockContinuationTask = nil
+            startBatch(recordIDs: pendingBatchStartIDs)
+        }
+    }
+
+    private func cancelBatchUnlockContinuation() {
+        unlockContinuationTask?.cancel()
+        unlockContinuationTask = nil
+        pendingBatchStartIDs = nil
+    }
+
+    private var batchPrimaryTitle: String {
+        guard purchase.isUnlocked else {
+            return "Unlock Batch Verified Output".localizedUI
+        }
+        return AppLocalization.format(
+            "Check & Create %lld",
+            selectedIDs.count
+        )
+    }
+
     private func resetBatch() {
+        guard model.activeBatchDeliveryRunID == nil else { return }
+        cancelBatchUnlockContinuation()
+        batchGeneration = UUID()
         batchTask?.cancel()
-        batchPersistenceTask?.cancel()
+        batchTask = nil
+        cancelBatchPersistence()
+        cancelIssueTransition()
         selectedIssueItem = nil
+        pendingIssueRoute = nil
+        pendingIssueRetryRecordID = nil
         resultFilter = .all
         wasStopped = false
+        batchStopRequested = false
+        dismissesAfterBatchStop = false
         phase = .selecting
+        searchText = ""
+        omittedInitialCount = 0
         batchRunID = UUID()
         batchStartedAt = Date()
-        selectedIDs = selectableRecordIDs
+        selectedIDs = []
+        batchSourceRevisionIDs = Dictionary(
+            uniqueKeysWithValues: eligibleRecords.map {
+                ($0.id, $0.contentRevisionID)
+            }
+        )
         items = Dictionary(
             eligibleRecords.map {
                 (
@@ -8661,41 +13584,321 @@ struct BatchSafeShareView: View {
             },
             uniquingKeysWith: { _, newest in newest }
         )
-        Task {
-            await model.clearBatchDeliveryRun()
+    }
+
+    private func completeIssueTransition() {
+        let route = pendingIssueRoute
+        let recordID = pendingIssueRetryRecordID
+        guard route != nil || recordID != nil else { return }
+        pendingIssueRoute = nil
+        pendingIssueRetryRecordID = nil
+        issueTransitionTask?.cancel()
+        let generation = UUID()
+        issueTransitionGeneration = generation
+        issueTransitionTask = Task { @MainActor in
+            defer {
+                if issueTransitionGeneration == generation {
+                    issueTransitionTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  issueTransitionGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            if let route {
+                guard model.record(id: route.recordID) != nil else {
+                    return
+                }
+                batchTask?.cancel()
+                onOpenDocument(route)
+            } else if let recordID {
+                startBatch(recordIDs: [recordID])
+            }
         }
+    }
+
+    private func cancelIssueTransition() {
+        issueTransitionGeneration = UUID()
+        issueTransitionTask?.cancel()
+        issueTransitionTask = nil
+        pendingIssueRoute = nil
+        pendingIssueRetryRecordID = nil
+    }
+
+    private func stopBatchProcessing(
+        dismissAfterCompletion: Bool = false,
+        invalidateResult: Bool = false
+    ) {
+        guard phase == .processing,
+              !batchStopRequested || invalidateResult
+        else { return }
+        wasStopped = true
+        dismissesAfterBatchStop =
+            dismissesAfterBatchStop || dismissAfterCompletion
+        if !invalidateResult {
+            batchStopRequested = true
+            batchTask?.cancel()
+            return
+        }
+        batchGeneration = UUID()
+        batchTask?.cancel()
+        batchTask = nil
+        batchStopRequested = false
+        dismissesAfterBatchStop = false
+        for recordID in selectedIDs {
+            guard let item = items[recordID],
+                  !item.stage.isFinal
+            else { continue }
+            items[recordID] = PDFBatchDeliveryItem(
+                sourceRecordID: recordID,
+                outputRecordID: item.outputRecordID,
+                stage: .stopped,
+                detail: "Stopped safely",
+                issue: .cancelled
+            )
+        }
+        phase = .finished
+        persistLatestBatchSnapshot()
     }
 
     private func scheduleBatchPersistence() {
         batchPersistenceTask?.cancel()
+        let generation = UUID()
+        batchPersistenceGeneration = generation
         let runID = batchRunID
         let startedAt = batchStartedAt
         let sourceIDs = selectedRecords.map(\.id)
+        let sourceRevisionIDs = batchSourceRevisionIDs
         let snapshot = sourceIDs.compactMap { items[$0] }
+        let snapshotAt = Date()
         batchPersistenceTask = Task {
+            defer {
+                if batchPersistenceGeneration == generation {
+                    batchPersistenceTask = nil
+                }
+            }
             do {
                 try await Task.sleep(for: .milliseconds(240))
             } catch {
                 return
             }
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  batchPersistenceGeneration == generation
+            else { return }
             await model.saveBatchDeliveryRun(
                 id: runID,
                 sourceRecordIDs: sourceIDs,
+                sourceRevisionIDs: sourceRevisionIDs,
                 items: snapshot,
-                startedAt: startedAt
+                startedAt: startedAt,
+                snapshotAt: snapshotAt
             )
         }
     }
 
-    private func persistBatchRun() async {
+    private func cancelBatchPersistence() {
+        batchPersistenceGeneration = UUID()
+        batchPersistenceTask?.cancel()
+        batchPersistenceTask = nil
+    }
+
+    @discardableResult
+    private func persistBatchRun() async -> Bool {
         let sourceIDs = selectedRecords.map(\.id)
-        await model.saveBatchDeliveryRun(
-            id: batchRunID,
-            sourceRecordIDs: sourceIDs,
-            items: sourceIDs.compactMap { items[$0] },
-            startedAt: batchStartedAt
+        let runID = batchRunID
+        let revisions = batchSourceRevisionIDs
+        let snapshot = sourceIDs.compactMap { items[$0] }
+        let startedAt = batchStartedAt
+        let snapshotAt = Date()
+        // The final recovery snapshot must survive cancellation of the batch worker.
+        return await Task { @MainActor in
+            await model.saveBatchDeliveryRun(
+                id: runID, sourceRecordIDs: sourceIDs,
+                sourceRevisionIDs: revisions, items: snapshot,
+                startedAt: startedAt, snapshotAt: snapshotAt
+            )
+        }.value
+    }
+
+    private func persistLatestBatchSnapshot() {
+        guard phase != .selecting else { return }
+        let runID = batchRunID
+        let startedAt = batchStartedAt
+        let sourceIDs = selectedRecords.map(\.id)
+        let sourceRevisionIDs = batchSourceRevisionIDs
+        let snapshot = sourceIDs.compactMap { items[$0] }
+        let snapshotAt = Date()
+        Task {
+            await model.saveBatchDeliveryRun(
+                id: runID,
+                sourceRecordIDs: sourceIDs,
+                sourceRevisionIDs: sourceRevisionIDs,
+                items: snapshot,
+                startedAt: startedAt,
+                snapshotAt: snapshotAt
+            )
+        }
+    }
+
+    private func prepareBatchShare() {
+        guard batchShareTask == nil,
+              !isSharing
+        else { return }
+        let records = verifiedOutputRecords
+        guard !records.isEmpty,
+              records.count == verifiedCount
+        else {
+            model[noticeFor: paperPathSceneID] =
+                "One or more verified PDFs are no longer available."
+                    .localizedUI
+            batchShareErrorFeedback += 1
+            return
+        }
+
+        cleanupPreparedBatchShares()
+        let generation = UUID()
+        batchShareGeneration = generation
+        batchShareRateWindow.reset()
+        batchShareProgress = PDFOperationProgress(
+            label: AppLocalization.format(
+                "Verifying %lld PDF%@",
+                records.count,
+                records.count == 1 ? "" : "s"
+            ),
+            fractionCompleted: 0,
+            byteStage: .verifying
         )
+        batchShareTask = Task { @MainActor in
+            var preparedURLs: [URL] = []
+            let workByRecord = records.map {
+                let (doubled, overflow) = max(
+                    1,
+                    $0.profile.byteCount
+                ).multipliedReportingOverflow(by: 2)
+                return overflow ? Int64.max : max(2, doubled)
+            }
+            let totalBytes = max(
+                1,
+                workByRecord.reduce(Int64.zero) { total, bytes in
+                    let (next, overflow) =
+                        total.addingReportingOverflow(bytes)
+                    return overflow ? .max : next
+                }
+            )
+            var completedBytes: Int64 = 0
+
+            for (index, record) in records.enumerated() {
+                guard !Task.isCancelled,
+                      batchShareGeneration == generation
+                else {
+                    await discardBatchShareCopies(preparedURLs)
+                    return
+                }
+                let unitBytes = workByRecord[index]
+                let completedBeforeCurrent = completedBytes
+                let preparedURL = await model.withFeedbackTarget(
+                    paperPathSceneID
+                ) {
+                    await model.makeFilesExportCopy(
+                        recordID: record.id
+                    ) { update in
+                        guard batchShareGeneration == generation else {
+                            return
+                        }
+                        let updateBytes = min(
+                            unitBytes,
+                            max(0, update.processedBytes)
+                        )
+                        let cumulativeUpdate = PDFByteProgressUpdate(
+                            stage: .verifying,
+                            processedBytes: {
+                                let (next, overflow) =
+                                    completedBeforeCurrent
+                                        .addingReportingOverflow(
+                                            updateBytes
+                                        )
+                                return overflow
+                                    ? totalBytes
+                                    : min(totalBytes, next)
+                            }(),
+                            totalBytes: totalBytes,
+                            completedUnitCount: index,
+                            totalUnitCount: records.count,
+                            currentUnitName: record.displayName
+                        )
+                        if let progress = batchShareRateWindow
+                            .operationProgress(
+                                label: AppLocalization.format(
+                                    "Verifying PDF %lld of %lld",
+                                    index + 1,
+                                    records.count
+                                ),
+                                update: cumulativeUpdate,
+                                current: batchShareProgress
+                            ) {
+                            batchShareProgress = progress
+                        }
+                    }
+                }
+                guard let preparedURL else {
+                    await discardBatchShareCopies(preparedURLs)
+                    guard batchShareGeneration == generation,
+                          !Task.isCancelled
+                    else { return }
+                    batchShareTask = nil
+                    batchShareProgress = nil
+                    batchShareRateWindow.reset()
+                    batchShareErrorFeedback += 1
+                    return
+                }
+                preparedURLs.append(preparedURL)
+                let (nextCompletedBytes, overflow) = completedBytes
+                    .addingReportingOverflow(unitBytes)
+                completedBytes = overflow
+                    ? totalBytes
+                    : min(totalBytes, nextCompletedBytes)
+            }
+
+            guard !Task.isCancelled,
+                  batchShareGeneration == generation
+            else {
+                await discardBatchShareCopies(preparedURLs)
+                return
+            }
+            batchShareTask = nil
+            batchShareProgress = nil
+            batchShareRateWindow.reset()
+            preparedShareURLs = preparedURLs
+            batchShareFeedback += 1
+            isSharing = true
+        }
+    }
+
+    private func stopBatchSharePreparation() {
+        batchShareGeneration = UUID()
+        batchShareTask?.cancel()
+        batchShareTask = nil
+        batchShareProgress = nil
+        batchShareRateWindow.reset()
+    }
+
+    private func cleanupPreparedBatchShares() {
+        let urls = preparedShareURLs
+        preparedShareURLs = []
+        guard !urls.isEmpty else { return }
+        Task {
+            await discardBatchShareCopies(urls)
+        }
+    }
+
+    private func discardBatchShareCopies(
+        _ urls: [URL]
+    ) async {
+        for url in urls {
+            await model.discardFilesExportCopy(at: url)
+        }
     }
 
     private func stageColor(
@@ -8716,13 +13919,21 @@ struct BatchSafeShareView: View {
         item: PDFBatchDeliveryItem?
     ) -> String {
         if phase == .selecting {
-            return "\(record.displayName), \(selectedIDs.contains(record.id) ? "selected" : "not selected")"
+            return AppLocalization.format(
+                "%@, %@",
+                record.displayName,
+                (
+                    selectedIDs.contains(record.id)
+                        ? "Selected"
+                        : "Not selected"
+                ).localizedUI
+            )
         }
         return [
             record.displayName,
-            item?.stage.title ?? "waiting",
-            item?.detail ?? "",
-            item?.issue?.recovery ?? ""
+            (item?.stage.title ?? "Waiting").localizedUI,
+            (item?.detail ?? "").localizedUI,
+            (item?.issue?.recovery ?? "").localizedUI
         ]
         .filter { !$0.isEmpty }
         .joined(separator: ", ")
@@ -8732,6 +13943,8 @@ struct BatchSafeShareView: View {
 private struct BatchDeliveryIssueView: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @AppStorage("privacy.hideLibraryPreviews") private var hideLibraryPreviews = false
 
     let item: PDFBatchDeliveryItem
     let onRetry: () -> Void
@@ -8764,15 +13977,31 @@ private struct BatchDeliveryIssueView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Close") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
             }
         }
     }
 
     private var issueHeader: some View {
-        HStack(alignment: .top, spacing: PPSpacing.large) {
-            if let record,
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.medium
+                )
+            )
+            : AnyLayout(
+                HStackLayout(
+                    alignment: .top,
+                    spacing: PPSpacing.large
+                )
+            )
+
+        return layout {
+            if !hideLibraryPreviews,
+               let record, !record.profile.isLocked,
                let url = model.url(for: record.id) {
                 PDFPageThumbnailView(
                     url: url,
@@ -8795,7 +14024,7 @@ private struct BatchDeliveryIssueView: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 SectionEyebrow(
-                    text: "\(issue.phase.title.uppercased()) · \(issue.code)"
+                    text: "\(issue.phase.title.localizedUI.uppercased()) · \(issue.code)"
                 )
                 Text(record?.displayName ?? "Source PDF")
                     .font(.title2.bold())
@@ -8807,6 +14036,7 @@ private struct BatchDeliveryIssueView: View {
                     .foregroundStyle(PPColor.textSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -8895,7 +14125,6 @@ private struct BatchDeliveryIssueView: View {
 
     private var openSourceButton: some View {
         Button {
-            dismiss()
             onOpenSource()
         } label: {
             Label("Open Source", systemImage: "doc.text.magnifyingglass")
@@ -8905,7 +14134,6 @@ private struct BatchDeliveryIssueView: View {
 
     private var retryButton: some View {
         Button {
-            dismiss()
             onRetry()
         } label: {
             Label("Retry This PDF", systemImage: "arrow.clockwise")
@@ -8998,19 +14226,26 @@ private struct BatchDeliveryIssueView: View {
 struct SourceLocationView: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let onOpenDocument: (DocumentRoute) -> Void
 
     @State private var snapshot: PDFSourceLocationSnapshot?
     @State private var isLoading = true
+    @State private var loadErrorMessage: String?
     @State private var isExporting = false
     @State private var exportURL: URL?
     @State private var exportTask: Task<Void, Never>?
-    @State private var isConfirmingWriteback = false
     @State private var isWorking = false
     @State private var actionTask: Task<Void, Never>?
     @State private var sourceGeneration = 0
+    @State private var operationGeneration = UUID()
+    @State private var actionStopRequested = false
+    @State private var exportProgress: PDFOperationProgress?
+    @State private var exportRateWindow = ByteRateWindow()
     @AppStorage(AppPreferences.metadataSyncEnabledKey)
     private var metadataSyncEnabled = false
 
@@ -9018,59 +14253,40 @@ struct SourceLocationView: View {
         NavigationStack {
             ZStack {
                 PPCanvas()
-                ScrollView {
-                    VStack(
-                        alignment: .leading,
-                        spacing: PPSpacing.large
-                    ) {
-                        sourceHeader
-                        sourceProvenance
-                        metadataSection
-                        sourceActions
-                    }
-                    .frame(maxWidth: 760)
-                    .padding(PPSpacing.regular)
-                    .frame(maxWidth: .infinity)
-                }
+                sourceContent
             }
-            .overlay {
-                if isLoading {
-                    ProgressView("Checking Files source")
+            .overlay(alignment: .topTrailing) {
+                if isLoading, snapshot != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(PPSpacing.regular)
                 }
             }
             .navigationTitle("Files & Source")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button((isWorking ? "Stop" : "Done").localizedUI) {
+                    Button(
+                        (
+                            actionStopRequested
+                                ? "Stopping"
+                                : isWorking
+                                    ? "Stop"
+                                    : "Close"
+                        ).localizedUI
+                    ) {
                         if isWorking {
-                            actionTask?.cancel()
-                            exportTask?.cancel()
-                            actionTask = nil
-                            exportTask = nil
-                            isWorking = false
+                            stopCurrentOperation()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(actionStopRequested)
                 }
             }
             .task {
                 await reload()
-            }
-            .confirmationDialog(
-                "Replace the original file?",
-                isPresented: $isConfirmingWriteback,
-                titleVisibility: .visible
-            ) {
-                Button("Replace Original") {
-                    writeBack()
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text(
-                    "PaperPath verified that the source has not changed since import. The private working copy remains in the library."
-                )
             }
             .sheet(
                 isPresented: $isExporting,
@@ -9088,11 +14304,91 @@ struct SourceLocationView: View {
             }
             .onDisappear {
                 guard !isExporting else { return }
-                exportTask?.cancel()
-                actionTask?.cancel()
-                discardPreparedExport()
+                interruptProtectedSourceWork()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    Task { await reload() }
+                } else if phase == .background {
+                    interruptProtectedSourceWork()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptProtectedSourceWork()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataDidBecomeAvailableNotification
+                )
+            ) { _ in
+                guard scenePhase == .active else { return }
+                Task { await reload() }
             }
             .interactiveDismissDisabled(isWorking)
+            .accessibilityAction(.escape) {
+                if isWorking {
+                    stopCurrentOperation()
+                } else {
+                    dismiss()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var sourceContent: some View {
+        if isLoading, snapshot == nil {
+            PPEmptyState(
+                kind: .processing,
+                title: "Checking Files source",
+                message: "Reading source provenance from the private working copy."
+            )
+            .frame(maxWidth: 520)
+            .padding(PPSpacing.regular)
+        } else if let loadErrorMessage {
+            VStack(spacing: PPSpacing.medium) {
+                PPEmptyState(
+                    kind: .tools,
+                    title: "Couldn’t inspect source",
+                    message: loadErrorMessage
+                )
+                Button {
+                    Task {
+                        await reload()
+                    }
+                } label: {
+                    Label(
+                        "Inspect Again",
+                        systemImage: "arrow.clockwise"
+                    )
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+                .disabled(isLoading)
+                .accessibilityIdentifier("retrySourceInspection")
+            }
+            .frame(maxWidth: 520)
+            .padding(PPSpacing.regular)
+        } else {
+            ScrollView {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.large
+                ) {
+                    sourceHeader
+                    sourceProvenance
+                    metadataSection
+                    sourceActions
+                }
+                .frame(maxWidth: 760)
+                .padding(PPSpacing.regular)
+                .frame(maxWidth: .infinity)
+            }
         }
     }
 
@@ -9150,8 +14446,8 @@ struct SourceLocationView: View {
             )
             sourceStatus
             Label(
-                "Edits stay in PaperPath until you explicitly export or replace the original.",
-                systemImage: "internaldrive"
+                "PaperPath never changes the original in Files. Export or import an updated source as a separate private copy.",
+                systemImage: "lock.doc"
             )
             .font(.caption)
             .foregroundStyle(PPColor.textSecondary)
@@ -9159,45 +14455,67 @@ struct SourceLocationView: View {
     }
 
     private var metadataSection: some View {
-        VStack(alignment: .leading, spacing: PPSpacing.small) {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(
+                HStackLayout(
+                    alignment: .top,
+                    spacing: PPSpacing.medium
+                )
+            )
+
+        return VStack(alignment: .leading, spacing: PPSpacing.small) {
             WorkflowSectionHeader(
                 eyebrow: "OPTIONAL METADATA",
                 title: metadataSyncEnabled
                     ? metadataSyncTitle
                     : "iCloud metadata is off"
             )
-            HStack(alignment: .top, spacing: PPSpacing.medium) {
-                Image(systemName: metadataSyncSymbol)
-                    .foregroundStyle(metadataSyncColor)
-                    .frame(width: 28)
-                VStack(alignment: .leading, spacing: 3) {
-                    Text(model.metadataSyncStatus.detail.localizedUI)
-                        .font(.caption)
-                        .foregroundStyle(PPColor.textSecondary)
-                    if let updatedAt =
-                        model.metadataSyncStatus.updatedAt {
-                        Text(
-                            updatedAt.formatted(
-                                date: .abbreviated,
-                                time: .shortened
+            layout {
+                HStack(alignment: .top, spacing: PPSpacing.medium) {
+                    Image(systemName: metadataSyncSymbol)
+                        .foregroundStyle(metadataSyncColor)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(model.metadataSyncStatus.detail.localizedUI)
+                            .font(.caption)
+                            .foregroundStyle(PPColor.textSecondary)
+                        if let updatedAt =
+                            model.metadataSyncStatus.updatedAt {
+                            Text(
+                                updatedAt.formatted(
+                                    date: .abbreviated,
+                                    time: .shortened
+                                )
                             )
-                        )
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(PPColor.textSecondary)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(PPColor.textSecondary)
+                        }
                     }
                 }
-                Spacer()
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer()
+                }
                 if metadataSyncEnabled {
                     Button {
                         Task {
-                            await model.synchronizeMetadata()
+                            await model.withFeedbackTarget(
+                                paperPathSceneID
+                            ) {
+                                await model.synchronizeMetadata()
+                            }
                         }
                     } label: {
                         Image(
                             systemName:
                                 "arrow.triangle.2.circlepath"
                         )
-                        .frame(width: 34, height: 34)
+                        .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.plain)
                     .disabled(
@@ -9233,6 +14551,11 @@ struct SourceLocationView: View {
             .buttonStyle(PPPrimaryButtonStyle())
             .disabled(workingURL == nil || isWorking)
 
+            if let exportProgress {
+                LocalOperationProgressView(progress: exportProgress)
+                    .transition(.opacity)
+            }
+
             if snapshot?.status == .changed
                 || snapshot?.status == .stale {
                 Button {
@@ -9245,19 +14568,6 @@ struct SourceLocationView: View {
                     )
                 }
                 .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
-                .disabled(isWorking)
-            }
-
-            if snapshot?.status == .current {
-                Button(role: .destructive) {
-                    isConfirmingWriteback = true
-                } label: {
-                    Label(
-                        "Replace Original in Files",
-                        systemImage: "arrow.down.doc"
-                    )
-                }
-                .buttonStyle(PPQuietButtonStyle(tint: .red))
                 .disabled(isWorking)
             }
         }
@@ -9309,6 +14619,7 @@ struct SourceLocationView: View {
             }
         }
         .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
         .accessibilityIdentifier("sourceLocationStatus")
     }
 
@@ -9364,33 +14675,101 @@ struct SourceLocationView: View {
         sourceGeneration += 1
         let generation = sourceGeneration
         isLoading = true
+        loadErrorMessage = nil
+        defer {
+            if generation == sourceGeneration {
+                isLoading = false
+            }
+        }
         let loadedSnapshot = await model.sourceLocation(
             recordID: recordID
         )
         guard !Task.isCancelled,
               generation == sourceGeneration
         else { return }
+        guard let loadedSnapshot else {
+            snapshot = nil
+            loadErrorMessage =
+                "The private working copy or its source metadata could not be opened."
+                    .localizedUI
+            return
+        }
         snapshot = loadedSnapshot
-        isLoading = false
     }
 
     private func prepareExport() {
+        guard actionTask == nil,
+              exportTask == nil,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        let generation = UUID()
+        operationGeneration = generation
+        actionStopRequested = false
         isWorking = true
-        exportTask = Task {
-            defer {
-                isWorking = false
-                exportTask = nil
+        exportRateWindow.reset()
+        exportProgress = PDFOperationProgress(
+            label: "Verifying protected copy",
+            fractionCompleted: 0,
+            byteStage: .checksumming
+        )
+        exportTask = Task { @MainActor in
+            let preparedURL = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.makeFilesExportCopy(
+                    recordID: recordID
+                ) { update in
+                    guard operationGeneration == generation else {
+                        return
+                    }
+                    if let progress =
+                        exportRateWindow.operationProgress(
+                            label: "Verifying protected copy",
+                            update: update,
+                            current: exportProgress
+                        ) {
+                        exportProgress = progress
+                    }
+                }
             }
-            guard !Task.isCancelled else { return }
-            let preparedURL = await model.makeFilesExportCopy(
-                recordID: recordID
-            )
+            guard operationGeneration == generation else {
+                if let preparedURL {
+                    await model.discardFilesExportCopy(at: preparedURL)
+                }
+                return
+            }
+            exportTask = nil
+            isWorking = false
+            exportProgress = nil
+            exportRateWindow.reset()
             guard !Task.isCancelled else {
                 if let preparedURL {
                     await model.discardFilesExportCopy(at: preparedURL)
                 }
                 return
             }
+#if DEBUG
+            // #region debug-point F:files-export-view-result
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "F",
+                location: "SourceLocationView.prepareExport",
+                message: "Files export preparation finished",
+                data: [
+                    "recordID": recordID.uuidString,
+                    "hasPreparedURL": String(preparedURL != nil),
+                    "hasError": String(
+                        model.presentationError(
+                            for: paperPathSceneID
+                        ) != nil
+                    ),
+                    "generationIsCurrent": String(
+                        operationGeneration == generation
+                    )
+                ]
+            )
+            // #endregion
+#endif
             exportURL = preparedURL
             isExporting = preparedURL != nil
         }
@@ -9404,36 +14783,68 @@ struct SourceLocationView: View {
         }
     }
 
-    private func writeBack() {
-        isWorking = true
-        actionTask = Task {
-            _ = await model.writeBackToSource(recordID: recordID)
-            guard !Task.isCancelled else {
-                isWorking = false
-                actionTask = nil
-                return
-            }
-            await reload()
-            isWorking = false
-            actionTask = nil
+    private func stopCurrentOperation(
+        invalidateResult: Bool = false
+    ) {
+        if !invalidateResult,
+           actionTask != nil {
+            guard !actionStopRequested else { return }
+            actionStopRequested = true
+            actionTask?.cancel()
+            return
         }
+        operationGeneration = UUID()
+        exportTask?.cancel()
+        actionTask?.cancel()
+        exportTask = nil
+        actionTask = nil
+        isWorking = false
+        actionStopRequested = false
+        exportProgress = nil
+        exportRateWindow.reset()
+    }
+
+    private func interruptProtectedSourceWork() {
+        sourceGeneration += 1
+        isLoading = false
+        stopCurrentOperation(invalidateResult: true)
+        isExporting = false
+        discardPreparedExport()
     }
 
     private func importChangedSource() {
+        guard actionTask == nil,
+              exportTask == nil,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        let generation = UUID()
+        operationGeneration = generation
+        actionStopRequested = false
         isWorking = true
-        actionTask = Task {
-            let imported = await model.importLatestSource(
-                recordID: recordID
-            )
-            guard !Task.isCancelled else {
-                isWorking = false
-                actionTask = nil
+        actionTask = Task { @MainActor in
+            let imported = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.importLatestSource(
+                    recordID: recordID
+                )
+            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                actionStopRequested || Task.isCancelled
+            actionTask = nil
+            isWorking = false
+            actionStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    imported == nil
+                        ? "Source import stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
                 return
             }
-            isWorking = false
-            actionTask = nil
             guard let imported else { return }
-            dismiss()
             onOpenDocument(
                 DocumentRoute(recordID: imported.id)
             )

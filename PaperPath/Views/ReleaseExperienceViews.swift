@@ -1,15 +1,23 @@
 import StoreKit
 import SwiftUI
+import UIKit
 import UserNotifications
 
 struct FirstRunExperienceView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
-    let onSample: () async -> Void
+    let hasExistingDocuments: Bool
+    let onSample: () async -> Bool
     let onComplete: () -> Void
 
     @State private var page = 0
     @State private var isCreatingSample = false
+    @State private var sampleError: String?
+    @State private var sampleTask: Task<Void, Never>?
+    @State private var sampleGeneration = UUID()
+    @State private var sampleErrorFeedback = 0
 
     var body: some View {
         ZStack {
@@ -18,17 +26,31 @@ struct FirstRunExperienceView: View {
             VStack(spacing: 0) {
                 HStack {
                     Text(AppBrand.name)
-                        .font(.headline)
+                        .font(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? .caption.weight(.semibold)
+                                : .headline
+                        )
                         .fontDesign(.serif)
                         .foregroundStyle(PPColor.textPrimary)
+                        .lineLimit(1)
                     Spacer()
-                    Button("Skip") {
-                        onComplete()
+                    if page < 2 {
+                        Button("Skip") {
+                            onComplete()
+                        }
+                        .font(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? .caption.weight(.semibold)
+                                : .subheadline.weight(.semibold)
+                        )
+                        .foregroundStyle(PPColor.textSecondary)
+                        .keyboardShortcut(.cancelAction)
+                        .accessibilityHint(
+                            "Skips the introduction and opens Home"
+                                .localizedUI
+                        )
                     }
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(PPColor.textSecondary)
-                    .opacity(page == 2 ? 0 : 1)
-                    .disabled(page == 2)
                 }
                 .padding(.horizontal, PPSpacing.large)
                 .padding(.top, PPSpacing.medium)
@@ -36,47 +58,43 @@ struct FirstRunExperienceView: View {
                 onboardingRail
                     .padding(.horizontal, PPSpacing.large)
                     .padding(.top, PPSpacing.small)
+                    .disabled(isCreatingSample)
 
                 TabView(selection: $page) {
                     introPage(
-                        eyebrow: "PRIVATE BY DEFAULT",
-                        title: "Finish important PDFs privately.",
-                        detail: "PDF content and extracted text stay in your local workspace.",
-                        illustration: .privacy,
-                        tint: PPColor.mint
+                        eyebrow: "START WITH A GOAL",
+                        title: "What do you need to do?",
+                        detail: "Sign, fill, combine, compress, or hide information. PaperPath shows only the steps you need.",
+                        illustration: .workspace,
+                        tint: PPColor.accent
                     )
                     .tag(0)
 
                     introPage(
-                        eyebrow: "ORIGINAL PRESERVED",
-                        title: "Work on a private copy.",
-                        detail: "Your imported original is not silently overwritten.",
-                        illustration: .workspace,
+                        eyebrow: "WORK ON A COPY",
+                        title: "Choose a PDF when you’re ready.",
+                        detail: "PaperPath creates a private working copy. Your imported original stays untouched.",
+                        illustration: .intake,
                         tint: PPColor.cyan
                     )
                     .tag(1)
 
                     introPage(
-                        eyebrow: "VERIFIED OUTPUT",
-                        title: "Check the copy before it leaves.",
-                        detail: "PaperPath reopens the output, checks it, and keeps a receipt.",
+                        eyebrow: "CHECK BEFORE SHARING",
+                        title: "Finish with confidence.",
+                        detail: "PaperPath reopens the finished copy, checks it, and keeps a local receipt.",
                         illustration: .processing,
-                        tint: PPColor.accent
+                        tint: PPColor.mint
                     )
                     .tag(2)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
+                .disabled(isCreatingSample)
 
                 VStack(spacing: PPSpacing.medium) {
                     if page < 2 {
                         Button {
-                            withAnimation(
-                                reduceMotion
-                                    ? nil
-                                    : .snappy(duration: 0.28)
-                            ) {
-                                page += 1
-                            }
+                            changeOnboardingPage(to: page + 1)
                         } label: {
                             Label(
                                 "Continue",
@@ -84,34 +102,60 @@ struct FirstRunExperienceView: View {
                             )
                         }
                         .buttonStyle(PPPrimaryButtonStyle())
+                        .keyboardShortcut(.defaultAction)
                     } else {
                         Button {
-                            isCreatingSample = true
-                            Task {
-                                await onSample()
-                                isCreatingSample = false
+                            if sampleTask != nil {
+                                interruptSampleCreation()
+                            } else {
+                                createSample()
                             }
                         } label: {
                             HStack(spacing: PPSpacing.small) {
                                 if isCreatingSample {
-                                    ProgressView()
-                                        .tint(.white)
-                                        .controlSize(.small)
+                                    Image(systemName: "stop.fill")
+                                } else if sampleError != nil {
+                                    Image(systemName: "arrow.clockwise")
+                                } else if hasExistingDocuments {
+                                    Image(systemName: "doc.text")
                                 } else {
                                     Image(systemName: "doc.text.magnifyingglass")
                                 }
-                                Text("Try a Local Sample")
+                                Text(sampleActionTitle.localizedUI)
                             }
                         }
                         .buttonStyle(PPPrimaryButtonStyle())
-                        .disabled(isCreatingSample)
+                        .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("samplePDFAction")
+                        .accessibilityHint(
+                            (
+                                isCreatingSample
+                                    ? "Stops before the sample is added"
+                                    : hasExistingDocuments
+                                        ? "Opens an existing private working copy"
+                                        : "Creates a local sample PDF"
+                            ).localizedUI
+                        )
 
-                        Button("Start Empty") {
+                        Button("Go to Home") {
                             onComplete()
                         }
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(PPColor.textSecondary)
                         .frame(minHeight: 44)
+                        .disabled(isCreatingSample)
+                        .keyboardShortcut(.cancelAction)
+
+                        if let sampleError {
+                            Label(
+                                sampleError.localizedUI,
+                                systemImage: "exclamationmark.triangle"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(PPColor.rose)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityAddTraits(.isStaticText)
+                        }
                     }
                 }
                 .padding(.horizontal, PPSpacing.large)
@@ -120,27 +164,115 @@ struct FirstRunExperienceView: View {
         }
         .interactiveDismissDisabled()
         .sensoryFeedback(.selection, trigger: page)
+        .sensoryFeedback(.error, trigger: sampleErrorFeedback)
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptSampleCreation()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptSampleCreation()
+        }
+        .onDisappear {
+            interruptSampleCreation()
+        }
     }
 
     private var onboardingRail: some View {
-        HStack(spacing: 0) {
-            onboardingStop(
-                index: 0,
-                title: "Local",
-                symbol: "iphone"
-            )
-            onboardingStop(
-                index: 1,
-                title: "Source",
-                symbol: "doc.on.doc"
-            )
-            onboardingStop(
-                index: 2,
-                title: "Deliver",
-                symbol: "checkmark.seal"
-            )
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                HStack(spacing: PPSpacing.small) {
+                    Text(
+                        AppLocalization.format(
+                            "Step %lld of 3",
+                            page + 1
+                        )
+                    )
+                    .font(.caption.monospacedDigit().weight(.bold))
+                    .foregroundStyle(PPColor.accent)
+                    Spacer()
+                    Label(
+                        onboardingStepTitle.localizedUI,
+                        systemImage: onboardingStepSymbol
+                    )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(1)
+                }
+                .frame(minHeight: 44)
+            } else {
+                HStack(spacing: 0) {
+                    onboardingStop(
+                        index: 0,
+                        title: "Goal",
+                        symbol: "scope"
+                    )
+                    onboardingStop(
+                        index: 1,
+                        title: "Work",
+                        symbol: "doc.on.doc"
+                    )
+                    onboardingStop(
+                        index: 2,
+                        title: "Share",
+                        symbol: "checkmark.seal"
+                    )
+                }
+            }
         }
-        .accessibilityElement(children: .contain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Introduction progress".localizedUI)
+        .accessibilityValue(
+            AppLocalization.format(
+                "Step %lld of 3, %@",
+                page + 1,
+                onboardingStepTitle.localizedUI
+            )
+        )
+        .accessibilityAdjustableAction { direction in
+            switch direction {
+            case .increment:
+                guard page < 2 else { return }
+                changeOnboardingPage(to: page + 1)
+            case .decrement:
+                guard page > 0 else { return }
+                changeOnboardingPage(to: page - 1)
+            @unknown default:
+                break
+            }
+        }
+    }
+
+    private var onboardingStepTitle: String {
+        switch page {
+        case 0: return "Goal"
+        case 1: return "Work"
+        default: return "Share"
+        }
+    }
+
+    private var onboardingStepSymbol: String {
+        switch page {
+        case 0: return "scope"
+        case 1: return "doc.on.doc"
+        default: return "checkmark.seal"
+        }
+    }
+
+    private var sampleActionTitle: String {
+        if isCreatingSample {
+            return "Stop Creating Sample"
+        }
+        if sampleError != nil {
+            return "Try Sample Again"
+        }
+        return hasExistingDocuments
+            ? "Open a Working Copy"
+            : "Try a Sample PDF"
     }
 
     private func onboardingStop(
@@ -154,11 +286,7 @@ struct FirstRunExperienceView: View {
             ? PPColor.mint
             : (selected ? PPColor.accent : PPColor.textSecondary)
         return Button {
-            withAnimation(
-                reduceMotion ? nil : .snappy(duration: 0.24)
-            ) {
-                page = index
-            }
+            changeOnboardingPage(to: index)
         } label: {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 5) {
@@ -182,6 +310,16 @@ struct FirstRunExperienceView: View {
         .accessibilityValue(selected ? "Selected" : "")
     }
 
+    private func changeOnboardingPage(to requestedPage: Int) {
+        let resolvedPage = min(max(0, requestedPage), 2)
+        guard resolvedPage != page else { return }
+        withAnimation(
+            reduceMotion ? nil : .snappy(duration: 0.24)
+        ) {
+            page = resolvedPage
+        }
+    }
+
     private func introPage(
         eyebrow: String,
         title: String,
@@ -191,38 +329,47 @@ struct FirstRunExperienceView: View {
     ) -> some View {
         ScrollView {
             VStack(spacing: PPSpacing.large) {
-                Spacer(minLength: PPSpacing.medium)
+                Spacer(
+                    minLength:
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? PPSpacing.xSmall
+                            : PPSpacing.medium
+                )
 
-                ViewThatFits(in: .horizontal) {
-                    HStack(
-                        alignment: .center,
-                        spacing: PPSpacing.xLarge
-                    ) {
-                        onboardingIllustration(illustration)
-                        onboardingCopy(
-                            eyebrow: eyebrow,
-                            title: title,
-                            detail: detail,
-                            tint: tint
-                        )
-                        .multilineTextAlignment(.leading)
-                    }
-
-                    VStack(spacing: PPSpacing.medium) {
-                        onboardingIllustration(illustration)
-                        onboardingCopy(
-                            eyebrow: eyebrow,
-                            title: title,
-                            detail: detail,
-                            tint: tint
-                        )
-                        .multilineTextAlignment(.leading)
+                Group {
+                    if dynamicTypeSize.ppPrefersExpandedLayout {
+                        VStack(spacing: PPSpacing.small) {
+                            onboardingIllustration(illustration)
+                            onboardingCopy(
+                                eyebrow: eyebrow,
+                                title: title,
+                                detail: detail,
+                                tint: tint
+                            )
+                            .multilineTextAlignment(.leading)
+                        }
+                    } else {
+                        HStack(
+                            alignment: .center,
+                            spacing: PPSpacing.xLarge
+                        ) {
+                            onboardingIllustration(illustration)
+                            onboardingCopy(
+                                eyebrow: eyebrow,
+                                title: title,
+                                detail: detail,
+                                tint: tint
+                            )
+                            .multilineTextAlignment(.leading)
+                        }
                     }
                 }
                 .padding(.horizontal, PPSpacing.xLarge)
 
-                onboardingEvidence
-                    .padding(.horizontal, PPSpacing.large)
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    onboardingEvidence
+                        .padding(.horizontal, PPSpacing.large)
+                }
                 Spacer(minLength: PPSpacing.medium)
             }
             .frame(maxWidth: .infinity, minHeight: 420)
@@ -234,8 +381,17 @@ struct FirstRunExperienceView: View {
     private func onboardingIllustration(
         _ illustration: PPIllustrationKind
     ) -> some View {
-        PPIllustration(kind: illustration, width: 164)
-            .frame(width: 170, height: 138)
+        let width: CGFloat =
+            dynamicTypeSize.ppPrefersExpandedLayout ? 92 : 164
+        return PPIllustration(kind: illustration, width: width)
+            .frame(
+                width: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? 102
+                    : 170,
+                height: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? 82
+                    : 138
+            )
             .overlay {
                 StudioStageMarks(
                     tint: page == 2 ? PPColor.mint : PPColor.accent,
@@ -255,7 +411,11 @@ struct FirstRunExperienceView: View {
             SectionEyebrow(text: eyebrow)
 
             Text(title.localizedUI)
-                .font(.title2.bold())
+                .font(
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .title3.bold()
+                        : .title2.bold()
+                )
                 .fontDesign(.serif)
                 .foregroundStyle(PPColor.textPrimary)
                 .accessibilityAddTraits(.isHeader)
@@ -286,24 +446,51 @@ struct FirstRunExperienceView: View {
             spacing: PPSpacing.medium
         ) {
             StudioMetricCell(
-                value: "Local",
-                label: "Processing",
-                symbol: "iphone",
-                tint: PPColor.mint
-            )
-            StudioMetricCell(
-                value: "Kept",
-                label: "Original",
-                symbol: "doc.on.doc",
+                value: "Choose",
+                label: "A clear goal",
+                symbol: "scope",
                 tint: PPColor.accent
             )
             StudioMetricCell(
-                value: "SHA-256",
-                label: "Receipt",
-                symbol: "number",
-                tint: PPColor.rose
+                value: "Edit",
+                label: "Private copy",
+                symbol: "doc.on.doc",
+                tint: PPColor.cyan
+            )
+            StudioMetricCell(
+                value: "Check",
+                label: "Before sharing",
+                symbol: "checkmark.seal",
+                tint: PPColor.mint
             )
         }
+    }
+
+    private func createSample() {
+        guard sampleTask == nil else { return }
+        let generation = UUID()
+        sampleGeneration = generation
+        sampleError = nil
+        isCreatingSample = true
+        sampleTask = Task { @MainActor in
+            let created = await onSample()
+            guard sampleGeneration == generation else { return }
+            sampleTask = nil
+            isCreatingSample = false
+            guard !Task.isCancelled else { return }
+            if !created {
+                sampleError =
+                    "The sample PDF could not be created. Try again or go to Home."
+                sampleErrorFeedback += 1
+            }
+        }
+    }
+
+    private func interruptSampleCreation() {
+        sampleGeneration = UUID()
+        sampleTask?.cancel()
+        sampleTask = nil
+        isCreatingSample = false
     }
 }
 
@@ -311,7 +498,10 @@ struct AppSettingsView: View {
     @EnvironmentObject private var model: PaperPathModel
     @EnvironmentObject private var appLock: AppLockController
     @EnvironmentObject private var purchase: PurchaseController
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @AppStorage(AppLanguage.defaultsKey)
     private var languageCode = AppLanguage.system.rawValue
@@ -334,6 +524,17 @@ struct AppSettingsView: View {
     @State private var isConfirmingReset = false
     @State private var isConfirmingMetadataDeletion = false
     @State private var isResetting = false
+    @State private var resetTask: Task<Void, Never>?
+    @State private var metadataTask: Task<Void, Never>?
+    @State private var metadataGeneration = UUID()
+    @State private var isDeletingSyncedMetadata = false
+    @State private var isUpdatingReminders = false
+    @State private var reminderUpdateTask: Task<Void, Never>?
+    @State private var reminderUpdateGeneration = UUID()
+    @State private var pendingReminderPreference: Bool?
+    @State private var appLockPreferenceTask: Task<Void, Never>?
+    @State private var appLockPreferenceGeneration = UUID()
+    @State private var shouldLockAfterPrivacyDismissal = false
 
     var body: some View {
         NavigationStack {
@@ -345,7 +546,6 @@ struct AppSettingsView: View {
                         alignment: .leading,
                         spacing: PPSpacing.large
                     ) {
-                        settingsStudioHeader
                         accountSection
                         languageSection
                         privacySection
@@ -365,17 +565,53 @@ struct AppSettingsView: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Done") { dismiss() }
+                        .disabled(hasBlockingSettingsOperation)
+                        .keyboardShortcut(.cancelAction)
+                }
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if let blockingOperationStatus {
+                    HStack(spacing: PPSpacing.small) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(blockingOperationStatus.localizedUI)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(PPColor.textPrimary)
+                        Spacer(minLength: 0)
+                        OnDeviceBadge(compact: true)
+                    }
+                    .padding(.horizontal, PPSpacing.regular)
+                    .frame(minHeight: 44)
+                    .background(.bar)
+                    .overlay(alignment: .top) {
+                        Rectangle()
+                            .fill(PPColor.border.opacity(0.62))
+                            .frame(height: 0.6)
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.updatesFrequently)
                 }
             }
         }
-        .sheet(isPresented: $isShowingPrivacy) {
-            PrivacyCenterView()
+        .interactiveDismissDisabled(hasBlockingSettingsOperation)
+        .accessibilityAction(.escape) {
+            guard !hasBlockingSettingsOperation else { return }
+            dismiss()
+        }
+        .sheet(
+            isPresented: $isShowingPrivacy,
+            onDismiss: completePrivacyCenterDismissal
+        ) {
+            PrivacyCenterView {
+                shouldLockAfterPrivacyDismissal = true
+                isShowingPrivacy = false
+            }
         }
         .sheet(isPresented: $isShowingWhatsNew) {
             WhatsNewView()
         }
         .sheet(isPresented: $isShowingUnlock) {
-            FullUnlockView()
+            FullUnlockView(context: .settings)
         }
         .sheet(
             isPresented: $isShowingDiagnostics,
@@ -395,20 +631,20 @@ struct AppSettingsView: View {
                 .autocorrectionDisabled()
             Button("Delete Local Data", role: .destructive) {
                 guard resetConfirmation == "DELETE" else { return }
-                isResetting = true
-                Task {
-                    await model.eraseAllLocalData()
-                    isResetting = false
-                    dismiss()
-                }
+                eraseAllLocalData()
             }
-            .disabled(resetConfirmation != "DELETE")
+            .disabled(
+                resetConfirmation != "DELETE"
+                    || hasBlockingSettingsOperation
+                    || metadataTask != nil
+                    || model.hasActiveLocalDataOperations
+            )
             Button("Cancel", role: .cancel) {
                 resetConfirmation = ""
             }
         } message: {
             Text(
-                "Working copies, OCR text, receipts, versions, signatures, and Trash will be permanently removed. Files originals stay untouched."
+                "Working copies, OCR text, receipts, versions, signatures, and Trash will be permanently removed. Original files stay untouched."
             )
         }
         .alert(
@@ -416,75 +652,49 @@ struct AppSettingsView: View {
             isPresented: $isConfirmingMetadataDeletion
         ) {
             Button("Delete Synced Metadata", role: .destructive) {
-                Task {
-                    await model.deleteSyncedMetadata()
-                }
+                deleteSyncedMetadata()
             }
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "This removes PaperPath metadata from iCloud. Local PDFs and Files originals stay untouched."
+                "This turns off metadata sync and removes PaperPath metadata from iCloud. Local PDFs and original files stay untouched."
             )
         }
         .task {
             await purchase.prepare()
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptDiagnosticsShare()
+            clearSensitiveConfirmations()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptDiagnosticsShare()
+            clearSensitiveConfirmations()
+        }
+        .onDisappear {
+            appLock.cancelPendingAuthentication()
+            interruptDiagnosticsShare()
+            clearSensitiveConfirmations()
+            interruptTransientSettingsWork()
+        }
     }
 
-    private var settingsStudioHeader: some View {
-        VStack(alignment: .leading, spacing: PPSpacing.medium) {
-            StudioSectionRule(
-                title: "STUDIO CONTROL",
-                detail: "Private workspace policy",
-                symbol: "switch.2",
-                tint: PPColor.rose
-            )
-
-            LazyVGrid(
-                columns: [
-                    GridItem(
-                        .adaptive(minimum: 128, maximum: 220),
-                        spacing: PPSpacing.medium
-                    )
-                ],
-                spacing: PPSpacing.medium
-            ) {
-                StudioMetricCell(
-                    value: purchase.isUnlocked ? "Owned" : "Free",
-                    label: "License",
-                    symbol: "seal",
-                    tint: purchase.isUnlocked
-                        ? PPColor.mint
-                        : PPColor.accent
-                )
-                StudioMetricCell(
-                    value: "\(model.documents.count)",
-                    label: "Copies",
-                    symbol: "doc.on.doc",
-                    tint: PPColor.cyan
-                )
-                StudioMetricCell(
-                    value: localStorageSize,
-                    label: "Storage",
-                    symbol: "internaldrive",
-                    tint: PPColor.amber
-                )
-                StudioMetricCell(
-                    value: appLock.isEnabled ? "On" : "Off",
-                    label: "App lock",
-                    symbol: appLock.symbol,
-                    tint: appLock.isEnabled
-                        ? PPColor.mint
-                        : PPColor.textSecondary
-                )
-            }
-        }
+    private func completePrivacyCenterDismissal() {
+        guard shouldLockAfterPrivacyDismissal else { return }
+        shouldLockAfterPrivacyDismissal = false
+        appLock.lockNow()
     }
 
     private var accountSection: some View {
         settingsSection(
-            title: "OWNERSHIP",
-            detail: "No account or subscription",
+            title: "PAPERPATH",
+            detail: "One-time access, no account",
             symbol: "seal",
             tint: PPColor.accent
         ) {
@@ -493,23 +703,10 @@ struct AppSettingsView: View {
                     isShowingUnlock = true
                 } label: {
                     settingsRow(
-                        symbol: purchase.isUnlocked
-                            ? "checkmark.seal.fill"
-                            : "seal",
-                        tint: purchase.isUnlocked
-                            ? PPColor.mint
-                            : PPColor.accent,
-                        title: purchase.isUnlocked
-                            ? "Verified Output Lifetime"
-                            : "Unlock Verified Output",
-                        detail: purchase.isUnlocked
-                            ? "Owned on this Apple ID"
-                            : purchase.product.map {
-                                AppLocalization.format(
-                                    "%@ once · no subscription",
-                                    $0.displayPrice
-                                )
-                            } ?? "One-time purchase · no subscription",
+                        symbol: purchaseOwnershipSymbol,
+                        tint: purchaseOwnershipTint,
+                        title: purchaseOwnershipTitle,
+                        detail: purchaseOwnershipDetail,
                         disclosure: true
                     )
                 }
@@ -520,8 +717,8 @@ struct AppSettingsView: View {
 
     private var languageSection: some View {
         settingsSection(
-            title: "LANGUAGE",
-            detail: "Interface only",
+            title: "APP LANGUAGE",
+            detail: "Change the PaperPath interface",
             symbol: "globe",
             tint: PPColor.cyan
         ) {
@@ -549,8 +746,8 @@ struct AppSettingsView: View {
 
     private var privacySection: some View {
         settingsSection(
-            title: "LOCAL-FIRST",
-            detail: "Protected temporary exports are deleted after handoff",
+            title: "PRIVACY & SECURITY",
+            detail: "App lock and optional metadata sync",
             symbol: "lock.shield",
             tint: PPColor.mint
         ) {
@@ -566,21 +763,20 @@ struct AppSettingsView: View {
                         title: "iCloud Metadata",
                         detail: metadataSyncEnabled
                             ? model.metadataSyncStatus.detail
-                            : "Off · Document content stays local"
+                            : "Off · PDF files and extracted text stay local"
                     )
                 }
+                .disabled(isDeletingSyncedMetadata || isResetting)
             }
 
             if metadataSyncEnabled {
                 settingsControl(tint: PPColor.cyan) {
                     Button {
-                        Task {
-                            await model.synchronizeMetadata()
-                        }
+                        synchronizeMetadataNow()
                     } label: {
                         settingsActionLabel(
                             "Sync Metadata Now",
-                            detail: "Document bytes never leave the device",
+                            detail: "PDF bytes and extracted text never sync",
                             symbol: "arrow.triangle.2.circlepath",
                             tint: PPColor.cyan
                         )
@@ -588,6 +784,8 @@ struct AppSettingsView: View {
                     .buttonStyle(.plain)
                     .disabled(
                         model.metadataSyncStatus.state == .syncing
+                            || metadataTask != nil
+                            || isResetting
                     )
                 }
 
@@ -603,6 +801,10 @@ struct AppSettingsView: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .disabled(
+                        metadataTask != nil
+                            || isResetting
+                    )
                 }
             }
 
@@ -611,13 +813,7 @@ struct AppSettingsView: View {
                     isOn: Binding(
                         get: { appLock.isEnabled },
                         set: { enabled in
-                            Task {
-                                if enabled {
-                                    _ = await appLock.enable()
-                                } else {
-                                    appLock.disable()
-                                }
-                            }
+                            updateAppLockPreference(enabled)
                         }
                     )
                 ) {
@@ -627,14 +823,30 @@ struct AppSettingsView: View {
                             ? PPColor.mint
                             : PPColor.textSecondary,
                         title: "App Lock",
-                        detail: appLock.isEnabled
-                            ? appLock.methodTitle
-                            : "Off"
+                        detail: appLock.isAuthenticating
+                            ? "Authenticating"
+                            : appLock.isEnabled
+                                ? appLock.methodTitle
+                                : "Off"
                     )
                 }
                 .disabled(
-                    !appLock.isAvailable && !appLock.isEnabled
+                    appLock.isAuthenticating
+                        || appLockPreferenceTask != nil
+                        || (!appLock.isAvailable && !appLock.isEnabled)
                 )
+            }
+
+            if let errorMessage = appLock.errorMessage {
+                Label(
+                    errorMessage,
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isStaticText)
+                .padding(.horizontal, PPSpacing.small)
             }
 
             if appLock.isEnabled {
@@ -681,8 +893,8 @@ struct AppSettingsView: View {
 
     private var performanceSection: some View {
         settingsSection(
-            title: "PERFORMANCE",
-            detail: "Balance preview detail and memory",
+            title: "PDF PREVIEWS",
+            detail: "Balance image detail and memory",
             symbol: "gauge.with.dots.needle.50percent",
             tint: PPColor.amber
         ) {
@@ -707,7 +919,9 @@ struct AppSettingsView: View {
     }
 
     private var remindersSection: some View {
-        settingsSection(
+        let displayedRemindersEnabled =
+            pendingReminderPreference ?? dueRemindersEnabled
+        return settingsSection(
             title: "REMINDERS",
             detail: "PDF names and content never appear in notifications",
             symbol: "calendar.badge.clock",
@@ -716,25 +930,28 @@ struct AppSettingsView: View {
             settingsControl(tint: PPColor.amber) {
                 Toggle(isOn: remindersBinding) {
                     settingsRow(
-                        symbol: dueRemindersEnabled
+                        symbol: displayedRemindersEnabled
                             ? "calendar.badge.clock"
                             : "bell.slash",
-                        tint: dueRemindersEnabled
+                        tint: displayedRemindersEnabled
                             ? PPColor.amber
                             : PPColor.textSecondary,
                         title: "Due-Date Reminders",
-                        detail: dueRemindersEnabled
-                            ? "Only reminders you schedule"
-                            : "No promotional notifications"
+                        detail: isUpdatingReminders
+                            ? "Updating scheduled reminders"
+                            : displayedRemindersEnabled
+                                ? "Only reminders you schedule"
+                                : "No promotional notifications"
                     )
                 }
+                .disabled(isUpdatingReminders || isResetting)
             }
         }
     }
 
     private var supportSection: some View {
         settingsSection(
-            title: "SUPPORT",
+            title: "HELP & ABOUT",
             detail: "Diagnostics exclude document content and names",
             symbol: "questionmark.circle",
             tint: PPColor.cyan
@@ -776,7 +993,7 @@ struct AppSettingsView: View {
                 } label: {
                     settingsActionLabel(
                         "Replay Introduction",
-                        detail: "Local → source → deliver",
+                        detail: "Review the basic workflow",
                         symbol: "rectangle.stack",
                         tint: PPColor.rose
                     )
@@ -788,7 +1005,7 @@ struct AppSettingsView: View {
 
     private var dataSection: some View {
         settingsSection(
-            title: "LOCAL DATA",
+            title: "STORAGE & DATA",
             detail: "Files originals stay untouched",
             symbol: "internaldrive",
             tint: PPColor.rose
@@ -818,8 +1035,10 @@ struct AppSettingsView: View {
                 } label: {
                     HStack {
                         settingsActionLabel(
-                        "Delete All Local Data",
-                            detail: "Permanent removal from PaperPath",
+                            "Delete All Local Data",
+                            detail: model.hasActiveLocalDataOperations
+                                ? "Finish active document work first"
+                                : "Permanent removal from PaperPath",
                             symbol: "trash",
                             tint: PPColor.rose
                         )
@@ -829,7 +1048,11 @@ struct AppSettingsView: View {
                     }
                 }
                 .buttonStyle(.plain)
-                .disabled(isResetting)
+                .disabled(
+                    hasBlockingSettingsOperation
+                        || metadataTask != nil
+                        || model.hasActiveLocalDataOperations
+                )
             }
         }
     }
@@ -881,24 +1104,57 @@ struct AppSettingsView: View {
         tint: Color,
         disclosure: Bool = false
     ) -> some View {
-        HStack(spacing: PPSpacing.medium) {
-            Image(systemName: symbol)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(tint)
-                .frame(width: 28)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title.localizedUI)
-                    .foregroundStyle(PPColor.textPrimary)
-                Text(detail.localizedUI)
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: PPSpacing.small)
-            if disclosure {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(PPColor.textSecondary)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        Image(systemName: symbol)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(tint)
+                            .frame(width: 28)
+                        Text(title.localizedUI)
+                            .foregroundStyle(PPColor.textPrimary)
+                        Spacer(minLength: PPSpacing.small)
+                        if disclosure {
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(PPColor.textSecondary)
+                        }
+                    }
+                    Text(detail.localizedUI)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 36)
+                }
+                .padding(.vertical, PPSpacing.xSmall)
+            } else {
+                HStack(spacing: PPSpacing.medium) {
+                    Image(systemName: symbol)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(tint)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title.localizedUI)
+                            .foregroundStyle(PPColor.textPrimary)
+                        Text(detail.localizedUI)
+                            .font(.caption)
+                            .foregroundStyle(PPColor.textSecondary)
+                            .fixedSize(
+                                horizontal: false,
+                                vertical: true
+                            )
+                    }
+                    Spacer(minLength: PPSpacing.small)
+                    if disclosure {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(PPColor.textSecondary)
+                    }
+                }
             }
         }
         .contentShape(Rectangle())
@@ -910,22 +1166,102 @@ struct AppSettingsView: View {
         symbol: String,
         tint: Color
     ) -> some View {
-        HStack(spacing: PPSpacing.medium) {
-            Image(systemName: symbol)
-                .foregroundStyle(tint)
-                .frame(width: 28)
-            Text(title.localizedUI)
-                .foregroundStyle(PPColor.textPrimary)
-            Spacer(minLength: PPSpacing.small)
-            Text(value.localizedUI)
-                .font(.subheadline.monospacedDigit().weight(.semibold))
-                .foregroundStyle(PPColor.textSecondary)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    Label {
+                        Text(title.localizedUI)
+                            .foregroundStyle(PPColor.textPrimary)
+                    } icon: {
+                        Image(systemName: symbol)
+                            .foregroundStyle(tint)
+                            .frame(width: 28)
+                    }
+                    Text(value.localizedUI)
+                        .font(
+                            .subheadline.monospacedDigit()
+                                .weight(.semibold)
+                        )
+                        .foregroundStyle(PPColor.textSecondary)
+                        .padding(.leading, 36)
+                }
+                .padding(.vertical, PPSpacing.xSmall)
+            } else {
+                HStack(spacing: PPSpacing.medium) {
+                    Image(systemName: symbol)
+                        .foregroundStyle(tint)
+                        .frame(width: 28)
+                    Text(title.localizedUI)
+                        .foregroundStyle(PPColor.textPrimary)
+                    Spacer(minLength: PPSpacing.small)
+                    Text(value.localizedUI)
+                        .font(
+                            .subheadline.monospacedDigit()
+                                .weight(.semibold)
+                        )
+                        .foregroundStyle(PPColor.textSecondary)
+                }
+            }
         }
     }
 
     private var selectedLanguageTitle: String {
         AppLanguage(rawValue: languageCode)?.title
             ?? AppLanguage.system.title
+    }
+
+    private var purchaseOwnershipTitle: String {
+        if purchase.isUnlocked {
+            return "Verified Output Lifetime"
+        }
+        if purchase.status == .pending {
+            return "Purchase Pending"
+        }
+        return "Unlock Verified Output"
+    }
+
+    private var purchaseOwnershipDetail: String {
+        if purchase.isUnlocked {
+            return "Lifetime access is active on this device"
+        }
+        switch purchase.status {
+        case .loading, .purchasing, .restoring, .pending,
+             .unavailable, .failed:
+            return purchase.status.detail
+        case .idle, .cancelled, .purchased:
+            return purchase.product.map {
+                AppLocalization.format(
+                    "%@ once · no subscription",
+                    $0.displayPrice
+                )
+            } ?? "One-time purchase · no subscription"
+        }
+    }
+
+    private var purchaseOwnershipSymbol: String {
+        if purchase.isUnlocked {
+            return "checkmark.seal.fill"
+        }
+        return purchase.status == .pending
+            ? "clock.badge.questionmark"
+            : "seal"
+    }
+
+    private var purchaseOwnershipTint: Color {
+        if purchase.isUnlocked {
+            return PPColor.mint
+        }
+        switch purchase.status {
+        case .pending:
+            return PPColor.amber
+        case .failed, .unavailable:
+            return PPColor.rose
+        default:
+            return PPColor.accent
+        }
     }
 
     private var selectedPreviewQualityTitle: String {
@@ -939,39 +1275,210 @@ struct AppSettingsView: View {
         Binding(
             get: { metadataSyncEnabled },
             set: { enabled in
-                metadataSyncEnabled = enabled
-                Task {
-                    await model.setMetadataSyncEnabled(enabled)
-                }
+                updateMetadataSyncPreference(enabled)
             }
         )
     }
 
     private var remindersBinding: Binding<Bool> {
         Binding(
-            get: { dueRemindersEnabled },
+            get: {
+                pendingReminderPreference
+                    ?? dueRemindersEnabled
+            },
             set: { enabled in
-                Task {
+                guard reminderUpdateTask == nil else { return }
+                let generation = UUID()
+                reminderUpdateGeneration = generation
+                pendingReminderPreference = enabled
+                isUpdatingReminders = true
+                if !enabled {
+                    dueRemindersEnabled = false
+                }
+                reminderUpdateTask = Task { @MainActor in
+                    guard !Task.isCancelled else { return }
+                    defer {
+                        if reminderUpdateGeneration == generation {
+                            isUpdatingReminders = false
+                            reminderUpdateTask = nil
+                            pendingReminderPreference = nil
+                        }
+                    }
                     if enabled {
                         let allowed = await LocalDueReminderScheduler
                             .requestAuthorization()
+                        guard reminderUpdateGeneration == generation,
+                              !Task.isCancelled
+                        else { return }
                         dueRemindersEnabled = allowed
                         if allowed {
+                            var failedCount = 0
                             for record in model.documents
                             where record.dueAt != nil {
-                                await LocalDueReminderScheduler.update(
+                                guard reminderUpdateGeneration
+                                        == generation,
+                                      !Task.isCancelled
+                                else { return }
+                                let scheduled =
+                                    await LocalDueReminderScheduler.update(
                                     recordID: record.id,
                                     dueAt: record.dueAt
                                 )
+                                guard reminderUpdateGeneration
+                                        == generation,
+                                      !Task.isCancelled
+                                else { return }
+                                if !scheduled {
+                                    failedCount += 1
+                                }
                             }
+                            if failedCount > 0 {
+                                model[noticeFor: paperPathSceneID] =
+                                    "Some due-date reminders could not be scheduled."
+                                        .localizedUI
+                            }
+                        } else {
+                            model[noticeFor: paperPathSceneID] =
+                                "Reminders remain off because notification access was not granted."
+                                    .localizedUI
                         }
                     } else {
-                        dueRemindersEnabled = false
-                        LocalDueReminderScheduler.disableAll()
+                        await LocalDueReminderScheduler.disableAll()
                     }
                 }
             }
         )
+    }
+
+    private var hasBlockingSettingsOperation: Bool {
+        isResetting
+            || isDeletingSyncedMetadata
+            || isUpdatingReminders
+            || appLockPreferenceTask != nil
+            || metadataTask != nil
+    }
+
+    private var blockingOperationStatus: String? {
+        if isResetting {
+            return "Deleting local PaperPath data"
+        }
+        if isDeletingSyncedMetadata {
+            return "Deleting synced metadata"
+        }
+        if isUpdatingReminders {
+            return "Updating due-date reminders"
+        }
+        if appLockPreferenceTask != nil {
+            return "Updating App Lock"
+        }
+        if metadataTask != nil {
+            return "Updating iCloud metadata"
+        }
+        return nil
+    }
+
+    private func eraseAllLocalData() {
+        guard resetTask == nil else { return }
+        isResetting = true
+        resetTask = Task { @MainActor in
+            let deleted = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.eraseAllLocalData()
+            }
+            isResetting = false
+            resetTask = nil
+            if deleted {
+                dismiss()
+            }
+        }
+    }
+
+    private func updateMetadataSyncPreference(_ enabled: Bool) {
+        let generation = UUID()
+        metadataGeneration = generation
+        metadataTask?.cancel()
+        metadataSyncEnabled = enabled
+        metadataTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            await model.withFeedbackTarget(paperPathSceneID) {
+                await model.setMetadataSyncEnabled(enabled)
+            }
+            guard metadataGeneration == generation else { return }
+            metadataTask = nil
+        }
+    }
+
+    private func updateAppLockPreference(_ enabled: Bool) {
+        guard appLockPreferenceTask == nil else { return }
+        let generation = UUID()
+        appLockPreferenceGeneration = generation
+        appLockPreferenceTask = Task { @MainActor in
+            if enabled {
+                _ = await appLock.enable()
+            } else {
+                _ = await appLock.disable()
+            }
+            guard appLockPreferenceGeneration == generation else {
+                return
+            }
+            appLockPreferenceTask = nil
+        }
+    }
+
+    private func synchronizeMetadataNow() {
+        guard metadataTask == nil else { return }
+        let generation = UUID()
+        metadataGeneration = generation
+        metadataTask = Task { @MainActor in
+            guard !Task.isCancelled else { return }
+            await model.withFeedbackTarget(paperPathSceneID) {
+                await model.synchronizeMetadata()
+            }
+            guard metadataGeneration == generation else { return }
+            metadataTask = nil
+        }
+    }
+
+    private func deleteSyncedMetadata() {
+        guard metadataTask == nil else { return }
+        let generation = UUID()
+        metadataGeneration = generation
+        isDeletingSyncedMetadata = true
+        metadataTask = Task { @MainActor in
+            await model.withFeedbackTarget(paperPathSceneID) {
+                await model.deleteSyncedMetadata()
+            }
+            guard metadataGeneration == generation else { return }
+            metadataSyncEnabled = false
+            isDeletingSyncedMetadata = false
+            metadataTask = nil
+        }
+    }
+
+    private func interruptTransientSettingsWork() {
+        metadataGeneration = UUID()
+        metadataTask?.cancel()
+        metadataTask = nil
+        isDeletingSyncedMetadata = false
+        let shouldRemovePendingReminders =
+            reminderUpdateTask != nil
+                && pendingReminderPreference == true
+        reminderUpdateGeneration = UUID()
+        reminderUpdateTask?.cancel()
+        reminderUpdateTask = nil
+        isUpdatingReminders = false
+        pendingReminderPreference = nil
+        if shouldRemovePendingReminders {
+            dueRemindersEnabled = false
+            Task {
+                await LocalDueReminderScheduler.disableAll()
+            }
+        }
+        appLockPreferenceGeneration = UUID()
+        appLockPreferenceTask?.cancel()
+        appLockPreferenceTask = nil
+        appLock.cancelPendingAuthentication()
     }
 
     private func settingsRow(
@@ -981,23 +1488,55 @@ struct AppSettingsView: View {
         detail: String,
         disclosure: Bool = false
     ) -> some View {
-        HStack(spacing: PPSpacing.medium) {
-            Image(systemName: symbol)
-                .foregroundStyle(tint)
-                .frame(width: 28)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title.localizedUI)
-                    .foregroundStyle(PPColor.textPrimary)
-                Text(detail.localizedUI)
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer(minLength: PPSpacing.small)
-            if disclosure {
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(PPColor.textSecondary)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        Image(systemName: symbol)
+                            .foregroundStyle(tint)
+                            .frame(width: 28)
+                        Text(title.localizedUI)
+                            .foregroundStyle(PPColor.textPrimary)
+                        Spacer(minLength: PPSpacing.small)
+                        if disclosure {
+                            Image(systemName: "chevron.right")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(PPColor.textSecondary)
+                        }
+                    }
+                    Text(detail.localizedUI)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.leading, 36)
+                }
+                .padding(.vertical, PPSpacing.xSmall)
+            } else {
+                HStack(spacing: PPSpacing.medium) {
+                    Image(systemName: symbol)
+                        .foregroundStyle(tint)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(title.localizedUI)
+                            .foregroundStyle(PPColor.textPrimary)
+                        Text(detail.localizedUI)
+                            .font(.caption)
+                            .foregroundStyle(PPColor.textSecondary)
+                            .fixedSize(
+                                horizontal: false,
+                                vertical: true
+                            )
+                    }
+                    Spacer(minLength: PPSpacing.small)
+                    if disclosure {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(PPColor.textSecondary)
+                    }
+                }
             }
         }
         .contentShape(Rectangle())
@@ -1005,112 +1544,248 @@ struct AppSettingsView: View {
 
     private var localStorageSize: String {
         ByteCountFormatter.string(
-            fromByteCount: model.documents.reduce(0) {
-                $0 + $1.profile.byteCount
-            },
+            fromByteCount: diagnosticsLibraryMetrics.byteCount,
             countStyle: .file
         )
     }
 
     private func createDiagnostics() {
+        let metrics = diagnosticsLibraryMetrics
         do {
             diagnosticsURL = try SupportBundleService.create(
                 documentCount: model.documents.count,
                 deletedCount: model.deletedDocuments.count,
-                pageCount: model.documents.reduce(0) {
-                    $0 + $1.profile.pageCount
-                },
-                localByteCount: model.documents.reduce(0) {
-                    $0 + $1.profile.byteCount
-                },
+                pageCount: metrics.pageCount,
+                localByteCount: metrics.byteCount,
                 indexedDocumentCount: model.textIndices.count,
                 ocrDocumentCount: model.ocrResults.count,
-                receiptCount: model.documents.filter {
-                    $0.deliveryReceipt != nil
-                }.count,
+                receiptCount: metrics.receiptCount,
                 metadataSyncState:
                     model.metadataSyncStatus.state.rawValue
             )
             isShowingDiagnostics = true
         } catch {
-            model.present(error)
+            model.present(error, in: paperPathSceneID)
         }
+    }
+
+    private var diagnosticsLibraryMetrics: (
+        pageCount: Int,
+        byteCount: Int64,
+        receiptCount: Int
+    ) {
+        var pageCount = 0
+        var byteCount: Int64 = 0
+        var receiptCount = 0
+        for record in model.documents {
+            let nextPages = pageCount.addingReportingOverflow(
+                max(0, record.profile.pageCount)
+            )
+            pageCount = nextPages.overflow
+                ? .max
+                : nextPages.partialValue
+            let nextBytes = byteCount.addingReportingOverflow(
+                max(0, record.profile.byteCount)
+            )
+            byteCount = nextBytes.overflow
+                ? .max
+                : nextBytes.partialValue
+            if record.deliveryReceipt != nil,
+               receiptCount < .max {
+                receiptCount += 1
+            }
+        }
+        return (pageCount, byteCount, receiptCount)
     }
 
     private func discardDiagnostics() {
         SupportBundleService.discard(diagnosticsURL)
         diagnosticsURL = nil
     }
+
+    private func clearSensitiveConfirmations() {
+        resetConfirmation = ""
+        isConfirmingReset = false
+        isConfirmingMetadataDeletion = false
+    }
+
+    private func interruptDiagnosticsShare() {
+        isShowingDiagnostics = false
+        discardDiagnostics()
+    }
 }
 
 struct FullUnlockView: View {
+    @EnvironmentObject private var model: PaperPathModel
     @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityVoiceOverEnabled)
+    private var voiceOverEnabled
+
+    let context: FullUnlockContext
+
+    @State private var purchaseSuccessFeedback = 0
+    @State private var purchaseErrorFeedback = 0
+    @State private var continuationTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
             ZStack {
                 PPCanvas()
 
-                ScrollView {
-                    VStack(
-                        alignment: .leading,
-                        spacing: PPSpacing.xLarge
-                    ) {
-                        unlockHero
-                        entitlementBoundary
-                        capability(
-                            "Unlimited Verified Output",
-                            detail: "Create verified copies without a limit",
-                            symbol: "checkmark.shield"
-                        )
-                        capability(
-                            "Single & Batch Delivery",
-                            detail: "Check one final copy or a complete batch",
-                            symbol: "square.stack.3d.up"
-                        )
-                        capability(
-                            "No Subscription",
-                            detail: "One purchase for this Apple ID",
-                            symbol: "infinity"
-                        )
-                        purchaseActions
+                ViewThatFits(in: .vertical) {
+                    unlockContent
+                        .padding(.horizontal, PPSpacing.xLarge)
+                        .padding(.vertical, PPSpacing.regular)
+
+                    ScrollView {
+                        unlockContent
+                            .padding(PPSpacing.xLarge)
                     }
-                    .frame(maxWidth: 560)
-                    .padding(PPSpacing.xLarge)
-                    .frame(maxWidth: .infinity)
+                    .scrollIndicators(.hidden)
                 }
             }
             .navigationTitle("Verified Output Lifetime")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button(
+                        (
+                            purchase.isUnlocked && context.isBlockedAction
+                                ? "Continue"
+                                : "Done"
+                        ).localizedUI
+                    ) {
+                        dismiss()
+                    }
+                    .disabled(isCommittingStoreOperation)
                 }
             }
         }
+        .interactiveDismissDisabled(isCommittingStoreOperation)
         .task {
             await purchase.prepare()
         }
+        .onChange(of: purchase.status) { _, status in
+            switch status {
+            case .purchased:
+                purchaseSuccessFeedback += 1
+            case .failed, .unavailable:
+                purchaseErrorFeedback += 1
+            default:
+                break
+            }
+            if voiceOverEnabled {
+                UIAccessibility.post(
+                    notification: .announcement,
+                    argument: status.detail.localizedUI
+                )
+            }
+        }
+        .onChange(of: purchase.isUnlocked) { _, isUnlocked in
+            guard isUnlocked else {
+                continuationTask?.cancel()
+                continuationTask = nil
+                return
+            }
+            scheduleBlockedActionContinuation()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                scheduleBlockedActionContinuation()
+            } else {
+                continuationTask?.cancel()
+                continuationTask = nil
+            }
+        }
+        .onDisappear {
+            continuationTask?.cancel()
+            continuationTask = nil
+        }
+        .sensoryFeedback(.success, trigger: purchaseSuccessFeedback)
+        .sensoryFeedback(.error, trigger: purchaseErrorFeedback)
+    }
+
+    private func scheduleBlockedActionContinuation() {
+        guard context.isBlockedAction,
+              purchase.isUnlocked,
+              scenePhase == .active,
+              !voiceOverEnabled
+        else { return }
+        continuationTask?.cancel()
+        continuationTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .milliseconds(450))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  purchase.isUnlocked,
+                  scenePhase == .active,
+                  !voiceOverEnabled
+            else { return }
+            continuationTask = nil
+            dismiss()
+        }
+    }
+
+    private var unlockContent: some View {
+        VStack(
+            alignment: .leading,
+            spacing: PPSpacing.large
+        ) {
+            unlockHero
+            entitlementBoundary
+            capability(
+                "Unlimited Verified Output",
+                detail: "Create verified copies without a limit",
+                symbol: "checkmark.shield"
+            )
+            capability(
+                "Single & Batch Delivery",
+                detail: "Check one final copy or a complete batch",
+                symbol: "square.stack.3d.up"
+            )
+            capability(
+                "No Subscription",
+                detail: ownershipCapabilityDetail,
+                symbol: "infinity"
+            )
+            purchaseActions
+        }
+        .frame(maxWidth: 560)
+        .frame(maxWidth: .infinity)
     }
 
     private var unlockHero: some View {
         VStack(alignment: .leading, spacing: PPSpacing.medium) {
             StudioSectionRule(
                 title: "ONE-TIME OWNERSHIP",
-                detail: "No account · no subscription",
+                detail: "No PaperPath account · no subscription",
                 symbol: "seal",
                 tint: PPColor.rose
             )
 
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: PPSpacing.xLarge) {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.medium
+                ) {
                     unlockIllustration
                     unlockCopy
                 }
-                VStack(spacing: PPSpacing.medium) {
-                    unlockIllustration
-                    unlockCopy
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.xLarge) {
+                        unlockIllustration
+                        unlockCopy
+                    }
+                    VStack(spacing: PPSpacing.medium) {
+                        unlockIllustration
+                        unlockCopy
+                    }
                 }
             }
         }
@@ -1118,8 +1793,18 @@ struct FullUnlockView: View {
     }
 
     private var unlockIllustration: some View {
-        PPIllustration(kind: .tools, width: 154)
-            .frame(width: 164, height: 132)
+        let width: CGFloat = dynamicTypeSize.ppPrefersExpandedLayout
+            ? 112
+            : 154
+        return PPIllustration(kind: .tools, width: width)
+            .frame(
+                width: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? 122
+                    : 164,
+                height: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? 100
+                    : 132
+            )
             .overlay {
                 StudioStageMarks(
                     tint: PPColor.mint,
@@ -1132,17 +1817,23 @@ struct FullUnlockView: View {
     private var unlockCopy: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             Text(
-                purchase.isUnlocked
-                    ? "Verified Output is unlocked."
-                    : "Own trusted delivery for life."
+                (
+                    purchase.isUnlocked
+                        ? "Verified Output is unlocked."
+                        : context.title
+                ).localizedUI
             )
             .font(.title2.bold())
             .fontDesign(.serif)
             .foregroundStyle(PPColor.textPrimary)
             Text(
-                purchase.isUnlocked
-                    ? "Thank you for supporting private, on-device PDF work."
-                    : "Your first real Verified Output is free. Unlock unlimited use when PaperPath has proved useful."
+                (
+                    purchase.isUnlocked
+                        ? context.isBlockedAction
+                            ? "Return to your document to continue."
+                            : "Thank you for supporting private, on-device PDF work."
+                        : context.detail
+                ).localizedUI
             )
             .font(.subheadline)
             .foregroundStyle(PPColor.textSecondary)
@@ -1181,51 +1872,23 @@ struct FullUnlockView: View {
     }
 
     private var entitlementBoundary: some View {
-        ViewThatFits(in: .horizontal) {
-            HStack(spacing: PPSpacing.small) {
-                entitlementFact(
-                    "Included",
-                    value: "Read/Edit",
-                    symbol: "doc.text",
-                    tint: PPColor.accent
-                )
-                entitlementFact(
-                    "First verified",
-                    value: AppEntitlement.verifiedOutputCount == 0
-                        ? "Free"
-                        : "\(AppEntitlement.verifiedOutputCount)",
-                    symbol: "checkmark.seal",
-                    tint: PPColor.mint
-                )
-                entitlementFact(
-                    "Lifetime",
-                    value: purchase.isUnlocked ? "Active" : "Optional",
-                    symbol: "infinity",
-                    tint: purchase.isUnlocked ? PPColor.mint : PPColor.amber
-                )
-            }
-
-            VStack(alignment: .leading, spacing: PPSpacing.small) {
-                entitlementFact(
-                    "Included",
-                    value: "Read/Edit",
-                    symbol: "doc.text",
-                    tint: PPColor.accent
-                )
-                entitlementFact(
-                    "First verified",
-                    value: AppEntitlement.verifiedOutputCount == 0
-                        ? "Free"
-                        : "\(AppEntitlement.verifiedOutputCount)",
-                    symbol: "checkmark.seal",
-                    tint: PPColor.mint
-                )
-                entitlementFact(
-                    "Lifetime",
-                    value: purchase.isUnlocked ? "Active" : "Optional",
-                    symbol: "infinity",
-                    tint: purchase.isUnlocked ? PPColor.mint : PPColor.amber
-                )
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                    entitlementFacts
+                }
+            } else {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.small) {
+                        entitlementFacts
+                    }
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    ) {
+                        entitlementFacts
+                    }
+                }
             }
         }
         .padding(.vertical, PPSpacing.small)
@@ -1235,6 +1898,32 @@ struct FullUnlockView: View {
                 .frame(height: 0.6)
         }
         .accessibilityElement(children: .contain)
+    }
+
+    @ViewBuilder
+    private var entitlementFacts: some View {
+        entitlementFact(
+            "Included",
+            value: "Read/Edit",
+            symbol: "doc.text",
+            tint: PPColor.accent
+        )
+        entitlementFact(
+            "Single verified",
+            value: purchase.isUnlocked
+                ? "Included"
+                : model.verifiedOutputSuccessCount == 0
+                    ? "Free once"
+                    : "Used",
+            symbol: "checkmark.seal",
+            tint: PPColor.mint
+        )
+        entitlementFact(
+            "Lifetime access",
+            value: purchase.isUnlocked ? "Active" : "Optional",
+            symbol: "infinity",
+            tint: purchase.isUnlocked ? PPColor.mint : PPColor.amber
+        )
     }
 
     private func entitlementFact(
@@ -1283,57 +1972,104 @@ struct FullUnlockView: View {
                 .frame(maxWidth: .infinity)
                 .frame(minHeight: 52)
             } else {
-                Button {
-                    Task {
-                        if purchase.product == nil {
-                            await purchase.prepare()
-                        } else {
-                            await purchase.purchase()
+                if purchase.status == .pending {
+                    Button {
+                        Task {
+                            await purchase.recheckPendingPurchase()
                         }
-                    }
-                } label: {
-                    HStack(spacing: PPSpacing.small) {
-                        if purchase.status == .purchasing
-                            || purchase.status == .loading {
-                            ProgressView()
-                                .tint(.white)
-                        } else {
-                            Image(systemName: "seal.fill")
-                        }
-                        Text(
-                            purchase.product == nil
-                                ? "Check App Store"
-                                : "Unlock for \(purchase.displayPrice)"
+                    } label: {
+                        Label(
+                            "Check Purchase Status",
+                            systemImage: "clock.arrow.circlepath"
                         )
                     }
-                }
-                .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(
-                    purchase.status == .purchasing
-                        || purchase.status == .loading
-                        || purchase.status == .pending
-                )
-
-                Button("Restore Purchase") {
-                    Task {
-                        await purchase.restore()
+                    .buttonStyle(PPPrimaryButtonStyle())
+                    .disabled(purchase.isBusy)
+                } else {
+                    Button {
+                        Task {
+                            await purchase.purchase()
+                        }
+                    } label: {
+                        HStack(spacing: PPSpacing.small) {
+                            if purchase.activeOperation == .purchasing
+                                || purchase.activeOperation == .preparing {
+                                ProgressView()
+                                    .tint(.white)
+                                    .frame(width: 20, height: 20)
+                            } else {
+                                Image(systemName: "seal.fill")
+                            }
+                            Text(purchaseButtonTitle)
+                        }
                     }
+                    .buttonStyle(PPPrimaryButtonStyle())
+                    .disabled(purchase.purchaseControlsDisabled)
+
+                    Button {
+                        Task {
+                            await purchase.restore()
+                        }
+                    } label: {
+                        HStack(spacing: PPSpacing.small) {
+                            if purchase.activeOperation == .restoring {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .frame(width: 20, height: 20)
+                            }
+                            Text("Restore Purchase")
+                        }
+                    }
+                    .disabled(purchase.purchaseControlsDisabled)
+                    .font(.subheadline.weight(.semibold))
+                    .frame(minHeight: 44)
                 }
-                .font(.subheadline.weight(.semibold))
-                .frame(minHeight: 44)
             }
 
             Text(purchase.status.detail.localizedUI)
                 .font(.caption)
-                .foregroundStyle(
-                    purchase.status == .purchased
-                        ? PPColor.mint
-                        : PPColor.textSecondary
-                )
+                .foregroundStyle(statusTint)
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
+                .accessibilityAddTraits(
+                    purchase.isBusy ? .updatesFrequently : []
+                )
         }
         .padding(.top, PPSpacing.small)
+    }
+
+    private var purchaseButtonTitle: String {
+        guard let product = purchase.product else {
+            return "Unlock with App Store".localizedUI
+        }
+        return AppLocalization.format(
+            "Unlock for %@",
+            product.displayPrice
+        )
+    }
+
+    private var ownershipCapabilityDetail: String {
+        purchase.product?.isFamilyShareable == true
+            ? "One purchase · Family Sharing"
+            : "One purchase · no recurring charge"
+    }
+
+    private var isCommittingStoreOperation: Bool {
+        purchase.activeOperation == .purchasing
+            || purchase.activeOperation == .restoring
+    }
+
+    private var statusTint: Color {
+        switch purchase.status {
+        case .purchased:
+            return PPColor.mint
+        case .failed, .unavailable:
+            return PPColor.rose
+        case .pending:
+            return PPColor.amber
+        default:
+            return PPColor.textSecondary
+        }
     }
 }
 
@@ -1396,7 +2132,8 @@ struct WhatsNewView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Close") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
             }
         }

@@ -11,7 +11,12 @@ private enum PencilShape: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .line: return "Line"
+        case .rectangle: return "Rectangle"
+        case .ellipse: return "Ellipse"
+        case .arrow: return "Arrow"
+        }
     }
 
     var symbol: String {
@@ -43,13 +48,13 @@ struct InkCaptureView: View {
         }
     }
 
-    private enum SignatureStage {
+    private enum SignatureStage: Equatable {
         case capture
         case placement
 
         var title: String {
             switch self {
-            case .capture: return "Capture"
+            case .capture: return "Draw"
             case .placement: return "Place"
             }
         }
@@ -65,7 +70,13 @@ struct InkCaptureView: View {
         var id: String { rawValue }
 
         var title: String {
-            rawValue.capitalized
+            switch self {
+            case .pen: return "Pen"
+            case .marker: return "Marker"
+            case .pencil: return "Pencil"
+            case .eraser: return "Eraser"
+            case .lasso: return "Lasso"
+            }
         }
 
         var symbol: String {
@@ -119,7 +130,12 @@ struct InkCaptureView: View {
         var id: String { rawValue }
 
         var title: String {
-            rawValue.capitalized
+            switch self {
+            case .blue: return "Blue"
+            case .black: return "Black"
+            case .red: return "Red"
+            case .yellow: return "Yellow"
+            }
         }
 
         var value: UIColor {
@@ -159,7 +175,11 @@ struct InkCaptureView: View {
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let pageIndex: Int
@@ -168,7 +188,11 @@ struct InkCaptureView: View {
     @State private var drawing = PKDrawing()
     @State private var canvasSize: CGSize = .zero
     @State private var signaturePreview: UIImage?
-    @State private var pencilPageImage: UIImage?
+    @State private var pagePreviewImage: UIImage?
+    @State private var pagePreviewErrorMessage: String?
+    @State private var isLoadingPagePreview = true
+    @State private var isPagePreviewVerified = false
+    @State private var previewContentRevisionID: UUID?
     @AppStorage("pencil.preset")
     private var savedPencilPreset = PencilPreset.pen.rawValue
     @AppStorage("pencil.color")
@@ -176,7 +200,7 @@ struct InkCaptureView: View {
     @AppStorage("pencil.width")
     private var pencilWidthScale = 1.0
     @AppStorage("pencil.input")
-    private var savedPencilInputMode = PencilInputMode.anyInput.rawValue
+    private var savedPencilInputMode = ""
     @State private var pencilCommand: PencilCanvasCommand?
     @State private var pencilZoomCommand: PencilZoomCommand?
     @State private var previousPencilPreset = PencilPreset.pen.rawValue
@@ -192,6 +216,18 @@ struct InkCaptureView: View {
     @State private var isConfirmingSavedSignatureRemoval = false
     @State private var isSaving = false
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var saveStopRequested = false
+    @State private var didCommitInk = false
+    @State private var inkValidationMessage: String?
+    @State private var signatureLibraryTask: Task<Void, Never>?
+    @State private var signatureLibraryGeneration = UUID()
+    @State private var busySignatureID: UUID?
+    @State private var selectedSignatureID: UUID?
+    @State private var didInitializeSignatureSelection = false
+    @State private var previewGeneration = 0
+    @State private var previewReloadToken = UUID()
+    @State private var didLoadSavedSignature = false
     @GestureState private var placementTranslation = CGSize.zero
     @GestureState private var placementScale: CGFloat = 1
 
@@ -204,7 +240,14 @@ struct InkCaptureView: View {
     }
 
     private var pencilInputMode: PencilInputMode {
-        PencilInputMode(rawValue: savedPencilInputMode) ?? .anyInput
+        if let savedMode = PencilInputMode(
+            rawValue: savedPencilInputMode
+        ) {
+            return savedMode
+        }
+        return UIPencilInteraction.prefersPencilOnlyDrawing
+            ? .pencilOnly
+            : .anyInput
     }
 
     init(
@@ -228,19 +271,16 @@ struct InkCaptureView: View {
     var body: some View {
         NavigationStack {
             GeometryReader { proxy in
-                if mode == .drawing,
-                   let url = model.url(for: recordID) {
+                if mode == .drawing {
                     pencilSurface(
-                        url: url,
                         availableSize: proxy.size
                     )
                 } else if signatureStage == .capture {
                     signatureCapture(
                         maxWidth: min(proxy.size.width - 48, 620)
                     )
-                } else if let url = model.url(for: recordID) {
+                } else {
                     signaturePlacementSurface(
-                        url: url,
                         availableSize: proxy.size
                     )
                 }
@@ -260,15 +300,25 @@ struct InkCaptureView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button((isSaving ? "Stop" : "Cancel").localizedUI) {
-                        if isSaving {
-                            operationTask?.cancel()
-                            operationTask = nil
-                            isSaving = false
+                    Button(
+                        (
+                            saveStopRequested
+                                ? "Stopping"
+                                : hasActiveInkTask
+                                    ? "Stop"
+                                    : didCommitInk
+                                        ? "Done"
+                                        : "Cancel"
+                        ).localizedUI
+                    ) {
+                        if hasActiveInkTask {
+                            stopActiveInkTask()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(saveStopRequested)
                 }
                 if mode == .drawing {
                     ToolbarItem(placement: .confirmationAction) {
@@ -278,30 +328,132 @@ struct InkCaptureView: View {
                         .disabled(
                             drawing.strokes.isEmpty
                                 || canvasSize.width <= 0
-                                || isSaving
+                                || !isPagePreviewVerified
+                                || hasActiveInkTask
+                                || didCommitInk
                         )
+                        .keyboardShortcut(.defaultAction)
                     }
                 }
             }
-            .task {
+            .onAppear {
+#if DEBUG
+                // #region debug-point C:experience-presentations
+                if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "C", "location": "InkCaptureView.appeared", "msg": "[DEBUG] Ink view appeared", "data": ["saving": isSaving]]); URLSession.shared.dataTask(with: request).resume() }
+                // #endregion
+#endif
+                initializeSignatureSelectionIfNeeded()
+            }
+            .onChange(of: savedPencilPreset) { _, _ in
+                announcePencilState(pencilPreset.title.localizedUI)
+            }
+            .onChange(of: savedPencilInputMode) { _, _ in
+                announcePencilState(pencilInputMode.title.localizedUI)
+            }
+            .onChange(of: isPencilViewportMode) { _, enabled in
+                announcePencilState(
+                    (enabled ? "Move and zoom page" : pencilPreset.title).localizedUI
+                )
+            }
+            .task(id: previewReloadToken) {
+                previewGeneration += 1
+                let generation = previewGeneration
+                guard let requestedRevisionID =
+                        model.record(id: recordID)?
+                            .contentRevisionID
+                else {
+                    isLoadingPagePreview = false
+                    pagePreviewErrorMessage =
+                        "The private working copy could not be opened."
+                            .localizedUI
+                    return
+                }
+                isLoadingPagePreview = true
+                isPagePreviewVerified = false
+                previewContentRevisionID = requestedRevisionID
+                pagePreviewErrorMessage = nil
+                pagePreviewImage = nil
+                if mode == .signature,
+                   !didLoadSavedSignature,
+                   let saved = selectedSavedSignatureDrawing() {
+                    drawing = saved
+                    didLoadSavedSignature = true
+                }
                 guard let url = model.url(for: recordID)
-                else { return }
+                else {
+                    isLoadingPagePreview = false
+                    pagePreviewErrorMessage =
+                        "The private working copy could not be opened."
+                            .localizedUI
+                    return
+                }
                 let preview = await PDFEditorPreviewLoader.shared.preview(
                     url: url,
                     pageIndex: pageIndex,
                     revision: model.refreshToken(for: recordID),
                     longEdge: 1_800
                 )
-                if mode == .signature,
-                   let saved = selectedSavedSignatureDrawing() {
-                    drawing = saved
+                guard !Task.isCancelled,
+                      generation == previewGeneration,
+                      model.record(id: recordID)?
+                        .contentRevisionID == requestedRevisionID
+                else { return }
+                guard let preview else {
+                    isLoadingPagePreview = false
+                    pagePreviewErrorMessage =
+                        "The page preview could not be loaded. Try again."
+                            .localizedUI
+                    return
                 }
-                if let preview, !Task.isCancelled {
-                    pageAspectRatio = CGFloat(preview.aspectRatio)
-                    if mode == .drawing {
-                        pencilPageImage = preview.image
+                pageAspectRatio = CGFloat(preview.aspectRatio)
+                pagePreviewImage = preview.image
+                previewContentRevisionID = requestedRevisionID
+                isPagePreviewVerified = true
+                isLoadingPagePreview = false
+            }
+            .onChange(
+                of: model.record(id: recordID)?
+                    .contentRevisionID
+            ) { _, revisionID in
+                guard !isSaving, !didCommitInk,
+                      let previewContentRevisionID,
+                      revisionID != previewContentRevisionID
+                else { return }
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                interruptProtectedInkWork()
+                dismiss()
+            }
+            .onChange(of: model.savedSignatures.map(\.id)) {
+                _, signatureIDs in
+                guard let selectedSignatureID,
+                      !signatureIDs.contains(selectedSignatureID)
+                else { return }
+                self.selectedSignatureID = nil
+                isConfirmingSavedSignatureRemoval = false
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    if mode == .signature,
+                       signatureStage == .placement,
+                       signaturePreview == nil {
+                        signaturePreview = makeSignatureImage()
                     }
+                    if !isPagePreviewVerified {
+                        previewReloadToken = UUID()
+                    }
+                } else if phase == .background {
+                    interruptProtectedInkWork()
                 }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptProtectedInkWork()
             }
             .confirmationDialog(
                 "Remove selected signature?",
@@ -309,15 +461,22 @@ struct InkCaptureView: View {
                 titleVisibility: .visible
             ) {
                 Button("Remove Selected Signature", role: .destructive) {
-                    drawing = PKDrawing()
-                    signaturePreview = nil
-                    Task {
-                        await model.saveSignature(nil)
-                    }
+                    removeSelectedSavedSignature()
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("PDFs already signed with it will not change.")
+            }
+            .alert(
+                "Drawing Not Saved".localizedUI,
+                isPresented: Binding(
+                    get: { inkValidationMessage != nil },
+                    set: { if !$0 { inkValidationMessage = nil } }
+                )
+            ) {
+                Button("OK".localizedUI, role: .cancel) {}
+            } message: {
+                Text(inkValidationMessage?.localizedUI ?? "")
             }
             .confirmationDialog(
                 "Pencil controls",
@@ -345,63 +504,90 @@ struct InkCaptureView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             }
-            .interactiveDismissDisabled(isSaving)
+            .interactiveDismissDisabled(hasActiveInkTask)
+            .accessibilityAction(.escape) {
+                if hasActiveInkTask {
+                    stopActiveInkTask()
+                } else {
+                    dismiss()
+                }
+            }
+            .sensoryFeedback(
+                .selection,
+                trigger: signatureStage
+            )
+            .sensoryFeedback(
+                .error,
+                trigger: pagePreviewErrorMessage
+            )
             .onDisappear {
-                operationTask?.cancel()
-                operationTask = nil
+                interruptProtectedInkWork()
             }
         }
     }
 
     private var precisionContextBar: some View {
-        HStack(spacing: PPSpacing.medium) {
-            Label(
-                "Page \(pageIndex + 1)",
-                systemImage: "doc.text"
-            )
-            Label(
-                mode == .signature
-                    ? signatureStage.title
-                    : (
-                        isPencilViewportMode
-                            ? "Move & Zoom"
-                            : pencilPreset.title
-                    ),
-                systemImage: mode == .signature
-                    ? "signature"
-                    : (
-                        isPencilViewportMode
-                            ? "hand.draw"
-                            : pencilPreset.symbol
+        ScrollView(.horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                Label(
+                    "Page \(pageIndex + 1)",
+                    systemImage: "doc.text"
+                )
+                Label(
+                    pagePreviewStatusTitle,
+                    systemImage: pagePreviewStatusSymbol
+                )
+                .foregroundStyle(pagePreviewStatusColor)
+                Label(
+                    (
+                        mode == .signature
+                            ? signatureStage.title
+                            : (
+                                isPencilViewportMode
+                                    ? "Move & Zoom"
+                                    : pencilPreset.title
+                            )
+                    ).localizedUI,
+                    systemImage: mode == .signature
+                        ? "signature"
+                        : (
+                            isPencilViewportMode
+                                ? "hand.draw"
+                                : pencilPreset.symbol
+                        )
+                )
+                if mode == .drawing {
+                    Label(
+                        "\(drawing.strokes.count)",
+                        systemImage: "scribble"
                     )
-            )
-            if mode == .drawing {
-                Label(
-                    "\(drawing.strokes.count)",
-                    systemImage: "scribble"
-                )
-                Label(
-                    pencilInputMode.title,
-                    systemImage: "pencil.and.scribble"
-                )
-            } else {
-                Label(
-                    model.savedSignatures.isEmpty
-                        ? "Not saved"
-                        : "\(model.savedSignatures.count) saved",
-                    systemImage: model.savedSignatures.isEmpty
-                        ? "internaldrive"
-                        : "checkmark.circle"
-                )
+                    Label(
+                        pencilInputMode.title.localizedUI,
+                        systemImage: "pencil.and.scribble"
+                    )
+                } else {
+                    Label(
+                        model.savedSignatures.isEmpty
+                            ? "Not saved".localizedUI
+                            : AppLocalization.format(
+                                "%lld saved",
+                                model.savedSignatures.count
+                            ),
+                        systemImage: model.savedSignatures.isEmpty
+                            ? "internaldrive"
+                            : "checkmark.circle"
+                    )
+                }
+                OnDeviceBadge(compact: true)
             }
-            Spacer(minLength: 0)
-            OnDeviceBadge(compact: true)
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, PPSpacing.regular)
         }
+        .scrollIndicators(.hidden)
         .font(.caption.weight(.semibold))
         .foregroundStyle(PPColor.textSecondary)
         .lineLimit(1)
-        .padding(.horizontal, PPSpacing.regular)
-        .frame(minHeight: 38)
+        .frame(minHeight: 44)
         .background(.bar)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -410,8 +596,126 @@ struct InkCaptureView: View {
         }
     }
 
+    private var pagePreviewStatusTitle: String {
+        if isLoadingPagePreview {
+            return "Loading preview".localizedUI
+        }
+        if pagePreviewErrorMessage != nil || !isPagePreviewVerified {
+            return "Preview unavailable".localizedUI
+        }
+        return "Preview ready".localizedUI
+    }
+
+    private var pagePreviewStatusSymbol: String {
+        if isLoadingPagePreview {
+            return "hourglass"
+        }
+        if pagePreviewErrorMessage != nil || !isPagePreviewVerified {
+            return "exclamationmark.triangle"
+        }
+        return "checkmark.circle"
+    }
+
+    private var pagePreviewStatusColor: Color {
+        if pagePreviewErrorMessage != nil || !isPagePreviewVerified {
+            return PPColor.amber
+        }
+        if isLoadingPagePreview {
+            return PPColor.textSecondary
+        }
+        return PPColor.mint
+    }
+
+    private var pagePreviewLoadingState: some View {
+        VStack(spacing: PPSpacing.small) {
+            ProgressView()
+            Text("Loading page preview".localizedUI)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func pagePreviewFailureState(
+        _ message: String
+    ) -> some View {
+        VStack(spacing: PPSpacing.small) {
+            Image(systemName: "doc.questionmark")
+                .font(.title2)
+                .foregroundStyle(PPColor.amber)
+            Text("Preview unavailable".localizedUI)
+                .font(.headline)
+                .foregroundStyle(PPColor.textPrimary)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                retryPagePreview()
+            } label: {
+                Label(
+                    "Load Preview Again",
+                    systemImage: "arrow.clockwise"
+                )
+            }
+            .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+            .accessibilityIdentifier("retryInkPagePreview")
+        }
+        .padding(PPSpacing.regular)
+    }
+
+    private func compactPagePreviewFailure(
+        _ message: String
+    ) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: PPSpacing.small) {
+                Label(
+                    message,
+                    systemImage: "doc.questionmark"
+                )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(PPColor.amber)
+                    .lineLimit(2)
+                Spacer(minLength: PPSpacing.small)
+                retryPagePreviewButton
+            }
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                Label(
+                    message,
+                    systemImage: "doc.questionmark"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.amber)
+                .fixedSize(horizontal: false, vertical: true)
+                retryPagePreviewButton
+            }
+        }
+    }
+
+    private var retryPagePreviewButton: some View {
+        Button {
+            retryPagePreview()
+        } label: {
+            Label(
+                "Retry Preview",
+                systemImage: "arrow.clockwise"
+            )
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+        .accessibilityIdentifier("retrySignaturePagePreview")
+    }
+
+    private func retryPagePreview() {
+        previewGeneration += 1
+        pagePreviewImage = nil
+        pagePreviewErrorMessage = nil
+        isPagePreviewVerified = false
+        isLoadingPagePreview = true
+        previewReloadToken = UUID()
+    }
+
     private func pencilSurface(
-        url: URL,
         availableSize: CGSize
     ) -> some View {
         let pageSize = fittedPageSize(in: availableSize)
@@ -425,7 +729,8 @@ struct InkCaptureView: View {
                     color: pencilColor.value,
                     widthScale: pencilWidthScale
                 ),
-                backgroundImage: pencilPageImage,
+                backgroundImage: pagePreviewImage,
+                referenceSize: CGSize(width: 768, height: 768 / pageAspectRatio),
                 drawingPolicy: pencilInputMode.policy,
                 allowsViewportGestures: isPencilViewportMode,
                 command: pencilCommand,
@@ -436,12 +741,20 @@ struct InkCaptureView: View {
                     canRedoDrawing = canRedo
                 }
             )
+            .allowsHitTesting(isPagePreviewVerified)
             .frame(width: pageSize.width, height: pageSize.height)
             .clipped()
             .shadow(color: .black.opacity(0.12), radius: 14, y: 6)
             .overlay {
-                if pencilPageImage == nil {
-                    ProgressView()
+                if isLoadingPagePreview {
+                    pagePreviewLoadingState
+                } else if let pagePreviewErrorMessage {
+                    pagePreviewFailureState(pagePreviewErrorMessage)
+                } else if !isPagePreviewVerified {
+                    pagePreviewFailureState(
+                        "The page preview stopped before it was ready. Try again."
+                            .localizedUI
+                    )
                 }
             }
         }
@@ -460,7 +773,7 @@ struct InkCaptureView: View {
                     } label: {
                         Image(systemName: "hand.draw")
                             .font(.body.weight(.semibold))
-                            .frame(width: 38, height: 38)
+                            .frame(width: 44, height: 44)
                             .foregroundStyle(
                                 isPencilViewportMode
                                     ? Color.white
@@ -488,7 +801,7 @@ struct InkCaptureView: View {
                         } label: {
                             Image(systemName: preset.symbol)
                                 .font(.body.weight(.semibold))
-                                .frame(width: 38, height: 38)
+                                .frame(width: 44, height: 44)
                                 .foregroundStyle(
                                     pencilPreset == preset
                                         ? Color.white
@@ -521,7 +834,7 @@ struct InkCaptureView: View {
                         }
                     } label: {
                         Image(systemName: "square.on.circle")
-                            .frame(width: 38, height: 38)
+                            .frame(width: 44, height: 44)
                     }
                     .accessibilityLabel("Insert shape")
 
@@ -529,7 +842,7 @@ struct InkCaptureView: View {
                         pencilZoomCommand = PencilZoomCommand(action: .fit)
                     } label: {
                         Image(systemName: "minus.magnifyingglass")
-                            .frame(width: 38, height: 38)
+                            .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Fit page")
@@ -538,24 +851,29 @@ struct InkCaptureView: View {
                         pencilCommand = PencilCanvasCommand(action: .undo)
                     } label: {
                         Image(systemName: "arrow.uturn.backward")
-                            .frame(width: 40, height: 38)
+                            .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.plain)
                     .disabled(!canUndoDrawing)
                     .accessibilityLabel("Undo stroke")
+                    .keyboardShortcut("z", modifiers: .command)
+                    .help("Undo stroke".localizedUI)
 
                     Button {
                         pencilCommand = PencilCanvasCommand(action: .redo)
                     } label: {
                         Image(systemName: "arrow.uturn.forward")
-                            .frame(width: 40, height: 38)
+                            .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.plain)
                     .disabled(!canRedoDrawing)
                     .accessibilityLabel("Redo stroke")
+                    .keyboardShortcut("z", modifiers: [.command, .shift])
+                    .help("Redo stroke".localizedUI)
                 }
             }
             .scrollClipDisabled()
+            .dynamicTypeSize(...DynamicTypeSize.accessibility1)
 
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: PPSpacing.large) {
@@ -569,7 +887,6 @@ struct InkCaptureView: View {
                 }
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
         .padding(.horizontal, PPSpacing.regular)
         .padding(.vertical, PPSpacing.small)
         .background(.bar)
@@ -583,72 +900,93 @@ struct InkCaptureView: View {
     }
 
     private var pencilColorAndWidth: some View {
-        HStack(spacing: PPSpacing.small) {
-                ForEach(PencilColor.allCases) { color in
-                    Button {
-                        savedPencilColor = color.rawValue
-                    } label: {
-                        Circle()
-                            .fill(color.displayColor)
-                            .frame(width: 24, height: 24)
-                            .overlay {
-                                Circle()
-                                    .stroke(
-                                        pencilColor == color
-                                            ? PPColor.textPrimary
-                                            : PPColor.border,
-                                        lineWidth: pencilColor == color
-                                            ? 2
-                                            : 0.8
-                                    )
-                                    .padding(-4)
-                            }
-                            .frame(width: 40, height: 38)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(
-                        "\(color.title.localizedUI) ink"
-                    )
-                    .accessibilityAddTraits(
-                        pencilColor == color ? .isSelected : []
-                    )
-                }
-
-                Slider(
-                    value: $pencilWidthScale,
-                    in: 0.65...1.8
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
                 ) {
-                    Text("Stroke width")
-                } minimumValueLabel: {
-                    Image(systemName: "circle.fill")
-                        .font(.system(size: 5))
-                } maximumValueLabel: {
-                    Image(systemName: "circle.fill")
-                        .font(.system(size: 13))
+                    pencilColorButtons
+                    pencilWidthSlider
                 }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    pencilColorButtons
+                    pencilWidthSlider
+                }
+            }
+        }
+    }
+
+    private var pencilColorButtons: some View {
+        HStack(spacing: PPSpacing.small) {
+            ForEach(PencilColor.allCases) { color in
+                Button {
+                    savedPencilColor = color.rawValue
+                } label: {
+                    Circle()
+                        .fill(color.displayColor)
+                        .frame(width: 24, height: 24)
+                        .overlay {
+                            Circle()
+                                .stroke(
+                                    pencilColor == color
+                                        ? PPColor.textPrimary
+                                        : PPColor.border,
+                                    lineWidth: pencilColor == color
+                                        ? 2
+                                        : 0.8
+                                )
+                                .padding(-4)
+                        }
+                        .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(
+                    AppLocalization.format(
+                        "%@ ink",
+                        color.title.localizedUI
+                    )
+                )
+                .accessibilityAddTraits(
+                    pencilColor == color ? .isSelected : []
+                )
+            }
+        }
+    }
+
+    private var pencilWidthSlider: some View {
+        Slider(
+            value: $pencilWidthScale,
+            in: 0.65...1.8
+        ) {
+            Text("Stroke width")
+        } minimumValueLabel: {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 5))
+        } maximumValueLabel: {
+            Image(systemName: "circle.fill")
+                .font(.system(size: 13))
         }
     }
 
     private var pencilInputAndClear: some View {
         HStack(spacing: PPSpacing.medium) {
-            Picker(
-                "Input",
-                selection: Binding(
-                    get: { pencilInputMode },
-                    set: { savedPencilInputMode = $0.rawValue }
-                )
-            ) {
-                ForEach(PencilInputMode.allCases) { inputMode in
-                    Text(inputMode.title.localizedUI).tag(inputMode)
-                }
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                pencilInputPicker
+                    .pickerStyle(.menu)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                pencilInputPicker
+                    .pickerStyle(.segmented)
             }
-            .pickerStyle(.segmented)
 
             Button(role: .destructive) {
                 pencilCommand = PencilCanvasCommand(action: .clear)
             } label: {
                 Image(systemName: "trash")
-                    .frame(width: 44, height: 38)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
             .disabled(drawing.strokes.isEmpty)
@@ -656,10 +994,24 @@ struct InkCaptureView: View {
         }
     }
 
+    private var pencilInputPicker: some View {
+        Picker(
+            "Input",
+            selection: Binding(
+                get: { pencilInputMode },
+                set: { savedPencilInputMode = $0.rawValue }
+            )
+        ) {
+            ForEach(PencilInputMode.allCases) { inputMode in
+                Text(inputMode.title.localizedUI).tag(inputMode)
+            }
+        }
+    }
+
     private func insert(_ shape: PencilShape) {
         isPencilViewportMode = false
         selectPencilPreset(.lasso)
-        model.noticeMessage = AppLocalization.format(
+        model[noticeFor: paperPathSceneID] = AppLocalization.format(
             "%@ inserted · Lasso selected",
             shape.title.localizedUI
         )
@@ -677,6 +1029,11 @@ struct InkCaptureView: View {
         guard pencilPreset != preset else { return }
         previousPencilPreset = pencilPreset.rawValue
         savedPencilPreset = preset.rawValue
+    }
+
+    private func announcePencilState(_ message: String) {
+        guard voiceOverEnabled, scenePhase == .active else { return }
+        UIAccessibility.post(notification: .announcement, argument: message)
     }
 
     private func handlePencilShortcut(
@@ -715,34 +1072,32 @@ struct InkCaptureView: View {
                 placementControls
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
         .padding(PPSpacing.regular)
         .background(.bar)
     }
 
     private var captureControls: some View {
         VStack(spacing: PPSpacing.small) {
+            if let pagePreviewErrorMessage {
+                compactPagePreviewFailure(pagePreviewErrorMessage)
+            }
+
             if !model.savedSignatures.isEmpty {
                 savedSignatureRail
             }
 
-            HStack {
-                Toggle(
-                    "Remember on this device",
-                    isOn: $rememberSignature
-                )
-                .font(.subheadline)
-
-                if !drawing.strokes.isEmpty {
-                    Button {
-                        drawing = PKDrawing()
-                        signaturePreview = nil
-                    } label: {
-                        Label("Clear", systemImage: "eraser")
+            Group {
+                if dynamicTypeSize.ppPrefersExpandedLayout {
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    ) {
+                        capturePreferenceControls
                     }
-                    .font(.subheadline.weight(.semibold))
-                    .buttonStyle(.plain)
-                    .foregroundStyle(PPColor.textSecondary)
+                } else {
+                    HStack {
+                        capturePreferenceControls
+                    }
                 }
             }
 
@@ -754,13 +1109,21 @@ struct InkCaptureView: View {
                 }
             } label: {
                 Label(
-                    "Continue to Placement",
+                    "Place on Page",
                     systemImage: "arrow.right"
                 )
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(PPPrimaryButtonStyle())
-            .disabled(drawing.strokes.isEmpty)
+            .keyboardShortcut(.defaultAction)
+            .disabled(
+                drawing.strokes.isEmpty
+                    || !isPagePreviewVerified
+                    || signatureLibraryTask != nil
+            )
+            .accessibilityHint(
+                signatureAdvanceHint.localizedUI
+            )
 
             if !model.savedSignatures.isEmpty {
                 Button("Remove Selected Signature") {
@@ -768,21 +1131,60 @@ struct InkCaptureView: View {
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
+                .disabled(
+                    signatureLibraryTask != nil
+                        || selectedSignatureID == nil
+                )
             }
         }
+    }
+
+    private var capturePreferenceControls: some View {
+        Group {
+            Toggle(
+                "Remember on this device",
+                isOn: $rememberSignature
+            )
+            .font(.subheadline)
+
+            if !drawing.strokes.isEmpty {
+                Button {
+                    drawing = PKDrawing()
+                    signaturePreview = nil
+                    selectedSignatureID = nil
+                } label: {
+                    Label("Clear", systemImage: "eraser")
+                }
+                .font(.subheadline.weight(.semibold))
+                .buttonStyle(.plain)
+                .foregroundStyle(PPColor.textSecondary)
+            }
+        }
+        .disabled(signatureLibraryTask != nil)
     }
 
     private var savedSignatureRail: some View {
         VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
             HStack(spacing: PPSpacing.small) {
                 Label(
-                    "Saved \(model.savedSignatures.count)/\(SignatureStore.maximumSignatureCount)",
+                    AppLocalization.format(
+                        "Saved %lld/%lld",
+                        model.savedSignatures.count,
+                        SignatureStore.maximumSignatureCount
+                    ),
                     systemImage: "signature"
                 )
                 Spacer(minLength: 0)
                 if let selectedIndex = selectedSignatureIndex {
                     Text("#\(selectedIndex + 1)")
                         .monospacedDigit()
+                }
+                if signatureLibraryTask != nil {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(
+                            "Updating saved signatures".localizedUI
+                        )
                 }
             }
             .font(.caption.smallCaps().weight(.semibold))
@@ -803,7 +1205,7 @@ struct InkCaptureView: View {
     }
 
     private var selectedSignatureIndex: Int? {
-        guard let selectedID = model.selectedSignatureID else { return nil }
+        guard let selectedID = selectedSignatureID else { return nil }
         return model.savedSignatures.firstIndex { $0.id == selectedID }
     }
 
@@ -811,7 +1213,7 @@ struct InkCaptureView: View {
         _ entry: SavedSignature,
         index: Int
     ) -> some View {
-        let isSelected = model.selectedSignatureID == entry.id
+        let isSelected = selectedSignatureID == entry.id
         return Button {
             useSavedSignature(entry)
         } label: {
@@ -848,6 +1250,7 @@ struct InkCaptureView: View {
             }
             .padding(.horizontal, PPSpacing.small)
             .padding(.vertical, PPSpacing.xSmall)
+            .frame(minHeight: 44)
             .background(
                 Color(.secondarySystemBackground),
                 in: RoundedRectangle(cornerRadius: 8)
@@ -859,9 +1262,23 @@ struct InkCaptureView: View {
                         lineWidth: isSelected ? 1.6 : 0.8
                     )
             }
+            .overlay {
+                if busySignatureID == entry.id {
+                    ProgressView()
+                        .controlSize(.small)
+                        .padding(PPSpacing.xSmall)
+                        .background(.regularMaterial, in: Circle())
+                }
+            }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Saved signature \(index + 1)")
+        .disabled(signatureLibraryTask != nil || isSaving)
+        .accessibilityLabel(
+            AppLocalization.format(
+                "Saved signature %lld",
+                index + 1
+            )
+        )
         .accessibilityAddTraits(isSelected ? .isSelected : [])
         .contextMenu {
             Button(role: .destructive) {
@@ -879,40 +1296,19 @@ struct InkCaptureView: View {
                 tint: PPColor.accent,
                 title: "Signature"
             )
-            HStack(spacing: PPSpacing.medium) {
-                Button {
-                    withAnimation(
-                        reduceMotion ? nil : .easeInOut(duration: 0.22)
+            Group {
+                if dynamicTypeSize.ppPrefersExpandedLayout {
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
                     ) {
-                        signatureStage = .capture
+                        placementAdjustmentControls
                     }
-                } label: {
-                    Label("Edit", systemImage: "pencil")
+                } else {
+                    HStack(spacing: PPSpacing.medium) {
+                        placementAdjustmentControls
+                    }
                 }
-                .buttonStyle(.plain)
-
-                Slider(
-                    value: Binding(
-                        get: { signatureBounds.width },
-                        set: { resizeSignature(to: $0) }
-                    ),
-                    in: 0.18...0.72
-                ) {
-                    Text("Signature size")
-                } minimumValueLabel: {
-                    Image(systemName: "signature")
-                        .font(.caption2)
-                } maximumValueLabel: {
-                    Image(systemName: "signature")
-                        .font(.title3)
-                }
-
-                Toggle(isOn: $snapsToMargins) {
-                    Image(systemName: "dot.scope")
-                }
-                .toggleStyle(.button)
-                .buttonStyle(.borderless)
-                .accessibilityLabel("Snap to page margins")
             }
 
             ViewThatFits(in: .horizontal) {
@@ -928,19 +1324,58 @@ struct InkCaptureView: View {
         }
     }
 
+    @ViewBuilder
+    private var placementAdjustmentControls: some View {
+        Button {
+            withAnimation(
+                reduceMotion ? nil : .easeInOut(duration: 0.22)
+            ) {
+                signatureStage = .capture
+            }
+        } label: {
+            Label("Edit", systemImage: "pencil")
+        }
+        .buttonStyle(.plain)
+
+        Slider(
+            value: Binding(
+                get: { signatureBounds.width },
+                set: { resizeSignature(to: $0) }
+            ),
+            in: 0.18...0.72
+        ) {
+            Text("Signature size")
+        } minimumValueLabel: {
+            Image(systemName: "signature")
+                .font(.caption2)
+        } maximumValueLabel: {
+            Image(systemName: "signature")
+                .font(.title3)
+        }
+
+        Toggle(isOn: $snapsToMargins) {
+            Image(systemName: "dot.scope")
+        }
+        .toggleStyle(.button)
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Snap to page margins")
+    }
+
     private var placeOnlyButton: some View {
         Button {
             save()
         } label: {
-            Label("Place Signature", systemImage: "signature")
+            Label("Place Only", systemImage: "signature")
                 .frame(maxWidth: .infinity)
         }
         .buttonStyle(PPQuietButtonStyle())
         .disabled(
             drawing.strokes.isEmpty
                 || canvasSize.width <= 0
-                || isSaving
+                || !isPagePreviewVerified
+                || hasActiveInkTask
         )
+        .accessibilityHint(signaturePlacementSaveHint.localizedUI)
         .accessibilityIdentifier("placeSignatureOnly")
     }
 
@@ -949,19 +1384,24 @@ struct InkCaptureView: View {
             save(preparesDelivery: true)
         } label: {
             Label(
-                "Place & Verify",
+                "Place & Continue",
                 systemImage: "checkmark.shield"
             )
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(PPPrimaryButtonStyle())
+        .keyboardShortcut(.defaultAction)
         .disabled(
             drawing.strokes.isEmpty
                 || canvasSize.width <= 0
-                || isSaving
+                || !isPagePreviewVerified
+                || hasActiveInkTask
         )
         .accessibilityHint(
-            "Places the signature, then checks the final copy before sharing"
+            (
+                signaturePlacementDisabledReason
+                    ?? "Places the signature, then continues to the next required step"
+            ).localizedUI
         )
         .accessibilityIdentifier("placeSignatureAndVerify")
     }
@@ -972,6 +1412,7 @@ struct InkCaptureView: View {
             Text("Sign for page \(pageIndex + 1)")
                 .font(.caption.smallCaps().weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
+                .accessibilityIdentifier("signaturePageContext")
 
             ZStack {
                 RoundedRectangle(
@@ -1021,7 +1462,6 @@ struct InkCaptureView: View {
     }
 
     private func signaturePlacementSurface(
-        url: URL,
         availableSize: CGSize
     ) -> some View {
         let pageSize = fittedPageSize(in: availableSize)
@@ -1029,15 +1469,23 @@ struct InkCaptureView: View {
             PPColor.canvas
 
             ZStack {
-                PDFPageThumbnailView(
-                    url: url,
-                    pageIndex: pageIndex,
-                    refreshToken: model.refreshToken(for: recordID),
-                    width: pageSize.width,
-                    height: pageSize.height
-                )
-
-                signaturePlacementOverlay(pageSize: pageSize)
+                Color.white
+                if let pagePreviewImage,
+                   isPagePreviewVerified {
+                    Image(uiImage: pagePreviewImage)
+                        .resizable()
+                        .scaledToFit()
+                    signaturePlacementOverlay(pageSize: pageSize)
+                } else if isLoadingPagePreview {
+                    pagePreviewLoadingState
+                } else if let pagePreviewErrorMessage {
+                    pagePreviewFailureState(pagePreviewErrorMessage)
+                } else {
+                    pagePreviewFailureState(
+                        "The page preview stopped before it was ready. Try again."
+                            .localizedUI
+                    )
+                }
             }
             .frame(width: pageSize.width, height: pageSize.height)
             .clipped()
@@ -1045,7 +1493,10 @@ struct InkCaptureView: View {
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel(
-            "Signature placement on page \(pageIndex + 1)"
+            AppLocalization.format(
+                "Signature placement on page %lld",
+                pageIndex + 1
+            )
         )
     }
 
@@ -1103,17 +1554,45 @@ struct InkCaptureView: View {
             "Drag to move or pinch to resize within the page"
         )
         .accessibilityValue(
-            "\(Int(signatureBounds.width * 100)) percent page width"
+            AppLocalization.format(
+                "%lld percent page width",
+                Int(signatureBounds.width * 100)
+            )
         )
         .accessibilityAdjustableAction { direction in
             let delta = direction == .increment ? 0.04 : -0.04
             resizeSignature(to: signatureBounds.width + delta)
         }
+        .accessibilityAction(
+            named: Text("Move signature left")
+        ) {
+            nudgeSignature(x: -0.025, y: 0)
+        }
+        .accessibilityAction(
+            named: Text("Move signature right")
+        ) {
+            nudgeSignature(x: 0.025, y: 0)
+        }
+        .accessibilityAction(
+            named: Text("Move signature up")
+        ) {
+            nudgeSignature(x: 0, y: -0.025)
+        }
+        .accessibilityAction(
+            named: Text("Move signature down")
+        ) {
+            nudgeSignature(x: 0, y: 0.025)
+        }
     }
 
     private func selectedSavedSignatureDrawing() -> PKDrawing? {
-        guard let data = model.savedSignatureData else { return nil }
-        return try? PKDrawing(data: data)
+        let selectedID = selectedSignatureID
+            ?? model.selectedSignatureID
+        guard let entry = model.savedSignatures.first(
+            where: { $0.id == selectedID }
+        ) ?? model.savedSignatures.first
+        else { return nil }
+        return try? PKDrawing(data: entry.data)
     }
 
     private func useSavedSignature(_ entry: SavedSignature) {
@@ -1123,9 +1602,8 @@ struct InkCaptureView: View {
         drawing = saved
         signaturePreview = makeSignatureImage(from: saved)
         rememberSignature = false
-        Task {
-            await model.selectSavedSignature(entry.id)
-        }
+        selectedSignatureID = entry.id
+        selectSavedSignature(entry.id)
         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
             resizeSignature(to: signatureBounds.width)
             signatureStage = .placement
@@ -1133,16 +1611,25 @@ struct InkCaptureView: View {
     }
 
     private func removeSavedSignature(_ entry: SavedSignature) {
-        let wasActive = model.selectedSignatureID == entry.id
-        Task {
-            await model.removeSavedSignature(entry.id)
-        }
-        guard wasActive else { return }
-        drawing = PKDrawing()
-        signaturePreview = nil
-        if signatureStage == .placement {
-            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
-                signatureStage = .capture
+        let wasActive = selectedSignatureID == entry.id
+        let generation = beginSignatureLibraryOperation(
+            signatureID: entry.id
+        )
+        signatureLibraryTask = Task { @MainActor in
+            await model.withFeedbackTarget(paperPathSceneID) {
+                await model.removeSavedSignature(entry.id)
+            }
+            guard !Task.isCancelled,
+                  signatureLibraryGeneration == generation
+            else { return }
+            signatureLibraryTask = nil
+            busySignatureID = nil
+            guard !model.savedSignatures.contains(
+                where: { $0.id == entry.id }
+            ) else { return }
+            if wasActive {
+                selectedSignatureID = nil
+                clearActiveSignatureAfterRemoval()
             }
         }
     }
@@ -1257,6 +1744,21 @@ struct InkCaptureView: View {
         )
     }
 
+    private func nudgeSignature(x: Double, y: Double) {
+        signatureBounds = PDFNormalizedRect(
+            x: min(
+                max(0, signatureBounds.x + x),
+                1 - signatureBounds.width
+            ),
+            y: min(
+                max(0, signatureBounds.y + y),
+                1 - signatureBounds.height
+            ),
+            width: signatureBounds.width,
+            height: signatureBounds.height
+        )
+    }
+
     private func scaleSignature(by scale: CGFloat) {
         resizeSignature(to: signatureBounds.width * scale)
     }
@@ -1291,7 +1793,28 @@ struct InkCaptureView: View {
     }
 
     private func save(preparesDelivery: Bool = false) {
-        guard canvasSize.width > 0, canvasSize.height > 0 else { return }
+        guard !hasActiveInkTask, !didCommitInk else { return }
+        guard let previewContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == previewContentRevisionID
+        else {
+            model[noticeFor: paperPathSceneID] =
+                "The PDF changed before this action started. Review the updated PDF."
+                    .localizedUI
+            interruptProtectedInkWork()
+            dismiss()
+            return
+        }
+        guard isPagePreviewVerified,
+              pagePreviewErrorMessage == nil,
+              !isLoadingPagePreview,
+              signatureLibraryTask == nil,
+              !didCommitInk,
+              canvasSize.width > 0,
+              canvasSize.height > 0,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         let normalizationBounds: CGRect
         if mode == .signature {
             normalizationBounds = drawing.bounds.insetBy(dx: -8, dy: -8)
@@ -1301,19 +1824,39 @@ struct InkCaptureView: View {
         guard normalizationBounds.width > 0,
               normalizationBounds.height > 0
         else { return }
-        var remainingPointCount = 20_000
-        let strokes = drawing.strokes.prefix(400).compactMap {
-            stroke -> PDFInkStroke? in
-            guard remainingPointCount > 1 else { return nil }
-            let sampledPoints = Array(
-                stroke.path.prefix(min(2_000, remainingPointCount))
-            )
+        // Reject over-budget drawings before conversion; never save a prefix.
+        guard !drawing.strokes.isEmpty else { return }
+        guard drawing.strokes.count <= PDFInkPayload.maximumStrokeCount else {
+            inkValidationMessage =
+                "The drawing exceeds the safe stroke or point limit."
+            return
+        }
+        var totalPointCount = 0
+        for stroke in drawing.strokes {
+            guard stroke.path.count >= 2 else {
+                inkValidationMessage =
+                    "A stroke cannot be exported completely. The PDF has not been changed."
+                return
+            }
+            guard stroke.path.count <= PDFInkPayload.maximumPointsPerStroke,
+                  stroke.path.count
+                    <= PDFInkPayload.maximumTotalPointCount - totalPointCount
+            else {
+                inkValidationMessage =
+                    "The drawing exceeds the safe stroke or point limit."
+                return
+            }
+            totalPointCount += stroke.path.count
+        }
+        let strokes = drawing.strokes.map { stroke -> PDFInkStroke in
+            let sampledPoints = Array(stroke.path)
             let points = sampledPoints.map { point in
-                PDFInkPoint(
+                let location = point.location.applying(stroke.transform)
+                return PDFInkPoint(
                     x: min(
                         max(
                             (
-                                point.location.x
+                                location.x
                                     - normalizationBounds.minX
                             ) / normalizationBounds.width,
                             0
@@ -1323,7 +1866,7 @@ struct InkCaptureView: View {
                     y: min(
                         max(
                             (
-                                point.location.y
+                                location.y
                                     - normalizationBounds.minY
                             ) / normalizationBounds.height,
                             0
@@ -1332,11 +1875,13 @@ struct InkCaptureView: View {
                     )
                 )
             }
-            remainingPointCount -= points.count
-            guard points.count > 1 else { return nil }
+            let transform = stroke.transform
+            let widthScale = sqrt(abs(
+                transform.a * transform.d - transform.b * transform.c
+            ))
             let averageWidth = sampledPoints.reduce(0) {
                 $0 + $1.size.width
-            } / CGFloat(sampledPoints.count)
+            } / CGFloat(sampledPoints.count) * widthScale
             return PDFInkStroke(
                 points: points,
                 color: pdfInkColor(from: stroke.ink.color),
@@ -1357,29 +1902,215 @@ struct InkCaptureView: View {
                 : nil
         )
         isSaving = true
-        operationTask = Task {
-            if mode == .signature, rememberSignature {
-                await model.saveSignature(drawing.dataRepresentation())
+        saveStopRequested = false
+        didCommitInk = false
+        let generation = UUID()
+        operationGeneration = generation
+        let savedSignatureData = mode == .signature && rememberSignature
+            ? drawing.dataRepresentation()
+            : nil
+        operationTask = Task { @MainActor in
+#if DEBUG
+            // #region debug-point B:experience-presentations
+            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "B", "location": "InkCaptureView.save.begin", "msg": "[DEBUG] Ink save entered"]); URLSession.shared.dataTask(with: request).resume() }
+            // #endregion
+#endif
+            let succeeded = await model.withFeedbackTarget(paperPathSceneID) {
+                let saved = await model.addInk(
+                    recordID: recordID,
+                    payload: payload,
+                    expectedContentRevisionID: previewContentRevisionID
+                )
+                if saved, let savedSignatureData, !Task.isCancelled {
+                    await model.saveSignature(savedSignatureData)
+                }
+                return saved
             }
-            let succeeded = await model.addInk(
-                recordID: recordID,
-                payload: payload
-            )
-            guard !Task.isCancelled else {
-                isSaving = false
-                operationTask = nil
-                return
-            }
+#if DEBUG
+            // #region debug-point B:experience-presentations
+            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "B", "location": "InkCaptureView.save.completed", "msg": "[DEBUG] Ink save returned", "data": ["success": succeeded, "current": operationGeneration == generation, "saving": isSaving, "cancelled": Task.isCancelled]]); URLSession.shared.dataTask(with: request).resume() }
+            // #endregion
+#endif
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                saveStopRequested || Task.isCancelled
+            didCommitInk = succeeded
             isSaving = false
             operationTask = nil
+            saveStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    succeeded
+                        ? "Ink update finished before stopping · changes kept"
+                        : "Ink update stopped · working copy unchanged"
+                ).localizedUI
+                return
+            }
             guard succeeded else { return }
-            dismiss()
-            if succeeded,
-               preparesDelivery,
+            if preparesDelivery,
                model.record(id: recordID)?
                 .taskCheckpoint?.stage == .verify {
                 onPrepare()
             }
+            dismiss()
+        }
+    }
+
+    private func interruptProtectedInkWork() {
+        stopSaving(invalidateResult: true)
+        stopSignatureLibraryOperation()
+        previewGeneration += 1
+        pagePreviewImage = nil
+        pagePreviewErrorMessage = nil
+        isLoadingPagePreview = false
+        isPagePreviewVerified = false
+        previewContentRevisionID = nil
+        signaturePreview = nil
+    }
+
+    private func stopSaving(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            saveStopRequested = false
+        } else {
+            guard operationTask != nil,
+                  !saveStopRequested
+            else { return }
+            saveStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isSaving = false
+        }
+    }
+
+    private var hasActiveInkTask: Bool {
+        isSaving || signatureLibraryTask != nil
+    }
+
+    private var signatureAdvanceHint: String {
+        if drawing.strokes.isEmpty {
+            return "Draw or choose a signature first."
+        }
+        if isLoadingPagePreview {
+            return "Wait for the page preview to finish loading."
+        }
+        if !isPagePreviewVerified {
+            return "Retry the page preview before placing the signature."
+        }
+        if signatureLibraryTask != nil {
+            return "Wait for the saved signature update to finish."
+        }
+        return "Shows the PDF so you can position and resize this signature"
+    }
+
+    private var signaturePlacementDisabledReason: String? {
+        if didCommitInk {
+            return "The ink update is already saved."
+        }
+        if drawing.strokes.isEmpty {
+            return "Draw or choose a signature first."
+        }
+        if isLoadingPagePreview {
+            return "Wait for the page preview to finish loading."
+        }
+        if !isPagePreviewVerified {
+            return "Retry the page preview before placing the signature."
+        }
+        if signatureLibraryTask != nil {
+            return "Wait for the saved signature update to finish."
+        }
+        if isSaving {
+            return "Wait for the current operation to finish."
+        }
+        return nil
+    }
+
+    private var signaturePlacementSaveHint: String {
+        signaturePlacementDisabledReason
+            ?? "Places the signature on this working copy."
+    }
+
+    @discardableResult
+    private func beginSignatureLibraryOperation(
+        signatureID: UUID?
+    ) -> UUID {
+        signatureLibraryGeneration = UUID()
+        signatureLibraryTask?.cancel()
+        busySignatureID = signatureID
+        return signatureLibraryGeneration
+    }
+
+    private func selectSavedSignature(_ id: UUID) {
+        let generation = beginSignatureLibraryOperation(
+            signatureID: id
+        )
+        signatureLibraryTask = Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled,
+                  signatureLibraryGeneration == generation
+            else { return }
+            await model.withFeedbackTarget(paperPathSceneID) {
+                await model.selectSavedSignature(
+                    id,
+                    presentsFeedback: false
+                )
+            }
+            guard !Task.isCancelled,
+                  signatureLibraryGeneration == generation
+            else { return }
+            signatureLibraryTask = nil
+            busySignatureID = nil
+        }
+    }
+
+    private func removeSelectedSavedSignature() {
+        guard let selectedID = selectedSignatureID,
+              let entry = model.savedSignatures.first(
+                where: { $0.id == selectedID }
+              )
+        else { return }
+        removeSavedSignature(entry)
+    }
+
+    private func initializeSignatureSelectionIfNeeded() {
+        guard mode == .signature,
+              !didInitializeSignatureSelection
+        else { return }
+        didInitializeSignatureSelection = true
+        let preferredID = model.selectedSignatureID
+        selectedSignatureID = model.savedSignatures.contains {
+            $0.id == preferredID
+        } ? preferredID : model.savedSignatures.first?.id
+    }
+
+    private func clearActiveSignatureAfterRemoval() {
+        drawing = PKDrawing()
+        signaturePreview = nil
+        if signatureStage == .placement {
+            withAnimation(
+                reduceMotion ? nil : .easeInOut(duration: 0.18)
+            ) {
+                signatureStage = .capture
+            }
+        }
+    }
+
+    private func stopSignatureLibraryOperation() {
+        signatureLibraryGeneration = UUID()
+        signatureLibraryTask?.cancel()
+        signatureLibraryTask = nil
+        busySignatureID = nil
+    }
+
+    private func stopActiveInkTask() {
+        if isSaving {
+            stopSaving()
+        } else {
+            stopSignatureLibraryOperation()
         }
     }
 
@@ -1447,11 +2178,45 @@ private struct PencilZoomCommand: Equatable {
     }
 }
 
+private final class PencilCanvasHostView: UIView {
+    let canvas = PKCanvasView()
+    var referenceSize: CGSize?
+    var onLayout: ((PKCanvasView) -> Void)?
+    private var initialSize: CGSize?
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        clipsToBounds = true
+        addSubview(canvas)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.width > 0, bounds.height > 0 else { return }
+        if initialSize == nil {
+            initialSize = bounds.size
+        }
+        let logicalSize = referenceSize ?? initialSize ?? bounds.size
+        guard logicalSize.width > 0, logicalSize.height > 0 else { return }
+        // Window resizing changes the viewport, never the saved stroke coordinates.
+        let scale = min(bounds.width / logicalSize.width, bounds.height / logicalSize.height)
+        canvas.bounds.size = logicalSize
+        canvas.center = CGPoint(x: bounds.midX, y: bounds.midY)
+        canvas.transform = CGAffineTransform(scaleX: scale, y: scale)
+        onLayout?(canvas)
+    }
+}
+
 private struct PencilCanvas: UIViewRepresentable {
     @Binding var drawing: PKDrawing
     @Binding var canvasSize: CGSize
     let tool: PKTool
     var backgroundImage: UIImage?
+    var referenceSize: CGSize?
     var drawingPolicy: PKCanvasViewDrawingPolicy = .anyInput
     var allowsViewportGestures = false
     var command: PencilCanvasCommand?
@@ -1468,8 +2233,14 @@ private struct PencilCanvas: UIViewRepresentable {
         )
     }
 
-    func makeUIView(context: Context) -> PKCanvasView {
-        let canvas = PKCanvasView()
+    func makeUIView(context: Context) -> PencilCanvasHostView {
+        let host = PencilCanvasHostView()
+        host.referenceSize = referenceSize
+        let canvas = host.canvas
+        context.coordinator.canvas = canvas
+        host.onLayout = { [weak coordinator = context.coordinator] canvas in
+            coordinator?.layoutCanvas(canvas)
+        }
         canvas.delegate = context.coordinator
         canvas.drawingPolicy = drawingPolicy
         canvas.backgroundColor = .clear
@@ -1483,8 +2254,8 @@ private struct PencilCanvas: UIViewRepresentable {
         canvas.showsHorizontalScrollIndicator = true
         canvas.contentInsetAdjustmentBehavior = .never
         canvas.isAccessibilityElement = true
-        canvas.accessibilityLabel = "Drawing canvas"
-        canvas.accessibilityHint = "Draw with Apple Pencil or one finger"
+        canvas.accessibilityLabel = "Drawing canvas".localizedUI
+        canvas.accessibilityHint = canvasAccessibilityHint
         canvas.tool = tool
         let imageView = UIImageView()
         imageView.contentMode = .scaleAspectFit
@@ -1503,10 +2274,13 @@ private struct PencilCanvas: UIViewRepresentable {
         }
         canvas.addInteraction(pencilInteraction)
         context.coordinator.pencilInteraction = pencilInteraction
-        return canvas
+        return host
     }
 
-    func updateUIView(_ canvas: PKCanvasView, context: Context) {
+    func updateUIView(_ host: PencilCanvasHostView, context: Context) {
+        host.referenceSize = referenceSize
+        host.setNeedsLayout()
+        let canvas = host.canvas
         context.coordinator.onHistoryChange = onHistoryChange
         context.coordinator.onHardwareShortcut = onHardwareShortcut
         if canvas.drawing != drawing {
@@ -1520,6 +2294,7 @@ private struct PencilCanvas: UIViewRepresentable {
         canvas.panGestureRecognizer.isEnabled = allowsViewportGestures
         canvas.pinchGestureRecognizer?.isEnabled = allowsViewportGestures
         canvas.drawingGestureRecognizer.isEnabled = !allowsViewportGestures
+        canvas.accessibilityHint = canvasAccessibilityHint
         canvas.minimumZoomScale = 1
         canvas.maximumZoomScale = 5
         if canvas.zoomScale < canvas.minimumZoomScale {
@@ -1570,14 +2345,41 @@ private struct PencilCanvas: UIViewRepresentable {
             context.coordinator.zoomCommandID = zoomCommand.id
             switch zoomCommand.action {
             case .fit:
-                canvas.setZoomScale(1, animated: true)
-                canvas.setContentOffset(.zero, animated: true)
+                canvas.setZoomScale(1, animated: !UIAccessibility.isReduceMotionEnabled)
+                canvas.setContentOffset(.zero, animated: !UIAccessibility.isReduceMotionEnabled)
             }
         }
-        DispatchQueue.main.async {
-            canvasSize = canvas.bounds.size
-            context.coordinator.reportHistory(from: canvas)
+        context.coordinator.scheduleStateReport(from: canvas)
+    }
+
+    private var canvasAccessibilityHint: String {
+        if allowsViewportGestures {
+            return "Use one finger to move the page and two fingers to zoom."
+                .localizedUI
         }
+        if drawingPolicy == .pencilOnly {
+            return "Draw with Apple Pencil. Touch gestures do not create ink."
+                .localizedUI
+        }
+        return "Draw with Apple Pencil or one finger".localizedUI
+    }
+
+    static func dismantleUIView(
+        _ host: PencilCanvasHostView,
+        coordinator: Coordinator
+    ) {
+        let canvas = host.canvas
+        host.onLayout = nil
+        coordinator.cancelPendingStateReport()
+        canvas.delegate = nil
+        canvas.accessibilityCustomActions = nil
+        coordinator.canvas = nil
+        if let pencilInteraction = coordinator.pencilInteraction {
+            canvas.removeInteraction(pencilInteraction)
+        }
+        coordinator.pencilInteraction = nil
+        coordinator.backgroundImageView?.removeFromSuperview()
+        coordinator.backgroundImageView = nil
     }
 
     final class Coordinator:
@@ -1590,9 +2392,11 @@ private struct PencilCanvas: UIViewRepresentable {
         var zoomCommandID: UUID?
         var logicalContentSize: CGSize = .zero
         weak var backgroundImageView: UIImageView?
+        weak var canvas: PKCanvasView?
         var pencilInteraction: UIPencilInteraction?
         var onHardwareShortcut: (PencilHardwareShortcut) -> Void
         var onHistoryChange: (Bool, Bool) -> Void
+        private var stateReportTask: Task<Void, Never>?
 
         init(
             drawing: Binding<PKDrawing>,
@@ -1607,24 +2411,76 @@ private struct PencilCanvas: UIViewRepresentable {
             self.onHistoryChange = onHistoryChange
         }
 
+        deinit {
+            stateReportTask?.cancel()
+        }
+
+        func scheduleStateReport(from canvas: PKCanvasView) {
+            stateReportTask?.cancel()
+            stateReportTask = Task { @MainActor [weak self, weak canvas] in
+                await Task.yield()
+                guard !Task.isCancelled,
+                      let self,
+                      let canvas
+                else { return }
+                stateReportTask = nil
+                canvasSize = canvas.bounds.size
+                reportHistory(from: canvas)
+            }
+        }
+
+        func cancelPendingStateReport() {
+            stateReportTask?.cancel()
+            stateReportTask = nil
+        }
+
+        func layoutCanvas(_ canvas: PKCanvasView) {
+            if logicalContentSize != canvas.bounds.size {
+                logicalContentSize = canvas.bounds.size
+                canvas.contentSize = logicalContentSize
+                backgroundImageView?.frame = CGRect(origin: .zero, size: logicalContentSize)
+            }
+            scheduleStateReport(from: canvas)
+        }
+
+        @objc private func accessibilityUndo(_ action: UIAccessibilityCustomAction) -> Bool {
+            guard let canvas, canvas.undoManager?.canUndo == true else { return false }
+            canvas.undoManager?.undo()
+            synchronize(from: canvas)
+            return true
+        }
+
+        @objc private func accessibilityRedo(_ action: UIAccessibilityCustomAction) -> Bool {
+            guard let canvas, canvas.undoManager?.canRedo == true else { return false }
+            canvas.undoManager?.redo()
+            synchronize(from: canvas)
+            return true
+        }
+
+        @objc private func accessibilityFit(_ action: UIAccessibilityCustomAction) -> Bool {
+            guard let canvas else { return false }
+            canvas.setZoomScale(1, animated: !UIAccessibility.isReduceMotionEnabled)
+            canvas.setContentOffset(.zero, animated: !UIAccessibility.isReduceMotionEnabled)
+            return true
+        }
+
+        @objc private func accessibilityTools(_ action: UIAccessibilityCustomAction) -> Bool {
+            onHardwareShortcut(.showContextualPalette)
+            return true
+        }
+
+        func pencilInteractionDidTap(
+            _ interaction: UIPencilInteraction
+        ) {
+            handlePreferredTapAction()
+        }
+
         @available(iOS 17.5, *)
         func pencilInteraction(
             _ interaction: UIPencilInteraction,
             didReceiveTap tap: UIPencilInteraction.Tap
         ) {
-            switch UIPencilInteraction.preferredTapAction {
-            case .switchEraser:
-                onHardwareShortcut(.switchEraser)
-            case .switchPrevious:
-                onHardwareShortcut(.switchPrevious)
-            case .showColorPalette, .showInkAttributes,
-                 .showContextualPalette:
-                onHardwareShortcut(.showContextualPalette)
-            case .ignore, .runSystemShortcut:
-                break
-            @unknown default:
-                break
-            }
+            handlePreferredTapAction()
         }
 
         @available(iOS 17.5, *)
@@ -1632,9 +2488,7 @@ private struct PencilCanvas: UIViewRepresentable {
             _ interaction: UIPencilInteraction,
             didReceiveSqueeze squeeze: UIPencilInteraction.Squeeze
         ) {
-            guard squeeze.phase == .began
-                    || squeeze.phase == .ended
-            else { return }
+            guard squeeze.phase == .ended else { return }
             switch UIPencilInteraction.preferredSqueezeAction {
             case .switchEraser:
                 onHardwareShortcut(.switchEraser)
@@ -1650,6 +2504,37 @@ private struct PencilCanvas: UIViewRepresentable {
             }
         }
 
+        private func handlePreferredTapAction() {
+            if #available(iOS 17.5, *) {
+                switch UIPencilInteraction.preferredTapAction {
+                case .switchEraser:
+                    onHardwareShortcut(.switchEraser)
+                case .switchPrevious:
+                    onHardwareShortcut(.switchPrevious)
+                case .showColorPalette, .showInkAttributes,
+                     .showContextualPalette:
+                    onHardwareShortcut(.showContextualPalette)
+                case .ignore, .runSystemShortcut:
+                    break
+                @unknown default:
+                    break
+                }
+            } else {
+                switch UIPencilInteraction.preferredTapAction {
+                case .switchEraser:
+                    onHardwareShortcut(.switchEraser)
+                case .switchPrevious:
+                    onHardwareShortcut(.switchPrevious)
+                case .showColorPalette, .showInkAttributes:
+                    onHardwareShortcut(.showContextualPalette)
+                case .ignore:
+                    break
+                default:
+                    break
+                }
+            }
+        }
+
         func canvasViewDrawingDidChange(_ canvasView: PKCanvasView) {
             synchronize(from: canvasView)
         }
@@ -1661,6 +2546,31 @@ private struct PencilCanvas: UIViewRepresentable {
         }
 
         func reportHistory(from canvasView: PKCanvasView) {
+            canvasView.accessibilityValue = AppLocalization.format(
+                "%lld strokes", canvasView.drawing.strokes.count
+            )
+            var actions: [UIAccessibilityCustomAction] = []
+            if canvasView.undoManager?.canUndo == true {
+                actions.append(UIAccessibilityCustomAction(
+                    name: "Undo stroke".localizedUI, target: self,
+                    selector: #selector(accessibilityUndo(_:))
+                ))
+            }
+            if canvasView.undoManager?.canRedo == true {
+                actions.append(UIAccessibilityCustomAction(
+                    name: "Redo stroke".localizedUI, target: self,
+                    selector: #selector(accessibilityRedo(_:))
+                ))
+            }
+            actions.append(UIAccessibilityCustomAction(
+                name: "Fit page".localizedUI, target: self,
+                selector: #selector(accessibilityFit(_:))
+            ))
+            actions.append(UIAccessibilityCustomAction(
+                name: "Pencil controls".localizedUI, target: self,
+                selector: #selector(accessibilityTools(_:))
+            ))
+            canvasView.accessibilityCustomActions = actions
             onHistoryChange(
                 canvasView.undoManager?.canUndo == true,
                 canvasView.undoManager?.canRedo == true

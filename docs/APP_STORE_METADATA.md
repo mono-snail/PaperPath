@@ -43,6 +43,7 @@ Do not duplicate `PaperPath` or `PDF` from the app name in the keyword field.
 5. `Review low-confidence OCR pages`
 6. `Batch-check every PDF separately`
 7. `Reopen outputs and keep a receipt`
+8. `Verify a received PDF without uploading it`
 
 ## Custom Product Pages
 

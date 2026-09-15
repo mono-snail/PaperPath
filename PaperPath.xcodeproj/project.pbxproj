@@ -12,6 +12,8 @@
 		A00000000000000000000003 /* ExternalPDFInbox.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000001 /* ExternalPDFInbox.swift */; };
 		A00000000000000000000004 /* PaperPathShareExtension.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* PaperPathShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A00000000000000000000005 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F4CC5CC5A8468C88F2899289 /* Assets.xcassets */; };
+		A00000000000000000000006 /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = E6A201A15F6B4B559B580001 /* Localizable.strings */; };
+		A4AB19D59A3152DE29197C79 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 6BD58F0FF5D9477F16CA58E1 /* PrivacyInfo.xcprivacy */; };
 		0146D9A135060A234A4248EF /* PDFFormInspectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6061F3EA8A1F1E60865AAAC7 /* PDFFormInspectionService.swift */; };
 		08E1123B5FE6F42AE597A6AE /* DemoPDFBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76046A9D59A11DFA597D93C8 /* DemoPDFBuilder.swift */; };
 		0C986D75FDF9D4A2EFA71F88 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F4CC5CC5A8468C88F2899289 /* Assets.xcassets */; };
@@ -38,6 +40,7 @@
 		7B397E9118CA6EF983183979 /* PaperPathTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 68282E311E6DB5FB6E471250 /* PaperPathTests.swift */; };
 		7C397E9118CA6EF983183979 /* PDFTestFixtureFactory.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6C282E311E6DB5FB6E471250 /* PDFTestFixtureFactory.swift */; };
 		7D397E9118CA6EF983183979 /* PDFCoreServiceRegressionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6D282E311E6DB5FB6E471250 /* PDFCoreServiceRegressionTests.swift */; };
+		F0A1B2C3D4E5F60718293A4B /* ServicePureLogicCoverageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0A1B2C3D4E5F60718293A4C /* ServicePureLogicCoverageTests.swift */; };
 		E6B100A15F6B4B559B580001 /* OfficeInteropCorpus in Resources */ = {isa = PBXBuildFile; fileRef = E6B101A15F6B4B559B580001 /* OfficeInteropCorpus */; };
 		7B570990F939C1D049E4367C /* AnnotationReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7EE61F757BFE837787D85DD9 /* AnnotationReviewView.swift */; };
 		832033BA97103B51EFE3BC35 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 909403FBB196D7C0BC62870F /* RootView.swift */; };
@@ -124,6 +127,7 @@
 		68282E311E6DB5FB6E471250 /* PaperPathTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaperPathTests.swift; sourceTree = "<group>"; };
 		6C282E311E6DB5FB6E471250 /* PDFTestFixtureFactory.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFTestFixtureFactory.swift; sourceTree = "<group>"; };
 		6D282E311E6DB5FB6E471250 /* PDFCoreServiceRegressionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFCoreServiceRegressionTests.swift; sourceTree = "<group>"; };
+		F0A1B2C3D4E5F60718293A4C /* ServicePureLogicCoverageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServicePureLogicCoverageTests.swift; sourceTree = "<group>"; };
 		E6B101A15F6B4B559B580001 /* OfficeInteropCorpus */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Fixtures/OfficeInteropCorpus; sourceTree = "<group>"; };
 		6B39801ADBE8F0771F58FC93 /* PaperPathModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PaperPathModel.swift; sourceTree = "<group>"; };
 		6BD58F0FF5D9477F16CA58E1 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
@@ -288,6 +292,7 @@
 				6D282E311E6DB5FB6E471250 /* PDFCoreServiceRegressionTests.swift */,
 				6C282E311E6DB5FB6E471250 /* PDFTestFixtureFactory.swift */,
 				68282E311E6DB5FB6E471250 /* PaperPathTests.swift */,
+				F0A1B2C3D4E5F60718293A4C /* ServicePureLogicCoverageTests.swift */,
 			);
 			path = PaperPathTests;
 			sourceTree = "<group>";
@@ -485,6 +490,8 @@
 			buildActionMask = 2147483647;
 			files = (
 				A00000000000000000000005 /* Assets.xcassets in Resources */,
+				A00000000000000000000006 /* Localizable.strings in Resources */,
+				A4AB19D59A3152DE29197C79 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -590,6 +597,7 @@
 				7D397E9118CA6EF983183979 /* PDFCoreServiceRegressionTests.swift in Sources */,
 				7C397E9118CA6EF983183979 /* PDFTestFixtureFactory.swift in Sources */,
 				7B397E9118CA6EF983183979 /* PaperPathTests.swift in Sources */,
+				F0A1B2C3D4E5F60718293A4B /* ServicePureLogicCoverageTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

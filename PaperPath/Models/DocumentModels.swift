@@ -27,19 +27,87 @@ struct AppActionNotice: Identifiable, Hashable, Sendable {
     let detail: String?
     let kind: AppNoticeKind
     let action: AppNoticeAction
+    let targetSceneID: UUID?
 
     init(
         id: UUID = UUID(),
         message: String,
         detail: String? = nil,
         kind: AppNoticeKind,
-        action: AppNoticeAction
+        action: AppNoticeAction,
+        targetSceneID: UUID? = nil
     ) {
         self.id = id
         self.message = message
         self.detail = detail
         self.kind = kind
         self.action = action
+        self.targetSceneID = targetSceneID
+    }
+
+    func targetingScene(_ sceneID: UUID?) -> AppActionNotice {
+        AppActionNotice(
+            id: id,
+            message: message,
+            detail: detail,
+            kind: kind,
+            action: action,
+            targetSceneID: sceneID
+        )
+    }
+}
+
+struct AppTransientNotice: Identifiable, Hashable, Sendable {
+    let id: UUID
+    let message: String
+    let targetSceneID: UUID?
+
+    init(
+        id: UUID = UUID(),
+        message: String,
+        targetSceneID: UUID? = nil
+    ) {
+        self.id = id
+        self.message = message
+        self.targetSceneID = targetSceneID
+    }
+
+    func targetingScene(_ sceneID: UUID?) -> AppTransientNotice {
+        AppTransientNotice(
+            id: id,
+            message: message,
+            targetSceneID: sceneID
+        )
+    }
+}
+
+struct AppPresentationError: Identifiable, Hashable, Sendable {
+    let id: UUID
+    let message: String
+    let offersSettings: Bool
+    let targetSceneID: UUID?
+
+    init(
+        id: UUID = UUID(),
+        message: String,
+        offersSettings: Bool = false,
+        targetSceneID: UUID? = nil
+    ) {
+        self.id = id
+        self.message = message
+        self.offersSettings = offersSettings
+        self.targetSceneID = targetSceneID
+    }
+
+    func targetingScene(
+        _ sceneID: UUID?
+    ) -> AppPresentationError {
+        AppPresentationError(
+            id: id,
+            message: message,
+            offersSettings: offersSettings,
+            targetSceneID: sceneID
+        )
     }
 }
 
@@ -47,15 +115,32 @@ struct DocumentRoute: Hashable {
     let recordID: UUID
     let pageIndex: Int?
     let quickTask: PDFQuickTask?
+    let expectedContentRevisionID: UUID?
 
     init(
         recordID: UUID,
         pageIndex: Int? = nil,
-        quickTask: PDFQuickTask? = nil
+        quickTask: PDFQuickTask? = nil,
+        expectedContentRevisionID: UUID? = nil
     ) {
         self.recordID = recordID
         self.pageIndex = pageIndex
         self.quickTask = quickTask
+        self.expectedContentRevisionID = expectedContentRevisionID
+    }
+
+    func bindingExpectedRevision(
+        _ contentRevisionID: UUID?
+    ) -> DocumentRoute {
+        guard expectedContentRevisionID == nil,
+              let contentRevisionID
+        else { return self }
+        return DocumentRoute(
+            recordID: recordID,
+            pageIndex: pageIndex,
+            quickTask: quickTask,
+            expectedContentRevisionID: contentRevisionID
+        )
     }
 }
 
@@ -201,7 +286,7 @@ enum PDFQuickTask: String, CaseIterable, Identifiable, Hashable {
         case .organizePages:
             return "reorder number paginate bates stamp watermark rotate crop delete sort 页面 页码 连续编号 水印 排序 旋转 裁切 删除"
         case .compressPDF:
-            return "smaller shrink reduce size optimize 瘦身 压缩 变小"
+            return "smaller shrink reduce size optimize too large attachment message 瘦身 压缩 变小 太大 发邮件 发微信"
         case .fillForms:
             return "form field type complete 表单 填写 填表"
         case .signPDF:
@@ -211,9 +296,9 @@ enum PDFQuickTask: String, CaseIterable, Identifiable, Hashable {
         case .protectPDF:
             return "password encrypt lock 加密 密码 上锁"
         case .safeShare:
-            return "flatten clean metadata verify secure delivery 安全分享 扁平化 清理 交付"
+            return "send share finish flatten clean metadata verify secure delivery ready final 发出去 发送 分享 扁平化 清理 检查 交付 最终版"
         case .recognizeText:
-            return "recognise vision image text scan 文字识别 扫描件"
+            return "recognise vision image text scan searchable copy 文字识别 扫描件 可搜索 搜文字"
         case .exportText:
             return "docx xlsx pptx word excel powerpoint text office convert 导出 转换"
         case .exportImages:
@@ -223,18 +308,29 @@ enum PDFQuickTask: String, CaseIterable, Identifiable, Hashable {
 
     func matchScore(_ query: String) -> Int? {
         let normalizedQuery = Self.normalizedSearchText(query)
-        let terms = normalizedQuery.split(whereSeparator: \.isWhitespace)
-        guard !terms.isEmpty else { return 0 }
+        let terms = SearchTextNormalizer.meaningfulTerms(in: query)
+        guard !terms.isEmpty else { return nil }
 
         let normalizedTitle = Self.normalizedSearchText(title)
         let searchableText = Self.normalizedSearchText(
             "\(title) \(detail) \(group.title) \(searchAliases)"
         )
-        guard terms.allSatisfy(searchableText.contains) else { return nil }
+        let matchedTermCount = terms.reduce(into: 0) { count, term in
+            if searchableText.contains(term) {
+                count += 1
+            }
+        }
+        let intentHitCount = SearchTextNormalizer.intentHitCount(
+            query: normalizedQuery,
+            searchableText: searchableText
+        )
+        guard matchedTermCount == terms.count || intentHitCount > 0 else {
+            return nil
+        }
         if normalizedTitle == normalizedQuery { return 100 }
         if normalizedTitle.hasPrefix(normalizedQuery) { return 80 }
         if normalizedTitle.contains(normalizedQuery) { return 60 }
-        return 30
+        return 30 + matchedTermCount * 8 + min(intentHitCount, 3) * 6
     }
 
     func matches(_ query: String) -> Bool {
@@ -310,7 +406,7 @@ enum PDFTaskPackage: String, CaseIterable, Identifiable, Hashable {
 
     var title: String {
         switch self {
-        case .prepareToSend: return "Finish & send"
+        case .prepareToSend: return "Finish & share"
         case .makeSearchable: return "Make searchable"
         case .convertForWork: return "Use in Office"
         case .compressForEmail: return "Fit for email"
@@ -358,13 +454,13 @@ enum PDFTaskPackage: String, CaseIterable, Identifiable, Hashable {
     var searchAliases: String {
         switch self {
         case .prepareToSend:
-            return "send share finish sign form clean verify batch multiple several 发出去 发送 签字 填表 检查 批量 多份"
+            return "send share finish sign form clean verify batch multiple several ready final 发出去 发送 分享 签字 填表 检查 批量 多份 最终版"
         case .makeSearchable:
-            return "ocr scan search text searchable 扫描 识别 搜索 文字"
+            return "ocr scan search text searchable find words 扫描 识别 搜索 文字 可搜索 搜文字"
         case .convertForWork:
             return "office word excel powerpoint docx xlsx pptx editable convert 办公 转换 可编辑"
         case .compressForEmail:
-            return "email mail small size compress shrink 邮件 太大 压缩 变小"
+            return "email mail message attachment small size compress shrink 邮件 微信 附件 太大 压缩 变小"
         case .redactAndProve:
             return "privacy sensitive redact hide remove 脱敏 隐私 打码 删除"
         case .fixPages:
@@ -373,13 +469,17 @@ enum PDFTaskPackage: String, CaseIterable, Identifiable, Hashable {
     }
 
     func matches(_ query: String) -> Bool {
-        let terms = SearchTextNormalizer.normalize(query)
-            .split(whereSeparator: \.isWhitespace)
-        guard !terms.isEmpty else { return true }
+        let normalizedQuery = SearchTextNormalizer.normalize(query)
+        let terms = SearchTextNormalizer.meaningfulTerms(in: query)
+        guard !terms.isEmpty else { return false }
         let text = SearchTextNormalizer.normalize(
             "\(title) \(detail) \(searchAliases)"
         )
         return terms.allSatisfy(text.contains)
+            || SearchTextNormalizer.intentHitCount(
+                query: normalizedQuery,
+                searchableText: text
+            ) > 0
     }
 
     func supports(_ record: DocumentRecord) -> Bool {
@@ -403,26 +503,22 @@ struct PDFTaskPackagePlanner {
         let package: PDFTaskPackage
         let task: PDFQuickTask
         let reason: String
+        var resumeStage: DocumentTaskStage? = nil
 
         var title: String {
+            if let resumeStage {
+                return resumeStage.title
+            }
             if reason == "Verified copy ready" {
                 return "Share verified PDF"
             }
-        if reason == "Output changed since verification" {
-            return "Verify changed output"
-        }
-            if reason.hasPrefix("Return to") {
-                switch task {
-                case .fillForms: return "Continue filling"
-                case .signPDF: return "Continue signing"
-                default: break
-                }
+            if reason == "Output changed since verification" {
+                return "Verify changed output"
             }
-            if task == .safeShare,
-               reason == DocumentTaskStage.verify.detail {
-                return "Continue verification"
+            if task == .fillForms {
+                return "Fill Form"
             }
-            return package.title
+            return task.title
         }
     }
 
@@ -517,7 +613,8 @@ struct PDFTaskPackagePlanner {
             return Recommendation(
                 package: .prepareToSend,
                 task: checkpoint.stage.quickTask,
-                reason: checkpoint.resumeReason
+                reason: checkpoint.resumeReason,
+                resumeStage: checkpoint.stage
             )
         }
 
@@ -673,6 +770,16 @@ struct PDFQuickTaskPlanner {
 }
 
 private enum SearchTextNormalizer {
+    private static let ignoredTerms: Set<String> = [
+        "a", "an", "and", "can", "could", "do", "document", "file",
+        "for", "help", "i", "in", "into", "it", "me", "my", "of",
+        "on", "or", "pdf", "please", "the", "this", "to", "want",
+        "with", "you"
+    ]
+    private static let weakIntentTerms: Set<String> = ignoredTerms.union([
+        "create", "make", "open", "tool", "tools"
+    ])
+
     static func normalize(_ value: String) -> String {
         value
             .folding(
@@ -682,6 +789,35 @@ private enum SearchTextNormalizer {
             .replacingOccurrences(of: "-", with: " ")
             .replacingOccurrences(of: "/", with: " ")
             .replacingOccurrences(of: "_", with: " ")
+    }
+
+    static func meaningfulTerms(in value: String) -> [String] {
+        normalize(value)
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+            .filter {
+                $0.count > 1 && !ignoredTerms.contains($0)
+            }
+    }
+
+    static func intentHitCount(
+        query normalizedQuery: String,
+        searchableText: String
+    ) -> Int {
+        guard !normalizedQuery.isEmpty else { return 0 }
+        let tokens = Set(
+            searchableText
+                .split(whereSeparator: \.isWhitespace)
+                .map(String.init)
+                .filter {
+                    $0.count > 1 && !weakIntentTerms.contains($0)
+                }
+        )
+        return tokens.reduce(into: 0) { count, token in
+            if normalizedQuery.contains(token) {
+                count += 1
+            }
+        }
     }
 }
 
@@ -1036,7 +1172,8 @@ struct PDFOfficeExportFailure: Hashable, Sendable {
         return PDFOfficeExportFailure(
             format: format,
             kind: kind,
-            detail: error.localizedDescription
+            detail: AppLocalization
+                .userFacingErrorDescription(error)
         )
     }
 }
@@ -1066,6 +1203,71 @@ enum PDFOfficeArtifactAvailability: Hashable, Sendable {
     }
 }
 
+struct PDFOfficeContentNotice: Codable, Hashable, Sendable, Identifiable {
+    enum Kind: String, Codable, Sendable {
+        case wordReconstruction, spreadsheetTextOnly, slideImages
+        case pagesWithoutText, missingVisualReferences, inferredTableLayout
+
+        var title: String {
+            switch self {
+            case .wordReconstruction: return "Word layout rebuilt"
+            case .spreadsheetTextOnly: return "Spreadsheet contains extracted text and values"
+            case .slideImages: return "Slides contain page images"
+            case .pagesWithoutText: return "Pages without extracted text"
+            case .missingVisualReferences: return "Page reference images not included"
+            case .inferredTableLayout: return "Table positions need review"
+            }
+        }
+
+        var detail: String {
+            switch self {
+            case .wordReconstruction:
+                return "Check paragraph order and numbering. Number labels remain text; headers and footers are ordinary paragraphs. Images, when included, are page references rather than editable objects."
+            case .spreadsheetTextOnly:
+                return "Charts, images and conditional formatting are not included. Formulas and pivot-table relationships are not recovered. Check headers and values against the source PDF."
+            case .slideImages:
+                return "Page appearance is preserved as images, not editable shapes or tables. Extracted text is stored separately; search and re-export support varies by Office app."
+            case .pagesWithoutText:
+                return "These source pages produced no text cells. Their worksheets are empty; check the source PDF for images or other content."
+            case .missingVisualReferences:
+                return "Reference images could not be included within the rendering or storage limit. Check these pages in the source PDF."
+            case .inferredTableLayout:
+                return "Some cell positions were inferred without reliable table boundaries. Check empty cells, merged headers and right-aligned values."
+            }
+        }
+    }
+
+    let kind: Kind
+    var pageIndices: [Int] = []
+    var id: String { kind.rawValue }
+
+    static func defaults(for format: PDFTextExportFormat) -> [Self] {
+        switch format {
+        case .wordDocument: return [Self(kind: .wordReconstruction)]
+        case .excelWorkbook: return [Self(kind: .spreadsheetTextOnly)]
+        case .powerPointPresentation: return [Self(kind: .slideImages)]
+        default: return []
+        }
+    }
+
+    func pageSummary(offset: Int = 0) -> String? {
+        guard !pageIndices.isEmpty else { return nil }
+        let pages = Array(Set(pageIndices.filter { $0 >= 0 })).sorted()
+        guard !pages.isEmpty else { return nil }
+        var ranges: [String] = []
+        var start = pages[0]
+        var end = start
+        for page in pages.dropFirst() {
+            if page == end + 1 { end = page; continue }
+            ranges.append(start == end ? "\(start + offset + 1)" : "\(start + offset + 1)-\(end + offset + 1)")
+            start = page
+            end = page
+        }
+        ranges.append(start == end ? "\(start + offset + 1)" : "\(start + offset + 1)-\(end + offset + 1)")
+        return AppLocalization.format("Source pages: %@", ranges.joined(separator: ", "))
+    }
+}
+
 struct PDFOfficeRuntimeEvidence:
     Codable,
     Hashable,
@@ -1081,6 +1283,7 @@ struct PDFOfficeRuntimeEvidence:
     let assetBudgetByteCount: Int
     let assetCompressionFallbackCount: Int
     let assetMinimumQualityPercent: Int
+    var contentNotices: [PDFOfficeContentNotice]? = nil
 
     var pageYieldPercent: Int {
         percentage(outputPageCount, of: sourcePageCount)
@@ -1142,6 +1345,7 @@ struct PDFOfficeRuntimeEvidence:
 struct PDFTextExportArtifact: Sendable {
     let url: URL
     let runtimeEvidence: PDFOfficeRuntimeEvidence?
+    let sourceProfile: DocumentProfile
 }
 
 struct PDFOfficeBatchSegment:
@@ -1189,6 +1393,9 @@ struct PDFOfficeBatchPlan:
     Codable,
     Hashable,
     Sendable {
+    static let maximumPageCount = 100_000
+    static let maximumSegmentCount = 64
+
     let id: UUID
     let format: PDFTextExportFormat
     let sourceRevisionID: UUID
@@ -1206,7 +1413,7 @@ struct PDFOfficeBatchPlan:
         self.format = format
         self.sourceRevisionID = sourceRevisionID
         sourcePageCount = max(0, profile.pageCount)
-        createdAt = Date()
+        createdAt = PDFOfficeTimeAnchor.process.trustedDate()
 
         let visualTarget = PDFOfficeVisualBudgetPlan(
             profile: profile
@@ -1221,6 +1428,7 @@ struct PDFOfficeBatchPlan:
         segmentPageTarget = max(
             1,
             min(
+                max(1, profile.pageCount),
                 formatLimit,
                 max(visualTarget, receiptWindowTarget)
             )
@@ -1260,6 +1468,34 @@ struct PDFOfficeBatchPlan:
             segmentPageTarget
         )
     }
+
+    func isStructurallyValid(
+        at date: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> Bool {
+        guard format.isOfficeFormat,
+              (1...Self.maximumPageCount).contains(sourcePageCount),
+              (1...sourcePageCount).contains(segmentPageTarget),
+              PDFEvidenceContract.isPlausiblePastDate(
+                  createdAt,
+                  now: date
+              ),
+              !segments.isEmpty,
+              segments.count <= Self.maximumSegmentCount,
+              Set(segments.map(\.id)).count == segments.count
+        else { return false }
+
+        var expectedStartPage = 0
+        for (offset, segment) in segments.enumerated() {
+            guard segment.index == offset,
+                  segment.startPageIndex == expectedStartPage,
+                  segment.endPageIndex >= segment.startPageIndex,
+                  segment.endPageIndex < sourcePageCount,
+                  segment.pageCount <= segmentPageTarget
+            else { return false }
+            expectedStartPage = segment.endPageIndex + 1
+        }
+        return expectedStartPage == sourcePageCount
+    }
 }
 
 enum PDFOfficeBatchSegmentStatus:
@@ -1296,6 +1532,15 @@ enum PDFOfficeBatchSegmentStatus:
         case .completed: return "checkmark.circle.fill"
         case .failed: return "xmark.octagon.fill"
         case .cancelled: return "stop.circle"
+        }
+    }
+
+    var isTerminal: Bool {
+        switch self {
+        case .completed, .failed, .cancelled:
+            return true
+        case .queued, .extracting, .rebuilding, .retaining:
+            return false
         }
     }
 }
@@ -1355,7 +1600,7 @@ struct PDFOfficeBatchRun:
     init(plan: PDFOfficeBatchPlan) {
         id = plan.id
         self.plan = plan
-        startedAt = Date()
+        startedAt = PDFOfficeTimeAnchor.process.trustedDate()
         completedAt = nil
         status = .preparing
         segments = plan.segments.map {
@@ -1380,7 +1625,10 @@ struct PDFOfficeBatchRun:
     var fractionCompleted: Double {
         guard !segments.isEmpty else { return 0 }
         return segments.reduce(0) {
-            $0 + min(1, max(0, $1.fractionCompleted))
+            let fraction = $1.fractionCompleted.isFinite
+                ? min(1, max(0, $1.fractionCompleted))
+                : 0
+            return $0 + fraction
         } / Double(segments.count)
     }
 
@@ -1397,6 +1645,60 @@ struct PDFOfficeBatchRun:
         }
     }
 
+    func isStructurallyValid(
+        at date: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> Bool {
+        guard id == plan.id,
+              plan.isStructurallyValid(at: date),
+              PDFEvidenceContract.isPlausiblePastDate(
+                  startedAt,
+                  now: date
+              ),
+              startedAt
+                >= plan.createdAt.addingTimeInterval(
+                    -PDFEvidenceContract.futureTolerance
+                ),
+              segments.count == plan.segments.count
+        else { return false }
+        if let completedAt {
+            guard PDFEvidenceContract.isPlausiblePastDate(
+                completedAt,
+                now: date
+            ),
+                  completedAt >= startedAt
+            else { return false }
+        }
+        for (expected, result) in zip(plan.segments, segments) {
+            let failureDetailIsValid = result.failureDetail.map {
+                PDFEvidenceContract.isSafeDisplayText(
+                    $0,
+                    maximumCharacters: 2_000,
+                    maximumUTF8Bytes: 8_000
+                )
+            } ?? true
+            guard result.segment == expected,
+                  result.fractionCompleted.isFinite,
+                  (0...1).contains(result.fractionCompleted),
+                  failureDetailIsValid,
+                  result.status != .completed
+                    || result.receiptID != nil
+            else { return false }
+        }
+        switch status {
+        case .preparing, .running, .paused:
+            return completedAt == nil
+        case .completed:
+            return completedAt != nil
+                && completedCount == segments.count
+        case .partial:
+            return completedAt != nil
+                && completedCount > 0
+                && completedCount < segments.count
+        case .failed, .cancelled:
+            return completedAt != nil && completedCount == 0
+        }
+    }
+
     var retryableSegmentIDs: Set<UUID> {
         Set(
             segments.compactMap { result in
@@ -1410,25 +1712,68 @@ struct PDFOfficeBatchRun:
         )
     }
 
-    func restored(
-        currentRevisionID: UUID
+    func reconcilingArtifacts(
+        currentRevisionID: UUID,
+        availableReceiptIDs: Set<UUID>
     ) -> PDFOfficeBatchRun {
-        var restored = self
-        guard plan.sourceRevisionID == currentRevisionID else {
-            for index in restored.segments.indices
-                where restored.segments[index].status != .completed {
-                restored.segments[index].status = .failed
-                restored.segments[index].fractionCompleted = 1
-                restored.segments[index].failureDetail =
-                    "The source changed after this batch was created."
+        var reconciled = self
+        var lostCompletedArtifact = false
+        var claimedReceiptIDs = Set<UUID>()
+        for index in reconciled.segments.indices {
+            guard reconciled.segments[index].status == .completed else {
+                reconciled.segments[index].receiptID = nil
+                continue
             }
-            restored.completedAt = restored.completedAt ?? Date()
-            restored.status = restored.completedCount > 0
-                ? .partial
-                : .failed
-            return restored
+            guard
+                  let receiptID = reconciled.segments[index].receiptID,
+                  availableReceiptIDs.contains(receiptID),
+                  claimedReceiptIDs.insert(receiptID).inserted
+            else {
+                reconciled.segments[index].status = .failed
+                reconciled.segments[index].fractionCompleted = 0
+                reconciled.segments[index].receiptID = nil
+                reconciled.segments[index].failureDetail =
+                    "The retained file for this part is no longer available. Retry to rebuild it."
+                lostCompletedArtifact = true
+                continue
+            }
         }
 
+        guard plan.sourceRevisionID == currentRevisionID else {
+            for index in reconciled.segments.indices {
+                reconciled.segments[index].status = .failed
+                reconciled.segments[index].fractionCompleted = 1
+                reconciled.segments[index].receiptID = nil
+                reconciled.segments[index].failureDetail =
+                    "The source changed after this batch was created."
+            }
+            reconciled.completedAt = reconciled.completedAt
+                ?? PDFOfficeTimeAnchor.process.trustedDate()
+            reconciled.status = .failed
+            return reconciled
+        }
+
+        if lostCompletedArtifact, reconciled.isFinished {
+            reconciled.completedAt = reconciled.completedAt
+                ?? PDFOfficeTimeAnchor.process.trustedDate()
+            reconciled.status = reconciled.completedCount > 0
+                ? .partial
+                : .failed
+        }
+        return reconciled
+    }
+
+    func restored(
+        currentRevisionID: UUID,
+        availableReceiptIDs: Set<UUID>
+    ) -> PDFOfficeBatchRun {
+        var restored = reconcilingArtifacts(
+            currentRevisionID: currentRevisionID,
+            availableReceiptIDs: availableReceiptIDs
+        )
+        guard plan.sourceRevisionID == currentRevisionID else {
+            return restored
+        }
         guard status == .preparing || status == .running else {
             return restored
         }
@@ -1572,7 +1917,8 @@ struct PDFOfficeQueueJob:
         sourcePageCount: Int,
         format: PDFTextExportFormat,
         priority: PDFOfficeQueuePriority,
-        createdAt: Date = Date()
+        createdAt: Date =
+            PDFOfficeTimeAnchor.process.trustedDate()
     ) {
         self.id = id
         self.recordID = recordID
@@ -1614,7 +1960,8 @@ struct PDFOfficeProductionQueue:
 
     init(
         jobs: [PDFOfficeQueueJob] = [],
-        updatedAt: Date = Date(),
+        updatedAt: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
         isSuspended: Bool = false
     ) {
         self.jobs = jobs
@@ -1651,14 +1998,30 @@ struct PDFOfficeProductionQueue:
         }
         isSuspended = wasSuspended
             || jobs.contains { $0.stage == .paused }
-        updatedAt = Date()
+        updatedAt = PDFOfficeTimeAnchor.process.trustedDate()
         boundHistory()
     }
 
     mutating func boundHistory() {
-        let active = jobs.filter { !$0.stage.isTerminal }
+        let prioritized = jobs.sorted {
+            let lhsDate = $0.completedAt
+                ?? $0.startedAt
+                ?? $0.createdAt
+            let rhsDate = $1.completedAt
+                ?? $1.startedAt
+                ?? $1.createdAt
+            if lhsDate != rhsDate {
+                return lhsDate > rhsDate
+            }
+            return $0.id.uuidString < $1.id.uuidString
+        }
+        var seenIDs = Set<UUID>()
+        let unique = prioritized.filter {
+            seenIDs.insert($0.id).inserted
+        }
+        let active = unique.filter { !$0.stage.isTerminal }
         let recent = Array(
-            jobs
+            unique
             .filter(\.stage.isTerminal)
             .sorted {
                 ($0.completedAt ?? $0.createdAt)
@@ -1857,6 +2220,7 @@ struct PDFOfficeIntegrityReport: Hashable, Sendable {
 }
 
 enum PDFByteProgressStage: String, Hashable, Sendable {
+    case copying
     case reconstructing
     case packaging
     case checksumming
@@ -1865,6 +2229,7 @@ enum PDFByteProgressStage: String, Hashable, Sendable {
 
     var title: String {
         switch self {
+        case .copying: return "Copying"
         case .reconstructing: return "Reconstructing"
         case .packaging: return "Building Office package"
         case .checksumming: return "Checksumming"
@@ -1875,6 +2240,7 @@ enum PDFByteProgressStage: String, Hashable, Sendable {
 
     var symbol: String {
         switch self {
+        case .copying: return "doc.on.doc"
         case .reconstructing: return "doc.badge.gearshape"
         case .packaging: return "shippingbox"
         case .checksumming: return "number.square"
@@ -1901,10 +2267,16 @@ struct PDFByteProgressUpdate: Hashable, Sendable {
         currentUnitName: String = ""
     ) {
         self.stage = stage
-        self.processedBytes = processedBytes
-        self.totalBytes = totalBytes
-        self.completedUnitCount = completedUnitCount
-        self.totalUnitCount = totalUnitCount
+        let boundedTotalBytes = max(0, totalBytes)
+        self.totalBytes = boundedTotalBytes
+        self.processedBytes = boundedTotalBytes > 0
+            ? min(max(0, processedBytes), boundedTotalBytes)
+            : max(0, processedBytes)
+        let boundedTotalUnitCount = max(0, totalUnitCount)
+        self.totalUnitCount = boundedTotalUnitCount
+        self.completedUnitCount = boundedTotalUnitCount > 0
+            ? min(max(0, completedUnitCount), boundedTotalUnitCount)
+            : max(0, completedUnitCount)
         self.currentUnitName = currentUnitName
     }
 }
@@ -1912,7 +2284,57 @@ struct PDFByteProgressUpdate: Hashable, Sendable {
 typealias PDFByteProgressHandler =
     @Sendable (PDFByteProgressUpdate) -> Void
 
+enum PDFImportProgressStage: Hashable, Sendable {
+    case preparing
+    case copying
+    case inspecting
+    case saving
+    case complete
+
+    var title: String {
+        switch self {
+        case .preparing: return "Preparing private copy"
+        case .copying: return "Copying private copy"
+        case .inspecting: return "Inspecting PDF"
+        case .saving: return "Saving to local library"
+        case .complete: return "Private copy ready"
+        }
+    }
+}
+
+struct PDFImportProgressUpdate: Hashable, Sendable {
+    let stage: PDFImportProgressStage
+    let fractionCompleted: Double
+    let processedBytes: Int64
+    let totalBytes: Int64
+
+    init(
+        stage: PDFImportProgressStage,
+        fractionCompleted: Double,
+        processedBytes: Int64 = 0,
+        totalBytes: Int64 = 0
+    ) {
+        self.stage = stage
+        self.fractionCompleted = fractionCompleted.isFinite
+            ? min(1, max(0, fractionCompleted))
+            : 0
+        let boundedTotalBytes = max(0, totalBytes)
+        self.totalBytes = boundedTotalBytes
+        self.processedBytes = boundedTotalBytes > 0
+            ? min(max(0, processedBytes), boundedTotalBytes)
+            : max(0, processedBytes)
+    }
+}
+
+typealias PDFImportProgressHandler =
+    @Sendable (PDFImportProgressUpdate) -> Void
+
 struct PDFOfficeIntegrityProgress: Hashable, Sendable {
+    private static let maximumDisplayByteRate =
+        Double(Int64.max / 2)
+    private static let maximumEstimatedRemainingSeconds:
+        TimeInterval = 365 * 24 * 60 * 60
+
     let completedCount: Int
     let totalCount: Int
     let currentSourceName: String
@@ -1936,16 +2358,42 @@ struct PDFOfficeIntegrityProgress: Hashable, Sendable {
         throughputHistory: [Double] = [],
         lastByteUpdateAt: Date? = nil
     ) {
-        self.completedCount = completedCount
-        self.totalCount = totalCount
+        let boundedTotalCount = max(0, totalCount)
+        self.totalCount = boundedTotalCount
+        self.completedCount = boundedTotalCount > 0
+            ? min(max(0, completedCount), boundedTotalCount)
+            : max(0, completedCount)
         self.currentSourceName = currentSourceName
-        self.processedBytes = processedBytes
-        self.totalBytes = totalBytes
-        self.bytesPerSecond = bytesPerSecond
-        self.estimatedRemainingSeconds = estimatedRemainingSeconds
+        let boundedTotalBytes = max(0, totalBytes)
+        self.totalBytes = boundedTotalBytes
+        self.processedBytes = boundedTotalBytes > 0
+            ? min(max(0, processedBytes), boundedTotalBytes)
+            : max(0, processedBytes)
+        self.bytesPerSecond = bytesPerSecond.isFinite
+            ? min(
+                Self.maximumDisplayByteRate,
+                max(0, bytesPerSecond)
+            )
+            : 0
+        self.estimatedRemainingSeconds =
+            estimatedRemainingSeconds.flatMap {
+                guard $0.isFinite, $0 >= 0 else { return nil }
+                return min(
+                    Self.maximumEstimatedRemainingSeconds,
+                    $0
+                )
+            }
         self.activity = activity
-        self.throughputHistory = throughputHistory
-        self.lastByteUpdateAt = lastByteUpdateAt
+        self.throughputHistory = Array(
+            throughputHistory.lazy
+                .filter { $0.isFinite && $0 >= 0 }
+                .map { min(Self.maximumDisplayByteRate, $0) }
+                .suffix(24)
+        )
+        self.lastByteUpdateAt =
+            lastByteUpdateAt?.timeIntervalSince1970.isFinite == true
+                ? lastByteUpdateAt
+                : nil
     }
 
     var fractionCompleted: Double {
@@ -1992,8 +2440,7 @@ struct PDFOfficeIntegrityProgress: Hashable, Sendable {
 
     func isStalled(at date: Date) -> Bool {
         guard processedBytes < totalBytes,
-              let lastByteUpdateAt,
-              processedBytes > 0
+              let lastByteUpdateAt
         else { return false }
         return date.timeIntervalSince(lastByteUpdateAt) >= 2
     }
@@ -2043,6 +2490,218 @@ struct PDFOfficeDeliveryEntry:
     }
 }
 
+private enum PDFEvidenceContract {
+    static let futureTolerance: TimeInterval = 5 * 60
+
+    static func isPlausiblePastDate(
+        _ date: Date,
+        now: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> Bool {
+        let timestamp = date.timeIntervalSince1970
+        return timestamp.isFinite
+            && timestamp >= 0
+            && date <= now.addingTimeInterval(futureTolerance)
+    }
+
+    static func isValidInterval(
+        from start: Date,
+        through end: Date,
+        maximumDuration: TimeInterval,
+        now: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> Bool {
+        let endTimestamp = end.timeIntervalSince1970
+        let duration = end.timeIntervalSince(start)
+        return isPlausiblePastDate(start, now: now)
+            && endTimestamp.isFinite
+            && duration.isFinite
+            && duration > 0
+            && duration <= maximumDuration
+    }
+
+    static func isSafeDisplayText(
+        _ value: String,
+        maximumCharacters: Int,
+        maximumUTF8Bytes: Int? = nil,
+        allowsEmpty: Bool = false
+    ) -> Bool {
+        guard allowsEmpty || !value.isEmpty,
+              value.count <= maximumCharacters,
+              maximumUTF8Bytes.map({
+                  value.utf8.count <= $0
+              }) ?? true
+        else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                codePoint == 0x061C
+                || codePoint == 0x200E
+                || codePoint == 0x200F
+                || (0x202A...0x202E).contains(codePoint)
+                || (0x2066...0x2069).contains(codePoint)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !isBidirectionalControl
+        }
+    }
+}
+
+func paperPathArchiveLeafNameIdentity(
+    _ name: String
+) -> String? {
+    let normalized = name.precomposedStringWithCanonicalMapping
+    guard !name.isEmpty,
+          name == normalized,
+          name == name.trimmingCharacters(
+            in: .whitespacesAndNewlines
+          ),
+          !name.hasPrefix("."),
+          !name.hasSuffix("."),
+          !name.contains("/"),
+          !name.contains("\\"),
+          name.utf8.count <= Int(UInt16.max),
+          name.unicodeScalars.allSatisfy({
+              let codePoint = $0.value
+              let isBidirectionalControl =
+                  codePoint == 0x061C
+                  || codePoint == 0x200E
+                  || codePoint == 0x200F
+                  || (0x202A...0x202E).contains(codePoint)
+                  || (0x2066...0x2069).contains(codePoint)
+              return !CharacterSet.controlCharacters.contains($0)
+                  && !CharacterSet.illegalCharacters.contains($0)
+                  && !isBidirectionalControl
+          })
+    else { return nil }
+    return normalized.lowercased()
+}
+
+func paperPathIsSafeArchiveLeafName(
+    _ name: String
+) -> Bool {
+    paperPathArchiveLeafNameIdentity(name) != nil
+}
+
+final class PDFOfficeTimeAnchor: @unchecked Sendable, Hashable {
+    static let rollbackTolerance: TimeInterval = 5
+    static let process = PDFOfficeTimeAnchor()
+
+    let referenceDate: Date
+    let systemUptime: TimeInterval
+    private let lock = NSLock()
+    private var latestTrustedDate: Date
+
+    init(
+        referenceDate: Date = Date(),
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) {
+        let validReferenceDate =
+            referenceDate.timeIntervalSince1970.isFinite
+            ? referenceDate
+            : Date(timeIntervalSince1970: 0)
+        self.referenceDate = validReferenceDate
+        self.systemUptime = systemUptime.isFinite && systemUptime >= 0
+            ? systemUptime
+            : 0
+        latestTrustedDate = validReferenceDate
+    }
+
+    static func == (
+        lhs: PDFOfficeTimeAnchor,
+        rhs: PDFOfficeTimeAnchor
+    ) -> Bool {
+        lhs === rhs
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(ObjectIdentifier(self))
+    }
+
+    @discardableResult
+    func restoreTrustedDate(_ date: Date) -> Bool {
+        let timestamp = date.timeIntervalSince1970
+        guard timestamp.isFinite, timestamp >= 0 else {
+            return false
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        latestTrustedDate = max(latestTrustedDate, date)
+        return true
+    }
+
+    func trustedDate(
+        wallDate: Date = Date(),
+        systemUptime currentUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Date {
+        let validWallDate = wallDate.timeIntervalSince1970.isFinite
+            ? wallDate
+            : referenceDate
+        let candidate: Date
+        if let monotonicDate = monotonicDate(
+            at: currentUptime
+        ) {
+            candidate = max(validWallDate, monotonicDate)
+        } else {
+            candidate = max(validWallDate, referenceDate)
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        latestTrustedDate = max(latestTrustedDate, candidate)
+        return latestTrustedDate
+    }
+
+    func evidenceIssuanceDate(
+        wallDate: Date = Date(),
+        systemUptime currentUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Date? {
+        let date = trustedDate(
+            wallDate: wallDate,
+            systemUptime: currentUptime
+        )
+        guard !hasWallClockRollback(
+            wallDate: wallDate,
+            systemUptime: currentUptime
+        ) else {
+            return nil
+        }
+        return date
+    }
+
+    func hasWallClockRollback(
+        wallDate: Date = Date(),
+        systemUptime currentUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime,
+        tolerance: TimeInterval =
+            PDFOfficeTimeAnchor.rollbackTolerance
+    ) -> Bool {
+        guard wallDate.timeIntervalSince1970.isFinite,
+              tolerance.isFinite,
+              tolerance >= 0
+        else { return false }
+        let monotonicDate = monotonicDate(at: currentUptime)
+        lock.lock()
+        defer { lock.unlock() }
+        let expectedDate = max(
+            latestTrustedDate,
+            monotonicDate ?? referenceDate
+        )
+        return wallDate.addingTimeInterval(tolerance) < expectedDate
+    }
+
+    private func monotonicDate(
+        at currentUptime: TimeInterval
+    ) -> Date? {
+        guard currentUptime.isFinite,
+              currentUptime >= systemUptime
+        else { return nil }
+        let elapsed = currentUptime - systemUptime
+        guard elapsed.isFinite else { return nil }
+        return referenceDate.addingTimeInterval(elapsed)
+    }
+}
+
 struct PDFOfficeVerificationPayload:
     Codable,
     Hashable,
@@ -2064,15 +2723,36 @@ struct PDFOfficeVerificationPayload:
     }
 
     var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        let archiveNameIdentities = files.compactMap {
+            paperPathArchiveLeafNameIdentity($0.archiveName)
+        }
+        let reservedManifestIdentity =
+            paperPathArchiveLeafNameIdentity(
+                "PaperPath-delivery-manifest.json"
+            ) ?? "paperpath-delivery-manifest.json"
         guard schema == "PaperPath Office Delivery V34",
+              PDFEvidenceContract.isValidInterval(
+                  from: createdAt,
+                  through: expiresAt,
+                  maximumDuration: 7 * 24 * 60 * 60,
+                  now: date
+              ),
               !files.isEmpty,
               files.count
                 <= PDFOfficeExternalMatchReport.maximumFileCount,
               verifiedOutputs == files.count,
-              expiresAt > createdAt,
               Set(files.map(\.receiptID)).count == files.count,
-              Set(files.map { $0.archiveName.lowercased() })
-                .count == files.count
+              archiveNameIdentities.count == files.count,
+              Set(archiveNameIdentities).count == files.count,
+              !archiveNameIdentities.contains(
+                reservedManifestIdentity
+              )
         else { return false }
         var totalBytes: Int64 = 0
         let hexadecimal = CharacterSet(
@@ -2085,18 +2765,17 @@ struct PDFOfficeVerificationPayload:
                   file.id == file.receiptID,
                   file.sourceName.count >= 1,
                   file.sourceName.count <= 160,
-                  file.sourceName.rangeOfCharacter(
-                      from: .controlCharacters
-                  ) == nil,
+                  Self.isSafeDisplayText(file.sourceName),
                   file.archiveName.count >= 1,
                   file.archiveName.count <= 180,
-                  file.archiveName
-                    == (file.archiveName as NSString)
-                        .lastPathComponent,
-                  !file.archiveName.contains("\\"),
-                  file.archiveName.lowercased().hasSuffix(
-                      ".\(file.format.fileExtension)"
+                  file.archiveName.utf8.count <= 240,
+                  paperPathIsSafeArchiveLeafName(
+                    file.archiveName
                   ),
+                  URL(fileURLWithPath: file.archiveName)
+                    .pathExtension
+                    .lowercased()
+                    == file.format.fileExtension.lowercased(),
                   file.byteCount > 0,
                   file.byteCount
                     <= PDFOfficeExternalMatchReport.maximumFileBytes,
@@ -2109,6 +2788,28 @@ struct PDFOfficeVerificationPayload:
         }
         return totalBytes
             <= PDFOfficeExternalMatchReport.maximumBatchBytes
+    }
+
+    func isActive(
+        at date: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> Bool {
+        isStructurallyValid(at: date) && expiresAt > date
+    }
+
+    private static func isSafeDisplayText(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                let codePoint = scalar.value
+                let isBidirectionalControl =
+                    codePoint == 0x061C
+                    || codePoint == 0x200E
+                    || codePoint == 0x200F
+                    || (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+                return !CharacterSet.controlCharacters.contains(scalar)
+                    && !CharacterSet.illegalCharacters.contains(scalar)
+                    && !isBidirectionalControl
+            }
     }
 }
 
@@ -2135,6 +2836,840 @@ struct PDFOfficeSignedVerificationReport:
     Sendable {
     let payload: PDFOfficeVerificationPayload
     let signature: PDFOfficeVerificationSignature
+}
+
+struct PDFChangeReportSignaturePayload:
+    Codable,
+    Hashable,
+    Sendable {
+    static let schema = "PaperPath Change Report Signature V1"
+    static let maximumBodyBytes = 4 * 1_024 * 1_024
+
+    let schema: String
+    let reportID: UUID
+    let generatedAt: Date
+    let sourceName: String
+    let revisedName: String
+    let sourceRevisionID: UUID?
+    let revisedRevisionID: UUID?
+    let sourceFingerprint: String?
+    let revisedFingerprint: String?
+    let deliveryReceiptID: UUID?
+    let changedPageCount: Int
+    let bodyByteCount: Int
+    let bodySHA256: String
+
+    private enum CodingKeys: String, CodingKey {
+        case schema
+        case reportID = "report_id"
+        case generatedAt = "generated_at"
+        case sourceName = "source_name"
+        case revisedName = "revised_name"
+        case sourceRevisionID = "source_revision_id"
+        case revisedRevisionID = "revised_revision_id"
+        case sourceFingerprint = "source_sha256"
+        case revisedFingerprint = "revised_sha256"
+        case deliveryReceiptID = "delivery_receipt_id"
+        case changedPageCount = "changed_page_count"
+        case bodyByteCount = "body_byte_count"
+        case bodySHA256 = "body_sha256"
+    }
+
+    var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        schema == Self.schema
+            && PDFEvidenceContract.isPlausiblePastDate(
+                generatedAt,
+                now: date
+            )
+            && Self.isSafeDisplayText(sourceName)
+            && sourceName.count <= 240
+            && Self.isSafeDisplayText(revisedName)
+            && revisedName.count <= 240
+            && changedPageCount >= 0
+            && changedPageCount <= 100_000
+            && bodyByteCount > 0
+            && bodyByteCount <= Self.maximumBodyBytes
+            && Self.isSHA256(bodySHA256)
+            && Self.isOptionalSHA256(sourceFingerprint)
+            && Self.isOptionalSHA256(revisedFingerprint)
+    }
+
+    private static func isOptionalSHA256(_ value: String?) -> Bool {
+        value.map(isSHA256) ?? true
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
+
+    private static func isSafeDisplayText(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                let codePoint = scalar.value
+                let isBidirectionalControl =
+                    codePoint == 0x061C
+                    || codePoint == 0x200E
+                    || codePoint == 0x200F
+                    || (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+                return !CharacterSet.controlCharacters.contains(scalar)
+                    && !CharacterSet.illegalCharacters.contains(scalar)
+                    && !isBidirectionalControl
+            }
+    }
+}
+
+struct PDFSignedChangeReportEnvelope:
+    Codable,
+    Hashable,
+    Sendable {
+    let payload: PDFChangeReportSignaturePayload
+    let signature: PDFOfficeVerificationSignature
+}
+
+struct PDFChangeReportVerificationResult:
+    Identifiable,
+    Hashable,
+    Sendable {
+    var id: UUID { reportID }
+
+    let status: PDFOfficeReportVerificationStatus
+    let reportID: UUID
+    let generatedAt: Date
+    let sourceName: String
+    let revisedName: String
+    let changedPageCount: Int
+    let deliveryReceiptID: UUID?
+    let sourceRevisionID: UUID?
+    let revisedRevisionID: UUID?
+    let sourceFingerprint: String?
+    let revisedFingerprint: String?
+    let verifiedBody: String?
+    let verifiedBodyByteCount: Int?
+    let verifiedBodySHA256: String?
+    let keyID: String?
+    let detail: String
+    let publicKeyBase64: String?
+    let trustStatus: PDFOfficeSignerTrustStatus
+    let trustedSignerName: String?
+
+    var isVerified: Bool {
+        status == .verified
+    }
+
+    var canTrustSigner: Bool {
+        isVerified
+            && trustStatus == .unknown
+            && keyID != nil
+            && publicKeyBase64 != nil
+    }
+
+    func resolvingTrust(
+        _ status: PDFOfficeSignerTrustStatus,
+        trustedSignerName: String?
+    ) -> PDFChangeReportVerificationResult {
+        PDFChangeReportVerificationResult(
+            status: self.status,
+            reportID: reportID,
+            generatedAt: generatedAt,
+            sourceName: sourceName,
+            revisedName: revisedName,
+            changedPageCount: changedPageCount,
+            deliveryReceiptID: deliveryReceiptID,
+            sourceRevisionID: sourceRevisionID,
+            revisedRevisionID: revisedRevisionID,
+            sourceFingerprint: sourceFingerprint,
+            revisedFingerprint: revisedFingerprint,
+            verifiedBody: verifiedBody,
+            verifiedBodyByteCount: verifiedBodyByteCount,
+            verifiedBodySHA256: verifiedBodySHA256,
+            keyID: keyID,
+            detail: detail,
+            publicKeyBase64: publicKeyBase64,
+            trustStatus: status,
+            trustedSignerName: trustedSignerName
+        )
+    }
+}
+
+struct PDFRetainedChangeReportLocalLink:
+    Codable,
+    Hashable,
+    Sendable {
+    enum Context: String, Codable, Hashable, Sendable {
+        case documentPair
+        case versionSnapshot
+        case deliveryReceipt
+    }
+
+    let context: Context
+    let sourceDocumentID: UUID?
+    let sourceRevisionID: UUID?
+    let sourceFingerprint: String?
+    let revisedDocumentID: UUID
+    let revisedRevisionID: UUID?
+    let revisedFingerprint: String?
+    let versionSnapshotID: UUID?
+    let deliveryReceiptID: UUID?
+
+    var isStructurallyValid: Bool {
+        guard sourceFingerprint.map(Self.isSHA256) ?? true,
+              revisedFingerprint.map(Self.isSHA256) ?? true
+        else { return false }
+        switch context {
+        case .documentPair:
+            return sourceDocumentID != nil
+                && sourceDocumentID != revisedDocumentID
+                && sourceRevisionID != nil
+                && revisedRevisionID != nil
+                && sourceFingerprint != nil
+                && revisedFingerprint != nil
+                && versionSnapshotID == nil
+                && deliveryReceiptID == nil
+        case .versionSnapshot:
+            return sourceDocumentID == revisedDocumentID
+                && sourceRevisionID != nil
+                && revisedRevisionID != nil
+                && sourceFingerprint != nil
+                && revisedFingerprint != nil
+                && versionSnapshotID != nil
+                && deliveryReceiptID == nil
+        case .deliveryReceipt:
+            return versionSnapshotID == nil
+                && revisedFingerprint != nil
+                && deliveryReceiptID != nil
+        }
+    }
+
+    func matches(
+        _ verification: PDFChangeReportVerificationResult
+    ) -> Bool {
+        verification.isVerified
+            && sourceRevisionID == verification.sourceRevisionID
+            && revisedRevisionID == verification.revisedRevisionID
+            && Self.equalFingerprints(
+                sourceFingerprint,
+                verification.sourceFingerprint
+            )
+            && Self.equalFingerprints(
+                revisedFingerprint,
+                verification.revisedFingerprint
+            )
+            && deliveryReceiptID
+                == verification.deliveryReceiptID
+    }
+
+    func referencesAnyDocument(
+        in documentIDs: Set<UUID>
+    ) -> Bool {
+        documentIDs.contains(revisedDocumentID)
+            || sourceDocumentID.map(documentIDs.contains) == true
+    }
+
+    static func documentPair(
+        source: DocumentRecord,
+        revised: DocumentRecord
+    ) -> PDFRetainedChangeReportLocalLink? {
+        guard let sourceFingerprint = source.contentFingerprint,
+              let revisedFingerprint = revised.contentFingerprint
+        else { return nil }
+        return PDFRetainedChangeReportLocalLink(
+            context: .documentPair,
+            sourceDocumentID: source.id,
+            sourceRevisionID: source.contentRevisionID,
+            sourceFingerprint: sourceFingerprint,
+            revisedDocumentID: revised.id,
+            revisedRevisionID: revised.contentRevisionID,
+            revisedFingerprint: revisedFingerprint,
+            versionSnapshotID: nil,
+            deliveryReceiptID: nil
+        )
+    }
+
+    static func versionSnapshot(
+        _ snapshot: PDFVersionSnapshot,
+        current: DocumentRecord
+    ) -> PDFRetainedChangeReportLocalLink? {
+        guard snapshot.documentID == current.id,
+              let revisedFingerprint = current.contentFingerprint
+        else { return nil }
+        return PDFRetainedChangeReportLocalLink(
+            context: .versionSnapshot,
+            sourceDocumentID: current.id,
+            sourceRevisionID: snapshot.contentRevisionID,
+            sourceFingerprint: snapshot.contentFingerprint,
+            revisedDocumentID: current.id,
+            revisedRevisionID: current.contentRevisionID,
+            revisedFingerprint: revisedFingerprint,
+            versionSnapshotID: snapshot.id,
+            deliveryReceiptID: nil
+        )
+    }
+
+    static func deliveryReceipt(
+        source: DocumentRecord?,
+        revised: DocumentRecord,
+        receipt: PDFDeliveryReceipt
+    ) -> PDFRetainedChangeReportLocalLink {
+        PDFRetainedChangeReportLocalLink(
+            context: .deliveryReceipt,
+            sourceDocumentID: source?.id,
+            sourceRevisionID: receipt.sourceRevisionID,
+            sourceFingerprint:
+                source?.contentRevisionID == receipt.sourceRevisionID
+                    ? source?.contentFingerprint
+                    : nil,
+            revisedDocumentID: revised.id,
+            revisedRevisionID: receipt.outputRevisionID,
+            revisedFingerprint: receipt.sha256,
+            versionSnapshotID: nil,
+            deliveryReceiptID: receipt.id
+        )
+    }
+
+    private static func equalFingerprints(
+        _ lhs: String?,
+        _ rhs: String?
+    ) -> Bool {
+        switch (lhs, rhs) {
+        case (.none, .none):
+            return true
+        case let (.some(lhs), .some(rhs)):
+            return lhs.caseInsensitiveCompare(rhs) == .orderedSame
+        default:
+            return false
+        }
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
+}
+
+enum PDFRetainedChangeReportDestination:
+    Hashable,
+    Identifiable,
+    Sendable {
+    case documentPair(
+        sourceRecordID: UUID,
+        sourceRevisionID: UUID,
+        revisedRecordID: UUID,
+        revisedRevisionID: UUID
+    )
+    case versionSnapshot(PDFVersionSnapshot)
+    case deliveryReceipt(
+        recordID: UUID,
+        receipt: PDFDeliveryReceipt
+    )
+
+    var id: String {
+        switch self {
+        case let .documentPair(
+            sourceRecordID,
+            sourceRevisionID,
+            revisedRecordID,
+            revisedRevisionID
+        ):
+            return [
+                "documents",
+                sourceRecordID.uuidString,
+                sourceRevisionID.uuidString,
+                revisedRecordID.uuidString,
+                revisedRevisionID.uuidString
+            ].joined(separator: ":")
+        case .versionSnapshot(let snapshot):
+            return "version:\(snapshot.documentID):\(snapshot.id)"
+        case let .deliveryReceipt(recordID, receipt):
+            return "receipt:\(recordID):\(receipt.id)"
+        }
+    }
+}
+
+enum PDFRetainedChangeReportLookup:
+    Hashable,
+    Sendable {
+    case documentPair(
+        sourceRecordID: UUID,
+        revisedRecordID: UUID
+    )
+    case versionSnapshot(
+        recordID: UUID,
+        snapshotID: UUID
+    )
+    case deliveryReceipt(
+        recordID: UUID,
+        receiptID: UUID
+    )
+
+    func matches(
+        _ link: PDFRetainedChangeReportLocalLink?
+    ) -> Bool {
+        guard let link else { return false }
+        switch self {
+        case let .documentPair(
+            sourceRecordID,
+            revisedRecordID
+        ):
+            return link.context == .documentPair
+                && link.sourceDocumentID == sourceRecordID
+                && link.revisedDocumentID == revisedRecordID
+        case let .versionSnapshot(recordID, snapshotID):
+            return link.context == .versionSnapshot
+                && link.sourceDocumentID == recordID
+                && link.revisedDocumentID == recordID
+                && link.versionSnapshotID == snapshotID
+        case let .deliveryReceipt(recordID, receiptID):
+            return link.context == .deliveryReceipt
+                && link.revisedDocumentID == recordID
+                && link.deliveryReceiptID == receiptID
+        }
+    }
+}
+
+enum PDFRetainedChangeReportLinkHealthStatus:
+    String,
+    Hashable,
+    Sendable {
+    case readyToVerify
+    case changed
+    case inTrash
+    case missing
+    case versionUnavailable
+    case receiptUnavailable
+    case verificationFailed
+    case unlinked
+
+    var title: String {
+        switch self {
+        case .readyToVerify:
+            return "Ready to reverify"
+        case .changed:
+            return "Linked PDF changed"
+        case .inTrash:
+            return "Linked PDF in Trash"
+        case .missing:
+            return "Linked PDF missing"
+        case .versionUnavailable:
+            return "Linked version unavailable"
+        case .receiptUnavailable:
+            return "Linked receipt unavailable"
+        case .verificationFailed:
+            return "Reverification failed"
+        case .unlinked:
+            return "No local evidence link"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .readyToVerify:
+            return "Revision metadata matches; bytes are checked on open"
+        case .changed:
+            return "The current revision no longer matches this report"
+        case .inTrash:
+            return "Restore the linked PDF before opening its evidence"
+        case .missing:
+            return "A linked private copy is no longer available"
+        case .versionUnavailable:
+            return "The linked recovery version is no longer retained"
+        case .receiptUnavailable:
+            return "The linked output no longer carries this receipt"
+        case .verificationFailed:
+            return "The report or linked PDF failed its full integrity check"
+        case .unlinked:
+            return "This report predates local evidence links"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .readyToVerify:
+            return "arrow.up.right.square"
+        case .changed:
+            return "pencil.and.outline"
+        case .inTrash:
+            return "trash"
+        case .missing:
+            return "doc.badge.questionmark"
+        case .versionUnavailable:
+            return "clock.badge.exclamationmark"
+        case .receiptUnavailable:
+            return "checkmark.seal"
+        case .verificationFailed:
+            return "xmark.shield.fill"
+        case .unlinked:
+            return "link.badge.plus"
+        }
+    }
+
+    var canOpenLocalEvidence: Bool {
+        self == .readyToVerify
+    }
+
+    var requiresAttention: Bool {
+        switch self {
+        case .changed, .inTrash, .missing,
+             .versionUnavailable, .receiptUnavailable,
+             .verificationFailed:
+            return true
+        case .readyToVerify, .unlinked:
+            return false
+        }
+    }
+}
+
+struct PDFRetainedChangeReportInventory:
+    Hashable,
+    Sendable {
+    let reports: [PDFRetainedChangeReport]
+    let linkHealthByReportID:
+        [UUID: PDFRetainedChangeReportLinkHealthStatus]
+
+    var readyLinkCount: Int {
+        linkHealthByReportID.values.filter {
+            $0 == .readyToVerify
+        }.count
+    }
+
+    var attentionLinkCount: Int {
+        linkHealthByReportID.values.filter(
+            \.requiresAttention
+        ).count
+    }
+}
+
+struct PDFRetainedChangeReport:
+    Codable,
+    Hashable,
+    Identifiable,
+    Sendable {
+    static let maximumReportCount = 24
+    static let maximumTotalBytes: Int64 = 64 * 1_024 * 1_024
+    static let maximumReportBytes: Int64 = 5 * 1_024 * 1_024
+
+    let id: UUID
+    let fileName: String
+    let sourceName: String
+    let revisedName: String
+    let generatedAt: Date
+    let retainedAt: Date
+    let changedPageCount: Int
+    let deliveryReceiptID: UUID?
+    let signerKeyID: String?
+    let byteCount: Int64
+    let sha256: String
+    let localLink: PDFRetainedChangeReportLocalLink?
+
+    private enum CodingKeys: String, CodingKey {
+        case id = "report_id"
+        case fileName = "file_name"
+        case sourceName = "source_name"
+        case revisedName = "revised_name"
+        case generatedAt = "generated_at"
+        case retainedAt = "retained_at"
+        case changedPageCount = "changed_page_count"
+        case deliveryReceiptID = "delivery_receipt_id"
+        case signerKeyID = "signer_key_id"
+        case byteCount = "byte_count"
+        case sha256
+        case localLink = "local_link"
+    }
+
+    init(
+        id: UUID,
+        fileName: String,
+        sourceName: String,
+        revisedName: String,
+        generatedAt: Date,
+        retainedAt: Date,
+        changedPageCount: Int,
+        deliveryReceiptID: UUID?,
+        signerKeyID: String?,
+        byteCount: Int64,
+        sha256: String,
+        localLink: PDFRetainedChangeReportLocalLink?
+    ) {
+        self.id = id
+        self.fileName = fileName
+        self.sourceName = sourceName
+        self.revisedName = revisedName
+        self.generatedAt = generatedAt
+        self.retainedAt = retainedAt
+        self.changedPageCount = changedPageCount
+        self.deliveryReceiptID = deliveryReceiptID
+        self.signerKeyID = signerKeyID
+        self.byteCount = byteCount
+        self.sha256 = sha256
+        self.localLink = localLink
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(
+            keyedBy: CodingKeys.self
+        )
+        id = try container.decode(UUID.self, forKey: .id)
+        fileName = try container.decode(
+            String.self,
+            forKey: .fileName
+        )
+        sourceName = try container.decode(
+            String.self,
+            forKey: .sourceName
+        )
+        revisedName = try container.decode(
+            String.self,
+            forKey: .revisedName
+        )
+        generatedAt = try container.decode(
+            Date.self,
+            forKey: .generatedAt
+        )
+        retainedAt = try container.decode(
+            Date.self,
+            forKey: .retainedAt
+        )
+        changedPageCount = try container.decode(
+            Int.self,
+            forKey: .changedPageCount
+        )
+        deliveryReceiptID = try container.decodeIfPresent(
+            UUID.self,
+            forKey: .deliveryReceiptID
+        )
+        signerKeyID = try container.decodeIfPresent(
+            String.self,
+            forKey: .signerKeyID
+        )
+        byteCount = try container.decode(
+            Int64.self,
+            forKey: .byteCount
+        )
+        sha256 = try container.decode(
+            String.self,
+            forKey: .sha256
+        )
+        localLink = (
+            try? container.decodeIfPresent(
+                PDFRetainedChangeReportLocalLink.self,
+                forKey: .localLink
+            )
+        ) ?? nil
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        fileName == "\(id.uuidString).md"
+            && PDFEvidenceContract.isSafeDisplayText(
+                sourceName,
+                maximumCharacters: 240,
+                maximumUTF8Bytes: 960
+            )
+            && PDFEvidenceContract.isSafeDisplayText(
+                revisedName,
+                maximumCharacters: 240,
+                maximumUTF8Bytes: 960
+            )
+            && PDFEvidenceContract.isPlausiblePastDate(
+                generatedAt,
+                now: date
+            )
+            && PDFEvidenceContract.isPlausiblePastDate(
+                retainedAt,
+                now: date
+            )
+            && retainedAt
+                >= generatedAt.addingTimeInterval(-5 * 60)
+            && changedPageCount >= 0
+            && changedPageCount <= 100_000
+            && byteCount > 0
+            && byteCount <= Self.maximumReportBytes
+            && Self.isSHA256(sha256)
+            && signerKeyID.map(Self.isSigningKeyID) ?? true
+    }
+
+    var formattedSize: String {
+        ByteCountFormatter.string(
+            fromByteCount: byteCount,
+            countStyle: .file
+        )
+    }
+
+    var shortFingerprint: String {
+        String(sha256.prefix(12))
+    }
+
+    func removingLocalLink(
+        referencing documentIDs: Set<UUID>
+    ) -> PDFRetainedChangeReport {
+        guard localLink?.referencesAnyDocument(
+            in: documentIDs
+        ) == true else { return self }
+        return replacingLocalLink(nil)
+    }
+
+    func sanitizingLocalLink() -> PDFRetainedChangeReport {
+        guard let localLink,
+              !localLink.isStructurallyValid
+        else { return self }
+        return replacingLocalLink(nil)
+    }
+
+    private func replacingLocalLink(
+        _ localLink: PDFRetainedChangeReportLocalLink?
+    ) -> PDFRetainedChangeReport {
+        PDFRetainedChangeReport(
+            id: id,
+            fileName: fileName,
+            sourceName: sourceName,
+            revisedName: revisedName,
+            generatedAt: generatedAt,
+            retainedAt: retainedAt,
+            changedPageCount: changedPageCount,
+            deliveryReceiptID: deliveryReceiptID,
+            signerKeyID: signerKeyID,
+            byteCount: byteCount,
+            sha256: sha256,
+            localLink: localLink
+        )
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
+
+    private static func isSigningKeyID(_ value: String) -> Bool {
+        value.count == 16
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
+}
+
+struct PDFRetainedChangeReportStorageSummary:
+    Hashable,
+    Sendable {
+    static let empty = PDFRetainedChangeReportStorageSummary(
+        reportCount: 0,
+        byteCount: 0
+    )
+
+    let reportCount: Int
+    let byteCount: Int64
+
+    static func measuring<S: Sequence>(
+        _ reports: S
+    ) -> PDFRetainedChangeReportStorageSummary
+    where S.Element == PDFRetainedChangeReport {
+        var count = 0
+        var total: Int64 = 0
+        for report in reports {
+            count += 1
+            let (sum, overflow) = total.addingReportingOverflow(
+                max(0, report.byteCount)
+            )
+            total = overflow ? .max : sum
+        }
+        return PDFRetainedChangeReportStorageSummary(
+            reportCount: count,
+            byteCount: total
+        )
+    }
+
+    var pressureFraction: Double {
+        max(
+            Double(reportCount)
+                / Double(PDFRetainedChangeReport.maximumReportCount),
+            Double(byteCount)
+                / Double(PDFRetainedChangeReport.maximumTotalBytes)
+        )
+    }
+
+    var isNearCapacity: Bool {
+        pressureFraction >= 0.8
+    }
+
+    var isAtCapacity: Bool {
+        reportCount >= PDFRetainedChangeReport.maximumReportCount
+            || byteCount >= PDFRetainedChangeReport.maximumTotalBytes
+    }
+
+    var remainingReportCount: Int {
+        max(
+            0,
+            PDFRetainedChangeReport.maximumReportCount - reportCount
+        )
+    }
+
+    var remainingByteCount: Int64 {
+        max(
+            0,
+            PDFRetainedChangeReport.maximumTotalBytes - byteCount
+        )
+    }
+
+    var formattedRemainingBytes: String {
+        ByteCountFormatter.string(
+            fromByteCount: remainingByteCount,
+            countStyle: .file
+        )
+    }
+
+    func canAdd(bytes: Int64) -> Bool {
+        guard bytes > 0,
+              bytes <= PDFRetainedChangeReport.maximumReportBytes,
+              reportCount < PDFRetainedChangeReport.maximumReportCount
+        else { return false }
+        let (projectedBytes, overflow) = byteCount
+            .addingReportingOverflow(bytes)
+        return !overflow
+            && projectedBytes
+                <= PDFRetainedChangeReport.maximumTotalBytes
+    }
+
+    var formattedBytes: String {
+        ByteCountFormatter.string(
+            fromByteCount: byteCount,
+            countStyle: .file
+        )
+    }
+
+    var countContract: String {
+        "\(reportCount)/\(PDFRetainedChangeReport.maximumReportCount)"
+    }
+
+    var byteContract: String {
+        AppLocalization.format(
+            "%@ / %@",
+            formattedBytes,
+            ByteCountFormatter.string(
+                fromByteCount:
+                    PDFRetainedChangeReport.maximumTotalBytes,
+                countStyle: .file
+            )
+        )
+    }
 }
 
 struct PDFOfficeSignerIdentityCard:
@@ -2211,12 +3746,14 @@ enum PDFOfficeReportVerificationStatus:
     Hashable,
     Sendable {
     case verified
+    case expired
     case invalid
     case unsupported
 
     var title: String {
         switch self {
         case .verified: return "Valid signature"
+        case .expired: return "Expired report"
         case .invalid: return "Invalid signature"
         case .unsupported: return "Unsupported report"
         }
@@ -2225,8 +3762,75 @@ enum PDFOfficeReportVerificationStatus:
     var symbol: String {
         switch self {
         case .verified: return "checkmark.seal.fill"
+        case .expired: return "clock.badge.exclamationmark"
         case .invalid: return "xmark.seal.fill"
         case .unsupported: return "questionmark.diamond.fill"
+        }
+    }
+}
+
+struct PDFOfficeVerifiedArtifact:
+    Identifiable,
+    Hashable,
+    Sendable {
+    var id: UUID { entry.receiptID }
+
+    let entry: PDFOfficeDeliveryEntry
+    let url: URL
+    let formatEvidence: PDFOfficeArtifactFormatEvidence
+
+    var formattedSize: String {
+        ByteCountFormatter.string(
+            fromByteCount: entry.byteCount,
+            countStyle: .file
+        )
+    }
+
+    var shortFingerprint: String {
+        String(entry.sha256.prefix(12))
+    }
+}
+
+enum PDFOfficeArtifactFormatEvidence: Hashable, Sendable {
+    case ooxml(
+        partCount: Int,
+        xmlPartCount: Int,
+        relationshipCount: Int,
+        mediaPartCount: Int
+    )
+    case richText
+    case utf8Text
+
+    var summary: String {
+        switch self {
+        case .ooxml(
+            let partCount,
+            let xmlPartCount,
+            let relationshipCount,
+            let mediaPartCount
+        ):
+            return AppLocalization.format(
+                "%lld parts · %lld XML · %lld relationships · %lld media",
+                partCount,
+                xmlPartCount,
+                relationshipCount,
+                mediaPartCount
+            )
+        case .richText:
+            return "RTF structure · UTF-8"
+        case .utf8Text:
+            return "Valid UTF-8 text"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .ooxml:
+            return "shippingbox.fill"
+        case .richText:
+            return "text.document.fill"
+        case .utf8Text:
+            return "text.alignleft"
         }
     }
 }
@@ -2240,11 +3844,15 @@ struct PDFOfficeReportVerificationResult:
     let sourceCount: Int
     let outputCount: Int
     let createdAt: Date?
+    let expiresAt: Date?
+    let verifiedAt: Date
+    let timeAnchor: PDFOfficeTimeAnchor?
     let detail: String
     let publicKeyBase64: String?
     let trustStatus: PDFOfficeSignerTrustStatus
     let trustedSignerName: String?
     let signedReport: PDFOfficeSignedVerificationReport?
+    let verifiedArtifacts: [PDFOfficeVerifiedArtifact]
 
     init(
         status: PDFOfficeReportVerificationStatus,
@@ -2253,11 +3861,16 @@ struct PDFOfficeReportVerificationResult:
         sourceCount: Int,
         outputCount: Int,
         createdAt: Date?,
+        expiresAt: Date? = nil,
+        verifiedAt: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
+        timeAnchor: PDFOfficeTimeAnchor? = nil,
         detail: String,
         publicKeyBase64: String?,
         trustStatus: PDFOfficeSignerTrustStatus,
         trustedSignerName: String?,
-        signedReport: PDFOfficeSignedVerificationReport? = nil
+        signedReport: PDFOfficeSignedVerificationReport? = nil,
+        verifiedArtifacts: [PDFOfficeVerifiedArtifact] = []
     ) {
         self.status = status
         self.packageID = packageID
@@ -2265,22 +3878,168 @@ struct PDFOfficeReportVerificationResult:
         self.sourceCount = sourceCount
         self.outputCount = outputCount
         self.createdAt = createdAt
+        self.expiresAt = expiresAt
+        self.verifiedAt = verifiedAt
+        self.timeAnchor = timeAnchor
         self.detail = detail
         self.publicKeyBase64 = publicKeyBase64
         self.trustStatus = trustStatus
         self.trustedSignerName = trustedSignerName
         self.signedReport = signedReport
+        self.verifiedArtifacts = verifiedArtifacts
+    }
+
+    func effectiveStatus(
+        at date: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> PDFOfficeReportVerificationStatus {
+        guard status == .verified,
+              let expiresAt,
+              expiresAt <= effectiveDate(
+                at: date,
+                systemUptime: systemUptime
+              )
+        else { return status }
+        return .expired
+    }
+
+    func effectiveDate(
+        at date: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Date {
+        timeAnchor?.trustedDate(
+            wallDate: date,
+            systemUptime: systemUptime
+        ) ?? date
+    }
+
+    func hasClockRollback(
+        at date: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        timeAnchor?.hasWallClockRollback(
+            wallDate: date,
+            systemUptime: systemUptime
+        ) ?? false
+    }
+
+    func isExpired(
+        at date: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        effectiveStatus(
+            at: date,
+            systemUptime: systemUptime
+        ) == .expired
+    }
+
+    func isVerified(
+        at date: Date,
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        effectiveStatus(
+            at: date,
+            systemUptime: systemUptime
+        ) == .verified
     }
 
     var isVerified: Bool {
-        status == .verified
+        isVerified(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
     }
 
-    var canTrustSigner: Bool {
-        isVerified
+    func canTrustSigner(
+        at date: Date,
+        systemUptime: TimeInterval =
+            ProcessInfo.processInfo.systemUptime
+    ) -> Bool {
+        isVerified(at: date, systemUptime: systemUptime)
             && trustStatus == .unknown
             && keyID != nil
             && publicKeyBase64 != nil
+    }
+
+    var canTrustSigner: Bool {
+        canTrustSigner(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func appendingDetail(
+        _ additionalDetail: String
+    ) -> PDFOfficeReportVerificationResult {
+        PDFOfficeReportVerificationResult(
+            status: status,
+            packageID: packageID,
+            keyID: keyID,
+            sourceCount: sourceCount,
+            outputCount: outputCount,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            verifiedAt: verifiedAt,
+            timeAnchor: timeAnchor,
+            detail: "\(detail) \(additionalDetail)",
+            publicKeyBase64: publicKeyBase64,
+            trustStatus: trustStatus,
+            trustedSignerName: trustedSignerName,
+            signedReport: signedReport,
+            verifiedArtifacts: verifiedArtifacts
+        )
+    }
+
+    func attachingVerifiedArtifacts(
+        _ artifacts: [PDFOfficeVerifiedArtifact]
+    ) -> PDFOfficeReportVerificationResult {
+        PDFOfficeReportVerificationResult(
+            status: status,
+            packageID: packageID,
+            keyID: keyID,
+            sourceCount: sourceCount,
+            outputCount: outputCount,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            verifiedAt: verifiedAt,
+            timeAnchor: timeAnchor,
+            detail: detail,
+            publicKeyBase64: publicKeyBase64,
+            trustStatus: trustStatus,
+            trustedSignerName: trustedSignerName,
+            signedReport: signedReport,
+            verifiedArtifacts: artifacts
+        )
+    }
+
+    func updatingTrust(
+        _ status: PDFOfficeSignerTrustStatus,
+        signerName: String?
+    ) -> PDFOfficeReportVerificationResult {
+        PDFOfficeReportVerificationResult(
+            status: self.status,
+            packageID: packageID,
+            keyID: keyID,
+            sourceCount: sourceCount,
+            outputCount: outputCount,
+            createdAt: createdAt,
+            expiresAt: expiresAt,
+            verifiedAt: verifiedAt,
+            timeAnchor: timeAnchor,
+            detail: detail,
+            publicKeyBase64: publicKeyBase64,
+            trustStatus: status,
+            trustedSignerName: signerName,
+            signedReport: signedReport,
+            verifiedArtifacts: verifiedArtifacts
+        )
     }
 }
 
@@ -2416,11 +4175,23 @@ struct PDFOfficeMatchReportPayload:
     }
 
     var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
         let deliveryEntries = deliveryReport.payload.files
         guard schema == Self.schema,
               reportID == matchReport.id,
               createdAt == matchReport.checkedAt,
-              deliveryReport.payload.isStructurallyValid,
+              PDFEvidenceContract.isPlausiblePastDate(
+                createdAt,
+                now: date
+              ),
+              deliveryReport.payload.isStructurallyValid(at: date),
+              createdAt >= deliveryReport.payload.createdAt,
+              createdAt <= deliveryReport.payload.expiresAt,
               matchReport.packageID
                 == deliveryReport.payload.packageID,
               matchReport.matches.count == deliveryEntries.count,
@@ -2448,11 +4219,11 @@ struct PDFOfficeMatchReportPayload:
             + matchReport.extraCandidates
         var candidatesByID: [UUID: PDFOfficeExternalCandidate] = [:]
         for candidate in allOccurrences {
-            guard candidate.fileName.count >= 1,
-                  candidate.fileName.count <= 180,
-                  candidate.fileName.rangeOfCharacter(
-                      from: .controlCharacters
-                  ) == nil,
+            guard PDFEvidenceContract.isSafeDisplayText(
+                      candidate.fileName,
+                      maximumCharacters: 180,
+                      maximumUTF8Bytes: 240
+                  ),
                   expectedExtensions.contains(
                       candidate.fileExtension.lowercased()
                   ),
@@ -2620,7 +4391,8 @@ struct PDFOfficeDeliveryPackage:
 
     init(
         id: UUID = UUID(),
-        createdAt: Date = Date(),
+        createdAt: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
         entries: [PDFOfficeDeliveryEntry]
     ) {
         self.id = id
@@ -2645,7 +4417,17 @@ struct PDFOfficeDeliveryPackage:
     }
 
     var isExpired: Bool {
-        !isPinned && expiresAt <= Date()
+        isExpired(at: PDFOfficeTimeAnchor.process.trustedDate())
+    }
+
+    func isExpired(at date: Date) -> Bool {
+        !isPinned && expiresAt <= date
+    }
+
+    func isReportExpired(
+        at date: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> Bool {
+        expiresAt <= date
     }
 
     var sourceCount: Int {
@@ -2663,9 +4445,19 @@ struct PDFOfficeDeliveryPackage:
         sha256.map { String($0.prefix(12)) }
     }
 
-    var retentionSummary: String {
+    func retentionSummary(
+        at date: Date = PDFOfficeTimeAnchor.process.trustedDate()
+    ) -> String {
         if isPinned {
-            return "Pinned until removed"
+            return isReportExpired(at: date)
+                ? "Pinned · report expired"
+                : AppLocalization.format(
+                    "Pinned · report valid until %@",
+                    expiresAt.formatted(
+                        date: .abbreviated,
+                        time: .shortened
+                    )
+                )
         }
         return AppLocalization.format(
             "Expires %@",
@@ -2674,6 +4466,124 @@ struct PDFOfficeDeliveryPackage:
                 time: .shortened
             )
         )
+    }
+
+    var retentionSummary: String {
+        retentionSummary(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        let hexadecimal = CharacterSet(
+            charactersIn: "0123456789abcdefABCDEF"
+        )
+        let expectedArchive = "\(id.uuidString).zip"
+        let expectedReport = "\(id.uuidString)-verification.json"
+        let receiptIDs = entries.map(\.receiptID)
+        let archiveNameIdentities = entries.compactMap {
+            paperPathArchiveLeafNameIdentity($0.archiveName)
+        }
+        let createdTimestamp = createdAt.timeIntervalSince1970
+        let expiryTimestamp = expiresAt.timeIntervalSince1970
+        let pinnedTimestamp = pinnedAt?.timeIntervalSince1970
+        guard createdTimestamp.isFinite,
+              expiryTimestamp.isFinite,
+              pinnedTimestamp?.isFinite != false,
+              createdTimestamp >= 0,
+              expiresAt >= createdAt,
+              createdAt <= date.addingTimeInterval(5 * 60),
+              (
+                  pinnedAt.map { pinnedDate in
+                      pinnedDate >= createdAt
+                          && pinnedDate
+                              <= date.addingTimeInterval(5 * 60)
+                  } ?? true
+              ),
+              !entries.isEmpty,
+              entries.count
+                <= PDFOfficeExternalMatchReport.maximumFileCount,
+              Set(receiptIDs).count == receiptIDs.count,
+              archiveNameIdentities.count == entries.count,
+              Set(archiveNameIdentities).count
+                == archiveNameIdentities.count
+        else { return false }
+
+        var totalEntryBytes: Int64 = 0
+        for entry in entries {
+            let (nextTotal, overflow) =
+                totalEntryBytes.addingReportingOverflow(
+                    entry.byteCount
+                )
+            guard !overflow,
+                  entry.id == entry.receiptID,
+                  entry.sourceName.count <= 160,
+                  Self.isSafeDisplayText(entry.sourceName),
+                  entry.archiveName.count <= 180,
+                  entry.archiveName.utf8.count <= 240,
+                  !entry.archiveName.hasPrefix("."),
+                  entry.archiveName
+                    == (entry.archiveName as NSString)
+                        .lastPathComponent,
+                  !entry.archiveName.contains("\\"),
+                  Self.isSafeDisplayText(entry.archiveName),
+                  entry.archiveName.lowercased().hasSuffix(
+                    ".\(entry.format.fileExtension)"
+                  ),
+                  entry.byteCount > 0,
+                  entry.byteCount
+                    <= PDFOfficeExternalMatchReport.maximumFileBytes,
+                  entry.sha256.count == 64,
+                  entry.sha256.unicodeScalars.allSatisfy(
+                    hexadecimal.contains
+                  )
+            else { return false }
+            totalEntryBytes = nextTotal
+        }
+
+        return totalEntryBytes
+                <= PDFOfficeExternalMatchReport.maximumBatchBytes
+            && archiveFileName == expectedArchive
+            && reportFileName == expectedReport
+            && byteCount > 0
+            && byteCount
+                <= PDFOfficeExternalMatchReport.maximumBatchBytes
+            && sha256?.count == 64
+            && sha256?.unicodeScalars.allSatisfy(
+                hexadecimal.contains
+            ) == true
+            && reportSHA256?.count == 64
+            && reportSHA256?.unicodeScalars.allSatisfy(
+                hexadecimal.contains
+            ) == true
+            && signerKeyID?.count == 16
+            && signerKeyID?.unicodeScalars.allSatisfy(
+                hexadecimal.contains
+            ) == true
+    }
+
+    private static func isSafeDisplayText(
+        _ value: String
+    ) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                let codePoint = scalar.value
+                let isBidirectionalControl =
+                    codePoint == 0x061C
+                    || codePoint == 0x200E
+                    || codePoint == 0x200F
+                    || (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+                return !CharacterSet.controlCharacters.contains(scalar)
+                    && !CharacterSet.illegalCharacters.contains(scalar)
+                    && !isBidirectionalControl
+            }
     }
 }
 
@@ -3010,12 +4920,12 @@ enum PDFOfficeVisualAnchorPolicy:
     init(profile: DocumentProfile) {
         if profile.textCoverage < 0.22 {
             self = .scanFirst
+        } else if profile.textCoverage < 0.72 {
+            self = .tableAware
         } else if profile.imageDominantPageCount > 0 {
             self = .imageFirst
-        } else if profile.textCoverage >= 0.72 {
-            self = .structureFirst
         } else {
-            self = .tableAware
+            self = .structureFirst
         }
     }
 
@@ -3177,7 +5087,7 @@ struct PDFOfficeVisualBudgetPlan:
     var pressureContract: String {
         AppLocalization.format(
             "%@ · %@ used · %@/page",
-            budgetPressure.title,
+            budgetPressure.title.localizedUI,
             "\(estimatedBudgetUsePercent)%",
             formattedPerPageBudget
         )
@@ -3185,7 +5095,7 @@ struct PDFOfficeVisualBudgetPlan:
 
     var chunkSummary: String {
         chunkCount <= 1
-            ? "Single package"
+            ? "Single package".localizedUI
             : AppLocalization.format(
                 "%lld chunks · %lld pages",
                 chunkCount,
@@ -3203,7 +5113,11 @@ struct PDFOfficeVisualBudgetPlan:
     }
 
     var anchorPolicySummary: String {
-        "\(anchorPolicy.title) · \(budgetPressure.title)"
+        AppLocalization.format(
+            "%@ · %@",
+            anchorPolicy.title.localizedUI,
+            budgetPressure.title.localizedUI
+        )
     }
 
     var reserveWindowSummary: String {
@@ -3216,7 +5130,7 @@ struct PDFOfficeVisualBudgetPlan:
     var memoryGuardSummary: String {
         AppLocalization.format(
             "%@ · %@ · %@",
-            mode.title,
+            mode.title.localizedUI,
             reserveWindowSummary,
             compressionLadderSummary
         )
@@ -3256,6 +5170,10 @@ struct PDFOfficeExportReceipt:
     var integrityStatus: PDFOfficeIntegrityStatus?
     var integrityCheckedAt: Date?
 
+    var contentNotices: [PDFOfficeContentNotice] {
+        runtimeEvidence?.contentNotices ?? PDFOfficeContentNotice.defaults(for: format)
+    }
+
     init(
         format: PDFTextExportFormat,
         fileName: String,
@@ -3287,7 +5205,7 @@ struct PDFOfficeExportReceipt:
         preflightSummary = portfolio?.preflightSummary
             ?? "Local rebuild"
         preflightSignals = portfolio?.preflightSignals ?? []
-        exportedAt = Date()
+        exportedAt = PDFOfficeTimeAnchor.process.trustedDate()
         sourceRevisionID = nil
         retainedFileName = nil
         reusableUntil = nil
@@ -3386,7 +5304,7 @@ struct PDFOfficeExportReceipt:
 
     func artifactAvailability(
         for currentRevisionID: UUID,
-        now: Date = Date()
+        now: Date = PDFOfficeTimeAnchor.process.trustedDate()
     ) -> PDFOfficeArtifactAvailability {
         guard retainedFileName != nil,
               let sourceRevisionID,
@@ -3414,6 +5332,14 @@ struct PDFOfficeExportReceipt:
         batchID != nil
             && batchSegmentIndex != nil
             && batchSegmentCount != nil
+    }
+
+    var sourcePageSummary: String? {
+        guard let start = sourcePageStartIndex,
+              let end = sourcePageEndIndex,
+              start >= 0, end >= start
+        else { return nil }
+        return AppLocalization.format("Source pages %lld-%lld", start + 1, end + 1)
     }
 
     var batchSummary: String? {
@@ -3474,10 +5400,20 @@ struct PDFOfficeExportReceipt:
 func boundedOfficeReceipts(
     _ receipts: [PDFOfficeExportReceipt]
 ) -> [PDFOfficeExportReceipt] {
-    let sorted = receipts.sorted { $0.exportedAt > $1.exportedAt }
-    let pinned = sorted.filter(\.isPinned)
-    let unpinned = sorted.filter { !$0.isPinned }
-    return Array((pinned + unpinned).prefix(72))
+    let prioritized = receipts.sorted {
+        if $0.isPinned != $1.isPinned {
+            return $0.isPinned
+        }
+        if $0.exportedAt != $1.exportedAt {
+            return $0.exportedAt > $1.exportedAt
+        }
+        return $0.id.uuidString < $1.id.uuidString
+    }
+    var seenIDs = Set<UUID>()
+    let unique = prioritized.filter {
+        seenIDs.insert($0.id).inserted
+    }
+    return Array(unique.prefix(72))
         .sorted { $0.exportedAt > $1.exportedAt }
 }
 
@@ -3573,14 +5509,14 @@ struct PDFOfficeExportFormatPlan:
                 format.officePageLimit ?? 0
             )
             : isLocked
-            ? "Locked source"
+            ? "Locked source".localizedUI
             : copyingRestricted
-                ? "Copy restricted"
+                ? "Copy restricted".localizedUI
                 : isLarge
-                    ? "Large document"
+                    ? "Large document".localizedUI
                     : imagePercent >= 45
-                        ? "Image-heavy"
-                        : "Local rebuild"
+                        ? "Image-heavy".localizedUI
+                        : "Local rebuild".localizedUI
 
         func readiness(
             edit: Int,
@@ -3618,7 +5554,7 @@ struct PDFOfficeExportFormatPlan:
                 appearanceScore: appearance,
                 sizeScore: size,
                 primaryEvidence: AppLocalization.format(
-                    "%lld%% text · %@ pages",
+                    "%lld%% text · %@ source",
                     textPercent,
                     profile.formattedSize
                 ),
@@ -3652,8 +5588,11 @@ struct PDFOfficeExportFormatPlan:
                     "%lld%% text · sheet per page",
                     textPercent
                 ),
-                riskEvidence:
-                    "\(riskPrefix) · tables inferred from spacing",
+                riskEvidence: AppLocalization.format(
+                    "%@ · %@",
+                    riskPrefix,
+                    "Tables inferred from spacing".localizedUI
+                ),
                 preferredUse:
                     "Statements, tabular reports, price lists, and ledgers",
                 fallbackFormat: textPercent < 45
@@ -3678,8 +5617,11 @@ struct PDFOfficeExportFormatPlan:
                     "%lld%% appearance · searchable layer",
                     appearance
                 ),
-                riskEvidence:
-                    "\(riskPrefix) · rendered slides can be larger",
+                riskEvidence: AppLocalization.format(
+                    "%@ · %@",
+                    riskPrefix,
+                    "Rendered slides can be larger".localizedUI
+                ),
                 preferredUse:
                     "Scans, visual reports, layouts, posters, and decks",
                 fallbackFormat: profile.pageCount > 220
@@ -3700,8 +5642,15 @@ struct PDFOfficeExportFormatPlan:
                 editabilityScore: edit,
                 appearanceScore: appearance,
                 sizeScore: size,
-                primaryEvidence: "\(textPercent)% text · styled paragraphs",
-                riskEvidence: "\(riskPrefix) · no visual page references",
+                primaryEvidence: AppLocalization.format(
+                    "%lld%% text · styled paragraphs",
+                    textPercent
+                ),
+                riskEvidence: AppLocalization.format(
+                    "%@ · %@",
+                    riskPrefix,
+                    "No visual page references".localizedUI
+                ),
                 preferredUse: "Fast handoff to Word-compatible editors",
                 fallbackFormat: nil
             )
@@ -3717,8 +5666,15 @@ struct PDFOfficeExportFormatPlan:
                 editabilityScore: edit,
                 appearanceScore: 18,
                 sizeScore: 98,
-                primaryEvidence: "\(textPercent)% text · plain structure",
-                riskEvidence: "\(riskPrefix) · styling is intentionally removed",
+                primaryEvidence: AppLocalization.format(
+                    "%lld%% text · plain structure",
+                    textPercent
+                ),
+                riskEvidence: AppLocalization.format(
+                    "%@ · %@",
+                    riskPrefix,
+                    "Styling is intentionally removed".localizedUI
+                ),
                 preferredUse: "Knowledge bases, developer notes, and review",
                 fallbackFormat: nil
             )
@@ -3734,8 +5690,15 @@ struct PDFOfficeExportFormatPlan:
                 editabilityScore: edit,
                 appearanceScore: 0,
                 sizeScore: 100,
-                primaryEvidence: "\(textPercent)% text · UTF-8 output",
-                riskEvidence: "\(riskPrefix) · no layout reconstruction",
+                primaryEvidence: AppLocalization.format(
+                    "%lld%% text · UTF-8 output",
+                    textPercent
+                ),
+                riskEvidence: AppLocalization.format(
+                    "%@ · %@",
+                    riskPrefix,
+                    "No layout reconstruction".localizedUI
+                ),
                 preferredUse: "Search, indexing, and maximum compatibility",
                 fallbackFormat: nil
             )
@@ -3833,25 +5796,30 @@ struct PDFOfficeExportPortfolio: Hashable, Sendable {
 
     var decisionLine: String {
         guard let recommendedPlan else {
-            return "Local Office rebuild"
+            return "Local Office rebuild".localizedUI
         }
-        let secondary = secondChoicePlan
-            .map { " · fallback \($0.format.fileExtension.uppercased())" }
-            ?? ""
+        if let secondChoicePlan {
+            return AppLocalization.format(
+                "%@ · %@ · score %lld · fallback %@",
+                recommendedPlan.format.fileExtension.uppercased(),
+                recommendedPlan.decisionRole.localizedUI,
+                recommendedPlan.compositeScore,
+                secondChoicePlan.format.fileExtension.uppercased()
+            )
+        }
         return AppLocalization.format(
-            "%@ · %@ · score %lld%@",
+            "%@ · %@ · score %lld",
             recommendedPlan.format.fileExtension.uppercased(),
-            recommendedPlan.decisionRole,
-            recommendedPlan.compositeScore,
-            secondary
+            recommendedPlan.decisionRole.localizedUI,
+            recommendedPlan.compositeScore
         )
     }
 
     var decisionDeckLine: String {
         AppLocalization.format(
             "%@ confidence · %@ · %@",
-            routeConfidence.title,
-            productionSLA.window,
+            routeConfidence.title.localizedUI,
+            productionSLA.window.localizedUI,
             visualBudgetPlan.pressureContract
         )
     }
@@ -3907,6 +5875,7 @@ struct PDFOfficeExportPortfolio: Hashable, Sendable {
     var cautionLine: String {
         preflightLeadSignal?.detail
             ?? "Editable structure and local evidence are preserved"
+                .localizedUI
     }
 
     var preflightLeadSignal: PDFOfficePreflightSignal? {
@@ -3937,7 +5906,7 @@ struct PDFOfficeExportPortfolio: Hashable, Sendable {
                 reviewSignalCount
             )
         }
-        return "Ready · local rebuild"
+        return "Ready · local rebuild".localizedUI
     }
 
     var routeRankLine: String {
@@ -4050,7 +6019,7 @@ struct PDFOfficeExportPortfolio: Hashable, Sendable {
         let rights = PDFOfficePreflightSignal(
             id: "rights",
             title: "Rights",
-            value: isProtected ? "Limited" : "Open",
+            value: isProtected ? "Limited" : "Rights clear",
             detail: isProtected
                 ? "Protected source can limit editable Office output"
                 : "Source permissions allow local reconstruction",
@@ -4639,7 +6608,8 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .brief: return "summary facts evidence digest 摘要 总结 事实 依据"
         case .find: return "search locate find 查找 搜索 定位"
-        case .recognize: return "ocr scan text recognize 识别 扫描文字 文字识别"
+        case .recognize:
+            return "ocr scan text recognize searchable find words 识别 扫描文字 文字识别 可搜索 搜文字"
         case .highlight: return "marker yellow highlight 高亮 标记"
         case .underline: return "line underline 下划线"
         case .strikeOut: return "delete strike strikethrough 删除线 划掉"
@@ -4663,10 +6633,11 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
         case .bookmarks: return "outline saved page bookmarks 书签 目录 大纲"
         case .organize:
             return "reorder number paginate rotate crop pages organize 页面 页码 编号 排序 旋转 裁切"
-        case .compress: return "smaller shrink size compress 压缩 瘦身 变小"
+        case .compress:
+            return "smaller shrink size compress too large attachment message 压缩 瘦身 变小 太大 发邮件 发微信"
         case .protect: return "password encrypt lock protect 密码 加密 上锁"
         case .export:
-            return "share flatten images text docx xlsx pptx word excel powerpoint office export convert 导出 分享 转换"
+            return "send share finish flatten images text docx xlsx pptx word excel powerpoint office export convert final 发出去 发送 导出 分享 转换 最终版"
         }
     }
 
@@ -4676,8 +6647,8 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
 
     func matchScore(_ query: String) -> Int? {
         let normalizedQuery = SearchTextNormalizer.normalize(query)
-        let terms = normalizedQuery.split(whereSeparator: \.isWhitespace)
-        guard !terms.isEmpty else { return 0 }
+        let terms = SearchTextNormalizer.meaningfulTerms(in: query)
+        guard !terms.isEmpty else { return nil }
         let normalizedTitle = SearchTextNormalizer.normalize(title)
         let normalizedCompactTitle = SearchTextNormalizer.normalize(
             compactTitle
@@ -4688,7 +6659,18 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
         let text = SearchTextNormalizer.normalize(
             "\(title) \(detail) \(group.title) \(searchAliases)"
         )
-        guard terms.allSatisfy(text.contains) else { return nil }
+        let matchedTermCount = terms.reduce(into: 0) { count, term in
+            if text.contains(term) {
+                count += 1
+            }
+        }
+        let intentHitCount = SearchTextNormalizer.intentHitCount(
+            query: normalizedQuery,
+            searchableText: text
+        )
+        guard matchedTermCount == terms.count || intentHitCount > 0 else {
+            return nil
+        }
 
         var score = 0
         if normalizedTitle == normalizedQuery
@@ -4711,6 +6693,7 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
                 score += 20
             }
         }
+        score += min(intentHitCount, 3) * 30
         return score
     }
 }
@@ -4954,25 +6937,21 @@ struct PDFBatesNumberingPayload: Hashable, Sendable {
         _ value: String,
         name: String
     ) throws -> String {
-        guard value.rangeOfCharacter(
-            from: .controlCharacters
-        ) == nil,
-              !value.contains("#")
+        let normalized = value.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).precomposedStringWithCanonicalMapping
+        guard PDFEvidenceContract.isSafeDisplayText(
+                  normalized,
+                  maximumCharacters: 24,
+                  maximumUTF8Bytes: 96,
+                  allowsEmpty: true
+              ),
+              !normalized.contains("#")
         else {
             throw PaperPathError.insufficientSelection(
                 name == "prefix"
-                    ? "The Bates prefix cannot contain # or line breaks."
-                    : "The Bates suffix cannot contain # or line breaks."
-            )
-        }
-        let normalized = value.trimmingCharacters(
-            in: .whitespacesAndNewlines
-        )
-        guard normalized.count <= 24 else {
-            throw PaperPathError.insufficientSelection(
-                name == "prefix"
-                    ? "Use 24 characters or fewer for the Bates prefix."
-                    : "Use 24 characters or fewer for the Bates suffix."
+                    ? "The Bates prefix cannot contain #, line breaks, or direction controls."
+                    : "The Bates suffix cannot contain #, line breaks, or direction controls."
             )
         }
         return normalized
@@ -5239,7 +7218,17 @@ struct PDFBatesBatchReceiptPayload:
     var documentCount: Int { entries.count }
 
     var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
         guard schema == Self.schema,
+              PDFEvidenceContract.isPlausiblePastDate(
+                createdAt,
+                now: date
+              ),
               !entries.isEmpty,
               entries.count
                 <= PDFBatesBatchPlan.maximumDocumentCount,
@@ -5247,11 +7236,6 @@ struct PDFBatesBatchReceiptPayload:
               (3...15).contains(digitCount),
               totalPageCount > 0,
               totalPageCount <= PDFBatesBatchPlan.maximumPageCount,
-              totalPageCount
-                == entries.reduce(
-                    0,
-                    { $0 + $1.pageCount }
-                ),
               (try? PDFBatesNumberingPayload.normalizedAffix(
                   prefix,
                   name: "prefix"
@@ -5271,14 +7255,28 @@ struct PDFBatesBatchReceiptPayload:
             charactersIn: "0123456789abcdef"
         )
         var expectedStart = entries[0].startNumber
+        var calculatedPageCount = 0
         for (index, entry) in entries.enumerated() {
-            guard entry.pageCount > 0,
-                  !entry.displayName.isEmpty,
-                  entry.displayName.count <= 120,
+            guard entry.pageCount > 0 else { return false }
+            let (nextPageCount, pageCountOverflow) =
+                calculatedPageCount.addingReportingOverflow(
+                    entry.pageCount
+                )
+            let (expectedEnd, endNumberOverflow) =
+                entry.startNumber.addingReportingOverflow(
+                    Int64(entry.pageCount - 1)
+                )
+            guard !pageCountOverflow,
+                  nextPageCount <= PDFBatesBatchPlan.maximumPageCount,
+                  !endNumberOverflow,
+                  PDFEvidenceContract.isSafeDisplayText(
+                      entry.displayName,
+                      maximumCharacters: 120,
+                      maximumUTF8Bytes: 480
+                  ),
                   entry.startNumber == expectedStart,
                   entry.startNumber >= 1,
-                  entry.endNumber
-                    == entry.startNumber + Int64(entry.pageCount - 1),
+                  entry.endNumber == expectedEnd,
                   entry.endNumber <= maximumNumber,
                   entry.startIdentifier
                     == PDFBatesNumberingPayload.text(
@@ -5303,11 +7301,12 @@ struct PDFBatesBatchReceiptPayload:
                       hexadecimal.contains
                   )
             else { return false }
+            calculatedPageCount = nextPageCount
             if index < entries.count - 1 {
                 expectedStart = entry.endNumber + 1
             }
         }
-        return true
+        return calculatedPageCount == totalPageCount
     }
 }
 
@@ -5359,38 +7358,70 @@ struct PDFBatesRemovalReceiptPayload:
     }
 
     var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
         let hexadecimal = CharacterSet(
             charactersIn: "0123456789abcdef"
         )
-        return schema == Self.schema
-            && !entries.isEmpty
-            && entries.count <= PDFBatesBatchPlan.maximumDocumentCount
-            && Set(entries.map(\.recordID)).count == entries.count
-            && totalPageCount > 0
-            && totalPageCount <= PDFBatesBatchPlan.maximumPageCount
-            && totalPageCount == entries.reduce(0) {
-                $0 + $1.pageCount
-            }
-            && entries.allSatisfy {
-                $0.pageCount > 0
-                    && !$0.displayName.isEmpty
-                    && $0.displayName.count <= 120
-                    && $0.numberedRevisionID != $0.clearedRevisionID
-                    && $0.numberedSHA256.count == 64
-                    && $0.clearedSHA256.count == 64
-                    && $0.numberedSHA256.unicodeScalars.allSatisfy(
-                        hexadecimal.contains
-                    )
-                    && $0.clearedSHA256.unicodeScalars.allSatisfy(
-                        hexadecimal.contains
-                    )
-            }
+        guard schema == Self.schema,
+              PDFEvidenceContract.isPlausiblePastDate(
+                createdAt,
+                now: date
+              ),
+              !entries.isEmpty,
+              entries.count <= PDFBatesBatchPlan.maximumDocumentCount,
+              Set(entries.map(\.recordID)).count == entries.count,
+              totalPageCount > 0,
+              totalPageCount <= PDFBatesBatchPlan.maximumPageCount
+        else { return false }
+        var calculatedPageCount = 0
+        for entry in entries {
+            let (nextPageCount, overflow) =
+                calculatedPageCount.addingReportingOverflow(
+                    entry.pageCount
+                )
+            guard entry.pageCount > 0,
+                  !overflow,
+                  nextPageCount <= PDFBatesBatchPlan.maximumPageCount,
+                  PDFEvidenceContract.isSafeDisplayText(
+                      entry.displayName,
+                      maximumCharacters: 120,
+                      maximumUTF8Bytes: 480
+                  ),
+                  entry.numberedRevisionID != entry.clearedRevisionID,
+                  entry.numberedSHA256.count == 64,
+                  entry.clearedSHA256.count == 64,
+                  entry.numberedSHA256.unicodeScalars.allSatisfy(
+                      hexadecimal.contains
+                  ),
+                  entry.clearedSHA256.unicodeScalars.allSatisfy(
+                      hexadecimal.contains
+                  )
+            else { return false }
+            calculatedPageCount = nextPageCount
+        }
+        return calculatedPageCount == totalPageCount
     }
 
     func isLinked(
         to batesPayload: PDFBatesBatchReceiptPayload
     ) -> Bool {
-        guard isStructurallyValid,
+        isLinked(
+            to: batesPayload,
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isLinked(
+        to batesPayload: PDFBatesBatchReceiptPayload,
+        at date: Date
+    ) -> Bool {
+        guard isStructurallyValid(at: date),
+              batesPayload.isStructurallyValid(at: date),
               batesBatchID == batesPayload.batchID,
               totalPageCount == batesPayload.totalPageCount,
               entries.count == batesPayload.entries.count
@@ -5695,12 +7726,23 @@ struct PDFBatesMatchReportPayload:
     }
 
     var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
         guard schema == Self.schema,
               reportID == report.id,
               createdAt == report.checkedAt,
-              receipt.payload.isStructurallyValid,
+              PDFEvidenceContract.isPlausiblePastDate(
+                createdAt,
+                now: date
+              ),
+              receipt.payload.isStructurallyValid(at: date),
               receipt.removal?.payload.isLinked(
-                  to: receipt.payload
+                  to: receipt.payload,
+                  at: date
               ) ?? true,
               report.receiptID == receipt.id,
               report.matches.count == receipt.payload.entries.count,
@@ -5722,11 +7764,11 @@ struct PDFBatesMatchReportPayload:
             + report.unrecognizedCandidates
         var candidatesByID: [UUID: PDFBatesExternalCandidate] = [:]
         for candidate in allOccurrences {
-            guard candidate.fileName.count >= 1,
-                  candidate.fileName.count <= 160,
-                  candidate.fileName.rangeOfCharacter(
-                      from: .controlCharacters
-                  ) == nil,
+            guard PDFEvidenceContract.isSafeDisplayText(
+                      candidate.fileName,
+                      maximumCharacters: 160,
+                      maximumUTF8Bytes: 240
+                  ),
                   candidate.byteCount > 0,
                   candidate.byteCount
                     <= PDFBatesExternalMatchReport.maximumFileBytes,
@@ -5885,6 +7927,7 @@ struct PDFBatesMatchReportInspection:
 
     var isVerified: Bool {
         signatureStatus == .verified
+            && receiptSignatureStatus == .verified
     }
 }
 
@@ -6119,6 +8162,9 @@ struct PDFViewCommand: Identifiable, Equatable {
         case markRedaction
         case captureTextForEditing
         case removeAnnotation
+        case zoomIn
+        case zoomOut
+        case fitToWindow
     }
 
     let id = UUID()
@@ -6240,6 +8286,7 @@ struct PDFTextSelectionSnapshot: Identifiable, Hashable, Sendable {
 enum PDFTextReplacementStatus: String, Hashable, Sendable {
     case ready
     case blocked
+    case unavailable
 }
 
 enum PDFTextReplacementFontStyle: String, CaseIterable, Identifiable, Sendable {
@@ -6560,7 +8607,11 @@ enum PDFPageCropConfidence: String, Hashable, Sendable {
     case low
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .high: return "High"
+        case .medium: return "Medium"
+        case .low: return "Low"
+        }
     }
 }
 
@@ -6610,6 +8661,17 @@ struct PDFPagePreparationItem: Identifiable, Hashable, Sendable {
 struct PDFPagePreparationAssessment: Hashable, Sendable {
     let revisionID: UUID
     let pages: [PDFPagePreparationItem]
+    let pageCount: Int
+
+    init(
+        revisionID: UUID,
+        pages: [PDFPagePreparationItem],
+        pageCount: Int? = nil
+    ) {
+        self.revisionID = revisionID
+        self.pages = pages
+        self.pageCount = max(pages.count, pageCount ?? pages.count)
+    }
 
     var geometryVariantCount: Int {
         Set(
@@ -6639,7 +8701,7 @@ struct PDFExternalPageSource:
     let assessment: PDFPagePreparationAssessment
 
     var pageCount: Int {
-        assessment.pages.count
+        assessment.pageCount
     }
 
     var formattedSize: String {
@@ -7261,7 +9323,11 @@ enum PDFSignaturePosition: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .left: return "Left"
+        case .center: return "Center"
+        case .right: return "Right"
+        }
     }
 }
 
@@ -7273,7 +9339,11 @@ enum PDFSignatureSize: String, CaseIterable, Identifiable, Sendable {
     var id: String { rawValue }
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .compact: return "Compact"
+        case .regular: return "Regular"
+        case .large: return "Large"
+        }
     }
 
     var pageWidthFraction: Double {
@@ -7286,6 +9356,10 @@ enum PDFSignatureSize: String, CaseIterable, Identifiable, Sendable {
 }
 
 struct PDFInkPayload: Sendable {
+    static let maximumStrokeCount = 400
+    static let maximumPointsPerStroke = 2_000
+    static let maximumTotalPointCount = 20_000
+
     let pageIndex: Int
     let strokes: [PDFInkStroke]
     let placement: PDFInkPlacement
@@ -7410,7 +9484,12 @@ enum PDFFormFormatKind: String, Hashable, Sendable {
     case time
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .number: return "Number"
+        case .percent: return "Percent"
+        case .date: return "Date"
+        case .time: return "Time"
+        }
     }
 }
 
@@ -7608,6 +9687,35 @@ struct PDFAnnotationSnapshot: Identifiable, Hashable, Sendable {
     let canEditContents: Bool
     let canEditStyle: Bool
     let canRemove: Bool
+    let mutationIdentity: String?
+
+    init(
+        pageIndex: Int,
+        annotationIndex: Int,
+        type: String,
+        contents: String?,
+        generatedKind: PDFGeneratedAnnotationKind?,
+        color: PDFInkColor,
+        lineWidth: Double?,
+        hasAppearanceStream: Bool,
+        canEditContents: Bool,
+        canEditStyle: Bool,
+        canRemove: Bool,
+        mutationIdentity: String? = nil
+    ) {
+        self.pageIndex = pageIndex
+        self.annotationIndex = annotationIndex
+        self.type = type
+        self.contents = contents
+        self.generatedKind = generatedKind
+        self.color = color
+        self.lineWidth = lineWidth
+        self.hasAppearanceStream = hasAppearanceStream
+        self.canEditContents = canEditContents
+        self.canEditStyle = canEditStyle
+        self.canRemove = canRemove
+        self.mutationIdentity = mutationIdentity
+    }
 
     var id: String {
         "\(pageIndex)-\(annotationIndex)-\(type)"
@@ -7636,6 +9744,7 @@ struct PDFAnnotationRemovalTarget: Hashable, Sendable {
     let expectedType: String
     let expectedContents: String?
     let expectedGeneratedKind: PDFGeneratedAnnotationKind?
+    let expectedMutationIdentity: String?
 
     init(annotation: PDFAnnotationSnapshot) {
         pageIndex = annotation.pageIndex
@@ -7643,6 +9752,7 @@ struct PDFAnnotationRemovalTarget: Hashable, Sendable {
         expectedType = annotation.type
         expectedContents = annotation.contents
         expectedGeneratedKind = annotation.generatedKind
+        expectedMutationIdentity = annotation.mutationIdentity
     }
 }
 
@@ -7805,9 +9915,28 @@ struct PDFAnnotationEditPayload: Hashable, Sendable {
     let pageIndex: Int
     let annotationIndex: Int
     let expectedType: String
+    let expectedMutationIdentity: String?
     let contents: String
     let color: PDFInkColor
     let lineWidth: Double?
+
+    init(
+        pageIndex: Int,
+        annotationIndex: Int,
+        expectedType: String,
+        expectedMutationIdentity: String? = nil,
+        contents: String,
+        color: PDFInkColor,
+        lineWidth: Double?
+    ) {
+        self.pageIndex = pageIndex
+        self.annotationIndex = annotationIndex
+        self.expectedType = expectedType
+        self.expectedMutationIdentity = expectedMutationIdentity
+        self.contents = contents
+        self.color = color
+        self.lineWidth = lineWidth
+    }
 }
 
 enum DocumentWorkflowStatus:
@@ -7896,6 +10025,7 @@ struct DocumentTaskCheckpoint: Codable, Hashable, Sendable {
     let pageIndex: Int?
     let fieldName: String?
     let normalizedBounds: PDFNormalizedRect?
+    let contentRevisionID: UUID?
     let updatedAt: Date
 
     init(
@@ -7903,6 +10033,7 @@ struct DocumentTaskCheckpoint: Codable, Hashable, Sendable {
         pageIndex: Int? = nil,
         fieldName: String? = nil,
         normalizedBounds: PDFNormalizedRect? = nil,
+        contentRevisionID: UUID? = nil,
         updatedAt: Date = Date()
     ) {
         self.stage = stage
@@ -7916,12 +10047,20 @@ struct DocumentTaskCheckpoint: Codable, Hashable, Sendable {
             nil
         }
         self.normalizedBounds = normalizedBounds
+        self.contentRevisionID = contentRevisionID
         self.updatedAt = updatedAt
     }
 
     var resumeReason: String {
         if let fieldName {
-            return "\(stage.detail): \(fieldName)"
+            if let pageIndex {
+                return AppLocalization.format(
+                    "%@ · page %lld",
+                    fieldName,
+                    pageIndex + 1
+                )
+            }
+            return fieldName
         }
         if let pageIndex {
             return "\(stage.detail) on page \(pageIndex + 1)"
@@ -7936,8 +10075,43 @@ struct DocumentTaskCheckpoint: Codable, Hashable, Sendable {
             pageIndex: min(max(pageIndex, 0), max(0, pageCount - 1)),
             fieldName: fieldName,
             normalizedBounds: normalizedBounds,
+            contentRevisionID: contentRevisionID,
             updatedAt: updatedAt
         )
+    }
+
+    func rebased(to contentRevisionID: UUID) -> Self {
+        guard self.contentRevisionID != contentRevisionID else {
+            return self
+        }
+        return DocumentTaskCheckpoint(
+            stage: stage,
+            pageIndex: pageIndex,
+            fieldName: fieldName,
+            normalizedBounds: normalizedBounds,
+            contentRevisionID: contentRevisionID,
+            updatedAt: updatedAt
+        )
+    }
+
+    func validated(
+        for contentRevisionID: UUID,
+        pageCount: Int
+    ) -> Self? {
+        if let boundRevisionID = self.contentRevisionID,
+           boundRevisionID != contentRevisionID {
+            return nil
+        }
+        return rebased(to: contentRevisionID)
+            .bounded(toPageCount: pageCount)
+    }
+
+    func hasSameResumeTarget(as other: Self) -> Bool {
+        stage == other.stage
+            && pageIndex == other.pageIndex
+            && fieldName == other.fieldName
+            && normalizedBounds == other.normalizedBounds
+            && contentRevisionID == other.contentRevisionID
     }
 }
 
@@ -7981,6 +10155,14 @@ enum IndexedTextSource: String, Codable, Sendable {
     case native
     case vision
     case searchableCopy
+
+    var title: String {
+        switch self {
+        case .native: return "Native PDF text"
+        case .vision: return "On-device text recognition"
+        case .searchableCopy: return "Searchable PDF text"
+        }
+    }
 }
 
 enum DocumentUnderstandingConfidence: String, Codable, Hashable {
@@ -8251,6 +10433,11 @@ enum PDFDeliveryOperation: String, Codable, Hashable, Sendable {
 }
 
 struct PDFOperationProgress: Equatable, Sendable {
+    private static let maximumDisplayByteRate =
+        Double(Int64.max / 2)
+    private static let maximumEstimatedRemainingSeconds:
+        TimeInterval = 365 * 24 * 60 * 60
+
     let label: String
     let fractionCompleted: Double
     let byteStage: PDFByteProgressStage?
@@ -8273,14 +10460,39 @@ struct PDFOperationProgress: Equatable, Sendable {
         lastByteUpdateAt: Date? = nil
     ) {
         self.label = label
-        self.fractionCompleted = fractionCompleted
+        self.fractionCompleted = fractionCompleted.isFinite
+            ? min(1, max(0, fractionCompleted))
+            : 0
         self.byteStage = byteStage
-        self.processedBytes = processedBytes
-        self.totalBytes = totalBytes
-        self.bytesPerSecond = bytesPerSecond
-        self.estimatedRemainingSeconds = estimatedRemainingSeconds
-        self.throughputHistory = throughputHistory
-        self.lastByteUpdateAt = lastByteUpdateAt
+        let boundedTotalBytes = max(0, totalBytes)
+        self.totalBytes = boundedTotalBytes
+        self.processedBytes = boundedTotalBytes > 0
+            ? min(max(0, processedBytes), boundedTotalBytes)
+            : max(0, processedBytes)
+        self.bytesPerSecond = bytesPerSecond.isFinite
+            ? min(
+                Self.maximumDisplayByteRate,
+                max(0, bytesPerSecond)
+            )
+            : 0
+        self.estimatedRemainingSeconds =
+            estimatedRemainingSeconds.flatMap {
+                guard $0.isFinite, $0 >= 0 else { return nil }
+                return min(
+                    Self.maximumEstimatedRemainingSeconds,
+                    $0
+                )
+            }
+        self.throughputHistory = Array(
+            throughputHistory.lazy
+                .filter { $0.isFinite && $0 >= 0 }
+                .map { min(Self.maximumDisplayByteRate, $0) }
+                .suffix(24)
+        )
+        self.lastByteUpdateAt =
+            lastByteUpdateAt?.timeIntervalSince1970.isFinite == true
+                ? lastByteUpdateAt
+                : nil
     }
 
     var percentCompleted: Int {
@@ -8310,14 +10522,100 @@ struct PDFOperationProgress: Equatable, Sendable {
         return "\(formatted)/s"
     }
 
+    var remainingSummary: String? {
+        guard let estimatedRemainingSeconds,
+              estimatedRemainingSeconds.isFinite,
+              estimatedRemainingSeconds >= 0
+        else { return nil }
+        let seconds = Int(ceil(estimatedRemainingSeconds))
+        if seconds < 1 { return "<1s" }
+        if seconds < 60 { return "\(seconds)s" }
+        return "\(seconds / 60)m \(seconds % 60)s"
+    }
+
     func isStalled(at date: Date) -> Bool {
         guard processedBytes < totalBytes,
-              let lastByteUpdateAt,
-              processedBytes > 0
+              let lastByteUpdateAt
         else { return false }
         return date.timeIntervalSince(lastByteUpdateAt) >= 2
     }
 }
+
+enum PDFComparisonProgressStage: String, Hashable, Sendable {
+    case opening
+    case readingSource
+    case readingRevised
+    case matchingPages
+    case inspectingChanges
+    case complete
+
+    var title: String {
+        switch self {
+        case .opening: return "Opening PDFs"
+        case .readingSource: return "Reading base PDF"
+        case .readingRevised: return "Reading revised PDF"
+        case .matchingPages: return "Matching pages"
+        case .inspectingChanges: return "Reviewing differences"
+        case .complete: return "Comparison ready"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .opening: return "doc.on.doc"
+        case .readingSource: return "doc"
+        case .readingRevised: return "doc.fill"
+        case .matchingPages: return "arrow.left.arrow.right"
+        case .inspectingChanges: return "viewfinder"
+        case .complete: return "checkmark.circle.fill"
+        }
+    }
+}
+
+struct PDFComparisonProgress: Hashable, Sendable {
+    let stage: PDFComparisonProgressStage
+    let completedPageCount: Int
+    let totalPageCount: Int
+    let fractionCompleted: Double
+
+    init(
+        stage: PDFComparisonProgressStage,
+        completedPageCount: Int = 0,
+        totalPageCount: Int = 0,
+        fractionCompleted: Double
+    ) {
+        self.stage = stage
+        self.totalPageCount = max(0, totalPageCount)
+        self.completedPageCount = min(
+            max(0, completedPageCount),
+            max(0, totalPageCount)
+        )
+        self.fractionCompleted = fractionCompleted.isFinite
+            ? min(max(0, fractionCompleted), 1)
+            : 0
+    }
+
+    var percentCompleted: Int {
+        Int((fractionCompleted * 100).rounded())
+    }
+
+    var pageSummary: String? {
+        guard totalPageCount > 0 else { return nil }
+        return AppLocalization.format(
+            "%lld of %lld pages",
+            completedPageCount,
+            totalPageCount
+        )
+    }
+
+    static let starting = PDFComparisonProgress(
+        stage: .opening,
+        fractionCompleted: 0
+    )
+}
+
+typealias PDFComparisonProgressHandler =
+    @Sendable (PDFComparisonProgress) -> Void
 
 enum PDFDeliveryCheckStatus: String, Codable, Hashable, Sendable {
     case passed
@@ -8355,12 +10653,54 @@ enum PDFDeliveryPreflightItemStatus: String, Codable, Hashable, Sendable {
     case blocked
 }
 
+enum PDFDeliveryPreflightRepairAction:
+    String,
+    Codable,
+    Hashable,
+    Sendable {
+    case organizePages
+    case createEditableCopy
+
+    var title: String {
+        switch self {
+        case .organizePages:
+            return "Fix in Pages"
+        case .createEditableCopy:
+            return "Create Editable Copy"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .organizePages:
+            return "square.grid.2x2"
+        case .createEditableCopy:
+            return "lock.open"
+        }
+    }
+}
+
 struct PDFDeliveryPreflightItem: Codable, Hashable, Identifiable, Sendable {
     let id: String
     let title: String
     let detail: String
     let status: PDFDeliveryPreflightItemStatus
     var reviewPageIndex: Int? = nil
+    var repairAction: PDFDeliveryPreflightRepairAction? = nil
+
+    var resolvedRepairAction: PDFDeliveryPreflightRepairAction? {
+        if let repairAction {
+            return repairAction
+        }
+        if id == "locked-source", status == .blocked {
+            return .createEditableCopy
+        }
+        guard id == "blank-pages",
+              status == .review,
+              reviewPageIndex != nil
+        else { return nil }
+        return .organizePages
+    }
 }
 
 struct PDFDeliveryPreflightAssessment: Codable, Hashable, Sendable {
@@ -8371,6 +10711,22 @@ struct PDFDeliveryPreflightAssessment: Codable, Hashable, Sendable {
     let reviewCount: Int
     let items: [PDFDeliveryPreflightItem]
 
+    var batchAttentionItem: PDFDeliveryPreflightItem? {
+        if let blocked = items.first(where: { $0.status == .blocked }) {
+            return blocked
+        }
+        if let review = items.first(where: { $0.status == .review }) {
+            return review
+        }
+        guard status != .ready else { return nil }
+        return PDFDeliveryPreflightItem(
+            id: "incomplete-preflight",
+            title: "Review before sending",
+            detail: "The preflight result was incomplete",
+            status: status == .blocked ? .blocked : .review
+        )
+    }
+
     var formattedSize: String {
         ByteCountFormatter.string(
             fromByteCount: byteCount,
@@ -8380,10 +10736,16 @@ struct PDFDeliveryPreflightAssessment: Codable, Hashable, Sendable {
 }
 
 struct PDFDeliveryPreflightCacheEntry: Codable, Hashable, Sendable {
+    static let currentRulesVersion = 2
     let recordID: UUID
     let revisionID: UUID
     let checkedAt: Date
     let assessment: PDFDeliveryPreflightAssessment
+    var rulesVersion: Int? = currentRulesVersion
+
+    var usesCurrentRules: Bool {
+        rulesVersion == Self.currentRulesVersion
+    }
 }
 
 enum PDFBatchDeliveryStage: String, Codable, Hashable, Sendable {
@@ -8485,6 +10847,15 @@ struct PDFBatchDeliveryIssue: Codable, LocalizedError, Hashable, Sendable {
         )
     }
 
+    static let sourceChanged = Self(
+        phase: .source,
+        code: "S-002",
+        message:
+            "The PDF changed before this action started. Review the updated PDF.",
+        recovery: "Recheck the current version in the batch results.",
+        isRetryable: false
+    )
+
     static func preflightFailed(_ message: String) -> Self {
         Self(
             phase: .preflight,
@@ -8510,7 +10881,7 @@ struct PDFBatchDeliveryIssue: Codable, LocalizedError, Hashable, Sendable {
             phase: .preflight,
             code: "P-202",
             message: message,
-            recovery: "Open the evidence page and confirm it first.",
+            recovery: "Review this PDF individually before creating a delivery copy.",
             isRetryable: false
         )
     }
@@ -8562,9 +10933,31 @@ struct PDFBatchDeliveryItem: Codable, Identifiable, Hashable, Sendable {
     var detail: String
     var reviewPageIndex: Int? = nil
     var issue: PDFBatchDeliveryIssue? = nil
+
+    static func changedSource(_ recordID: UUID) -> Self {
+        Self(
+            sourceRecordID: recordID, stage: .needsReview,
+            detail: PDFBatchDeliveryIssue.sourceChanged.message,
+            issue: .sourceChanged
+        )
+    }
+}
+
+enum PDFBatchSelection {
+    static func adding(
+        _ matches: [UUID], to selected: Set<UUID>, limit: Int = 64
+    ) -> Set<UUID> {
+        var result = selected
+        for id in matches where result.count < max(0, limit) {
+            result.insert(id)
+        }
+        return result
+    }
 }
 
 struct PDFBatchDeliveryRun: Codable, Hashable, Identifiable, Sendable {
+    static let maximumDocumentCount = 64
+
     let id: UUID
     let startedAt: Date
     let updatedAt: Date
@@ -8582,6 +10975,61 @@ struct PDFBatchDeliveryRun: Codable, Hashable, Identifiable, Sendable {
 
     var needsAttention: Bool {
         items.contains { !$0.stage.isShareable }
+    }
+
+    var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        let sourceIDs = Set(sourceRecordIDs)
+        let itemIDs = Set(items.map(\.sourceRecordID))
+        let outputIDs = items.compactMap(\.outputRecordID)
+        return PDFEvidenceContract.isPlausiblePastDate(
+                startedAt,
+                now: date
+            )
+            && PDFEvidenceContract.isPlausiblePastDate(
+                updatedAt,
+                now: date
+            )
+            && updatedAt >= startedAt
+            && !sourceRecordIDs.isEmpty
+            && sourceRecordIDs.count <= Self.maximumDocumentCount
+            && sourceIDs.count == sourceRecordIDs.count
+            && sourceIDs == Set(sourceRevisionIDs.keys)
+            && sourceIDs == itemIDs
+            && itemIDs.count == items.count
+            && Set(outputIDs).count == outputIDs.count
+            && items.allSatisfy {
+                ($0.reviewPageIndex ?? 0) >= 0
+                    && $0.outputRecordID != $0.sourceRecordID
+                    && PDFEvidenceContract.isSafeDisplayText(
+                        $0.detail,
+                        maximumCharacters: 2_000,
+                        maximumUTF8Bytes: 8_000,
+                        allowsEmpty: true
+                    )
+                    && ($0.issue.map {
+                        PDFEvidenceContract.isSafeDisplayText(
+                            $0.code,
+                            maximumCharacters: 32,
+                            maximumUTF8Bytes: 64
+                        )
+                            && PDFEvidenceContract.isSafeDisplayText(
+                                $0.message,
+                                maximumCharacters: 2_000,
+                                maximumUTF8Bytes: 8_000
+                            )
+                            && PDFEvidenceContract.isSafeDisplayText(
+                                $0.recovery,
+                                maximumCharacters: 2_000,
+                                maximumUTF8Bytes: 8_000
+                            )
+                    } ?? true)
+            }
     }
 }
 
@@ -8635,7 +11083,11 @@ enum PDFChangeSeverity:
     case minor
 
     var title: String {
-        rawValue.capitalized
+        switch self {
+        case .critical: return "Critical"
+        case .major: return "Major"
+        case .minor: return "Minor"
+        }
     }
 }
 
@@ -8648,6 +11100,18 @@ struct PDFDifferenceRegion:
     let width: Double
     let height: Double
     let intensity: Double
+
+    var isStructurallyValid: Bool {
+        let values = [x, y, width, height, intensity]
+        return values.allSatisfy(\.isFinite)
+            && x >= 0
+            && y >= 0
+            && width > 0
+            && height > 0
+            && x + width <= 1.001
+            && y + height <= 1.001
+            && (0...1).contains(intensity)
+    }
 }
 
 enum PDFTextDifferenceKind:
@@ -8708,6 +11172,30 @@ struct PDFTextDifferenceEvidence:
     }
 }
 
+enum PDFVectorDifferenceKind:
+    String,
+    Codable,
+    Hashable,
+    Sendable {
+    case removed
+    case inserted
+
+    var title: String {
+        switch self {
+        case .removed: return "Removed vector object"
+        case .inserted: return "Added vector object"
+        }
+    }
+}
+
+struct PDFVectorDifferenceEvidence:
+    Codable,
+    Hashable,
+    Sendable {
+    let kind: PDFVectorDifferenceKind
+    let region: PDFDifferenceRegion
+}
+
 enum PDFEvidenceOverlayTone:
     String,
     Hashable,
@@ -8723,6 +11211,7 @@ struct PDFEvidenceOverlay:
     let regions: [PDFDifferenceRegion]
     let textRegions: [PDFDifferenceRegion]
     let characterTextRegions: [PDFDifferenceRegion]
+    let vectorRegions: [PDFDifferenceRegion]
     let tone: PDFEvidenceOverlayTone
     let generation: Int
 
@@ -8731,6 +11220,7 @@ struct PDFEvidenceOverlay:
         regions: [PDFDifferenceRegion],
         textRegions: [PDFDifferenceRegion] = [],
         characterTextRegions: [PDFDifferenceRegion] = [],
+        vectorRegions: [PDFDifferenceRegion] = [],
         tone: PDFEvidenceOverlayTone,
         generation: Int
     ) {
@@ -8738,6 +11228,7 @@ struct PDFEvidenceOverlay:
         self.regions = regions
         self.textRegions = textRegions
         self.characterTextRegions = characterTextRegions
+        self.vectorRegions = vectorRegions
         self.tone = tone
         self.generation = generation
     }
@@ -8749,21 +11240,311 @@ enum PDFPageMatchBasis:
     Hashable,
     Sendable {
     case exactContent
+    case repeatedContent
     case pageLabel
     case textMarker
     case barcode
     case context
+    case manual
     case similarity
 
     var title: String {
         switch self {
         case .exactContent: return "Exact page"
+        case .repeatedContent: return "Repeated template"
         case .pageLabel: return "Page label"
         case .textMarker: return "Text marker"
         case .barcode: return "Barcode"
         case .context: return "Neighbor context"
+        case .manual: return "Manual match"
         case .similarity: return "Visual similarity"
         }
+    }
+
+    var evidenceDetail: String {
+        switch self {
+        case .exactContent:
+            return "Identical page content"
+        case .repeatedContent:
+            return "Same template paired by stable document order"
+        case .pageLabel:
+            return "Matching PDF page label"
+        case .textMarker:
+            return "Matching stable text marker"
+        case .barcode:
+            return "Matching barcode evidence"
+        case .context:
+            return "Matching neighboring page context"
+        case .manual:
+            return "Confirmed by you for this comparison"
+        case .similarity:
+            return "Best bounded visual similarity"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .exactContent:
+            return "checkmark.square"
+        case .repeatedContent:
+            return "square.stack.3d.up"
+        case .pageLabel:
+            return "number.square"
+        case .textMarker:
+            return "text.magnifyingglass"
+        case .barcode:
+            return "barcode.viewfinder"
+        case .context:
+            return "link"
+        case .manual:
+            return "checkmark.circle"
+        case .similarity:
+            return "viewfinder"
+        }
+    }
+}
+
+struct PDFManualPageMatch:
+    Codable,
+    Hashable,
+    Identifiable,
+    Sendable {
+    let sourcePageIndex: Int
+    let revisedPageIndex: Int
+
+    var id: String {
+        "\(sourcePageIndex)-\(revisedPageIndex)"
+    }
+
+    func isValid(
+        sourcePageCount: Int,
+        revisedPageCount: Int
+    ) -> Bool {
+        sourcePageIndex >= 0
+            && sourcePageIndex < sourcePageCount
+            && revisedPageIndex >= 0
+            && revisedPageIndex < revisedPageCount
+    }
+}
+
+enum PDFManualPageMatchPersistence:
+    String,
+    Codable,
+    Hashable,
+    Sendable {
+    case savedOnDevice
+    case restoredFromDevice
+}
+
+enum PDFManualPageMatchCorrectionContext:
+    String,
+    Codable,
+    Hashable,
+    Sendable {
+    case documentPair
+    case versionSnapshot
+}
+
+struct PDFManualPageMatchCorrection:
+    Codable,
+    Hashable,
+    Sendable {
+    static let maximumPageCount = 100_000
+    static let maximumMatchCount = 1_024
+
+    let context: PDFManualPageMatchCorrectionContext
+    let sourceDocumentID: UUID
+    let sourceRevisionID: UUID
+    let revisedDocumentID: UUID
+    let revisedRevisionID: UUID
+    let versionSnapshotID: UUID?
+    let sourcePageCount: Int
+    let revisedPageCount: Int
+    let matches: [PDFManualPageMatch]
+    let updatedAt: Date
+
+    var comparisonIdentity: String {
+        switch context {
+        case .documentPair:
+            return [
+                context.rawValue,
+                sourceDocumentID.uuidString,
+                revisedDocumentID.uuidString
+            ].joined(separator: ":")
+        case .versionSnapshot:
+            return [
+                context.rawValue,
+                revisedDocumentID.uuidString,
+                versionSnapshotID?.uuidString ?? ""
+            ].joined(separator: ":")
+        }
+    }
+
+    func isStructurallyValid(
+        at referenceDate: Date
+    ) -> Bool {
+        let timestamp = updatedAt.timeIntervalSince1970
+        guard timestamp.isFinite,
+              timestamp >= 0,
+              updatedAt <= referenceDate.addingTimeInterval(5 * 60),
+              (1...Self.maximumPageCount).contains(
+                sourcePageCount
+              ),
+              (1...Self.maximumPageCount).contains(
+                revisedPageCount
+              ),
+              !matches.isEmpty,
+              matches.count <= Self.maximumMatchCount,
+              matches.count <= min(
+                sourcePageCount,
+                revisedPageCount
+              )
+        else { return false }
+
+        switch context {
+        case .documentPair:
+            guard sourceDocumentID != revisedDocumentID,
+                  versionSnapshotID == nil
+            else { return false }
+        case .versionSnapshot:
+            guard sourceDocumentID == revisedDocumentID,
+                  versionSnapshotID != nil
+            else { return false }
+        }
+
+        var previousSource = -1
+        var previousRevised = -1
+        for match in matches {
+            guard match.isValid(
+                sourcePageCount: sourcePageCount,
+                revisedPageCount: revisedPageCount
+            ),
+                  match.sourcePageIndex > previousSource,
+                  match.revisedPageIndex > previousRevised
+            else { return false }
+            previousSource = match.sourcePageIndex
+            previousRevised = match.revisedPageIndex
+        }
+        return true
+    }
+
+    func reversedDocumentPair() -> PDFManualPageMatchCorrection? {
+        guard context == .documentPair else { return nil }
+        return PDFManualPageMatchCorrection(
+            context: .documentPair,
+            sourceDocumentID: revisedDocumentID,
+            sourceRevisionID: revisedRevisionID,
+            revisedDocumentID: sourceDocumentID,
+            revisedRevisionID: sourceRevisionID,
+            versionSnapshotID: nil,
+            sourcePageCount: revisedPageCount,
+            revisedPageCount: sourcePageCount,
+            matches: matches.map {
+                PDFManualPageMatch(
+                    sourcePageIndex: $0.revisedPageIndex,
+                    revisedPageIndex: $0.sourcePageIndex
+                )
+            },
+            updatedAt: updatedAt
+        )
+    }
+}
+
+struct PDFManualPageMatchCorrectionLookup: Sendable {
+    let correction: PDFManualPageMatchCorrection?
+    let discardedStaleCorrection: Bool
+
+    static let none = PDFManualPageMatchCorrectionLookup(
+        correction: nil,
+        discardedStaleCorrection: false
+    )
+}
+
+struct PDFManualPageMatchStorageSummary: Hashable, Sendable {
+    static let maximumCorrectionCount = 256
+    static let maximumByteCount: Int64 = 1 * 1_024 * 1_024
+
+    static let empty = PDFManualPageMatchStorageSummary(
+        correctionCount: 0,
+        pageMatchCount: 0,
+        byteCount: 0,
+        newestUpdate: nil
+    )
+
+    let correctionCount: Int
+    let pageMatchCount: Int
+    let byteCount: Int64
+    let newestUpdate: Date?
+
+    static func measuring<S: Sequence>(
+        _ corrections: S,
+        byteCount: Int64
+    ) -> PDFManualPageMatchStorageSummary
+    where S.Element == PDFManualPageMatchCorrection {
+        var correctionCount = 0
+        var pageMatchCount = 0
+        var newestUpdate: Date?
+        for correction in corrections {
+            correctionCount += 1
+            pageMatchCount += correction.matches.count
+            newestUpdate = max(
+                newestUpdate ?? correction.updatedAt,
+                correction.updatedAt
+            )
+        }
+        return PDFManualPageMatchStorageSummary(
+            correctionCount: correctionCount,
+            pageMatchCount: pageMatchCount,
+            byteCount: max(0, byteCount),
+            newestUpdate: newestUpdate
+        )
+    }
+
+    var formattedBytes: String {
+        ByteCountFormatter.string(
+            fromByteCount: byteCount,
+            countStyle: .file
+        )
+    }
+
+    var countContract: String {
+        "\(correctionCount)/\(Self.maximumCorrectionCount)"
+    }
+
+    var byteContract: String {
+        AppLocalization.format(
+            "%@ / %@",
+            formattedBytes,
+            ByteCountFormatter.string(
+                fromByteCount: Self.maximumByteCount,
+                countStyle: .file
+            )
+        )
+    }
+
+    var countUsageFraction: Double {
+        min(
+            1,
+            Double(max(0, correctionCount))
+                / Double(Self.maximumCorrectionCount)
+        )
+    }
+
+    var byteUsageFraction: Double {
+        min(
+            1,
+            Double(max(0, byteCount))
+                / Double(Self.maximumByteCount)
+        )
+    }
+
+    var pressureFraction: Double {
+        max(countUsageFraction, byteUsageFraction)
+    }
+
+    var isNearCapacity: Bool {
+        correctionCount >= Self.maximumCorrectionCount - 32
+            || byteUsageFraction >= 0.8
     }
 }
 
@@ -8813,6 +11594,10 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
     let differenceRegions: [PDFDifferenceRegion]?
     let sourceTextDifferences: [PDFTextDifferenceEvidence]?
     let revisedTextDifferences: [PDFTextDifferenceEvidence]?
+    let sourceTextDifferenceOmittedCount: Int?
+    let revisedTextDifferenceOmittedCount: Int?
+    let sourceVectorDifferences: [PDFVectorDifferenceEvidence]?
+    let revisedVectorDifferences: [PDFVectorDifferenceEvidence]?
     let matchBasis: PDFPageMatchBasis?
 
     init(
@@ -8831,6 +11616,10 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
         differenceRegions: [PDFDifferenceRegion]? = nil,
         sourceTextDifferences: [PDFTextDifferenceEvidence]? = nil,
         revisedTextDifferences: [PDFTextDifferenceEvidence]? = nil,
+        sourceTextDifferenceOmittedCount: Int? = nil,
+        revisedTextDifferenceOmittedCount: Int? = nil,
+        sourceVectorDifferences: [PDFVectorDifferenceEvidence]? = nil,
+        revisedVectorDifferences: [PDFVectorDifferenceEvidence]? = nil,
         matchBasis: PDFPageMatchBasis? = nil
     ) {
         self.pageIndex = pageIndex
@@ -8848,6 +11637,12 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
         self.differenceRegions = differenceRegions
         self.sourceTextDifferences = sourceTextDifferences
         self.revisedTextDifferences = revisedTextDifferences
+        self.sourceTextDifferenceOmittedCount =
+            sourceTextDifferenceOmittedCount
+        self.revisedTextDifferenceOmittedCount =
+            revisedTextDifferenceOmittedCount
+        self.sourceVectorDifferences = sourceVectorDifferences
+        self.revisedVectorDifferences = revisedVectorDifferences
         self.matchBasis = matchBasis
     }
 
@@ -8890,7 +11685,45 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
     }
 
     var hasLocatedTextDifferences: Bool {
-        textDifferenceCount > 0
+        textDifferenceCount > 0 || hasTruncatedTextDifferences
+    }
+
+    var resolvedSourceTextDifferenceOmittedCount: Int {
+        max(0, sourceTextDifferenceOmittedCount ?? 0)
+    }
+
+    var resolvedRevisedTextDifferenceOmittedCount: Int {
+        max(0, revisedTextDifferenceOmittedCount ?? 0)
+    }
+
+    var textDifferenceOmittedCount: Int {
+        let (total, overflow) =
+            resolvedSourceTextDifferenceOmittedCount
+                .addingReportingOverflow(
+                    resolvedRevisedTextDifferenceOmittedCount
+                )
+        return overflow ? .max : total
+    }
+
+    var hasTruncatedTextDifferences: Bool {
+        textDifferenceOmittedCount > 0
+    }
+
+    var vectorDifferenceCount: Int {
+        (sourceVectorDifferences?.count ?? 0)
+            + (revisedVectorDifferences?.count ?? 0)
+    }
+
+    var hasLocatedVectorDifferences: Bool {
+        vectorDifferenceCount > 0
+    }
+
+    var localizedVectorEvidenceCountLabel: String {
+        AppLocalization.format(
+            "%lld vector boundar%@",
+            vectorDifferenceCount,
+            vectorDifferenceCount == 1 ? "y" : "ies"
+        )
     }
 
     var characterDifferenceCount: Int {
@@ -8902,8 +11735,51 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
             }.count
     }
 
+    var wordDifferenceCount: Int {
+        max(0, textDifferenceCount - characterDifferenceCount)
+    }
+
     var hasCharacterDifferences: Bool {
         characterDifferenceCount > 0
+    }
+
+    var localizedTextEvidenceCountLabel: String {
+        let capturedLabel: String
+        if characterDifferenceCount > 0, wordDifferenceCount > 0 {
+            capturedLabel = [
+                localizedTextEvidenceCount(
+                    characterDifferenceCount,
+                    key: "%lld character mark%@"
+                ),
+                localizedTextEvidenceCount(
+                    wordDifferenceCount,
+                    key: "%lld word mark%@"
+                )
+            ].joined(separator: " · ")
+        } else if characterDifferenceCount > 0 {
+            capturedLabel = localizedTextEvidenceCount(
+                characterDifferenceCount,
+                key: "%lld character mark%@"
+            )
+        } else {
+            capturedLabel = localizedTextEvidenceCount(
+                wordDifferenceCount,
+                key: "%lld word mark%@"
+            )
+        }
+        guard hasTruncatedTextDifferences else {
+            return capturedLabel
+        }
+        let omittedLabel = textDifferenceOmittedCount == 1
+            ? "1 additional text mark not shown".localizedUI
+            : AppLocalization.format(
+                "%lld additional text marks not shown",
+                textDifferenceOmittedCount
+            )
+        return [
+            capturedLabel,
+            omittedLabel
+        ].joined(separator: " · ")
     }
 
     var resolvedTextDifferenceGranularity:
@@ -8913,24 +11789,91 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
     }
 
     var textDifferencePreview: String? {
-        let removed = sourceTextDifferences?
-            .prefix(2)
-            .map(\.text)
-            .joined(separator: " ")
-        let inserted = revisedTextDifferences?
-            .prefix(2)
-            .map(\.text)
-            .joined(separator: " ")
+        let removed = compactTextEvidence(sourceTextDifferences)
+        let inserted = compactTextEvidence(revisedTextDifferences)
         switch (removed?.isEmpty == false, inserted?.isEmpty == false) {
         case (true, true):
-            return "\(removed ?? "") → \(inserted ?? "")"
+            return AppLocalization.format(
+                "%@ → %@",
+                removed ?? "",
+                inserted ?? ""
+            )
         case (true, false):
-            return "Removed \(removed ?? "")"
+            return AppLocalization.format(
+                "Deleted text: %@",
+                removed ?? ""
+            )
         case (false, true):
-            return "Added \(inserted ?? "")"
+            return AppLocalization.format(
+                "Added text: %@",
+                inserted ?? ""
+            )
         case (false, false):
             return nil
         }
+    }
+
+    private func compactTextEvidence(
+        _ evidence: [PDFTextDifferenceEvidence]?
+    ) -> String? {
+        guard let evidence else { return nil }
+        let characterEvidence = evidence.filter {
+            $0.resolvedGranularity == .character
+        }
+        let preferredEvidence = characterEvidence.isEmpty
+            ? evidence
+            : characterEvidence
+        let snippets = preferredEvidence
+            .prefix(3)
+            .map {
+                compactTextFragment(
+                    $0.text,
+                    limit: $0.resolvedGranularity == .character ? 18 : 48
+                )
+            }
+            .filter { !$0.isEmpty }
+        guard !snippets.isEmpty else { return nil }
+        let omitted = preferredEvidence.count - snippets.count
+        let summary = snippets.joined(separator: " · ")
+        return omitted > 0 ? "\(summary) +\(omitted)" : summary
+    }
+
+    private func localizedTextEvidenceCount(
+        _ count: Int,
+        key: String
+    ) -> String {
+        AppLocalization.format(
+            key,
+            count,
+            count == 1 ? "" : "s"
+        )
+    }
+
+    private func compactTextFragment(
+        _ value: String,
+        limit: Int
+    ) -> String {
+        let collapsed = value
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        let visible = collapsed.isEmpty && !value.isEmpty
+            ? visibleWhitespacePreview(value)
+            : collapsed
+        guard visible.count > limit else { return visible }
+        return String(visible.prefix(limit)) + "..."
+    }
+
+    private func visibleWhitespacePreview(_ value: String) -> String {
+        value.map { character -> String in
+            switch character {
+            case " ": return "␠"
+            case "\n", "\r": return "↵"
+            case "\t": return "⇥"
+            default: return String(character)
+            }
+        }
+        .joined()
     }
 
     var isMajorVisibleChange: Bool {
@@ -8943,6 +11886,15 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
 
     var preferredOpenSide: PDFChangePageSide {
         revisedExists ? .revised : .source
+    }
+
+    var preferredOpenPageIndex: Int? {
+        switch preferredOpenSide {
+        case .source:
+            return resolvedSourcePageIndex
+        case .revised:
+            return resolvedRevisedPageIndex
+        }
     }
 
     var severity: PDFChangeSeverity {
@@ -8963,24 +11915,40 @@ struct PDFPageChange: Codable, Hashable, Identifiable, Sendable {
 }
 
 struct PDFChangeReview: Codable, Hashable, Sendable {
+    private static let maximumPageCount = 100_000
+    private static let maximumAlignmentCount = 200_000
+    private static let maximumVisualRegionsPerChange = 12
+    private static let maximumEvidencePerSide = 24
+    private static let maximumEvidenceCharacters = 160
+    private static let maximumEvidenceUTF8Bytes = 640
+
     let sourcePageCount: Int
     let revisedPageCount: Int
     let comparedPageCount: Int
     let changes: [PDFPageChange]
     let pageMatches: [PDFPageMatch]?
+    let manualPageMatches: [PDFManualPageMatch]?
+    let manualPageMatchPersistence:
+        PDFManualPageMatchPersistence?
 
     init(
         sourcePageCount: Int,
         revisedPageCount: Int,
         comparedPageCount: Int,
         changes: [PDFPageChange],
-        pageMatches: [PDFPageMatch]? = nil
+        pageMatches: [PDFPageMatch]? = nil,
+        manualPageMatches: [PDFManualPageMatch]? = nil,
+        manualPageMatchPersistence:
+            PDFManualPageMatchPersistence? = nil
     ) {
         self.sourcePageCount = sourcePageCount
         self.revisedPageCount = revisedPageCount
         self.comparedPageCount = comparedPageCount
         self.changes = changes
         self.pageMatches = pageMatches
+        self.manualPageMatches = manualPageMatches
+        self.manualPageMatchPersistence =
+            manualPageMatchPersistence
     }
 
     var visibleChanges: [PDFPageChange] {
@@ -8989,6 +11957,10 @@ struct PDFChangeReview: Codable, Hashable, Sendable {
 
     var textChanges: [PDFPageChange] {
         changes.filter(\.textChanged)
+    }
+
+    var vectorChanges: [PDFPageChange] {
+        changes.filter(\.hasLocatedVectorDifferences)
     }
 
     var majorVisibleChanges: [PDFPageChange] {
@@ -9023,6 +11995,16 @@ struct PDFChangeReview: Codable, Hashable, Sendable {
         textChanges.count
     }
 
+    var vectorChangedPageCount: Int {
+        vectorChanges.count
+    }
+
+    var totalVectorDifferenceCount: Int {
+        changes.reduce(0) {
+            $0 + $1.vectorDifferenceCount
+        }
+    }
+
     var geometryChangedPageCount: Int {
         geometryChanges.count
     }
@@ -9049,6 +12031,353 @@ struct PDFChangeReview: Codable, Hashable, Sendable {
         sourcePageCount == revisedPageCount && changes.isEmpty
     }
 
+    func isStructurallyValid() -> Bool {
+        guard (1...Self.maximumPageCount).contains(sourcePageCount),
+              (1...Self.maximumPageCount).contains(revisedPageCount),
+              (0...min(sourcePageCount, revisedPageCount))
+                .contains(comparedPageCount),
+              changes.count <= Self.maximumAlignmentCount,
+              (pageMatches?.count ?? 0) <= Self.maximumAlignmentCount,
+              (manualPageMatches?.count ?? 0)
+                <= PDFManualPageMatchCorrection.maximumMatchCount,
+              validChanges(),
+              validPageMatches(),
+              validManualPageMatches()
+        else { return false }
+        return true
+    }
+
+    private func validChanges() -> Bool {
+        var identities: Set<String> = []
+        return changes.allSatisfy { change in
+            let sourceIndexIsValid =
+                change.resolvedSourcePageIndex.map {
+                    (0..<sourcePageCount).contains($0)
+                } ?? true
+            let revisedIndexIsValid =
+                change.resolvedRevisedPageIndex.map {
+                    (0..<revisedPageCount).contains($0)
+                } ?? true
+            guard identities.insert(change.id).inserted,
+                  change.pageIndex >= 0,
+                  change.pageIndex < Self.maximumAlignmentCount,
+                  change.visibleDifference.isFinite,
+                  (0...1).contains(change.visibleDifference),
+                  change.changedPixelRatio.isFinite,
+                  (0...1).contains(change.changedPixelRatio),
+                  change.sourceTextCharacterCount >= 0,
+                  change.revisedTextCharacterCount >= 0,
+                  change.sourceExists
+                    == (change.resolvedSourcePageIndex != nil),
+                  change.revisedExists
+                    == (change.resolvedRevisedPageIndex != nil),
+                  change.sourceExists || change.revisedExists,
+                  validChangeKind(change),
+                  sourceIndexIsValid,
+                  revisedIndexIsValid,
+                  validRegions(
+                      change.differenceRegions,
+                      maximumCount:
+                        Self.maximumVisualRegionsPerChange
+                  ),
+                  validTextEvidence(change.sourceTextDifferences),
+                  validTextEvidence(change.revisedTextDifferences),
+                  validVectorEvidence(change.sourceVectorDifferences),
+                  validVectorEvidence(change.revisedVectorDifferences),
+                  change.resolvedSourceTextDifferenceOmittedCount
+                    <= Self.maximumPageCount,
+                  change.resolvedRevisedTextDifferenceOmittedCount
+                    <= Self.maximumPageCount
+            else { return false }
+            return true
+        }
+    }
+
+    private func validPageMatches() -> Bool {
+        guard let pageMatches else { return true }
+        var identities: Set<Int> = []
+        var sourceIndices: Set<Int> = []
+        var revisedIndices: Set<Int> = []
+        var pairedCount = 0
+        for match in pageMatches {
+            guard identities.insert(match.id).inserted,
+                  match.sourcePageIndex != nil
+                    || match.revisedPageIndex != nil,
+                  validMatchKind(match)
+            else { return false }
+            if let sourceIndex = match.sourcePageIndex {
+                guard (0..<sourcePageCount).contains(sourceIndex),
+                      sourceIndices.insert(sourceIndex).inserted
+                else { return false }
+            }
+            if let revisedIndex = match.revisedPageIndex {
+                guard (0..<revisedPageCount).contains(revisedIndex),
+                      revisedIndices.insert(revisedIndex).inserted
+                else { return false }
+            }
+            if match.sourcePageIndex != nil,
+               match.revisedPageIndex != nil {
+                pairedCount += 1
+            }
+        }
+        return pairedCount == comparedPageCount
+    }
+
+    private func validManualPageMatches() -> Bool {
+        guard let manualPageMatches else { return true }
+        var previousSource = -1
+        var previousRevised = -1
+        for match in manualPageMatches {
+            guard match.isValid(
+                sourcePageCount: sourcePageCount,
+                revisedPageCount: revisedPageCount
+            ),
+                  match.sourcePageIndex > previousSource,
+                  match.revisedPageIndex > previousRevised
+            else { return false }
+            previousSource = match.sourcePageIndex
+            previousRevised = match.revisedPageIndex
+        }
+        return true
+    }
+
+    private func validTextEvidence(
+        _ evidence: [PDFTextDifferenceEvidence]?
+    ) -> Bool {
+        guard let evidence else { return true }
+        return evidence.count <= Self.maximumEvidencePerSide
+            && evidence.allSatisfy {
+                validEvidenceText($0.text)
+                    && $0.region.isStructurallyValid
+            }
+    }
+
+    private func validEvidenceText(_ text: String) -> Bool {
+        !text.isEmpty
+            && text.count <= Self.maximumEvidenceCharacters
+            && text.utf8.count <= Self.maximumEvidenceUTF8Bytes
+            && text.unicodeScalars.allSatisfy {
+                $0.value != 0
+                    && !CharacterSet.illegalCharacters.contains($0)
+            }
+    }
+
+    private func validVectorEvidence(
+        _ evidence: [PDFVectorDifferenceEvidence]?
+    ) -> Bool {
+        guard let evidence else { return true }
+        return evidence.count <= Self.maximumEvidencePerSide
+            && evidence.allSatisfy {
+                $0.region.isStructurallyValid
+            }
+    }
+
+    private func validRegions(
+        _ regions: [PDFDifferenceRegion]?,
+        maximumCount: Int
+    ) -> Bool {
+        guard let regions else { return true }
+        return regions.count <= maximumCount
+            && regions.allSatisfy(\.isStructurallyValid)
+    }
+
+    private func validChangeKind(_ change: PDFPageChange) -> Bool {
+        switch (
+            change.sourceExists,
+            change.revisedExists,
+            change.resolvedMatchKind
+        ) {
+        case (false, true, .inserted),
+             (true, false, .removed),
+             (true, true, .modified):
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func validMatchKind(_ match: PDFPageMatch) -> Bool {
+        switch (
+            match.sourcePageIndex != nil,
+            match.revisedPageIndex != nil,
+            match.kind
+        ) {
+        case (false, true, .inserted),
+             (true, false, .removed),
+             (true, true, .modified),
+             (true, true, .unchanged):
+            return true
+        default:
+            return false
+        }
+    }
+
+    var pairedPageMatchCount: Int {
+        guard let pageMatches,
+              !pageMatches.isEmpty
+        else {
+            return min(sourcePageCount, revisedPageCount)
+        }
+        return pageMatches.reduce(into: 0) { count, match in
+            if match.sourcePageIndex != nil,
+               match.revisedPageIndex != nil {
+                count += 1
+            }
+        }
+    }
+
+    var stablePageMatchCount: Int {
+        guard let pageMatches,
+              !pageMatches.isEmpty
+        else { return 0 }
+        return pageMatches.reduce(into: 0) { count, match in
+            if match.sourcePageIndex != nil,
+               match.revisedPageIndex != nil,
+               let basis = match.basis,
+               basis != .similarity {
+                count += 1
+            }
+        }
+    }
+
+    var repeatedTemplateMatchCount: Int {
+        guard let pageMatches,
+              !pageMatches.isEmpty
+        else { return 0 }
+        return pageMatches.reduce(into: 0) { count, match in
+            if match.sourcePageIndex != nil,
+               match.revisedPageIndex != nil,
+               match.basis == .repeatedContent {
+                count += 1
+            }
+        }
+    }
+
+    var similarityPageMatchCount: Int {
+        guard let pageMatches,
+              !pageMatches.isEmpty
+        else { return 0 }
+        return pageMatches.reduce(into: 0) { count, match in
+            if match.sourcePageIndex != nil,
+               match.revisedPageIndex != nil,
+               match.basis == .similarity {
+                count += 1
+            }
+        }
+    }
+
+    var resolvedManualPageMatches: [PDFManualPageMatch] {
+        if let manualPageMatches {
+            return manualPageMatches
+        }
+        guard let pageMatches,
+              !pageMatches.isEmpty
+        else { return [] }
+        return pageMatches.compactMap { match in
+            guard match.basis == .manual,
+                  let sourcePageIndex = match.sourcePageIndex,
+                  let revisedPageIndex = match.revisedPageIndex
+            else { return nil }
+            return PDFManualPageMatch(
+                sourcePageIndex: sourcePageIndex,
+                revisedPageIndex: revisedPageIndex
+            )
+        }
+    }
+
+    var manualPageMatchCount: Int {
+        resolvedManualPageMatches.count
+    }
+
+    func markingManualPageMatchPersistence(
+        _ persistence: PDFManualPageMatchPersistence?
+    ) -> PDFChangeReview {
+        PDFChangeReview(
+            sourcePageCount: sourcePageCount,
+            revisedPageCount: revisedPageCount,
+            comparedPageCount: comparedPageCount,
+            changes: changes,
+            pageMatches: pageMatches,
+            manualPageMatches: manualPageMatches,
+            manualPageMatchPersistence:
+                resolvedManualPageMatches.isEmpty
+                    ? nil
+                    : persistence
+        )
+    }
+
+    var estimatedCacheByteCount: Int64 {
+        func adding(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
+
+        func scaled(_ count: Int, by unit: Int64) -> Int64 {
+            let (product, overflow) = Int64(clamping: count)
+                .multipliedReportingOverflow(by: unit)
+            return overflow ? .max : product
+        }
+
+        func evidenceCost(
+            _ evidence: [PDFTextDifferenceEvidence]?
+        ) -> Int64 {
+            (evidence ?? []).reduce(Int64.zero) { total, item in
+                adding(
+                    total,
+                    adding(
+                        128,
+                        Int64(clamping: item.text.utf8.count)
+                    )
+                )
+            }
+        }
+
+        var total = adding(
+            256,
+            scaled(changes.count, by: 256)
+        )
+        total = adding(
+            total,
+            scaled(pageMatches?.count ?? 0, by: 48)
+        )
+        total = adding(
+            total,
+            scaled(manualPageMatches?.count ?? 0, by: 24)
+        )
+        for change in changes {
+            total = adding(
+                total,
+                scaled(
+                    change.differenceRegions?.count ?? 0,
+                    by: 48
+                )
+            )
+            total = adding(
+                total,
+                evidenceCost(change.sourceTextDifferences)
+            )
+            total = adding(
+                total,
+                evidenceCost(change.revisedTextDifferences)
+            )
+            total = adding(
+                total,
+                scaled(
+                    change.sourceVectorDifferences?.count ?? 0,
+                    by: 64
+                )
+            )
+            total = adding(
+                total,
+                scaled(
+                    change.revisedVectorDifferences?.count ?? 0,
+                    by: 64
+                )
+            )
+        }
+        return total
+    }
+
     var resolvedPageMatches: [PDFPageMatch] {
         if let pageMatches, !pageMatches.isEmpty {
             return pageMatches
@@ -9071,19 +12400,109 @@ struct PDFChangeReview: Codable, Hashable, Sendable {
     }
 
     func revisedPage(matchingSourcePage index: Int) -> Int? {
-        resolvedPageMatches.first {
+        guard sourcePageCount > 0,
+              index >= 0,
+              index < sourcePageCount
+        else { return nil }
+        guard let pageMatches, !pageMatches.isEmpty else {
+            return index < revisedPageCount ? index : nil
+        }
+        return pageMatches.first {
             $0.sourcePageIndex == index
         }?.revisedPageIndex
     }
 
     func sourcePage(matchingRevisedPage index: Int) -> Int? {
-        resolvedPageMatches.first {
+        guard revisedPageCount > 0,
+              index >= 0,
+              index < revisedPageCount
+        else { return nil }
+        guard let pageMatches, !pageMatches.isEmpty else {
+            return index < sourcePageCount ? index : nil
+        }
+        return pageMatches.first {
             $0.revisedPageIndex == index
         }?.sourcePageIndex
     }
 }
 
+struct PDFPageMatchLookup: Sendable {
+    private static let maximumPageCount = 100_000
+    private let revisedBySource: [Int?]
+    private let sourceByRevised: [Int?]
+
+    init(review: PDFChangeReview) {
+        guard (0...Self.maximumPageCount).contains(
+            review.sourcePageCount
+        ),
+        (0...Self.maximumPageCount).contains(
+            review.revisedPageCount
+        ) else {
+            revisedBySource = []
+            sourceByRevised = []
+            return
+        }
+
+        var revisedBySource = Array<Int?>(
+            repeating: nil,
+            count: review.sourcePageCount
+        )
+        var sourceByRevised = Array<Int?>(
+            repeating: nil,
+            count: review.revisedPageCount
+        )
+        if let matches = review.pageMatches, !matches.isEmpty {
+            for match in matches {
+                if let source = match.sourcePageIndex,
+                   let revised = match.revisedPageIndex,
+                   revisedBySource.indices.contains(source),
+                   sourceByRevised.indices.contains(revised),
+                   revisedBySource[source] == nil,
+                   sourceByRevised[revised] == nil {
+                    revisedBySource[source] = revised
+                    sourceByRevised[revised] = source
+                }
+            }
+        } else {
+            for index in 0..<min(
+                review.sourcePageCount,
+                review.revisedPageCount
+            ) {
+                revisedBySource[index] = index
+                sourceByRevised[index] = index
+            }
+        }
+        self.revisedBySource = revisedBySource
+        self.sourceByRevised = sourceByRevised
+    }
+
+    func revisedPage(matchingSourcePage index: Int) -> Int? {
+        guard revisedBySource.indices.contains(index) else {
+            return nil
+        }
+        return revisedBySource[index]
+    }
+
+    func sourcePage(matchingRevisedPage index: Int) -> Int? {
+        guard sourceByRevised.indices.contains(index) else {
+            return nil
+        }
+        return sourceByRevised[index]
+    }
+}
+
 struct PDFDeliveryReceipt: Codable, Hashable, Identifiable, Sendable {
+    private static let maximumPageCount = 100_000
+    private static let maximumArtifactBytes: Int64 =
+        1_073_741_824
+    private static let maximumCheckCount = 64
+    private static let maximumCheckIDLength = 64
+    private static let maximumCheckTitleLength = 120
+    private static let maximumCheckDetailLength = 320
+    private static let sha256Characters = CharacterSet(
+        charactersIn: "0123456789abcdefABCDEF"
+    )
+
     let id: UUID
     let operation: PDFDeliveryOperation
     let createdAt: Date
@@ -9112,10 +12531,71 @@ struct PDFDeliveryReceipt: Codable, Hashable, Identifiable, Sendable {
     }
 
     var isVerified: Bool {
-        !checks.contains { $0.status == .failed }
+        isVerified(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isVerified(at date: Date) -> Bool {
+        isStructurallyValid(at: date)
+            && !checks.contains { $0.status == .failed }
             && renderedPageCount == outputPageCount
             && hasExpectedPageCount
-            && !sha256.isEmpty
+    }
+
+    var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        let timestamp = createdAt.timeIntervalSince1970
+        return timestamp.isFinite
+            && timestamp >= 0
+            && createdAt <= date.addingTimeInterval(5 * 60)
+            && (1...Self.maximumPageCount).contains(sourcePageCount)
+            && (1...Self.maximumPageCount).contains(outputPageCount)
+            && (0...outputPageCount).contains(renderedPageCount)
+            && sourceByteCount > 0
+            && sourceByteCount <= Self.maximumArtifactBytes
+            && outputByteCount > 0
+            && outputByteCount <= Self.maximumArtifactBytes
+            && annotationCount >= 0
+            && textCharacterCount >= 0
+            && personalMetadataEntryCount >= 0
+            && hasValidFingerprint
+            && !checks.isEmpty
+            && checks.count <= Self.maximumCheckCount
+            && Set(checks.map(\.id)).count == checks.count
+            && checks.allSatisfy(Self.isValidCheck)
+            && (
+                changeReview.map {
+                    $0.sourcePageCount == sourcePageCount
+                        && $0.revisedPageCount == outputPageCount
+                        && $0.isStructurallyValid()
+                } ?? true
+            )
+            && Set(unexpectedBlankPageIndices).count
+                == unexpectedBlankPageIndices.count
+            && unexpectedBlankPageIndices.allSatisfy {
+                (0..<outputPageCount).contains($0)
+            }
+            && (
+                operation != .protected
+                    || isEncrypted
+            )
+            && (
+                operation != .unlocked
+                    || !isEncrypted
+            )
+    }
+
+    private var hasValidFingerprint: Bool {
+        sha256.count == 64
+            && sha256.unicodeScalars.allSatisfy {
+                Self.sha256Characters.contains($0)
+            }
     }
 
     private var hasExpectedPageCount: Bool {
@@ -9199,6 +12679,60 @@ struct PDFDeliveryReceipt: Codable, Hashable, Identifiable, Sendable {
             result.append(pair.element)
         }
     }
+
+    var milestoneArchiveCopy: PDFDeliveryReceipt {
+        PDFDeliveryReceipt(
+            id: id,
+            operation: operation,
+            createdAt: createdAt,
+            sourcePageCount: sourcePageCount,
+            outputPageCount: outputPageCount,
+            renderedPageCount: renderedPageCount,
+            sourceByteCount: sourceByteCount,
+            outputByteCount: outputByteCount,
+            unexpectedBlankPageIndices: unexpectedBlankPageIndices,
+            annotationCount: annotationCount,
+            textCharacterCount: textCharacterCount,
+            personalMetadataEntryCount: personalMetadataEntryCount,
+            isEncrypted: isEncrypted,
+            sha256: sha256,
+            checks: checks,
+            changeReview: nil,
+            sourceRevisionID: sourceRevisionID,
+            outputRevisionID: outputRevisionID
+        )
+    }
+
+    private static func isValidCheck(
+        _ check: PDFDeliveryCheck
+    ) -> Bool {
+        !check.id.isEmpty
+            && check.id.count <= maximumCheckIDLength
+            && !check.title.isEmpty
+            && check.title.count <= maximumCheckTitleLength
+            && !check.detail.isEmpty
+            && check.detail.count <= maximumCheckDetailLength
+            && isSafeDisplayText(check.id)
+            && isSafeDisplayText(check.title)
+            && isSafeDisplayText(check.detail)
+    }
+
+    private static func isSafeDisplayText(
+        _ value: String
+    ) -> Bool {
+        value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                codePoint == 0x061C
+                || codePoint == 0x200E
+                || codePoint == 0x200F
+                || (0x202A...0x202E).contains(codePoint)
+                || (0x2066...0x2069).contains(codePoint)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !isBidirectionalControl
+        }
+    }
 }
 
 struct PDFDeliveryPackageManifest:
@@ -9224,11 +12758,12 @@ struct PDFDeliveryPackageManifest:
     static let currentSchema = "PaperPath PDF Delivery Package V1"
     static let maximumArtifactBytes: Int64 =
         1_073_741_824
-    static let maximumArtifactPageCount = 10_000
+    static let maximumArtifactPageCount = 100_000
     static let maximumCheckCount = 64
     static let maximumCheckIDLength = 64
     static let maximumCheckTitleLength = 120
     static let maximumCheckDetailLength = 320
+    static let maximumArtifactFileNameBytes = 255
 
     let schema: String
     let packageID: UUID
@@ -9276,7 +12811,8 @@ struct PDFDeliveryPackageManifest:
 
     init(
         packageID: UUID = UUID(),
-        createdAt: Date = Date(),
+        createdAt: Date =
+            PDFOfficeTimeAnchor.process.trustedDate(),
         artifactFileName: String,
         record: DocumentRecord,
         receipt: PDFDeliveryReceipt
@@ -9311,11 +12847,27 @@ struct PDFDeliveryPackageManifest:
     }
 
     var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
         let hexadecimal = CharacterSet(
             charactersIn: "0123456789abcdefABCDEF"
         )
+        let createdTimestamp = createdAt.timeIntervalSince1970
+        let verificationTimestamp =
+            verificationCreatedAt.timeIntervalSince1970
         guard sourcePageCount > 0,
-              sourcePageCount <= Self.maximumArtifactPageCount
+              sourcePageCount <= Self.maximumArtifactPageCount,
+              createdTimestamp.isFinite,
+              verificationTimestamp.isFinite,
+              createdTimestamp >= 0,
+              verificationTimestamp >= 0,
+              createdAt <= date.addingTimeInterval(5 * 60),
+              verificationCreatedAt
+                <= createdAt.addingTimeInterval(5 * 60)
         else { return false }
         let expectedPageCount: Int
         switch operation {
@@ -9327,12 +12879,15 @@ struct PDFDeliveryPackageManifest:
         return schema == Self.currentSchema
             && artifact.fileName.count >= 5
             && artifact.fileName.count <= 180
+            && artifact.fileName.utf8.count
+                <= Self.maximumArtifactFileNameBytes
             && artifact.fileName
                 == (artifact.fileName as NSString)
                     .lastPathComponent
             && !artifact.fileName.hasPrefix(".")
             && !artifact.fileName.contains("\\")
             && artifact.fileName.lowercased().hasSuffix(".pdf")
+            && Self.isSafeDisplayText(artifact.fileName)
             && artifact.byteCount > 0
             && artifact.byteCount <= Self.maximumArtifactBytes
             && artifact.pageCount > 0
@@ -9354,10 +12909,13 @@ struct PDFDeliveryPackageManifest:
             && checks.allSatisfy {
                 !$0.id.isEmpty
                     && $0.id.count <= Self.maximumCheckIDLength
+                    && Self.isSafeDisplayText($0.id)
                     && !$0.title.isEmpty
                     && $0.title.count <= Self.maximumCheckTitleLength
+                    && Self.isSafeDisplayText($0.title)
                     && !$0.detail.isEmpty
                     && $0.detail.count <= Self.maximumCheckDetailLength
+                    && Self.isSafeDisplayText($0.detail)
             }
             && Set(unexpectedBlankPageIndices).count
                 == unexpectedBlankPageIndices.count
@@ -9368,10 +12926,35 @@ struct PDFDeliveryPackageManifest:
             && textCharacterCount >= 0
             && personalMetadataEntryCount >= 0
             && (
+                operation != .protected
+                    || isEncrypted
+            )
+            && (
+                operation != .unlocked
+                    || !isEncrypted
+            )
+            && (
                 outputRevisionID == nil
                     || outputRevisionID
                         == artifact.contentRevisionID
             )
+    }
+
+    private static func isSafeDisplayText(
+        _ value: String
+    ) -> Bool {
+        value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                codePoint == 0x061C
+                || codePoint == 0x200E
+                || codePoint == 0x200F
+                || (0x202A...0x202E).contains(codePoint)
+                || (0x2066...0x2069).contains(codePoint)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !isBidirectionalControl
+        }
     }
 }
 
@@ -9381,6 +12964,54 @@ struct PDFSignedDeliveryPackageManifest:
     Sendable {
     let manifest: PDFDeliveryPackageManifest
     let signature: PDFOfficeVerificationSignature
+}
+
+enum PDFDeliveryPackageVerificationFailureKind:
+    Hashable,
+    Sendable {
+    case access
+    case integrity
+    case sourceLimit
+    case storage
+    case unknown
+}
+
+struct PDFDeliveryPackageVerificationFailure:
+    Identifiable,
+    Hashable,
+    Sendable {
+    let id: UUID
+    let kind: PDFDeliveryPackageVerificationFailureKind
+    let detail: String
+
+    init(
+        id: UUID = UUID(),
+        kind: PDFDeliveryPackageVerificationFailureKind,
+        detail: String
+    ) {
+        self.id = id
+        self.kind = kind
+        self.detail = detail
+    }
+
+    var title: String {
+        switch kind {
+        case .access:
+            return "Package Unavailable"
+        case .integrity:
+            return "Package Could Not Be Verified"
+        case .sourceLimit:
+            return "Package Too Large"
+        case .storage:
+            return "Free Space Needed"
+        case .unknown:
+            return "Couldn’t Verify Package"
+        }
+    }
+
+    var offersStorageRecovery: Bool {
+        kind == .storage
+    }
 }
 
 struct PDFDeliveryPackageVerificationReport:
@@ -9396,6 +13027,7 @@ struct PDFDeliveryPackageVerificationReport:
     let artifactFileName: String
     let artifactByteCount: Int64
     let artifactPageCount: Int
+    let isEncrypted: Bool
     let operation: PDFDeliveryOperation
     let deliveryReceiptID: UUID
     let expectedSHA256: String
@@ -9408,6 +13040,7 @@ struct PDFDeliveryPackageVerificationReport:
     let signerPublicKeyBase64: String?
     let trustStatus: PDFOfficeSignerTrustStatus
     let trustedSignerName: String?
+    let verifiedArtifactURL: URL?
 
     init(
         id: UUID = UUID(),
@@ -9419,6 +13052,7 @@ struct PDFDeliveryPackageVerificationReport:
         artifactFileName: String,
         artifactByteCount: Int64,
         artifactPageCount: Int,
+        isEncrypted: Bool,
         operation: PDFDeliveryOperation,
         deliveryReceiptID: UUID,
         expectedSHA256: String,
@@ -9430,7 +13064,8 @@ struct PDFDeliveryPackageVerificationReport:
         signerKeyID: String?,
         signerPublicKeyBase64: String?,
         trustStatus: PDFOfficeSignerTrustStatus,
-        trustedSignerName: String?
+        trustedSignerName: String?,
+        verifiedArtifactURL: URL? = nil
     ) {
         self.id = id
         self.archiveName = archiveName
@@ -9441,6 +13076,7 @@ struct PDFDeliveryPackageVerificationReport:
         self.artifactFileName = artifactFileName
         self.artifactByteCount = artifactByteCount
         self.artifactPageCount = artifactPageCount
+        self.isEncrypted = isEncrypted
         self.operation = operation
         self.deliveryReceiptID = deliveryReceiptID
         self.expectedSHA256 = expectedSHA256
@@ -9453,6 +13089,7 @@ struct PDFDeliveryPackageVerificationReport:
         self.signerPublicKeyBase64 = signerPublicKeyBase64
         self.trustStatus = trustStatus
         self.trustedSignerName = trustedSignerName
+        self.verifiedArtifactURL = verifiedArtifactURL
     }
 
     var integrityStatus: PDFVersionArchiveVerificationStatus {
@@ -9498,6 +13135,14 @@ struct PDFDeliveryPackageVerificationReport:
             && signerPublicKeyBase64 != nil
     }
 
+    var canOpenArtifact: Bool {
+        status == .verified && verifiedArtifactURL != nil
+    }
+
+    var canPreviewArtifact: Bool {
+        canOpenArtifact && !isEncrypted
+    }
+
     var provenanceTitle: String {
         if hasInvalidSourceSignature {
             return "Invalid source signature"
@@ -9519,6 +13164,7 @@ struct PDFDeliveryPackageVerificationReport:
             artifactFileName: artifactFileName,
             artifactByteCount: artifactByteCount,
             artifactPageCount: artifactPageCount,
+            isEncrypted: isEncrypted,
             operation: operation,
             deliveryReceiptID: deliveryReceiptID,
             expectedSHA256: expectedSHA256,
@@ -9530,7 +13176,87 @@ struct PDFDeliveryPackageVerificationReport:
             signerKeyID: signerKeyID,
             signerPublicKeyBase64: signerPublicKeyBase64,
             trustStatus: trustStatus,
-            trustedSignerName: trustedSignerName
+            trustedSignerName: trustedSignerName,
+            verifiedArtifactURL: verifiedArtifactURL
+        )
+    }
+}
+
+struct PDFReceivedPackageProvenance:
+    Codable,
+    Hashable,
+    Sendable {
+    let packageID: UUID
+    let deliveryReceiptID: UUID
+    let packageCreatedAt: Date
+    let verifiedAt: Date
+    let importedAt: Date
+    let operation: PDFDeliveryOperation
+    let artifactSHA256: String
+    let artifactByteCount: Int64
+    let signerKeyID: String?
+    let signerTrustStatus: PDFOfficeSignerTrustStatus
+    let trustedSignerName: String?
+
+    init(
+        report: PDFDeliveryPackageVerificationReport,
+        importedAt: Date = Date()
+    ) {
+        packageID = report.packageID
+        deliveryReceiptID = report.deliveryReceiptID
+        packageCreatedAt = report.packageCreatedAt
+        verifiedAt = report.verifiedAt
+        self.importedAt = importedAt
+        operation = report.operation
+        artifactSHA256 = report.expectedSHA256.lowercased()
+        artifactByteCount = report.artifactByteCount
+        signerKeyID = report.signerKeyID
+        signerTrustStatus = report.trustStatus
+        trustedSignerName = report.trustedSignerName
+    }
+
+    func matchesCurrentBytes(
+        fingerprint: String?,
+        byteCount: Int64
+    ) -> Bool {
+        guard let fingerprint,
+              Self.isSHA256(artifactSHA256),
+              Self.isSHA256(fingerprint),
+              artifactByteCount > 0,
+              byteCount == artifactByteCount
+        else { return false }
+        return fingerprint.caseInsensitiveCompare(artifactSHA256)
+            == .orderedSame
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
+
+    var sourceTitle: String {
+        switch signerTrustStatus {
+        case .thisDevice:
+            return "Verified on this device"
+        case .trusted:
+            return trustedSignerName ?? "Trusted signer"
+        case .unknown:
+            return "Unknown signer"
+        case .invalid:
+            return "Invalid source"
+        case .unsupported:
+            return "Unsupported source"
+        }
+    }
+
+    var formattedArtifactSize: String {
+        ByteCountFormatter.string(
+            fromByteCount: artifactByteCount,
+            countStyle: .file
         )
     }
 }
@@ -9559,12 +13285,15 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
     var sourceBookmarkData: Data?
     var sourceLocationName: String?
     var sourceImportedFingerprint: String?
+    // Legacy archive metadata; current workflows never replace source files.
     var sourceWritebackAt: Date?
     var contentFingerprint: String?
     var deletedAt: Date?
     var dueAt: Date?
     var privateNote: String?
     var bookmarkNames: [Int: String]
+    var receivedPackageProvenance: PDFReceivedPackageProvenance?
+    var sharedImportID: UUID?
 
     init(
         id: UUID = UUID(),
@@ -9595,7 +13324,10 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
         deletedAt: Date? = nil,
         dueAt: Date? = nil,
         privateNote: String? = nil,
-        bookmarkNames: [Int: String] = [:]
+        bookmarkNames: [Int: String] = [:],
+        receivedPackageProvenance:
+            PDFReceivedPackageProvenance? = nil,
+        sharedImportID: UUID? = nil
     ) {
         self.id = id
         self.displayName = displayName
@@ -9633,6 +13365,9 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
         self.dueAt = dueAt
         self.privateNote = privateNote
         self.bookmarkNames = bookmarkNames
+        self.receivedPackageProvenance =
+            receivedPackageProvenance
+        self.sharedImportID = sharedImportID
     }
 
     var subtitle: String {
@@ -9648,8 +13383,8 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
         guard let receipt = deliveryReceipt,
               receipt.isVerified,
               let contentFingerprint,
-              !contentFingerprint.isEmpty,
-              !receipt.sha256.isEmpty,
+              receipt.outputPageCount == profile.pageCount,
+              receipt.outputByteCount == profile.byteCount,
               contentFingerprint.caseInsensitiveCompare(receipt.sha256)
                 == .orderedSame
         else { return false }
@@ -9666,6 +13401,13 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
 
     var isWorkingCopy: Bool {
         !isDeliveryArtifact
+    }
+
+    var hasCurrentReceivedPackageProvenance: Bool {
+        receivedPackageProvenance?.matchesCurrentBytes(
+            fingerprint: contentFingerprint,
+            byteCount: profile.byteCount
+        ) == true
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -9698,6 +13440,8 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
         case dueAt
         case privateNote
         case bookmarkNames
+        case receivedPackageProvenance
+        case sharedImportID
     }
 
     init(from decoder: Decoder) throws {
@@ -9799,6 +13543,14 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
             [Int: String].self,
             forKey: .bookmarkNames
         ) ?? [:]
+        receivedPackageProvenance = try container.decodeIfPresent(
+            PDFReceivedPackageProvenance.self,
+            forKey: .receivedPackageProvenance
+        )
+        sharedImportID = try container.decodeIfPresent(
+            UUID.self,
+            forKey: .sharedImportID
+        )
     }
 }
 
@@ -9889,6 +13641,46 @@ enum DocumentCommandReadiness: String, Hashable {
     }
 }
 
+enum DocumentTextAvailability: Hashable {
+    case locked, recognized, imageOnly, partial, available
+
+    init(isLocked: Bool, hasRecognizedText: Bool, textCoverage: Double, imagePageCount: Int) {
+        if isLocked {
+            self = .locked
+        } else if hasRecognizedText {
+            self = .recognized
+        } else if !textCoverage.isFinite || textCoverage <= 0 {
+            self = .imageOnly
+        } else if imagePageCount > 0 || textCoverage < 0.6 {
+            self = .partial
+        } else {
+            self = .available
+        }
+    }
+
+    var needsRecognition: Bool { self == .imageOnly || self == .partial }
+
+    var title: String {
+        switch self {
+        case .locked: return "Unlock to inspect text"
+        case .recognized: return "Recognized text saved"
+        case .imageOnly: return "Recognition needed"
+        case .partial: return "Some pages need recognition"
+        case .available: return "Text available"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .locked: return "The PDF is locked."
+        case .recognized: return "Review saved text before creating a searchable copy."
+        case .imageOnly: return "This PDF has no detected text layer."
+        case .partial: return "Image pages may not appear in text searches."
+        case .available: return "Detected text can be searched and selected."
+        }
+    }
+}
+
 struct DocumentCommandSignal: Identifiable, Hashable {
     let id: String
     let title: String
@@ -9973,6 +13765,7 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
     let milestoneName: String?
     let isPinned: Bool?
     let linkedDeliveryReceiptID: UUID?
+    let linkedDeliveryReceipt: PDFDeliveryReceipt?
 
     var formattedSize: String {
         ByteCountFormatter.string(
@@ -9993,6 +13786,16 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
         isPinned == true
     }
 
+    var archivedDeliveryReceipt: PDFDeliveryReceipt? {
+        guard isPinnedMilestone,
+              let linkedDeliveryReceiptID,
+              let linkedDeliveryReceipt,
+              linkedDeliveryReceipt.id == linkedDeliveryReceiptID,
+              matchesDeliveryReceipt(linkedDeliveryReceipt)
+        else { return nil }
+        return linkedDeliveryReceipt
+    }
+
     var displayTitle: String {
         resolvedMilestoneName
             ?? AppLocalization.format(
@@ -10005,8 +13808,9 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
         _ receipt: PDFDeliveryReceipt
     ) -> Bool {
         guard receipt.isVerified,
-              !contentFingerprint.isEmpty,
-              !receipt.sha256.isEmpty,
+              receipt.outputPageCount == pageCount,
+              receipt.outputByteCount == byteCount,
+              Self.isSHA256(contentFingerprint),
               contentFingerprint.caseInsensitiveCompare(receipt.sha256)
                 == .orderedSame
         else { return false }
@@ -10016,13 +13820,36 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
         return outputRevisionID == contentRevisionID
     }
 
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
+
     func updatingMilestone(
         name: String?,
         pinned: Bool,
-        linkedDeliveryReceiptID: UUID?
+        linkedDeliveryReceiptID: UUID?,
+        deliveryReceipt: PDFDeliveryReceipt? = nil
     ) -> PDFVersionSnapshot {
         let normalizedName = name?
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolvedReceipt: PDFDeliveryReceipt? =
+            if let deliveryReceipt,
+               deliveryReceipt.id == linkedDeliveryReceiptID,
+               matchesDeliveryReceipt(deliveryReceipt) {
+            deliveryReceipt
+        } else if let linkedDeliveryReceipt,
+                  linkedDeliveryReceipt.id
+                    == linkedDeliveryReceiptID,
+                  matchesDeliveryReceipt(linkedDeliveryReceipt) {
+            linkedDeliveryReceipt
+        } else {
+            nil
+        }
         return PDFVersionSnapshot(
             id: id,
             documentID: documentID,
@@ -10040,7 +13867,35 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
                 $0.isEmpty ? nil : String($0.prefix(80))
             },
             isPinned: pinned ? true : nil,
-            linkedDeliveryReceiptID: linkedDeliveryReceiptID
+            linkedDeliveryReceiptID: pinned
+                ? linkedDeliveryReceiptID
+                : nil,
+            linkedDeliveryReceipt: pinned
+                ? resolvedReceipt
+                : nil
+        )
+    }
+
+    func updatingMeasuredByteCount(
+        _ measuredByteCount: Int64
+    ) -> PDFVersionSnapshot {
+        PDFVersionSnapshot(
+            id: id,
+            documentID: documentID,
+            createdAt: createdAt,
+            label: label,
+            fileName: fileName,
+            byteCount: max(0, measuredByteCount),
+            pageCount: pageCount,
+            contentRevisionID: contentRevisionID,
+            contentFingerprint: contentFingerprint,
+            bookmarkedPages: bookmarkedPages,
+            bookmarkNames: bookmarkNames,
+            lastPageIndex: lastPageIndex,
+            milestoneName: milestoneName,
+            isPinned: isPinned,
+            linkedDeliveryReceiptID: linkedDeliveryReceiptID,
+            linkedDeliveryReceipt: linkedDeliveryReceipt
         )
     }
 }
@@ -10058,11 +13913,50 @@ enum PDFDeliveryMilestoneAvailability:
 struct PDFDeliveryMilestoneEvidence: Hashable, Sendable {
     static let unavailable = PDFDeliveryMilestoneEvidence(
         availability: .unavailable,
-        linkedMilestones: []
+        linkedMilestones: [],
+        matchingUnlinkedMilestone: nil,
+        pinnedStorageSummary: .empty
     )
 
     let availability: PDFDeliveryMilestoneAvailability
     let linkedMilestones: [PDFVersionSnapshot]
+    let matchingUnlinkedMilestone: PDFVersionSnapshot?
+    let pinnedStorageSummary: PDFPinnedVersionStorageSummary
+}
+
+struct PDFVersionStorageHealth: Hashable, Sendable {
+    static let empty = PDFVersionStorageHealth(
+        indexedVersionCount: 0,
+        pinnedMilestoneCount: 0,
+        removedIndexEntryCount: 0,
+        removedOrphanFileCount: 0,
+        repairedMetadataCount: 0,
+        reclaimedByteCount: 0
+    )
+
+    let indexedVersionCount: Int
+    let pinnedMilestoneCount: Int
+    let removedIndexEntryCount: Int
+    let removedOrphanFileCount: Int
+    let repairedMetadataCount: Int
+    let reclaimedByteCount: Int64
+
+    var repairedItemCount: Int {
+        removedIndexEntryCount
+            + removedOrphanFileCount
+            + repairedMetadataCount
+    }
+
+    var didRepairStorage: Bool {
+        repairedItemCount > 0
+    }
+
+    var formattedReclaimedBytes: String {
+        ByteCountFormatter.string(
+            fromByteCount: reclaimedByteCount,
+            countStyle: .file
+        )
+    }
 }
 
 struct LocalStorageSnapshot: Hashable, Sendable {
@@ -10073,17 +13967,28 @@ struct LocalStorageSnapshot: Hashable, Sendable {
     let deliveryCacheBytes: Int64
     let officeExportBytes: Int64
     let officeDeliveryBytes: Int64
+    let changeReportBytes: Int64
     let metadataBytes: Int64
+    var versionStorageHealth = PDFVersionStorageHealth.empty
+    var pageMatchStorage = PDFManualPageMatchStorageSummary.empty
 
     var totalBytes: Int64 {
-        pdfBytes
-            + versionBytes
-            + textIndexBytes
-            + ocrBytes
-            + deliveryCacheBytes
-            + officeExportBytes
-            + officeDeliveryBytes
-            + metadataBytes
+        [
+            pdfBytes,
+            versionBytes,
+            textIndexBytes,
+            ocrBytes,
+            deliveryCacheBytes,
+            officeExportBytes,
+            officeDeliveryBytes,
+            changeReportBytes,
+            metadataBytes
+        ].reduce(Int64.zero) { total, value in
+            let (sum, overflow) = total.addingReportingOverflow(
+                max(0, value)
+            )
+            return overflow ? .max : sum
+        }
     }
 }
 
@@ -10106,6 +14011,25 @@ struct PDFPinnedVersionStorageSummary: Hashable, Sendable {
 
     let milestoneCount: Int
     let byteCount: Int64
+
+    static func measuring<S: Sequence>(
+        _ milestones: S
+    ) -> PDFPinnedVersionStorageSummary
+    where S.Element == PDFVersionSnapshot {
+        var count = 0
+        var totalBytes: Int64 = 0
+        for milestone in milestones {
+            count += 1
+            let (sum, overflow) = totalBytes.addingReportingOverflow(
+                max(0, milestone.byteCount)
+            )
+            totalBytes = overflow ? .max : sum
+        }
+        return PDFPinnedVersionStorageSummary(
+            milestoneCount: count,
+            byteCount: totalBytes
+        )
+    }
 
     var formattedBytes: String {
         ByteCountFormatter.string(
@@ -10138,18 +14062,82 @@ struct PDFPinnedVersionStorageSummary: Hashable, Sendable {
         )
     }
 
-    var isNearCapacity: Bool {
+    var countUsageFraction: Double {
+        guard Self.maximumMilestoneCount > 0 else { return 0 }
+        return min(
+            1,
+            Double(max(0, milestoneCount))
+                / Double(Self.maximumMilestoneCount)
+        )
+    }
+
+    var pressureFraction: Double {
+        max(usageFraction, countUsageFraction)
+    }
+
+    var remainingMilestoneCount: Int {
+        max(0, Self.maximumMilestoneCount - milestoneCount)
+    }
+
+    var remainingByteCount: Int64 {
+        max(0, Self.maximumByteCount - max(0, byteCount))
+    }
+
+    var formattedRemainingBytes: String {
+        ByteCountFormatter.string(
+            fromByteCount: remainingByteCount,
+            countStyle: .file
+        )
+    }
+
+    var isCountAtCapacity: Bool {
+        milestoneCount >= Self.maximumMilestoneCount
+    }
+
+    var isByteAtCapacity: Bool {
+        byteCount >= Self.maximumByteCount
+    }
+
+    var isCountNearCapacity: Bool {
         milestoneCount >= Self.maximumMilestoneCount - 4
-            || usageFraction >= 0.8
+    }
+
+    var isByteNearCapacity: Bool {
+        usageFraction >= 0.8
+    }
+
+    var isAtCapacity: Bool {
+        isCountAtCapacity || isByteAtCapacity
+    }
+
+    var isNearCapacity: Bool {
+        isCountNearCapacity || isByteNearCapacity
     }
 
     func canAdd(bytes: Int64) -> Bool {
-        milestoneCount < Self.maximumMilestoneCount
-            && byteCount + max(0, bytes) <= Self.maximumByteCount
+        let (combinedBytes, overflow) = max(0, byteCount)
+            .addingReportingOverflow(max(0, bytes))
+        return milestoneCount < Self.maximumMilestoneCount
+            && !overflow
+            && combinedBytes <= Self.maximumByteCount
     }
 }
 
 struct PDFVersionArchiveManifest: Codable, Hashable, Sendable {
+    static let currentSchema = "PaperPath Version Archive V49"
+    static let supportedSchemas = [
+        "PaperPath Version Archive V47",
+        "PaperPath Version Archive V48",
+        currentSchema
+    ]
+    static let maximumEntryCount =
+        PDFPinnedVersionStorageSummary.maximumMilestoneCount
+    static let maximumEntryByteCount =
+        PDFPinnedVersionStorageSummary.maximumByteCount
+    static let maximumPageCount = 100_000
+    static let maximumTitleCharacters = 160
+    static let maximumFileNameBytes = 255
+
     struct Entry: Codable, Hashable, Sendable {
         let fileName: String
         let documentID: UUID
@@ -10165,6 +14153,86 @@ struct PDFVersionArchiveManifest: Codable, Hashable, Sendable {
     let schema: String
     let createdAt: Date
     let entries: [Entry]
+
+    var isStructurallyValid: Bool {
+        isStructurallyValid(
+            at: PDFOfficeTimeAnchor.process.trustedDate()
+        )
+    }
+
+    func isStructurallyValid(at date: Date) -> Bool {
+        guard Self.supportedSchemas.contains(schema),
+              createdAt.timeIntervalSince1970 >= 0,
+              createdAt <= date.addingTimeInterval(5 * 60),
+              !entries.isEmpty,
+              entries.count <= Self.maximumEntryCount
+        else { return false }
+
+        var names: Set<String> = []
+        var snapshotIDs: Set<UUID> = []
+        var totalBytes: Int64 = 0
+        for entry in entries {
+            let normalizedName = entry.fileName.lowercased()
+            let (nextTotal, overflow) = totalBytes
+                .addingReportingOverflow(entry.byteCount)
+            guard Self.isSafeArchiveFileName(entry.fileName),
+                  names.insert(normalizedName).inserted,
+                  snapshotIDs.insert(entry.snapshotID).inserted,
+                  Self.isSafeDisplayText(entry.title),
+                  entry.title.count <= Self.maximumTitleCharacters,
+                  entry.createdAt.timeIntervalSince1970 >= 0,
+                  entry.createdAt
+                    <= createdAt.addingTimeInterval(5 * 60),
+                  entry.byteCount > 0,
+                  entry.byteCount <= Self.maximumEntryByteCount,
+                  !overflow,
+                  nextTotal <= Self.maximumEntryByteCount,
+                  (1...Self.maximumPageCount).contains(
+                    entry.pageCount
+                  ),
+                  Self.isSHA256(entry.sha256)
+            else { return false }
+            totalBytes = nextTotal
+        }
+        return true
+    }
+
+    private static func isSafeArchiveFileName(
+        _ value: String
+    ) -> Bool {
+        !value.isEmpty
+            && !value.hasPrefix(".")
+            && !value.contains("/")
+            && !value.contains("\\")
+            && value.utf8.count <= maximumFileNameBytes
+            && value.lowercased().hasSuffix(".pdf")
+            && isSafeDisplayText(value)
+    }
+
+    private static func isSafeDisplayText(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.unicodeScalars.allSatisfy { scalar in
+                let codePoint = scalar.value
+                let isBidirectionalControl =
+                    codePoint == 0x061C
+                    || codePoint == 0x200E
+                    || codePoint == 0x200F
+                    || (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+                return !CharacterSet.controlCharacters.contains(scalar)
+                    && !CharacterSet.illegalCharacters.contains(scalar)
+                    && !isBidirectionalControl
+            }
+    }
+
+    private static func isSHA256(_ value: String) -> Bool {
+        value.count == 64
+            && value.unicodeScalars.allSatisfy {
+                CharacterSet(
+                    charactersIn: "0123456789abcdefABCDEF"
+                ).contains($0)
+            }
+    }
 }
 
 struct PDFSignedVersionArchiveManifest:
@@ -10203,12 +14271,14 @@ struct PDFVersionArchiveVerificationItem:
     Hashable,
     Sendable {
     let id: UUID
+    let documentID: UUID
     let fileName: String
     let title: String
     let byteCount: Int64
     let pageCount: Int
     let expectedSHA256: String
     let actualSHA256: String?
+    let linkedDeliveryReceiptID: UUID?
     let status: PDFVersionArchiveVerificationStatus
     let detail: String
 
@@ -10218,6 +14288,16 @@ struct PDFVersionArchiveVerificationItem:
             countStyle: .file
         )
     }
+}
+
+struct PDFVersionArchiveVerifiedArtifact:
+    Identifiable,
+    Hashable,
+    Sendable {
+    let item: PDFVersionArchiveVerificationItem
+    let url: URL
+
+    var id: UUID { item.id }
 }
 
 struct PDFVersionArchiveVerificationReport:
@@ -10240,6 +14320,7 @@ struct PDFVersionArchiveVerificationReport:
     let signerPublicKeyBase64: String?
     let trustStatus: PDFOfficeSignerTrustStatus
     let trustedSignerName: String?
+    let verifiedArtifacts: [PDFVersionArchiveVerifiedArtifact]
 
     init(
         id: UUID = UUID(),
@@ -10259,7 +14340,8 @@ struct PDFVersionArchiveVerificationReport:
         signerKeyID: String? = nil,
         signerPublicKeyBase64: String? = nil,
         trustStatus: PDFOfficeSignerTrustStatus = .unsupported,
-        trustedSignerName: String? = nil
+        trustedSignerName: String? = nil,
+        verifiedArtifacts: [PDFVersionArchiveVerifiedArtifact] = []
     ) {
         self.id = id
         self.archiveName = archiveName
@@ -10277,15 +14359,21 @@ struct PDFVersionArchiveVerificationReport:
         self.signerPublicKeyBase64 = signerPublicKeyBase64
         self.trustStatus = trustStatus
         self.trustedSignerName = trustedSignerName
+        self.verifiedArtifacts = verifiedArtifacts
     }
 
     var verifiedCount: Int {
         items.filter { $0.status == .verified }.count
     }
 
+    var signatureFailureCount: Int {
+        signatureStatus == .invalid ? 1 : 0
+    }
+
     var failedCount: Int {
         items.filter { $0.status == .failed }.count
             + structuralFailures.count
+            + signatureFailureCount
     }
 
     var status: PDFVersionArchiveVerificationStatus {
@@ -10322,6 +14410,21 @@ struct PDFVersionArchiveVerificationReport:
             && signerPublicKeyBase64 != nil
     }
 
+    var canRecoverArtifacts: Bool {
+        status == .verified
+            && hasValidSourceSignature
+            && verifiedArtifacts.count == manifestEntryCount
+            && Set(verifiedArtifacts.map(\.id)).count
+                == manifestEntryCount
+    }
+
+    func verifiedArtifact(
+        for itemID: UUID
+    ) -> PDFVersionArchiveVerifiedArtifact? {
+        guard canRecoverArtifacts else { return nil }
+        return verifiedArtifacts.first { $0.id == itemID }
+    }
+
     var provenanceTitle: String {
         if hasInvalidSourceSignature {
             return "Invalid source signature"
@@ -10352,7 +14455,31 @@ struct PDFVersionArchiveVerificationReport:
             signerKeyID: signerKeyID,
             signerPublicKeyBase64: signerPublicKeyBase64,
             trustStatus: trustStatus,
-            trustedSignerName: trustedSignerName
+            trustedSignerName: trustedSignerName,
+            verifiedArtifacts: verifiedArtifacts
+        )
+    }
+
+    func removingVerifiedArtifacts()
+        -> PDFVersionArchiveVerificationReport {
+        PDFVersionArchiveVerificationReport(
+            id: id,
+            archiveName: archiveName,
+            archiveByteCount: archiveByteCount,
+            schema: schema,
+            archiveCreatedAt: archiveCreatedAt,
+            verifiedAt: verifiedAt,
+            manifestEntryCount: manifestEntryCount,
+            archiveEntryCount: archiveEntryCount,
+            items: items,
+            structuralFailures: structuralFailures,
+            signatureStatus: signatureStatus,
+            signatureDetail: signatureDetail,
+            signerKeyID: signerKeyID,
+            signerPublicKeyBase64: signerPublicKeyBase64,
+            trustStatus: trustStatus,
+            trustedSignerName: trustedSignerName,
+            verifiedArtifacts: []
         )
     }
 }
@@ -10363,6 +14490,25 @@ struct PDFOfficePinnedStorageSummary: Hashable, Sendable {
 
     let outputCount: Int
     let byteCount: Int64
+
+    static func measuring<S: Sequence>(
+        _ outputs: S
+    ) -> PDFOfficePinnedStorageSummary
+    where S.Element == PDFPinnedOfficeOutput {
+        var count = 0
+        var totalBytes: Int64 = 0
+        for output in outputs {
+            count += 1
+            let (sum, overflow) = totalBytes.addingReportingOverflow(
+                max(0, output.receipt.fileSizeBytes)
+            )
+            totalBytes = overflow ? .max : sum
+        }
+        return PDFOfficePinnedStorageSummary(
+            outputCount: count,
+            byteCount: totalBytes
+        )
+    }
 
     var formattedBytes: String {
         ByteCountFormatter.string(
@@ -10386,9 +14532,59 @@ struct PDFOfficePinnedStorageSummary: Hashable, Sendable {
         )
     }
 
+    var byteUsageFraction: Double {
+        guard Self.maximumByteCount > 0 else { return 0 }
+        return min(
+            1,
+            Double(max(0, byteCount))
+                / Double(Self.maximumByteCount)
+        )
+    }
+
+    var countUsageFraction: Double {
+        guard Self.maximumOutputCount > 0 else { return 0 }
+        return min(
+            1,
+            Double(max(0, outputCount))
+                / Double(Self.maximumOutputCount)
+        )
+    }
+
+    var pressureFraction: Double {
+        max(byteUsageFraction, countUsageFraction)
+    }
+
+    var remainingOutputCount: Int {
+        max(0, Self.maximumOutputCount - outputCount)
+    }
+
+    var remainingByteCount: Int64 {
+        max(0, Self.maximumByteCount - max(0, byteCount))
+    }
+
+    var formattedRemainingBytes: String {
+        ByteCountFormatter.string(
+            fromByteCount: remainingByteCount,
+            countStyle: .file
+        )
+    }
+
+    var isAtCapacity: Bool {
+        outputCount >= Self.maximumOutputCount
+            || byteCount >= Self.maximumByteCount
+    }
+
+    var isNearCapacity: Bool {
+        outputCount >= Self.maximumOutputCount - 4
+            || byteUsageFraction >= 0.8
+    }
+
     func canAdd(bytes: Int64) -> Bool {
-        outputCount < Self.maximumOutputCount
-            && byteCount + max(0, bytes) <= Self.maximumByteCount
+        let (combinedBytes, overflow) = max(0, byteCount)
+            .addingReportingOverflow(max(0, bytes))
+        return outputCount < Self.maximumOutputCount
+            && !overflow
+            && combinedBytes <= Self.maximumByteCount
     }
 }
 
@@ -10454,7 +14650,7 @@ struct PDFSourceLocationSnapshot: Sendable {
     let modificationDate: Date?
 }
 
-struct OCRTextBlock: Codable, Identifiable, Hashable {
+struct OCRTextBlock: Codable, Identifiable, Hashable, Sendable {
     let id: UUID
     let text: String
     let confidence: Double
@@ -10624,7 +14820,7 @@ struct OCRRecognitionConfiguration:
     }
 }
 
-struct OCRPageResult: Codable, Identifiable, Hashable {
+struct OCRPageResult: Codable, Identifiable, Hashable, Sendable {
     var id: Int { pageIndex }
     let pageIndex: Int
     let text: String
@@ -10684,7 +14880,11 @@ struct OCRPageResult: Codable, Identifiable, Hashable {
     }
 }
 
-struct OCRResult: Codable, Hashable {
+struct OCRResult: Codable, Hashable, Sendable {
+    static let maximumPageCount = 1_000
+    static let maximumBlockCount = 100_000
+    static let maximumEncodedTextBytes = 64 * 1_024 * 1_024
+
     let pages: [OCRPageResult]
     let configuration: OCRRecognitionConfiguration
 
@@ -10792,6 +14992,65 @@ struct OCRResult: Codable, Hashable {
 
     var enhancedPageCount: Int {
         pages.filter { $0.recognitionPass == .enhanced }.count
+    }
+}
+
+enum PDFPageSelection {
+    enum SelectionError: LocalizedError {
+        case empty
+        case syntax
+        case outOfBounds(Int)
+        case tooLong
+
+        var errorDescription: String? {
+            switch self {
+            case .empty:
+                return "Enter at least one page number.".localizedUI
+            case .syntax:
+                return "Use page numbers or ascending ranges separated by commas.".localizedUI
+            case .outOfBounds(let pageCount):
+                return AppLocalization.format("Page numbers must be between 1 and %lld.", pageCount)
+            case .tooLong:
+                return "The page selection is too long.".localizedUI
+            }
+        }
+    }
+
+    static func parse(_ text: String, pageCount: Int) throws -> [Int] {
+        guard text.count <= 2_048 else { throw SelectionError.tooLong }
+        guard (1...100_000).contains(pageCount) else {
+            throw SelectionError.outOfBounds(max(0, pageCount))
+        }
+        let normalized = text.precomposedStringWithCompatibilityMapping
+            .replacingOccurrences(of: "、", with: ",")
+            .replacingOccurrences(of: ";", with: ",")
+            .replacingOccurrences(of: "–", with: "-")
+            .replacingOccurrences(of: "—", with: "-")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { throw SelectionError.empty }
+        let tokens = normalized.split(separator: ",", omittingEmptySubsequences: false)
+        guard tokens.count <= 256 else { throw SelectionError.tooLong }
+        var indices: Set<Int> = []
+        for token in tokens {
+            let parts = token.split(separator: "-", omittingEmptySubsequences: false)
+            guard (1...2).contains(parts.count) else { throw SelectionError.syntax }
+            let numbers = try parts.map { part -> Int in
+                let value = part.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !value.isEmpty,
+                      value.utf8.allSatisfy({ (48...57).contains($0) }),
+                      let number = Int(value)
+                else { throw SelectionError.syntax }
+                guard (1...pageCount).contains(number) else {
+                    throw SelectionError.outOfBounds(pageCount)
+                }
+                return number
+            }
+            let first = numbers[0]
+            let last = numbers.last ?? first
+            guard first <= last else { throw SelectionError.syntax }
+            indices.formUnion((first - 1)..<last)
+        }
+        return indices.sorted()
     }
 }
 

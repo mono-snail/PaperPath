@@ -1,6 +1,12 @@
 import PDFKit
 import SwiftUI
 
+struct PDFTextSearchHighlight: Equatable, Sendable {
+    let query: String
+    let pageIndex: Int
+    let contentRevisionID: UUID
+}
+
 struct PDFDocumentView: UIViewRepresentable {
     let url: URL
     let refreshToken: Int
@@ -9,6 +15,8 @@ struct PDFDocumentView: UIViewRepresentable {
     let readingPreferences: PDFReadingPreferences
     let command: PDFViewCommand?
     let evidenceOverlay: PDFEvidenceOverlay?
+    let searchHighlight: PDFTextSearchHighlight?
+    let allowsMutation: Bool
     let onMutation: () -> Void
     let onRedactionMarks: ([PDFRedactionMark]) -> Void
     let onTextSelection: (PDFTextSelectionSnapshot) -> Void
@@ -25,6 +33,8 @@ struct PDFDocumentView: UIViewRepresentable {
         readingPreferences: PDFReadingPreferences = PDFReadingPreferences(),
         command: PDFViewCommand? = nil,
         evidenceOverlay: PDFEvidenceOverlay? = nil,
+        searchHighlight: PDFTextSearchHighlight? = nil,
+        allowsMutation: Bool = true,
         onMutation: @escaping () -> Void = {},
         onRedactionMarks: @escaping ([PDFRedactionMark]) -> Void = { _ in },
         onTextSelection: @escaping (
@@ -42,6 +52,8 @@ struct PDFDocumentView: UIViewRepresentable {
         self.readingPreferences = readingPreferences
         self.command = command
         self.evidenceOverlay = evidenceOverlay
+        self.searchHighlight = searchHighlight
+        self.allowsMutation = allowsMutation
         self.onMutation = onMutation
         self.onRedactionMarks = onRedactionMarks
         self.onTextSelection = onTextSelection
@@ -73,50 +85,94 @@ struct PDFDocumentView: UIViewRepresentable {
             in: view,
             coordinator: context.coordinator
         )
+        applySearchHighlight(
+            searchHighlight,
+            in: view,
+            coordinator: context.coordinator,
+            revealsFirstMatch: true
+        )
         return view
     }
 
     func updateUIView(_ view: PDFView, context: Context) {
-        context.coordinator.onPageChange = onPageChange
+        let coordinator = context.coordinator
+        coordinator.onPageChange = onPageChange
+        coordinator.allowsMutation = allowsMutation
+        // PDFKit can promote a responder while replacing its document. Do not
+        // reenter SwiftUI's view graph from inside updateUIView.
+        DispatchQueue.main.async { [weak view, weak coordinator] in
+            guard let view, let coordinator,
+                  coordinator.isObserving(view)
+            else { return }
+            updatePDFView(view, coordinator: coordinator)
+        }
+    }
+
+    private func updatePDFView(
+        _ view: PDFView,
+        coordinator: Coordinator
+    ) {
         applyReadingPreferences(to: view)
-        let needsReload = context.coordinator.url != url
-            || context.coordinator.refreshToken != refreshToken
-            || context.coordinator.unlockPassword != unlockPassword
+        let needsReload = coordinator.url != url
+            || coordinator.refreshToken != refreshToken
+            || coordinator.unlockPassword != unlockPassword
         let shouldPreserveViewport = needsReload
-            && context.coordinator.url == url
-            && context.coordinator.unlockPassword == unlockPassword
-            && context.coordinator.navigationToken == navigationToken
+            && coordinator.url == url
+            && coordinator.unlockPassword == unlockPassword
+            && coordinator.navigationToken == navigationToken
         let needsNavigation =
-            context.coordinator.navigationToken != navigationToken
+            coordinator.navigationToken != navigationToken
+        let needsSearchHighlight =
+            coordinator.searchHighlight != searchHighlight
         let isSelfMutationRefresh = needsReload
-            && context.coordinator.skipsNextSelfMutationReload
-            && context.coordinator.url == url
-            && context.coordinator.unlockPassword == unlockPassword
+            && coordinator.skipsNextSelfMutationReload
+            && coordinator.url == url
+            && coordinator.unlockPassword == unlockPassword
         if isSelfMutationRefresh {
-            context.coordinator.skipsNextSelfMutationReload = false
-            context.coordinator.refreshToken = refreshToken
+            coordinator.skipsNextSelfMutationReload = false
+            coordinator.refreshToken = refreshToken
         } else if needsReload {
             load(
                 into: view,
-                coordinator: context.coordinator,
+                coordinator: coordinator,
                 preservingViewport: shouldPreserveViewport
             )
         }
         if needsNavigation || (needsReload && !shouldPreserveViewport) {
-            navigate(in: view, coordinator: context.coordinator)
+            navigate(in: view, coordinator: coordinator)
         }
         if let command,
-           context.coordinator.commandID != command.id {
-            context.coordinator.commandID = command.id
-            execute(command, in: view, coordinator: context.coordinator)
+           coordinator.commandID != command.id {
+            coordinator.commandID = command.id
+            if commandWritesDocument(command.action),
+               !allowsMutation || !coordinator.allowsMutation {
+                deliverCommandMessage(
+                    "Wait for the current document task to finish"
+                )
+            } else {
+                execute(
+                    command,
+                    in: view,
+                    coordinator: coordinator
+                )
+            }
         }
         if needsReload
             || needsNavigation
-            || context.coordinator.evidenceOverlay != evidenceOverlay {
+            || coordinator.evidenceOverlay != evidenceOverlay {
             applyEvidenceOverlay(
                 evidenceOverlay,
                 in: view,
-                coordinator: context.coordinator
+                coordinator: coordinator
+            )
+        }
+        if needsReload || needsNavigation || needsSearchHighlight {
+            applySearchHighlight(
+                searchHighlight,
+                in: view,
+                coordinator: coordinator,
+                revealsFirstMatch:
+                    needsReload || needsNavigation || needsSearchHighlight
             )
         }
     }
@@ -125,7 +181,14 @@ struct PDFDocumentView: UIViewRepresentable {
         _ view: PDFView,
         coordinator: Coordinator
     ) {
+        coordinator.stopObservingPageChanges()
         coordinator.removeEvidenceAnnotations()
+        view.highlightedSelections = nil
+        view.clearSelection()
+        view.document = nil
+        coordinator.unlockPassword = nil
+        coordinator.url = nil
+        coordinator.fileRevision = nil
     }
 
     private func applyReadingPreferences(to view: PDFView) {
@@ -179,11 +242,95 @@ struct PDFDocumentView: UIViewRepresentable {
         case .addNote(let text):
             addNote(text, in: view, coordinator: coordinator)
         case .markRedaction:
-            captureRedactionMarks(in: view)
+            captureRedactionMarks(
+                in: view,
+                coordinator: coordinator
+            )
         case .captureTextForEditing:
-            captureTextForEditing(in: view)
+            captureTextForEditing(
+                in: view,
+                coordinator: coordinator
+            )
         case .removeAnnotation:
             removeAnnotation(in: view, coordinator: coordinator)
+        case .zoomIn:
+            adjustZoom(in: view, multiplier: 1.2)
+        case .zoomOut:
+            adjustZoom(in: view, multiplier: 1 / 1.2)
+        case .fitToWindow:
+            fitPDFToWindow(in: view)
+        }
+    }
+
+    private func commandWritesDocument(
+        _ action: PDFViewCommand.Action
+    ) -> Bool {
+        switch action {
+        case .markup, .addNote, .removeAnnotation:
+            return true
+        case .markRedaction,
+             .captureTextForEditing,
+             .zoomIn,
+             .zoomOut,
+             .fitToWindow:
+            return false
+        }
+    }
+
+    private func adjustZoom(
+        in view: PDFView,
+        multiplier: CGFloat
+    ) {
+        guard view.document != nil,
+              multiplier.isFinite,
+              multiplier > 0
+        else { return }
+        view.layoutIfNeeded()
+        let minimum = view.minScaleFactor > 0
+            ? view.minScaleFactor
+            : 0.1
+        let maximum = view.maxScaleFactor > minimum
+            ? view.maxScaleFactor
+            : max(minimum, 8)
+        let current = view.scaleFactor > 0
+            ? view.scaleFactor
+            : max(view.scaleFactorForSizeToFit, minimum)
+        let target = min(
+            max(current * multiplier, minimum),
+            maximum
+        )
+        guard target.isFinite else { return }
+        view.autoScales = false
+        view.scaleFactor = target
+    }
+
+    private func fitPDFToWindow(in view: PDFView) {
+        guard view.document != nil else { return }
+        view.layoutIfNeeded()
+        let fittedScale = view.scaleFactorForSizeToFit
+        guard fittedScale.isFinite, fittedScale > 0 else {
+            view.autoScales = true
+            return
+        }
+        view.scaleFactor = fittedScale
+        view.autoScales = true
+    }
+
+    private func deliverCommandMessage(_ message: String) {
+        DispatchQueue.main.async {
+            onCommandMessage(message)
+        }
+    }
+
+    private func deliverMutation() {
+        DispatchQueue.main.async {
+            onMutation()
+        }
+    }
+
+    private func deliverUnlock(_ didUnlock: Bool) {
+        DispatchQueue.main.async {
+            onUnlock(didUnlock)
         }
     }
 
@@ -198,7 +345,7 @@ struct PDFDocumentView: UIViewRepresentable {
               let selectedText = selection.string,
               !selectedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
-            onCommandMessage("Select text in the PDF first")
+            deliverCommandMessage("Select text in the PDF first")
             return
         }
 
@@ -225,7 +372,15 @@ struct PDFDocumentView: UIViewRepresentable {
             )
         }
 
-        for line in selection.selectionsByLine() {
+        let selectedLines = selection.selectionsByLine()
+        guard !selectedLines.isEmpty,
+              selectedLines.count <= 256
+        else {
+            deliverCommandMessage("Select up to 256 lines at a time")
+            return
+        }
+        var addedAnnotations: [(page: PDFPage, annotation: PDFAnnotation)] = []
+        for line in selectedLines {
             guard let page = line.pages.first else { continue }
             let bounds = line.bounds(for: page).insetBy(dx: -1, dy: -1)
             let annotation = PDFAnnotation(
@@ -238,11 +393,31 @@ struct PDFDocumentView: UIViewRepresentable {
             annotation.shouldDisplay = true
             annotation.shouldPrint = true
             annotation.isReadOnly = true
+            annotation.userName = Self.annotationAuthor
+            annotation.modificationDate = Date()
             page.addAnnotation(annotation)
+            addedAnnotations.append((page, annotation))
         }
-        resetTextSelection(in: view)
-        persist(document, coordinator: coordinator)
-        onCommandMessage("Markup saved")
+        guard !addedAnnotations.isEmpty else {
+            deliverCommandMessage("The selected text has no editable bounds")
+            return
+        }
+        let expectedCounts = annotationCounts(
+            in: document,
+            pages: addedAnnotations.map { $0.page }
+        )
+        if persist(
+            document,
+            expectedAnnotationCounts: expectedCounts,
+            coordinator: coordinator
+        ) {
+            resetTextSelection(in: view)
+            deliverCommandMessage("Markup saved")
+        } else {
+            for item in addedAnnotations {
+                item.page.removeAnnotation(item.annotation)
+            }
+        }
     }
 
     private func markupUIColor(
@@ -269,16 +444,36 @@ struct PDFDocumentView: UIViewRepresentable {
               let page = view.currentPage,
               !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         else {
-            onCommandMessage("The note could not be placed")
+            deliverCommandMessage("The note could not be placed")
             return
         }
         let pageBounds = page.bounds(for: .cropBox)
-        let visibleCenter = CGPoint(
-            x: pageBounds.midX - 16,
-            y: pageBounds.midY - 16
+        guard pageBounds.width > 0,
+              pageBounds.height > 0
+        else {
+            deliverCommandMessage("The note could not be placed")
+            return
+        }
+        let annotationSize = CGSize(
+            width: min(32, pageBounds.width),
+            height: min(32, pageBounds.height)
+        )
+        let viewportCenter = view.convert(
+            CGPoint(x: view.bounds.midX, y: view.bounds.midY),
+            to: page
+        )
+        let visibleOrigin = CGPoint(
+            x: min(
+                max(pageBounds.minX, viewportCenter.x - annotationSize.width / 2),
+                pageBounds.maxX - annotationSize.width
+            ),
+            y: min(
+                max(pageBounds.minY, viewportCenter.y - annotationSize.height / 2),
+                pageBounds.maxY - annotationSize.height
+            )
         )
         let annotation = PDFAnnotation(
-            bounds: CGRect(origin: visibleCenter, size: CGSize(width: 32, height: 32)),
+            bounds: CGRect(origin: visibleOrigin, size: annotationSize),
             forType: .text,
             withProperties: nil
         )
@@ -287,14 +482,30 @@ struct PDFDocumentView: UIViewRepresentable {
         annotation.iconType = .comment
         annotation.shouldDisplay = true
         annotation.shouldPrint = true
+        annotation.userName = Self.annotationAuthor
+        annotation.modificationDate = Date()
         page.addAnnotation(annotation)
-        persist(document, coordinator: coordinator)
-        onCommandMessage("Note added to the current page")
+        let expectedCounts = annotationCounts(
+            in: document,
+            pages: [page]
+        )
+        if persist(
+            document,
+            expectedAnnotationCounts: expectedCounts,
+            coordinator: coordinator
+        ) {
+            deliverCommandMessage("Note added to the current page")
+        } else {
+            page.removeAnnotation(annotation)
+        }
     }
 
-    private func captureRedactionMarks(in view: PDFView) {
+    private func captureRedactionMarks(
+        in view: PDFView,
+        coordinator: Coordinator
+    ) {
         guard let document = view.document,
-              let selection = view.currentSelection
+              let selection = coordinator.selectionForCommand(in: view)
         else { return }
         let marks = selection.selectionsByLine().compactMap { line -> PDFRedactionMark? in
             guard let page = line.pages.first else { return nil }
@@ -312,15 +523,20 @@ struct PDFDocumentView: UIViewRepresentable {
                 normalizedHeight: bounds.height / pageBounds.height
             )
         }
+        let cleanedMarks = PDFRedactionMarkSanitizer.clean(marks)
         view.clearSelection()
-        onRedactionMarks(
-            PDFRedactionMarkSanitizer.clean(marks)
-        )
+        coordinator.resetSelectionSnapshot()
+        DispatchQueue.main.async {
+            onRedactionMarks(cleanedMarks)
+        }
     }
 
-    private func captureTextForEditing(in view: PDFView) {
+    private func captureTextForEditing(
+        in view: PDFView,
+        coordinator: Coordinator
+    ) {
         guard let document = view.document,
-              let selection = view.currentSelection,
+              let selection = coordinator.selectionForCommand(in: view),
               (1...4).contains(selection.pages.count),
               let firstPage = selection.pages.min(by: {
                   document.index(for: $0) < document.index(for: $1)
@@ -329,12 +545,12 @@ struct PDFDocumentView: UIViewRepresentable {
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !selectedText.isEmpty
         else {
-            onCommandMessage("Select text across no more than four pages")
+            deliverCommandMessage("Select text across no more than four pages")
             return
         }
         let lines = selection.selectionsByLine()
         guard !lines.isEmpty, lines.count <= 96 else {
-            onCommandMessage("Select up to 96 lines")
+            deliverCommandMessage("Select up to 96 lines")
             return
         }
         let firstPageBounds = firstPage.bounds(for: .cropBox)
@@ -345,7 +561,7 @@ struct PDFDocumentView: UIViewRepresentable {
               selectionBounds.width > 2,
               selectionBounds.height > 2
         else {
-            onCommandMessage("The selected text has no editable bounds")
+            deliverCommandMessage("The selected text has no editable bounds")
             return
         }
 
@@ -359,7 +575,7 @@ struct PDFDocumentView: UIViewRepresentable {
             guard pageBounds.width > 0,
                   pageBounds.height > 0
             else {
-                onCommandMessage("One selected page has invalid bounds")
+                deliverCommandMessage("One selected page has invalid bounds")
                 return
             }
             let pageLines = lines.filter {
@@ -394,7 +610,7 @@ struct PDFDocumentView: UIViewRepresentable {
             )
         }
         guard !flowRegions.isEmpty, flowRegions.count <= 16 else {
-            onCommandMessage("Select no more than sixteen text boxes")
+            deliverCommandMessage("Select no more than sixteen text boxes")
             return
         }
 
@@ -462,7 +678,10 @@ struct PDFDocumentView: UIViewRepresentable {
             flowRegions: flowRegions
         )
         view.clearSelection()
-        onTextSelection(snapshot)
+        coordinator.resetSelectionSnapshot()
+        DispatchQueue.main.async {
+            onTextSelection(snapshot)
+        }
     }
 
     private func textFlowBounds(
@@ -591,21 +810,233 @@ struct PDFDocumentView: UIViewRepresentable {
     ) {
         guard let document = view.document,
               let page = view.currentPage,
-              let annotation = page.annotations.last
+              let annotation = page.annotations.last(where: {
+                  $0.userName == Self.annotationAuthor
+              })
         else {
-            onCommandMessage("No annotation to undo on this page")
+            deliverCommandMessage(
+                "No PaperPath annotation to undo on this page"
+            )
             return
         }
         page.removeAnnotation(annotation)
-        persist(document, coordinator: coordinator)
-        onCommandMessage("Last annotation removed")
+        let expectedCounts = annotationCounts(
+            in: document,
+            pages: [page]
+        )
+        if persist(
+            document,
+            expectedAnnotationCounts: expectedCounts,
+            coordinator: coordinator
+        ) {
+            deliverCommandMessage("Last annotation removed")
+        } else {
+            page.addAnnotation(annotation)
+        }
     }
 
-    private func persist(_ document: PDFDocument, coordinator: Coordinator) {
-        guard document.write(to: url) else { return }
-        LocalFileSecurity.applyCompleteProtection(to: url)
+    private func persist(
+        _ document: PDFDocument,
+        expectedAnnotationCounts: [Int: Int],
+        coordinator: Coordinator
+    ) -> Bool {
+        guard let expectedRevision = coordinator.fileRevision,
+              fileRevision(at: url) == expectedRevision
+        else {
+            deliverCommandMessage(
+                "The PDF changed before this annotation was saved. Reopen it and try again."
+            )
+            return false
+        }
+        guard hasCapacityForAnnotationWrite(
+            sourceBytes: expectedRevision.fileSize
+        ) else {
+            deliverCommandMessage(
+                PaperPathError.insufficientStorage.errorDescription
+                    ?? "There isn’t enough free space to save this annotation."
+            )
+            return false
+        }
+
+        let fileManager = FileManager.default
+        let stagingURL = url.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".annotation-\(UUID().uuidString).pdf",
+                isDirectory: false
+            )
+        let rollbackName =
+            ".annotation-rollback-\(UUID().uuidString).pdf"
+        let rollbackURL = url.deletingLastPathComponent()
+            .appendingPathComponent(rollbackName)
+        let suspendedEvidence = coordinator.detachEvidenceAnnotations()
+        defer {
+            coordinator.restoreEvidenceAnnotations(suspendedEvidence)
+            try? fileManager.removeItem(at: stagingURL)
+            try? fileManager.removeItem(at: rollbackURL)
+        }
+
+        guard document.write(to: stagingURL) else {
+            deliverCommandMessage(
+                "The annotation could not be saved. Your existing PDF was not changed."
+            )
+            return false
+        }
+        do {
+            try LocalFileSecurity.requireCompleteProtection(
+                to: stagingURL,
+                fileManager: fileManager
+            )
+            guard let reopened = PDFDocument(url: stagingURL) else {
+                deliverCommandMessage(
+                    "The saved annotation could not be verified. Your existing PDF was not changed."
+                )
+                return false
+            }
+            if reopened.isLocked {
+                guard let unlockPassword,
+                      !unlockPassword.isEmpty,
+                      reopened.unlock(withPassword: unlockPassword)
+                else {
+                    deliverCommandMessage(
+                        "The saved annotation could not be verified. Your existing PDF was not changed."
+                    )
+                    return false
+                }
+            }
+            guard reopened.pageCount == document.pageCount else {
+                deliverCommandMessage(
+                    "The saved annotation could not be verified. Your existing PDF was not changed."
+                )
+                return false
+            }
+            for (pageIndex, expectedCount) in expectedAnnotationCounts {
+                guard pageIndex >= 0,
+                      pageIndex < reopened.pageCount,
+                      let page = reopened.page(at: pageIndex),
+                      page.annotations.filter({
+                          $0.userName == Self.annotationAuthor
+                      }).count == expectedCount
+                else {
+                    deliverCommandMessage(
+                        "The saved annotation could not be verified. Your existing PDF was not changed."
+                    )
+                    return false
+                }
+            }
+            guard fileRevision(at: url) == expectedRevision else {
+                deliverCommandMessage(
+                    "The PDF changed before this annotation was saved. Reopen it and try again."
+                )
+                return false
+            }
+            _ = try fileManager.replaceItemAt(
+                url,
+                withItemAt: stagingURL,
+                backupItemName: rollbackName,
+                options: [.withoutDeletingBackupItem]
+            )
+            if fileManager.fileExists(atPath: rollbackURL.path) {
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: rollbackURL,
+                    fileManager: fileManager
+                )
+            }
+            try LocalFileSecurity.requireCompleteProtection(
+                to: url,
+                fileManager: fileManager
+            )
+        } catch {
+            let restored = restoreAnnotationRollback(
+                from: rollbackURL,
+                expectedRevision: expectedRevision,
+                fileManager: fileManager
+            )
+            deliverCommandMessage(
+                restored
+                    ? "The annotation could not be saved. Your existing PDF was not changed."
+                    : "The annotation could not be saved. Reopen the PDF and verify its contents."
+            )
+            return false
+        }
+
+        coordinator.fileRevision = fileRevision(at: url)
         coordinator.skipsNextSelfMutationReload = true
-        onMutation()
+        deliverMutation()
+        return true
+    }
+
+    private func restoreAnnotationRollback(
+        from rollbackURL: URL,
+        expectedRevision: PDFFileRevision,
+        fileManager: FileManager
+    ) -> Bool {
+        guard fileManager.fileExists(atPath: rollbackURL.path) else {
+            return fileRevision(at: url) == expectedRevision
+        }
+        do {
+            if fileManager.fileExists(atPath: url.path) {
+                _ = try fileManager.replaceItemAt(
+                    url,
+                    withItemAt: rollbackURL
+                )
+            } else {
+                try fileManager.moveItem(at: rollbackURL, to: url)
+            }
+            try LocalFileSecurity.requireCompleteProtection(
+                to: url,
+                fileManager: fileManager
+            )
+            return fileRevision(at: url) == expectedRevision
+        } catch {
+            return false
+        }
+    }
+
+    private func annotationCounts(
+        in document: PDFDocument,
+        pages: [PDFPage]
+    ) -> [Int: Int] {
+        var counts: [Int: Int] = [:]
+        for page in pages {
+            let pageIndex = document.index(for: page)
+            guard pageIndex != NSNotFound,
+                  counts[pageIndex] == nil
+            else { continue }
+            counts[pageIndex] = page.annotations.filter {
+                $0.userName == Self.annotationAuthor
+            }.count
+        }
+        return counts
+    }
+
+    private func hasCapacityForAnnotationWrite(
+        sourceBytes: Int64
+    ) -> Bool {
+        let directory = url.deletingLastPathComponent()
+        let values = try? directory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        )
+        guard let available =
+                values?.volumeAvailableCapacityForImportantUsage
+        else { return true }
+        let reserve = Int64(16 * 1_024 * 1_024)
+        let (required, overflow) = max(0, sourceBytes)
+            .addingReportingOverflow(reserve)
+        return !overflow && available >= required
+    }
+
+    private func fileRevision(at url: URL) -> PDFFileRevision? {
+        guard let attributes = try? FileManager.default
+            .attributesOfItem(atPath: url.path),
+              let size = (attributes[.size] as? NSNumber)?.int64Value
+        else { return nil }
+        return PDFFileRevision(
+            fileSize: size,
+            modificationDate: attributes[.modificationDate] as? Date,
+            fileNumber: (
+                attributes[.systemFileNumber] as? NSNumber
+            )?.uint64Value
+        )
     }
 
     private func load(
@@ -613,18 +1044,24 @@ struct PDFDocumentView: UIViewRepresentable {
         coordinator: Coordinator,
         preservingViewport: Bool
     ) {
+#if DEBUG
+        // #region debug-point D:experience-presentations
+        if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "D", "location": "PDFDocumentView.load.begin", "msg": "[DEBUG] PDF reload entered", "data": ["preservesViewport": preservingViewport]]); URLSession.shared.dataTask(with: request).resume() }
+        // #endregion
+#endif
         let viewport = preservingViewport
             ? PDFViewportState.capture(from: view)
             : nil
+        coordinator.resetSelectionSnapshot()
         resetTextSelection(in: view)
         view.document = nil
         let document = PDFDocument(url: url)
-        var didUnlock = false
-        if document?.isLocked == true,
+        if let document,
            let unlockPassword,
            !unlockPassword.isEmpty {
-            didUnlock = document?.unlock(withPassword: unlockPassword) == true
-            onUnlock(didUnlock)
+            let didUnlock = !document.isLocked
+                || document.unlock(withPassword: unlockPassword)
+            deliverUnlock(didUnlock)
         }
         view.document = document
         view.autoScales = true
@@ -633,20 +1070,25 @@ struct PDFDocumentView: UIViewRepresentable {
         coordinator.url = url
         coordinator.refreshToken = refreshToken
         coordinator.unlockPassword = unlockPassword
+        coordinator.fileRevision = fileRevision(at: url)
+#if DEBUG
+        // #region debug-point D:experience-presentations
+        if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "D", "location": "PDFDocumentView.load.end", "msg": "[DEBUG] PDF reload returned"]); URLSession.shared.dataTask(with: request).resume() }
+        // #endregion
+#endif
     }
 
     private func resetTextSelection(in view: PDFView) {
+        view.highlightedSelections = nil
         view.clearSelection()
         view.currentSelection = nil
     }
 
     private func restoreTextSelectionInteraction(in view: PDFView) {
         view.isUserInteractionEnabled = true
-        DispatchQueue.main.async {
-            view.becomeFirstResponder()
-        }
     }
 
+    @MainActor
     private struct PDFViewportState {
         let pageIndex: Int
         let pagePoint: CGPoint
@@ -775,7 +1217,84 @@ struct PDFDocumentView: UIViewRepresentable {
             return
         }
         view.go(to: page)
-        view.accessibilityValue = "Page \(targetPageIndex + 1)"
+        view.accessibilityValue = AppLocalization.format(
+            "Page %lld",
+            targetPageIndex + 1
+        )
+    }
+
+    private func applySearchHighlight(
+        _ highlight: PDFTextSearchHighlight?,
+        in view: PDFView,
+        coordinator: Coordinator,
+        revealsFirstMatch: Bool
+    ) {
+        coordinator.searchHighlight = highlight
+        view.highlightedSelections = nil
+        guard let highlight,
+              let document = view.document,
+              highlight.pageIndex >= 0,
+              highlight.pageIndex < document.pageCount,
+              let page = document.page(at: highlight.pageIndex),
+              let pageText = page.string,
+              !pageText.isEmpty
+        else { return }
+
+        let terms = DocumentSearchNormalization.terms(
+            in: highlight.query
+        )
+        guard !terms.isEmpty else { return }
+
+        let selectionLimit = 32
+        let perTermLimit = max(1, selectionLimit / terms.count)
+        var locatedSelections: [
+            (location: Int, selection: PDFSelection)
+        ] = []
+        locatedSelections.reserveCapacity(selectionLimit)
+
+        for term in terms {
+            var termSelectionCount = 0
+            var searchStart = pageText.startIndex
+            while searchStart < pageText.endIndex,
+                  locatedSelections.count < selectionLimit,
+                  termSelectionCount < perTermLimit,
+                  let range = pageText.range(
+                      of: term,
+                      options: [
+                          .caseInsensitive,
+                          .diacriticInsensitive,
+                          .widthInsensitive
+                      ],
+                      range: searchStart..<pageText.endIndex,
+                      locale: nil
+                  ) {
+                let sourceRange = NSRange(range, in: pageText)
+                if let selection = page.selection(for: sourceRange) {
+                    selection.color = UIColor.systemYellow
+                        .withAlphaComponent(0.42)
+                    locatedSelections.append(
+                        (sourceRange.location, selection)
+                    )
+                    termSelectionCount += 1
+                }
+                searchStart = range.upperBound
+            }
+            if locatedSelections.count == selectionLimit {
+                break
+            }
+        }
+
+        locatedSelections.sort { $0.location < $1.location }
+        let selections = locatedSelections.map(\.selection)
+        guard !selections.isEmpty else { return }
+        view.highlightedSelections = selections
+        view.accessibilityValue = AppLocalization.format(
+            "Page %lld, search terms highlighted",
+            highlight.pageIndex + 1
+        )
+        if revealsFirstMatch, let first = selections.first {
+            view.go(to: first)
+        }
     }
 
     private func applyEvidenceOverlay(
@@ -788,7 +1307,8 @@ struct PDFDocumentView: UIViewRepresentable {
         guard let overlay,
               !overlay.regions.isEmpty
                 || !overlay.textRegions.isEmpty
-                || !overlay.characterTextRegions.isEmpty,
+                || !overlay.characterTextRegions.isEmpty
+                || !overlay.vectorRegions.isEmpty,
               let document = view.document,
               overlay.pageIndex >= 0,
               overlay.pageIndex < document.pageCount,
@@ -825,6 +1345,29 @@ struct PDFDocumentView: UIViewRepresentable {
             annotation.shouldPrint = false
             annotation.isReadOnly = true
             annotation.userName = "PaperPath Evidence"
+            page.addAnnotation(annotation)
+            coordinator.evidenceAnnotations.append(annotation)
+        }
+
+        for region in overlay.vectorRegions.prefix(24) {
+            guard let bounds = evidenceBounds(
+                region,
+                pageBounds: pageBounds,
+                inset: -1
+            ) else { continue }
+            let annotation = PDFAnnotation(
+                bounds: bounds,
+                forType: .square,
+                withProperties: nil
+            )
+            annotation.color = baseColor.withAlphaComponent(0.96)
+            annotation.interiorColor = .clear
+            annotation.border = PDFBorder()
+            annotation.border?.lineWidth = 2
+            annotation.shouldDisplay = true
+            annotation.shouldPrint = false
+            annotation.isReadOnly = true
+            annotation.userName = "PaperPath Vector Evidence"
             page.addAnnotation(annotation)
             coordinator.evidenceAnnotations.append(annotation)
         }
@@ -911,25 +1454,45 @@ struct PDFDocumentView: UIViewRepresentable {
         return bounds
     }
 
+    private static let annotationAuthor = "PaperPath"
+
+    fileprivate struct PDFFileRevision: Equatable {
+        let fileSize: Int64
+        let modificationDate: Date?
+        let fileNumber: UInt64?
+    }
+
     @MainActor
     final class Coordinator: NSObject {
         var url: URL?
         var refreshToken = -1
         var navigationToken = -1
         var commandID: UUID?
+        var allowsMutation = true
         var unlockPassword: String?
+        fileprivate var fileRevision: PDFFileRevision?
         var skipsNextSelfMutationReload = false
         var evidenceOverlay: PDFEvidenceOverlay?
+        var searchHighlight: PDFTextSearchHighlight?
         var evidenceAnnotations: [PDFAnnotation] = []
         var onPageChange: (Int) -> Void
         private weak var observedView: PDFView?
+        private var pageChangeGeneration = 0
+        private var lastDeliveredPageIndex: Int?
+        private var recentSelection: PDFSelection?
+        private var selectionClearedAt: TimeInterval?
 
         init(onPageChange: @escaping (Int) -> Void) {
             self.onPageChange = onPageChange
             super.init()
         }
 
+        func isObserving(_ view: PDFView) -> Bool {
+            observedView === view
+        }
+
         func observePageChanges(in view: PDFView) {
+            stopObservingPageChanges()
             observedView = view
             NotificationCenter.default.addObserver(
                 self,
@@ -937,25 +1500,128 @@ struct PDFDocumentView: UIViewRepresentable {
                 name: .PDFViewPageChanged,
                 object: view
             )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(selectionDidChange),
+                name: .PDFViewSelectionChanged,
+                object: view
+            )
         }
 
         @objc private func pageDidChange() {
-            guard let view = observedView,
-                  let document = view.document,
-                  let page = view.currentPage
-            else { return }
-            let pageIndex = document.index(for: page)
-            let callback = onPageChange
-            DispatchQueue.main.async {
-                callback(pageIndex)
+            pageChangeGeneration &+= 1
+            let generation = pageChangeGeneration
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.pageChangeGeneration == generation,
+                      let view = self.observedView,
+                      let document = view.document,
+                      let page = view.currentPage
+                else { return }
+                let pageIndex = document.index(for: page)
+                guard pageIndex != NSNotFound,
+                      pageIndex >= 0,
+                      pageIndex < document.pageCount,
+                      pageIndex != self.lastDeliveredPageIndex
+                else { return }
+                self.lastDeliveredPageIndex = pageIndex
+                self.onPageChange(pageIndex)
             }
         }
 
+        func stopObservingPageChanges() {
+            pageChangeGeneration &+= 1
+            if let observedView {
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: .PDFViewPageChanged,
+                    object: observedView
+                )
+                NotificationCenter.default.removeObserver(
+                    self,
+                    name: .PDFViewSelectionChanged,
+                    object: observedView
+                )
+            }
+            observedView = nil
+            lastDeliveredPageIndex = nil
+            resetSelectionSnapshot()
+        }
+
+        @objc private func selectionDidChange() {
+            guard let view = observedView else {
+                resetSelectionSnapshot()
+                return
+            }
+            guard let selection = view.currentSelection,
+                  selection.string?.isEmpty == false
+            else {
+                if recentSelection != nil {
+                    selectionClearedAt =
+                        ProcessInfo.processInfo.systemUptime
+                }
+                return
+            }
+            recentSelection = selection.copy() as? PDFSelection
+            selectionClearedAt = nil
+        }
+
+        func selectionForCommand(
+            in view: PDFView
+        ) -> PDFSelection? {
+            if let selection = view.currentSelection,
+               selection.string?.isEmpty == false {
+                return selection
+            }
+            guard let recentSelection,
+                  let selectionClearedAt,
+                  ProcessInfo.processInfo.systemUptime
+                    - selectionClearedAt <= 1,
+                  let document = view.document,
+                  recentSelection.pages.allSatisfy({
+                      document.index(for: $0) != NSNotFound
+                  })
+            else {
+                resetSelectionSnapshot()
+                return nil
+            }
+            return recentSelection
+        }
+
+        func resetSelectionSnapshot() {
+            recentSelection = nil
+            selectionClearedAt = nil
+        }
+
         func removeEvidenceAnnotations() {
-            for annotation in evidenceAnnotations {
-                annotation.page?.removeAnnotation(annotation)
+            _ = detachEvidenceAnnotations()
+        }
+
+        func detachEvidenceAnnotations() -> [
+            (page: PDFPage, annotation: PDFAnnotation)
+        ] {
+            let detached = evidenceAnnotations.compactMap {
+                annotation -> (
+                    page: PDFPage,
+                    annotation: PDFAnnotation
+                )? in
+                guard let page = annotation.page else { return nil }
+                page.removeAnnotation(annotation)
+                return (page, annotation)
             }
             evidenceAnnotations.removeAll(keepingCapacity: true)
+            return detached
+        }
+
+        func restoreEvidenceAnnotations(
+            _ annotations: [
+                (page: PDFPage, annotation: PDFAnnotation)
+            ]
+        ) {
+            for item in annotations {
+                item.page.addAnnotation(item.annotation)
+            }
+            evidenceAnnotations = annotations.map(\.annotation)
         }
 
         deinit {
@@ -976,23 +1642,67 @@ struct PDFEditorPreview: Sendable {
     }
 }
 
+private struct PDFPreviewSource: Hashable {
+    let path: String
+    let revision: Int
+    let byteCount: UInt64
+    let modifiedAt: Date
+    let fileNumber: UInt64
+
+    init?(url: URL, revision: Int) {
+        guard url.isFileURL,
+              let attributes = try? FileManager.default.attributesOfItem(
+                  atPath: url.path
+              ),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber,
+              size.uint64Value > 0,
+              let modifiedAt = attributes[.modificationDate] as? Date,
+              let fileNumber = attributes[.systemFileNumber] as? NSNumber
+        else { return nil }
+        path = url.standardizedFileURL.path
+        self.revision = revision
+        byteCount = size.uint64Value
+        self.modifiedAt = modifiedAt
+        self.fileNumber = fileNumber.uint64Value
+    }
+}
+
 actor PDFEditorPreviewLoader {
     static let shared = PDFEditorPreviewLoader()
+    private static let maximumPreviewPixels = 6_000_000
+    private static let maximumPreviewBytes = 24 * 1_024 * 1_024
 
     private struct Key: Hashable {
-        let path: String
+        let source: PDFPreviewSource
         let pageIndex: Int
-        let revision: Int
         let longEdge: Int
     }
 
     private var cache: [Key: PDFEditorPreview] = [:]
     private var order: [Key] = []
     private var totalBytes = 0
-    private let maximumEntries = 10
-    private let maximumBytes = 28 * 1_024 * 1_024
+    private var cacheGeneration = UUID()
+
+    private var maximumEntries: Int {
+        max(
+            3,
+            min(10, ThumbnailPreviewQuality.selected.cacheEntryLimit / 8)
+        )
+    }
+
+    private var maximumBytes: Int {
+        max(
+            8 * 1_024 * 1_024,
+            min(
+                28 * 1_024 * 1_024,
+                ThumbnailPreviewQuality.selected.cacheByteLimit * 2
+            )
+        )
+    }
 
     func removeAllCachedPreviews() {
+        cacheGeneration = UUID()
         cache.removeAll(keepingCapacity: false)
         order.removeAll(keepingCapacity: false)
         totalBytes = 0
@@ -1004,12 +1714,26 @@ actor PDFEditorPreviewLoader {
         revision: Int,
         longEdge: Int = 1_600
     ) async -> PDFEditorPreview? {
+        guard await PDFThumbnailLoader.prepareForRendering(),
+              !Task.isCancelled,
+              let source = PDFPreviewSource(url: url, revision: revision)
+        else { return nil }
+        let generation = cacheGeneration
+        trimIfNeeded()
+        let resolvedLongEdge = min(max(longEdge, 256), 2_400)
         let key = Key(
-            path: url.standardizedFileURL.path,
+            source: source,
             pageIndex: pageIndex,
-            revision: revision,
-            longEdge: longEdge
+            longEdge: resolvedLongEdge
         )
+        for staleKey in order.filter({
+            $0.source.path == source.path && $0.source != source
+        }) {
+            if let removed = cache.removeValue(forKey: staleKey) {
+                totalBytes -= removed.imageData.count
+            }
+            order.removeAll { $0 == staleKey }
+        }
         if let cached = cache[key] {
             touch(key)
             return cached
@@ -1017,24 +1741,48 @@ actor PDFEditorPreviewLoader {
 
         guard !Task.isCancelled,
               let document = PDFDocument(url: url),
+              !document.isLocked,
               pageIndex >= 0,
               pageIndex < document.pageCount,
               let page = document.page(at: pageIndex)
         else { return nil }
 
         let bounds = page.bounds(for: .cropBox)
-        guard bounds.width > 0, bounds.height > 0 else { return nil }
-        let scale = CGFloat(longEdge)
+        guard bounds.width.isFinite,
+              bounds.height.isFinite,
+              bounds.width > 0,
+              bounds.height > 0
+        else { return nil }
+        let scale = CGFloat(resolvedLongEdge)
             / max(bounds.width, bounds.height)
-        let image = page.thumbnail(
-            of: CGSize(
-                width: max(1, bounds.width * scale),
-                height: max(1, bounds.height * scale)
-            ),
-            for: .cropBox
-        )
-        guard !Task.isCancelled,
-              let imageData = image.pngData()
+        let rendered = autoreleasepool {
+            let image = page.thumbnail(
+                of: CGSize(
+                    width: max(1, bounds.width * scale),
+                    height: max(1, bounds.height * scale)
+                ),
+                for: .cropBox
+            )
+            guard let cgImage = image.cgImage,
+                  cgImage.width > 0,
+                  cgImage.height > 0
+            else { return nil as Data? }
+            let pixels = cgImage.width.multipliedReportingOverflow(
+                by: cgImage.height
+            )
+            guard !pixels.overflow,
+                  pixels.partialValue <= Self.maximumPreviewPixels,
+                  let data = image.pngData(),
+                  !data.isEmpty,
+                  data.count <= Self.maximumPreviewBytes
+            else { return nil }
+            return data
+        }
+        guard let imageData = rendered,
+              await PDFThumbnailLoader.prepareForRendering(),
+              !Task.isCancelled,
+              generation == cacheGeneration,
+              PDFPreviewSource(url: url, revision: revision) == source
         else { return nil }
 
         let preview = PDFEditorPreview(
@@ -1062,7 +1810,10 @@ actor PDFEditorPreviewLoader {
         cache[key] = preview
         totalBytes += preview.imageData.count
         touch(key)
+        trimIfNeeded()
+    }
 
+    private func trimIfNeeded() {
         while order.count > maximumEntries
             || totalBytes > maximumBytes {
             guard let oldest = order.first else { break }
@@ -1074,7 +1825,144 @@ actor PDFEditorPreviewLoader {
     }
 }
 
+enum PDFPagePreviewWindow {
+    static func indices(pageCount: Int, selectedPage: Int) -> Range<Int> {
+        let count = max(0, pageCount)
+        let visibleCount = min(9, count)
+        let selected = min(max(0, selectedPage), max(0, count - 1))
+        let start = min(max(0, selected - visibleCount / 2), count - visibleCount)
+        return start..<(start + visibleCount)
+    }
+}
+
+struct PDFPageFilmstrip: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let url: URL
+    let pageCount: Int
+    let refreshToken: Int
+    @Binding var selectedPage: Int
+    var showsThumbnails = true
+    var onChoosePage: (() -> Void)?
+
+    private var currentPage: Int {
+        min(max(0, selectedPage), max(0, pageCount - 1))
+    }
+
+    var body: some View {
+        VStack(spacing: PPSpacing.xSmall) {
+            HStack(spacing: PPSpacing.small) {
+                pageButton("Previous page", symbol: "chevron.left", offset: -1)
+                    .disabled(currentPage == 0)
+                Button {
+                    onChoosePage?()
+                } label: {
+                    Text(AppLocalization.format(
+                        "Page %lld of %lld", currentPage + 1, max(1, pageCount)
+                    ))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(maxWidth: .infinity, minHeight: PPDeskLayout.touchTarget)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut("l", modifiers: .command)
+                .disabled(onChoosePage == nil)
+                .accessibilityLabel("Go to page".localizedUI)
+                .accessibilityValue(AppLocalization.format(
+                    "Page %lld of %lld", currentPage + 1, max(1, pageCount)
+                ))
+                pageButton("Next page", symbol: "chevron.right", offset: 1)
+                    .disabled(currentPage >= pageCount - 1)
+            }
+
+            if pageCount > 1, showsThumbnails {
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal) {
+                        HStack(spacing: PPSpacing.small) {
+                            ForEach(
+                                PDFPagePreviewWindow.indices(
+                                    pageCount: pageCount, selectedPage: currentPage
+                                ), id: \.self
+                            ) { page in
+                                Button {
+                                    selectedPage = page
+                                } label: {
+                                    VStack(spacing: PPSpacing.xSmall) {
+                                        PDFPageThumbnailView(
+                                            url: url, pageIndex: page,
+                                            refreshToken: refreshToken, width: 44
+                                        )
+                                        .accessibilityHidden(true)
+                                        Text("\(page + 1)")
+                                            .font(.caption2.monospacedDigit())
+                                            .foregroundStyle(
+                                                page == currentPage
+                                                    ? PPColor.accent : PPColor.textSecondary
+                                            )
+                                    }
+                                    .padding(PPSpacing.xSmall)
+                                    .frame(width: 56)
+                                    .background(
+                                        page == currentPage
+                                            ? PPColor.surface : Color.clear,
+                                        in: RoundedRectangle(cornerRadius: PPRadius.control)
+                                    )
+                                    .overlay {
+                                        RoundedRectangle(cornerRadius: PPRadius.control)
+                                            .strokeBorder(
+                                                page == currentPage
+                                                    ? PPColor.accent : .clear,
+                                                lineWidth: 2
+                                            )
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                                .hoverEffect(.highlight)
+                                .id(page)
+                                .accessibilityLabel(AppLocalization.format(
+                                    "Page %lld preview", page + 1
+                                ))
+                                .accessibilityAddTraits(page == currentPage ? .isSelected : [])
+                                .accessibilityIdentifier("pageFilmstrip-\(page)")
+                            }
+                        }
+                        .padding(.vertical, 2)
+                    }
+                    .scrollIndicators(.hidden)
+                    .onChange(of: currentPage, initial: true) { _, page in
+                        withAnimation(reduceMotion ? nil : PPMotion.selection) {
+                            proxy.scrollTo(page, anchor: .center)
+                        }
+                    }
+                }
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("pdfPageFilmstrip")
+    }
+
+    private func pageButton(
+        _ title: String, symbol: String, offset: Int
+    ) -> some View {
+        Button {
+            selectedPage = min(max(0, currentPage + offset), max(0, pageCount - 1))
+        } label: {
+            Image(systemName: symbol)
+                .font(.system(size: 15, weight: .semibold))
+                .frame(width: PPDeskLayout.touchTarget, height: PPDeskLayout.touchTarget)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .keyboardShortcut(offset < 0 ? .leftArrow : .rightArrow, modifiers: .option)
+        .help(title.localizedUI)
+        .accessibilityLabel(title.localizedUI)
+    }
+}
+
 struct PDFPageThumbnailView: View {
+    @Environment(\.scenePhase) private var scenePhase
+
     let url: URL
     let pageIndex: Int
     let refreshToken: Int
@@ -1085,10 +1973,45 @@ struct PDFPageThumbnailView: View {
         height ?? width * 1.28
     }
 
+    private var renderSize: CGSize {
+        let quality = ThumbnailPreviewQuality(
+            rawValue: previewQuality
+        ) ?? .automatic
+        func bucket(_ value: CGFloat) -> CGFloat {
+            guard value.isFinite, value > 0 else { return 32 }
+            return min(1_200, max(32, (value / 32).rounded(.up) * 32))
+        }
+        return CGSize(
+            width: bucket(width * quality.renderScale),
+            height: bucket(resolvedHeight * quality.renderScale)
+        )
+    }
+
+    private var imageIdentity: String {
+        "\(url.standardizedFileURL.path)#\(refreshToken)#\(pageIndex)"
+    }
+
+    private var thumbnailTaskID: String {
+        [
+            url.standardizedFileURL.path,
+            String(refreshToken),
+            String(pageIndex),
+            previewQuality,
+            scenePhase == .background ? "paused" : "visible",
+            String(protectedDataAvailable),
+            String(Int(renderSize.width)),
+            String(Int(renderSize.height))
+        ].joined(separator: "#")
+    }
+
     @AppStorage(AppPreferences.previewQualityKey)
     private var previewQuality =
         ThumbnailPreviewQuality.automatic.rawValue
     @State private var image: UIImage?
+    @State private var loadedImageIdentity: String?
+    @State private var didFinishLoading = false
+    @State private var protectedDataAvailable =
+        UIApplication.shared.isProtectedDataAvailable
 
     var body: some View {
         ZStack {
@@ -1107,6 +2030,10 @@ struct PDFPageThumbnailView: View {
                     )
                     .padding(2)
                     .transition(.opacity)
+            } else if didFinishLoading {
+                Image(systemName: "doc")
+                    .font(.title3)
+                    .foregroundStyle(PPColor.textSecondary)
             } else {
                 ProgressView()
                     .controlSize(.small)
@@ -1117,22 +2044,56 @@ struct PDFPageThumbnailView: View {
             RoundedRectangle(cornerRadius: 5, style: .continuous)
                 .stroke(PPColor.border.opacity(0.64), lineWidth: 0.55)
         }
-        .task(id: "\(refreshToken)-\(pageIndex)-\(previewQuality)") {
-            image = nil
-            let quality = ThumbnailPreviewQuality(
-                rawValue: previewQuality
-            ) ?? .automatic
+        .task(id: thumbnailTaskID) {
+            let requestedIdentity = imageIdentity
+            if loadedImageIdentity != requestedIdentity {
+                image = nil
+            }
+            didFinishLoading = false
+            guard scenePhase != .background,
+                  protectedDataAvailable,
+                  UIApplication.shared.isProtectedDataAvailable
+            else {
+                image = nil
+                loadedImageIdentity = nil
+                return
+            }
             let loadedImage = await PDFThumbnailLoader.thumbnail(
                 url: url,
                 pageIndex: pageIndex,
                 revision: refreshToken,
-                size: CGSize(
-                    width: width * quality.renderScale,
-                    height: resolvedHeight * quality.renderScale
-                )
+                size: renderSize
             )
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  imageIdentity == requestedIdentity,
+                  scenePhase != .background,
+                  protectedDataAvailable,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
             image = loadedImage
+            loadedImageIdentity = requestedIdentity
+            didFinishLoading = true
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication.protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            protectedDataAvailable = false
+            image = nil
+            loadedImageIdentity = nil
+            didFinishLoading = false
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication.protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            protectedDataAvailable = true
+        }
+        .onDisappear {
+            image = nil
+            loadedImageIdentity = nil
         }
         .accessibilityLabel(
             AppLocalization.format(
@@ -1140,14 +2101,28 @@ struct PDFPageThumbnailView: View {
                 pageIndex + 1
             )
         )
+        .accessibilityValue(
+            (
+                image != nil
+                    ? "Ready"
+                    : didFinishLoading
+                        ? "Preview unavailable"
+                        : "Loading"
+            ).localizedUI
+        )
     }
 }
 
 private enum PDFThumbnailLoader {
     private static let cache = PDFThumbnailCache()
-    private static let memoryWarningObserver: NSObjectProtocol =
+    @MainActor
+    private static let cachePressureObservers: [NSObjectProtocol] = [
+        UIApplication.didReceiveMemoryWarningNotification,
+        UIApplication.didEnterBackgroundNotification,
+        UIApplication.protectedDataWillBecomeUnavailableNotification
+    ].map { name in
         NotificationCenter.default.addObserver(
-            forName: UIApplication.didReceiveMemoryWarningNotification,
+            forName: name,
             object: nil,
             queue: .main
         ) { _ in
@@ -1157,34 +2132,55 @@ private enum PDFThumbnailLoader {
                     .removeAllCachedPreviews()
             }
         }
+    }
 
+    @MainActor
+    static func prepareForRendering() -> Bool {
+        _ = cachePressureObservers
+        return UIApplication.shared.isProtectedDataAvailable
+            && UIApplication.shared.applicationState != .background
+    }
+
+    @MainActor
     static func thumbnail(
         url: URL,
         pageIndex: Int,
         revision: Int,
         size: CGSize
     ) async -> UIImage? {
-        _ = memoryWarningObserver
+        guard !Task.isCancelled,
+              prepareForRendering()
+        else { return nil }
         let data = await cache.thumbnailData(
             url: url,
             pageIndex: pageIndex,
             revision: revision,
             size: size
         )
-        guard let data else { return nil }
+        guard let data,
+              !Task.isCancelled,
+              prepareForRendering()
+        else { return nil }
         return UIImage(data: data)
     }
 }
 
 private actor PDFThumbnailCache {
+    private struct Key: Hashable {
+        let source: PDFPreviewSource
+        let pageIndex: Int
+        let width: Int
+        let height: Int
+    }
+
     private struct Entry {
         let data: Data
         var access: UInt64
     }
 
-    private var entries: [String: Entry] = [:]
-    private var documents: [String: PDFDocument] = [:]
-    private var documentOrder: [String] = []
+    private var entries: [Key: Entry] = [:]
+    private var documents: [PDFPreviewSource: PDFDocument] = [:]
+    private var documentOrder: [PDFPreviewSource] = []
     private var totalByteCount = 0
     private var accessCounter: UInt64 = 0
 
@@ -1201,15 +2197,36 @@ private actor PDFThumbnailCache {
         revision: Int,
         size: CGSize
     ) -> Data? {
-        guard !Task.isCancelled else { return nil }
-        let documentKey = "\(url.path)#\(revision)"
-        let key = [
-            documentKey,
-            String(pageIndex),
-            String(Int(size.width.rounded())),
-            String(Int(size.height.rounded()))
-        ].joined(separator: ":")
+        guard !Task.isCancelled,
+              pageIndex >= 0,
+              let source = PDFPreviewSource(url: url, revision: revision),
+              size.width.isFinite,
+              size.height.isFinite,
+              size.width > 0,
+              size.height > 0
+        else { return nil }
+        let resolvedSize = CGSize(
+            width: min(max(size.width.rounded(.up), 1), 1_200),
+            height: min(max(size.height.rounded(.up), 1), 1_200)
+        )
+        let documentKey = source
+        let key = Key(
+            source: source,
+            pageIndex: pageIndex,
+            width: Int(resolvedSize.width),
+            height: Int(resolvedSize.height)
+        )
+        let staleSources = Set(entries.keys.map(\.source))
+            .union(documents.keys)
+            .filter { $0.path == source.path && $0 != source }
+        for stale in staleSources {
+            documents[stale] = nil
+            documentOrder.removeAll { $0 == stale }
+            removeEntries(withDocumentKey: stale)
+        }
         accessCounter &+= 1
+        trimDocumentsIfNeeded()
+        trimIfNeeded()
         if var cached = entries[key] {
             cached.access = accessCounter
             entries[key] = cached
@@ -1219,25 +2236,47 @@ private actor PDFThumbnailCache {
         let document: PDFDocument
         if let cached = documents[documentKey] {
             document = cached
+            touchDocument(documentKey)
         } else {
-            guard let opened = PDFDocument(url: url) else { return nil }
+            guard let opened = PDFDocument(url: url),
+                  !opened.isLocked
+            else { return nil }
             document = opened
             documents[documentKey] = opened
-            documentOrder.removeAll { $0 == documentKey }
-            documentOrder.append(documentKey)
-            while documentOrder.count > maximumDocumentCount {
-                let removed = documentOrder.removeFirst()
-                documents[removed] = nil
-                removeEntries(withDocumentKey: removed)
-            }
+            touchDocument(documentKey)
+            trimDocumentsIfNeeded()
         }
         guard !Task.isCancelled,
+              pageIndex < document.pageCount,
               let page = document.page(at: pageIndex)
         else { return nil }
-        let data: Data? = autoreleasepool {
-            page.thumbnail(of: size, for: .mediaBox).pngData()
+        let bounds = page.bounds(for: .cropBox)
+        guard bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width > 0, bounds.height > 0
+        else { return nil }
+        let rendered = autoreleasepool {
+            let image = page.thumbnail(
+                of: resolvedSize,
+                for: .cropBox
+            )
+            guard let cgImage = image.cgImage,
+                  cgImage.width > 0,
+                  cgImage.height > 0
+            else { return nil as Data? }
+            let pixels = cgImage.width.multipliedReportingOverflow(
+                by: cgImage.height
+            )
+            guard !pixels.overflow,
+                  pixels.partialValue <= 1_440_000,
+                  let data = image.pngData(),
+                  !data.isEmpty,
+                  data.count <= 5 * 1_024 * 1_024
+            else { return nil }
+            return data
         }
-        guard let data, !Task.isCancelled else { return nil }
+        guard let data = rendered, !Task.isCancelled,
+              PDFPreviewSource(url: url, revision: revision) == source
+        else { return nil }
         entries[key] = Entry(data: data, access: accessCounter)
         totalByteCount += data.count
         trimIfNeeded()
@@ -1260,11 +2299,23 @@ private actor PDFThumbnailCache {
         ThumbnailPreviewQuality.selected.cacheDocumentLimit
     }
 
+    private func trimDocumentsIfNeeded() {
+        while documentOrder.count > maximumDocumentCount {
+            let removed = documentOrder.removeFirst()
+            documents[removed] = nil
+        }
+    }
+
+    private func touchDocument(_ documentKey: PDFPreviewSource) {
+        documentOrder.removeAll { $0 == documentKey }
+        documentOrder.append(documentKey)
+    }
+
     private func removeEntries(
-        withDocumentKey documentKey: String
+        withDocumentKey documentKey: PDFPreviewSource
     ) {
         let keys = entries.keys.filter {
-            $0.hasPrefix(documentKey + ":")
+            $0.source == documentKey
         }
         for key in keys {
             if let entry = entries.removeValue(forKey: key) {
@@ -1274,20 +2325,99 @@ private actor PDFThumbnailCache {
     }
 }
 
+private final class ManagedShareLease {
+    private var leaseID: UUID?
+    private var protectedDataObserver: NSObjectProtocol?
+
+    func begin(for urls: [URL], removesItemsOnCompletion: Bool = true) {
+        finish()
+        guard let leaseID =
+            PaperPathTemporaryArtifact.beginShareLease(
+                for: urls,
+                removesItemsOnCompletion: removesItemsOnCompletion
+            )
+        else { return }
+        self.leaseID = leaseID
+        protectedDataObserver = NotificationCenter.default
+            .addObserver(
+                forName: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.finish(forcesCleanup: true)
+            }
+    }
+
+    func finish(forcesCleanup: Bool = false) {
+        if let protectedDataObserver {
+            NotificationCenter.default.removeObserver(
+                protectedDataObserver
+            )
+            self.protectedDataObserver = nil
+        }
+        guard let leaseID else { return }
+        self.leaseID = nil
+        PaperPathTemporaryArtifact.endShareLease(
+            leaseID,
+            forcesCleanup: forcesCleanup
+        )
+    }
+
+    deinit {
+        finish()
+    }
+}
+
 struct ShareSheet: UIViewControllerRepresentable {
     let items: [Any]
+    var removesTemporaryItemsOnCompletion = true
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(
+        context.coordinator.beginShareLease(
+            for: items,
+            removesItemsOnCompletion: removesTemporaryItemsOnCompletion
+        )
+        let controller = UIActivityViewController(
             activityItems: items,
             applicationActivities: nil
         )
+        let coordinator = context.coordinator
+        controller.completionWithItemsHandler = {
+            _,
+            _,
+            _,
+            _ in
+            coordinator.finishShareLease()
+        }
+        return controller
     }
 
     func updateUIViewController(
         _ uiViewController: UIActivityViewController,
         context: Context
     ) {}
+
+    final class Coordinator {
+        private let shareLease = ManagedShareLease()
+
+        func beginShareLease(for items: [Any], removesItemsOnCompletion: Bool) {
+            shareLease.begin(
+                for: items.compactMap { $0 as? URL },
+                removesItemsOnCompletion: removesItemsOnCompletion
+            )
+        }
+
+        func finishShareLease(
+            forcesCleanup: Bool = false
+        ) {
+            shareLease.finish(forcesCleanup: forcesCleanup)
+        }
+    }
 }
 
 struct FileExportPicker: UIViewControllerRepresentable {
@@ -1301,11 +2431,27 @@ struct FileExportPicker: UIViewControllerRepresentable {
     func makeUIViewController(
         context: Context
     ) -> UIDocumentPickerViewController {
+        context.coordinator.beginShareLease(for: url)
         let picker = UIDocumentPickerViewController(
             forExporting: [url],
             asCopy: true
         )
         picker.delegate = context.coordinator
+        picker.view.accessibilityIdentifier = "fileExportPicker"
+#if DEBUG
+        // #region debug-point G:files-picker-created
+        reportFrequentUIFreezeDebugEvent(
+            hypothesisID: "G",
+            location: "FileExportPicker.makeUIViewController",
+            message: "Files picker created",
+            data: [
+                "fileExists": String(
+                    FileManager.default.fileExists(atPath: url.path)
+                )
+            ]
+        )
+        // #endregion
+#endif
         return picker
     }
 
@@ -1317,10 +2463,15 @@ struct FileExportPicker: UIViewControllerRepresentable {
     @MainActor
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         private let onCompletion: () -> Void
+        private let shareLease = ManagedShareLease()
         private var hasCompleted = false
 
         init(onCompletion: @escaping () -> Void) {
             self.onCompletion = onCompletion
+        }
+
+        func beginShareLease(for url: URL) {
+            shareLease.begin(for: [url])
         }
 
         func documentPicker(
@@ -1339,6 +2490,7 @@ struct FileExportPicker: UIViewControllerRepresentable {
         private func complete() {
             guard !hasCompleted else { return }
             hasCompleted = true
+            shareLease.finish()
             onCompletion()
         }
     }

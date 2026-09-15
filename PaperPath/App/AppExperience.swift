@@ -127,6 +127,7 @@ enum ThumbnailPreviewQuality:
     }
 }
 
+@MainActor
 enum AppEntitlement {
     static let productID =
         "com.monoware.paperpath.full-unlock"
@@ -141,28 +142,40 @@ enum AppEntitlement {
         "commerce.lastVerifiedFailureAt"
     private static let ratingRequestedKey =
         "experience.ratingRequested"
+    private static let maximumVerifiedOutputCount = 1_000_000
+    private(set) static var didVerifyStoreKitEntitlement = false
 
     static var isUnlocked: Bool {
         UserDefaults.standard.bool(forKey: unlockedKey)
     }
 
-    static var verifiedOutputCount: Int {
-        UserDefaults.standard.integer(
-            forKey: verifiedOutputCountKey
-        )
+    static var canCreateVerifiedOutput: Bool {
+        didVerifyStoreKitEntitlement && isUnlocked
     }
 
-    static var canCreateSingleVerifiedOutput: Bool {
-        isUnlocked || verifiedOutputCount == 0
+    static var verifiedOutputCount: Int {
+        min(
+            maximumVerifiedOutputCount,
+            max(
+                0,
+                UserDefaults.standard.integer(
+                    forKey: verifiedOutputCountKey
+                )
+            )
+        )
     }
 
     static func setUnlocked(_ value: Bool) {
         UserDefaults.standard.set(value, forKey: unlockedKey)
+        didVerifyStoreKitEntitlement = true
     }
 
     @discardableResult
     static func recordVerifiedOutput() -> Int {
-        let count = verifiedOutputCount + 1
+        let count = min(
+            maximumVerifiedOutputCount,
+            verifiedOutputCount + 1
+        )
         UserDefaults.standard.set(
             count,
             forKey: verifiedOutputCountKey
@@ -187,12 +200,25 @@ enum AppEntitlement {
               !defaults.bool(forKey: ratingRequestedKey),
               let successAt = defaults.object(
                 forKey: lastVerifiedOutputAtKey
-              ) as? Date
+              ) as? Date,
+              isPlausibleExperienceDate(successAt)
         else { return false }
-        let failureAt = defaults.object(
+        guard let failureAt = defaults.object(
             forKey: lastVerifiedFailureAtKey
-        ) as? Date
-        return failureAt == nil || failureAt! < successAt
+        ) as? Date else {
+            return true
+        }
+        return isPlausibleExperienceDate(failureAt)
+            && failureAt < successAt
+    }
+
+    private static func isPlausibleExperienceDate(
+        _ date: Date
+    ) -> Bool {
+        let timestamp = date.timeIntervalSince1970
+        return timestamp.isFinite
+            && timestamp >= 0
+            && date <= Date().addingTimeInterval(5 * 60)
     }
 
     static func markRatingRequested() {
@@ -201,14 +227,64 @@ enum AppEntitlement {
             forKey: ratingRequestedKey
         )
     }
+
+#if DEBUG
+    static func resetVerifiedOutputHistoryForUITesting() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: verifiedOutputCountKey)
+        defaults.removeObject(forKey: lastVerifiedOutputAtKey)
+        defaults.removeObject(forKey: lastVerifiedFailureAtKey)
+        defaults.removeObject(forKey: ratingRequestedKey)
+    }
+#endif
+}
+
+enum FullUnlockContext: Equatable {
+    case settings
+    case singleVerifiedOutput
+    case batchVerifiedOutput
+
+    var isBlockedAction: Bool {
+        self != .settings
+    }
+
+    var title: String {
+        switch self {
+        case .settings:
+            return "Own trusted delivery for life."
+        case .singleVerifiedOutput:
+            return "Continue verified delivery."
+        case .batchVerifiedOutput:
+            return "Unlock batch verified delivery."
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .settings:
+            return "Your first real Verified Output is free. Unlock unlimited use when PaperPath has proved useful."
+        case .singleVerifiedOutput:
+            return "Your free Verified Output has been used. One purchase unlocks unlimited verified copies."
+        case .batchVerifiedOutput:
+            return "Batch Verified Output is included with lifetime access. Reading and editing remain available."
+        }
+    }
 }
 
 @MainActor
 final class PurchaseController: ObservableObject {
+    enum Operation: Equatable {
+        case refreshing
+        case preparing
+        case purchasing
+        case restoring
+    }
+
     enum Status: Equatable {
         case idle
         case loading
         case purchasing
+        case restoring
         case pending
         case purchased
         case cancelled
@@ -223,6 +299,8 @@ final class PurchaseController: ObservableObject {
                 return "Checking App Store"
             case .purchasing:
                 return "Confirming purchase"
+            case .restoring:
+                return "Checking previous purchases"
             case .pending:
                 return "Purchase approval is pending"
             case .purchased:
@@ -241,65 +319,134 @@ final class PurchaseController: ObservableObject {
     @Published private(set) var isUnlocked =
         AppEntitlement.isUnlocked
     @Published private(set) var status = Status.idle
+    @Published private(set) var activeOperation: Operation?
 
     private var updatesTask: Task<Void, Never>?
+    private var entitlementRefreshTask: Task<Bool, Never>?
+    private var entitlementRefreshID: UUID?
+    private var entitlementRefreshRevision: UInt64?
+    private var entitlementRevision: UInt64 = 0
 
     init() {
         updatesTask = Task { [weak self] in
             for await result in StoreKit.Transaction.updates {
                 guard let self,
-                      case let .verified(transaction) = result
+                      case let .verified(transaction) = result,
+                      transaction.productID == AppEntitlement.productID
                 else { continue }
                 await self.apply(transaction)
                 await transaction.finish()
+                if self.activeOperation == nil {
+                    self.status = self.isUnlocked
+                        ? .purchased
+                        : .idle
+                }
             }
         }
     }
 
     deinit {
         updatesTask?.cancel()
+        entitlementRefreshTask?.cancel()
     }
 
     var displayPrice: String {
         product?.displayPrice ?? ""
     }
 
+    var isBusy: Bool {
+        activeOperation != nil
+    }
+
+    var purchaseControlsDisabled: Bool {
+        isBusy || status == .pending
+    }
+
     func prepare() async {
+        while activeOperation == .refreshing {
+            do {
+                try await Task.sleep(for: .milliseconds(20))
+            } catch {
+                return
+            }
+        }
+        guard begin(.preparing) else { return }
+        defer { finishOperation() }
+        let preservesPendingStatus = status == .pending
         status = .loading
         do {
-            product = try await Product.products(
-                for: [AppEntitlement.productID]
-            ).first
-            await refreshEntitlement()
+            if product == nil {
+                product = try await Product.products(
+                    for: [AppEntitlement.productID]
+                ).first
+            }
+            guard !Task.isCancelled else {
+                restoreStableStatus(
+                    preservingPending: preservesPendingStatus
+                )
+                return
+            }
+            guard await refreshEntitlement() else {
+                restoreStableStatus(
+                    preservingPending: preservesPendingStatus
+                )
+                return
+            }
             if isUnlocked {
                 status = .purchased
             } else {
-                status = product == nil ? .unavailable : .idle
+                status = product == nil
+                    ? .unavailable
+                    : preservesPendingStatus ? .pending : .idle
             }
+        } catch is CancellationError {
+            restoreStableStatus(
+                preservingPending: preservesPendingStatus
+            )
         } catch {
-            status = .failed(error.localizedDescription)
+            status = .failed(
+                AppLocalization.userFacingErrorDescription(error)
+            )
         }
     }
 
     func refreshForLaunch() async {
-        await refreshEntitlement()
-        let refreshedStatus: Status =
-            isUnlocked ? .purchased : .idle
-        if status != refreshedStatus {
-            status = refreshedStatus
+        let ownsOperation = begin(.refreshing)
+        defer {
+            if ownsOperation {
+                finishOperation()
+            }
+        }
+        guard await refreshEntitlement() else { return }
+        if ownsOperation {
+            restoreStableStatus()
         }
     }
 
     func purchase() async {
-        guard let product else {
-            status = .unavailable
-            return
-        }
-        status = .purchasing
+        guard begin(.purchasing) else { return }
+        defer { finishOperation() }
         do {
+            if product == nil {
+                status = .loading
+                product = try await Product.products(
+                    for: [AppEntitlement.productID]
+                ).first
+                guard !Task.isCancelled else {
+                    restoreStableStatus()
+                    return
+                }
+            }
+            guard let product else {
+                status = .unavailable
+                return
+            }
+            status = .purchasing
             switch try await product.purchase() {
             case let .success(result):
-                guard case let .verified(transaction) = result else {
+                guard case let .verified(transaction) = result,
+                      transaction.productID == AppEntitlement.productID
+                else {
                     status = .failed(
                         "The purchase could not be verified."
                     )
@@ -307,7 +454,9 @@ final class PurchaseController: ObservableObject {
                 }
                 await apply(transaction)
                 await transaction.finish()
-                status = .purchased
+                status = isUnlocked
+                    ? .purchased
+                    : .failed("The purchase is no longer active.")
             case .pending:
                 status = .pending
             case .userCancelled:
@@ -317,33 +466,96 @@ final class PurchaseController: ObservableObject {
                     "The App Store returned an unknown result."
                 )
             }
+        } catch is CancellationError {
+            restoreStableStatus()
         } catch {
-            status = .failed(error.localizedDescription)
+            status = .failed(
+                AppLocalization.userFacingErrorDescription(error)
+            )
         }
     }
 
     func restore() async {
-        status = .loading
+        guard begin(.restoring) else { return }
+        defer { finishOperation() }
+        status = .restoring
         do {
             try await AppStore.sync()
-            await refreshEntitlement()
+            guard await refreshEntitlement() else {
+                restoreStableStatus()
+                return
+            }
             status = isUnlocked
                 ? .purchased
                 : .failed("No lifetime purchase was found.")
+        } catch is CancellationError {
+            restoreStableStatus()
         } catch {
-            status = .failed(error.localizedDescription)
+            status = .failed(
+                AppLocalization.userFacingErrorDescription(error)
+            )
         }
     }
 
-    private func refreshEntitlement() async {
-        var unlocked = false
-        for await result in StoreKit.Transaction.currentEntitlements {
-            guard case let .verified(transaction) = result,
-                  transaction.productID == AppEntitlement.productID,
-                  transaction.revocationDate == nil
-            else { continue }
-            unlocked = true
-            break
+    func recheckPendingPurchase() async {
+        guard status == .pending else {
+            await prepare()
+            return
+        }
+        guard begin(.refreshing) else { return }
+        defer { finishOperation() }
+        status = .loading
+        guard await refreshEntitlement() else {
+            restoreStableStatus(preservingPending: true)
+            return
+        }
+        status = isUnlocked
+            ? .purchased
+            : .failed("No approved purchase was found yet.")
+    }
+
+    private func refreshEntitlement() async -> Bool {
+        let refreshID: UUID
+        let requestedRevision: UInt64
+        let task: Task<Bool, Never>
+        if let activeTask = entitlementRefreshTask,
+           let activeID = entitlementRefreshID,
+           let activeRevision = entitlementRefreshRevision {
+            refreshID = activeID
+            requestedRevision = activeRevision
+            task = activeTask
+        } else {
+            refreshID = UUID()
+            requestedRevision = entitlementRevision
+            task = Task {
+                var unlocked = false
+                for await result in StoreKit.Transaction
+                    .currentEntitlements {
+                    guard case let .verified(transaction) = result,
+                          transaction.productID
+                            == AppEntitlement.productID,
+                          transaction.revocationDate == nil
+                    else { continue }
+                    unlocked = true
+                    break
+                }
+                return unlocked
+            }
+            entitlementRefreshID = refreshID
+            entitlementRefreshRevision = requestedRevision
+            entitlementRefreshTask = task
+        }
+
+        let unlocked = await task.value
+        let callerWasCancelled = Task.isCancelled
+        guard entitlementRefreshID == refreshID else {
+            return !callerWasCancelled
+        }
+        entitlementRefreshID = nil
+        entitlementRefreshRevision = nil
+        entitlementRefreshTask = nil
+        guard entitlementRevision == requestedRevision else {
+            return !callerWasCancelled
         }
         // StoreKit's current entitlements are the authority after launch.
         // Keeping a stale local unlock here would ignore refunds or revocation.
@@ -351,6 +563,7 @@ final class PurchaseController: ObservableObject {
             isUnlocked = unlocked
         }
         AppEntitlement.setUnlocked(isUnlocked)
+        return !callerWasCancelled
     }
 
     private func apply(
@@ -358,17 +571,38 @@ final class PurchaseController: ObservableObject {
     ) async {
         guard transaction.productID == AppEntitlement.productID
         else { return }
+        entitlementRevision &+= 1
         let unlocked = transaction.revocationDate == nil
         if isUnlocked != unlocked {
             isUnlocked = unlocked
         }
         AppEntitlement.setUnlocked(unlocked)
     }
+
+    private func begin(_ operation: Operation) -> Bool {
+        guard activeOperation == nil else { return false }
+        activeOperation = operation
+        return true
+    }
+
+    private func finishOperation() {
+        activeOperation = nil
+    }
+
+    private func restoreStableStatus(
+        preservingPending: Bool = false
+    ) {
+        status = isUnlocked
+            ? .purchased
+            : preservingPending ? .pending : .idle
+    }
 }
 
 enum LocalDueReminderScheduler {
     private static let identifierPrefix =
         "paperpath.due."
+    // Keep headroom below the system-wide pending notification limit.
+    private static let maximumPendingReminderCount = 60
 
     static func requestAuthorization() async -> Bool {
         do {
@@ -385,10 +619,11 @@ enum LocalDueReminderScheduler {
             .notificationSettings().authorizationStatus
     }
 
+    @discardableResult
     static func update(
         recordID: UUID,
         dueAt: Date?
-    ) async {
+    ) async -> Bool {
         let center = UNUserNotificationCenter.current()
         let identifier = identifierPrefix + recordID.uuidString
         center.removePendingNotificationRequests(
@@ -398,7 +633,7 @@ enum LocalDueReminderScheduler {
             forKey: AppPreferences.dueRemindersEnabledKey
         ),
         let dueAt
-        else { return }
+        else { return true }
 
         let content = UNMutableNotificationContent()
         content.title = AppBrand.name
@@ -417,6 +652,38 @@ enum LocalDueReminderScheduler {
         if fireDate <= Date() {
             fireDate = Date().addingTimeInterval(60)
         }
+        let pending = await center.pendingNotificationRequests()
+        let otherPaperPathRequests = pending.filter {
+            $0.identifier.hasPrefix(identifierPrefix)
+                && $0.identifier != identifier
+        }
+        if otherPaperPathRequests.count
+            >= maximumPendingReminderCount {
+            let scheduledRequests = otherPaperPathRequests.map {
+                request in
+                (
+                    request: request,
+                    date: nextFireDate(for: request)
+                )
+            }
+            let furthestFirst = scheduledRequests.sorted {
+                lhs, rhs in
+                lhs.date > rhs.date
+            }
+            guard let furthest = furthestFirst.first,
+                  fireDate < furthest.date
+            else {
+                return false
+            }
+            let removalCount =
+                otherPaperPathRequests.count
+                    - maximumPendingReminderCount + 1
+            center.removePendingNotificationRequests(
+                withIdentifiers: furthestFirst
+                    .prefix(removalCount)
+                    .map { $0.request.identifier }
+            )
+        }
         let components = calendar.dateComponents(
             [.year, .month, .day, .hour, .minute],
             from: fireDate
@@ -429,19 +696,30 @@ enum LocalDueReminderScheduler {
                 repeats: false
             )
         )
-        try? await center.add(request)
+        do {
+            try await center.add(request)
+            return true
+        } catch {
+            return false
+        }
     }
 
-    static func disableAll() {
+    static func disableAll() async {
         let center = UNUserNotificationCenter.current()
-        center.getPendingNotificationRequests { requests in
-            let identifiers = requests
-                .map(\.identifier)
-                .filter { $0.hasPrefix(identifierPrefix) }
-            center.removePendingNotificationRequests(
-                withIdentifiers: identifiers
-            )
-        }
+        let requests = await center.pendingNotificationRequests()
+        let identifiers = requests
+            .map(\.identifier)
+            .filter { $0.hasPrefix(identifierPrefix) }
+        center.removePendingNotificationRequests(
+            withIdentifiers: identifiers
+        )
+    }
+
+    private static func nextFireDate(
+        for request: UNNotificationRequest
+    ) -> Date {
+        (request.trigger as? UNCalendarNotificationTrigger)?
+            .nextTriggerDate() ?? .distantFuture
     }
 }
 
@@ -492,7 +770,8 @@ enum SupportBundleService {
                 "appLockEnabled": UserDefaults.standard.bool(
                     forKey: AppLockController.defaultsKey
                 ),
-                "fullUnlock": AppEntitlement.isUnlocked
+                "fullUnlock":
+                    AppEntitlement.canCreateVerifiedOutput
             ],
             "privacy": [
                 "containsPDFBytes": false,
@@ -511,26 +790,30 @@ enum SupportBundleService {
                 "PaperPath-Diagnostics-\(UUID().uuidString)",
                 isDirectory: true
             )
-        try FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true
-        )
-        LocalFileSecurity.applyCompleteProtection(to: directory)
-        LocalFileSecurity.excludeFromBackup(directory)
         let url = directory.appendingPathComponent(
             "PaperPath-Diagnostics.json"
         )
-        try data.write(to: url, options: .atomic)
-        LocalFileSecurity.applyCompleteProtection(to: url)
-        return url
+        do {
+            try LocalFileSecurity.prepareProtectedDirectory(
+                at: directory
+            )
+            try data.write(to: url, options: .atomic)
+            try LocalFileSecurity.requireCompleteProtection(to: url)
+            return url
+        } catch {
+            PaperPathTemporaryArtifact.removeManagedItem(
+                containing: directory,
+                allowedPrefixes: ["PaperPath-Diagnostics-"]
+            )
+            throw error
+        }
     }
 
     static func discard(_ url: URL?) {
         guard let url else { return }
-        let directory = url.deletingLastPathComponent()
-        guard directory.lastPathComponent
-            .hasPrefix("PaperPath-Diagnostics-")
-        else { return }
-        try? FileManager.default.removeItem(at: directory)
+        PaperPathTemporaryArtifact.removeManagedItem(
+            containing: url,
+            allowedPrefixes: ["PaperPath-Diagnostics-"]
+        )
     }
 }

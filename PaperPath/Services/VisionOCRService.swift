@@ -5,9 +5,37 @@ import PDFKit
 import UIKit
 @preconcurrency import Vision
 
+struct OCRCheckpointIdentity: Codable, Hashable, Sendable {
+    static let currentEngineVersion = 1
+
+    let recordID: UUID
+    let revisionID: UUID
+    let pageCount: Int
+    let configuration: OCRRecognitionConfiguration
+    var engineVersion = currentEngineVersion
+    var systemVersion = ProcessInfo.processInfo.operatingSystemVersionString
+}
+
+struct OCRCheckpoint: Sendable {
+    let identity: OCRCheckpointIdentity
+    let pages: [OCRPageResult]
+}
+
+struct OCRRecoverySummary: Hashable, Sendable {
+    let identity: OCRCheckpointIdentity
+    let completedPageIndices: [Int]
+    let damagedPageCount: Int
+
+    var completedPageCount: Int { completedPageIndices.count }
+}
+
 struct VisionOCRService: Sendable {
     private let maximumImageDimension: CGFloat = 2_200
     private let retryImageDimension: CGFloat = 3_200
+    private static let maximumBlocksPerPage = 4_096
+    private static let maximumBlockTextBytes = 16 * 1_024
+    private static let maximumPageTextBytes = 1 * 1_024 * 1_024
+    private static let maximumPageDimension: CGFloat = 200_000
     private static let enhancementContext = CIContext(
         options: [
             .cacheIntermediates: false,
@@ -22,6 +50,8 @@ struct VisionOCRService: Sendable {
     func recognize(
         url: URL,
         configuration: OCRRecognitionConfiguration = .automatic,
+        checkpoint: OCRCheckpoint? = nil,
+        onPageCompleted: @escaping @Sendable (OCRPageResult) async throws -> Void = { _ in },
         progress: @escaping PDFProgressHandler = { _ in }
     ) async throws -> OCRResult {
         let task = Task.detached(priority: .userInitiated) {
@@ -31,29 +61,102 @@ struct VisionOCRService: Sendable {
             guard !document.isLocked else {
                 throw PaperPathError.lockedPDF
             }
+            guard document.pageCount > 0 else {
+                throw PaperPathError.unreadablePDF
+            }
+            guard document.pageCount <= OCRResult.maximumPageCount else {
+                throw PaperPathError.insufficientSelection(
+                    "Recognize up to 1,000 pages at once."
+                )
+            }
 
             let appliedConfiguration = try validated(
                 configuration
             )
+            if let checkpoint {
+                guard checkpoint.identity.configuration == appliedConfiguration,
+                      checkpoint.identity.pageCount == document.pageCount,
+                      checkpoint.identity.engineVersion
+                        == OCRCheckpointIdentity.currentEngineVersion,
+                      checkpoint.identity.systemVersion
+                        == ProcessInfo.processInfo.operatingSystemVersionString,
+                      checkpoint.pages.count <= document.pageCount,
+                      Set(checkpoint.pages.map(\.pageIndex)).count == checkpoint.pages.count,
+                      checkpoint.pages.allSatisfy({
+                          (0..<document.pageCount).contains($0.pageIndex)
+                      })
+                else { throw PaperPathError.invalidPage }
+            }
+            let savedPages = Dictionary(
+                uniqueKeysWithValues: (checkpoint?.pages ?? []).map {
+                    ($0.pageIndex, $0)
+                }
+            )
             var pages: [OCRPageResult] = []
             pages.reserveCapacity(min(document.pageCount, 128))
-            progress(0)
+            var totalBlockCount = 0
+            var totalTextBytes = 0
+            var lastReportedPercent = -1
+            var completedPageCount = savedPages.count
+            progress(Double(completedPageCount) / Double(document.pageCount))
             for index in 0..<document.pageCount {
                 try Task.checkCancellation()
-                guard let page = document.page(at: index) else { continue }
-                let result = try autoreleasepool {
-                    try recognize(
+                let result: OCRPageResult
+                if let saved = savedPages[index] {
+                    result = saved
+                } else {
+                    guard let page = document.page(at: index) else {
+                        throw PaperPathError.invalidPage
+                    }
+                    result = try await recognize(
                         page: page,
                         pageIndex: index,
                         configuration: appliedConfiguration
                     )
                 }
                 try Task.checkCancellation()
+                let blockTextBytes = result.blocks.reduce(0) {
+                    partial, block in
+                    let (sum, overflow) = partial.addingReportingOverflow(
+                        block.text.utf8.count
+                    )
+                    return overflow ? .max : sum
+                }
+                let (pageTextBytes, pageTextOverflow) =
+                    result.text.utf8.count.addingReportingOverflow(
+                        blockTextBytes
+                    )
+                let (nextTextBytes, textOverflow) =
+                    totalTextBytes.addingReportingOverflow(pageTextBytes)
+                let (nextBlockCount, blockOverflow) =
+                    totalBlockCount.addingReportingOverflow(
+                        result.blocks.count
+                    )
+                guard !pageTextOverflow,
+                      !textOverflow,
+                      !blockOverflow,
+                      nextTextBytes
+                        <= OCRResult.maximumEncodedTextBytes,
+                      nextBlockCount <= OCRResult.maximumBlockCount
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "This document contains too much recognized text to process safely."
+                    )
+                }
+                if savedPages[index] == nil {
+                    try await onPageCompleted(result)
+                    completedPageCount += 1
+                }
                 pages.append(result)
-                progress(
-                    Double(index + 1)
-                        / Double(max(1, document.pageCount))
-                )
+                totalTextBytes = nextTextBytes
+                totalBlockCount = nextBlockCount
+                let fraction = Double(completedPageCount)
+                    / Double(document.pageCount)
+                let percent = Int((fraction * 100).rounded(.down))
+                if percent > lastReportedPercent {
+                    lastReportedPercent = percent
+                    progress(fraction)
+                }
             }
             return OCRResult(
                 pages: pages,
@@ -71,45 +174,69 @@ struct VisionOCRService: Sendable {
         page: PDFPage,
         pageIndex: Int,
         configuration: OCRRecognitionConfiguration
-    ) throws -> OCRPageResult {
+    ) async throws -> OCRPageResult {
         let bounds = page.bounds(for: .mediaBox)
-        guard bounds.width > 0, bounds.height > 0 else {
-            return OCRPageResult(pageIndex: pageIndex, text: "", confidence: 0)
+        guard Self.hasValidPageGeometry(bounds) else {
+            throw PaperPathError.invalidPage
         }
 
-        guard let primaryImage = renderedImage(
+        guard let primary = try await recognizeRenderedPage(
             page,
             bounds: bounds,
-            longestEdge: maximumImageDimension
-        ) else {
-            return OCRPageResult(pageIndex: pageIndex, text: "", confidence: 0)
-        }
-        let primary = try recognize(
-            image: primaryImage,
+            longestEdge: maximumImageDimension,
             pageIndex: pageIndex,
             configuration: configuration,
             pass: .standard
-        )
+        ) else {
+            throw PaperPathError.unreadableImage
+        }
         guard shouldRetry(primary) else { return primary }
         try Task.checkCancellation()
 
-        guard let retryImage = renderedImage(
+        guard let enhanced = try await recognizeRenderedPage(
             page,
             bounds: bounds,
-            longestEdge: retryImageDimension
-        ),
-              let enhancedImage = enhancedTextImage(retryImage)
-        else { return primary }
-        let enhanced = try recognize(
-            image: enhancedImage,
+            longestEdge: retryImageDimension,
             pageIndex: pageIndex,
             configuration: configuration,
             pass: .enhanced
         )
+        else { return primary }
         return recognitionScore(enhanced)
             > recognitionScore(primary) + 0.012
             ? enhanced
             : primary
+    }
+
+    private func recognizeRenderedPage(
+        _ page: PDFPage,
+        bounds: CGRect,
+        longestEdge: CGFloat,
+        pageIndex: Int,
+        configuration: OCRRecognitionConfiguration,
+        pass: OCRRecognitionPass
+    ) async throws -> OCRPageResult? {
+        try Task.checkCancellation()
+        guard let image = autoreleasepool(invoking: {
+            () -> CGImage? in
+            guard let rendered = renderedImage(
+                page,
+                bounds: bounds,
+                longestEdge: longestEdge
+            ) else { return nil }
+            switch pass {
+            case .standard:
+                return rendered
+            case .enhanced:
+                return enhancedTextImage(rendered)
+            }
+        }) else { return nil }
+        return try await recognize(
+            image: image,
+            pageIndex: pageIndex,
+            configuration: configuration,
+            pass: pass
+        )
     }
 
     private func recognize(
@@ -117,7 +244,7 @@ struct VisionOCRService: Sendable {
         pageIndex: Int,
         configuration: OCRRecognitionConfiguration,
         pass: OCRRecognitionPass
-    ) throws -> OCRPageResult {
+    ) async throws -> OCRPageResult {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
@@ -129,15 +256,30 @@ struct VisionOCRService: Sendable {
         request.minimumTextHeight = 0.003
 
         let handler = VNImageRequestHandler(cgImage: image)
-        try handler.perform([request])
-        if Task.isCancelled {
-            request.cancel()
-            throw CancellationError()
+        do {
+            try await withTaskCancellationHandler {
+                try Task.checkCancellation()
+                try handler.perform([request])
+            } onCancel: {
+                request.cancel()
+            }
+        } catch {
+            if Task.isCancelled {
+                throw CancellationError()
+            }
+            throw error
         }
+        try Task.checkCancellation()
 
         var candidates: [OCRTextBlock] = []
         let observations = request.results ?? []
+        guard observations.count <= Self.maximumBlocksPerPage else {
+            throw PaperPathError.insufficientSelection(
+                "This page contains too many text regions to recognize safely."
+            )
+        }
         candidates.reserveCapacity(observations.count)
+        var pageTextBytes = 0
         for (index, observation) in observations.enumerated() {
             if index.isMultiple(of: 64) {
                 try Task.checkCancellation()
@@ -145,17 +287,51 @@ struct VisionOCRService: Sendable {
             guard let candidate = observation.topCandidates(1).first else {
                 continue
             }
-            let bounds = observation.boundingBox
+            let text = candidate.string.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard !text.isEmpty else { continue }
+            let textBytes = text.utf8.count
+            guard textBytes <= Self.maximumBlockTextBytes else {
+                throw PaperPathError.insufficientSelection(
+                    "This page contains too much recognized text to process safely."
+                )
+            }
+            let (nextPageTextBytes, overflow) = pageTextBytes
+                .addingReportingOverflow(textBytes + 1)
+            guard !overflow,
+                  nextPageTextBytes <= Self.maximumPageTextBytes
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This page contains too much recognized text to process safely."
+                )
+            }
+            let rawBounds = observation.boundingBox
+            guard rawBounds.origin.x.isFinite,
+                  rawBounds.origin.y.isFinite,
+                  rawBounds.width.isFinite,
+                  rawBounds.height.isFinite
+            else { continue }
+            let bounds = rawBounds
+                .standardized
+                .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
+            let confidence = Double(candidate.confidence)
+            guard bounds.width > 0,
+                  bounds.height > 0,
+                  confidence.isFinite,
+                  (0...1).contains(confidence)
+            else { continue }
             candidates.append(
                 OCRTextBlock(
-                    text: candidate.string,
-                    confidence: Double(candidate.confidence),
+                    text: text,
+                    confidence: confidence,
                     normalizedX: bounds.origin.x,
                     normalizedY: bounds.origin.y,
                     normalizedWidth: bounds.width,
                     normalizedHeight: bounds.height
                 )
             )
+            pageTextBytes = nextPageTextBytes
         }
         try Task.checkCancellation()
         let ordered = readingOrder(candidates)
@@ -223,7 +399,7 @@ struct VisionOCRService: Sendable {
         )
     }
 
-    private func shouldRetry(_ result: OCRPageResult) -> Bool {
+    func shouldRetry(_ result: OCRPageResult) -> Bool {
         let characterCount = result.text
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .count
@@ -238,7 +414,7 @@ struct VisionOCRService: Sendable {
             )
     }
 
-    private func recognitionScore(
+    func recognitionScore(
         _ result: OCRPageResult
     ) -> Double {
         let characterValue = min(
@@ -252,7 +428,7 @@ struct VisionOCRService: Sendable {
         return result.confidence + characterValue + blockValue
     }
 
-    private func readingOrder(
+    func readingOrder(
         _ blocks: [OCRTextBlock]
     ) -> [OCRTextBlock] {
         guard hasTwoColumns(blocks) else {
@@ -266,81 +442,103 @@ struct VisionOCRService: Sendable {
                 )
         }
         .sorted(by: lineOrder)
+        let spanningIDs = Set(spanning.map(\.id))
         let narrow = blocks.filter {
-            !spanning.contains($0)
+            !spanningIDs.contains($0.id)
+        }
+        .sorted {
+            let leftCenter = $0.normalizedY
+                + $0.normalizedHeight * 0.5
+            let rightCenter = $1.normalizedY
+                + $1.normalizedHeight * 0.5
+            if abs(leftCenter - rightCenter) > 0.001 {
+                return leftCenter > rightCenter
+            }
+            return $0.normalizedX < $1.normalizedX
         }
         var result: [OCRTextBlock] = []
-        var upperY = 1.1
+        result.reserveCapacity(blocks.count)
+        var narrowIndex = 0
         for anchor in spanning {
+            guard !Task.isCancelled else { return [] }
             let anchorY = anchor.normalizedY
                 + anchor.normalizedHeight * 0.5
-            let band = narrow.filter {
-                let centerY = $0.normalizedY
-                    + $0.normalizedHeight * 0.5
-                return centerY < upperY && centerY > anchorY
+            var band: [OCRTextBlock] = []
+            while narrowIndex < narrow.count {
+                let block = narrow[narrowIndex]
+                let centerY = block.normalizedY
+                    + block.normalizedHeight * 0.5
+                guard centerY >= anchorY else { break }
+                band.append(block)
+                narrowIndex += 1
             }
             result.append(contentsOf: columnOrder(band))
             result.append(anchor)
-            upperY = anchorY
         }
-        result.append(
-            contentsOf: columnOrder(
-                narrow.filter {
-                    $0.normalizedY
-                        + $0.normalizedHeight * 0.5 < upperY
-                }
+        if narrowIndex < narrow.count {
+            result.append(
+                contentsOf: columnOrder(
+                    Array(narrow[narrowIndex...])
+                )
             )
-        )
+        }
         return result
     }
 
-    private func hasTwoColumns(
+    func hasTwoColumns(
         _ blocks: [OCRTextBlock]
     ) -> Bool {
-        let candidates = blocks.filter {
-            $0.normalizedWidth < 0.58
+        var leftCount = 0
+        var rightCount = 0
+        var leftLower = Double.greatestFiniteMagnitude
+        var leftUpper = -Double.greatestFiniteMagnitude
+        var rightLower = Double.greatestFiniteMagnitude
+        var rightUpper = -Double.greatestFiniteMagnitude
+        for block in blocks where block.normalizedWidth < 0.58 {
+            guard !Task.isCancelled else { return false }
+            let centerX = block.normalizedX
+                + block.normalizedWidth * 0.5
+            let upperY = block.normalizedY
+                + block.normalizedHeight
+            if centerX < 0.46 {
+                leftCount += 1
+                leftLower = min(leftLower, block.normalizedY)
+                leftUpper = max(leftUpper, upperY)
+            } else if centerX > 0.54 {
+                rightCount += 1
+                rightLower = min(rightLower, block.normalizedY)
+                rightUpper = max(rightUpper, upperY)
+            }
         }
-        let left = candidates.filter {
-            $0.normalizedX + $0.normalizedWidth * 0.5 < 0.46
-        }
-        let right = candidates.filter {
-            $0.normalizedX + $0.normalizedWidth * 0.5 > 0.54
-        }
-        guard left.count >= 3, right.count >= 3 else {
+        guard leftCount >= 3, rightCount >= 3 else {
             return false
         }
-        let leftRange = verticalRange(left)
-        let rightRange = verticalRange(right)
-        let overlap = min(leftRange.upperBound, rightRange.upperBound)
-            - max(leftRange.lowerBound, rightRange.lowerBound)
+        let overlap = min(leftUpper, rightUpper)
+            - max(leftLower, rightLower)
         return overlap > 0.22
     }
 
-    private func verticalRange(
-        _ blocks: [OCRTextBlock]
-    ) -> ClosedRange<Double> {
-        let lower = blocks.map(\.normalizedY).min() ?? 0
-        let upper = blocks.map {
-            $0.normalizedY + $0.normalizedHeight
-        }.max() ?? 0
-        return lower...upper
-    }
-
-    private func columnOrder(
+    func columnOrder(
         _ blocks: [OCRTextBlock]
     ) -> [OCRTextBlock] {
-        let left = blocks.filter {
-            $0.normalizedX + $0.normalizedWidth * 0.5 < 0.5
+        var left: [OCRTextBlock] = []
+        var right: [OCRTextBlock] = []
+        left.reserveCapacity(blocks.count / 2)
+        right.reserveCapacity(blocks.count / 2)
+        for block in blocks {
+            if block.normalizedX
+                + block.normalizedWidth * 0.5 < 0.5 {
+                left.append(block)
+            } else {
+                right.append(block)
+            }
         }
-        .sorted(by: lineOrder)
-        let right = blocks.filter {
-            $0.normalizedX + $0.normalizedWidth * 0.5 >= 0.5
-        }
-        .sorted(by: lineOrder)
+        left.sort(by: lineOrder)
+        right.sort(by: lineOrder)
         return left + right
     }
 
-    private func lineOrder(
+    func lineOrder(
         _ left: OCRTextBlock,
         _ right: OCRTextBlock
     ) -> Bool {
@@ -355,7 +553,7 @@ struct VisionOCRService: Sendable {
         return left.normalizedX < right.normalizedX
     }
 
-    private func validated(
+    func validated(
         _ configuration: OCRRecognitionConfiguration
     ) throws -> OCRRecognitionConfiguration {
         let customWords = configuration.customWords
@@ -412,5 +610,16 @@ struct VisionOCRService: Sendable {
                     : [],
             customWords: uniqueWords
         )
+    }
+
+    private static func hasValidPageGeometry(_ bounds: CGRect) -> Bool {
+        bounds.origin.x.isFinite
+            && bounds.origin.y.isFinite
+            && bounds.width.isFinite
+            && bounds.height.isFinite
+            && bounds.width > 0
+            && bounds.height > 0
+            && bounds.width <= maximumPageDimension
+            && bounds.height <= maximumPageDimension
     }
 }

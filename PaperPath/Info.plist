@@ -60,6 +60,13 @@
 	<string>Scan paper documents and signing identity QR codes on device.</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Unlock your private PaperPath document workspace.</string>
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict/>
+	</dict>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UILaunchScreen</key>

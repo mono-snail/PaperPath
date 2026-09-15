@@ -4,7 +4,10 @@ import PDFKit
 
 struct PDFFormInspectionService: Sendable {
     private let maximumFormFields = 10_000
+    private let maximumFormPages = 20_000
     private let maximumAnnotationsScanned = 50_000
+    private let maximumFieldValueCharacters = 65_536
+    private let maximumFieldValueBytes = 256 * 1_024
 
     func fields(in url: URL) throws -> [PDFFormFieldSnapshot] {
         try inspect(url: url).fields
@@ -13,9 +16,15 @@ struct PDFFormInspectionService: Sendable {
     func inspect(url: URL) throws -> PDFFormInspectionReport {
         try Task.checkCancellation()
         guard let document = PDFDocument(url: url),
-              !document.isLocked
+              !document.isLocked,
+              document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
+        }
+        guard document.pageCount <= maximumFormPages else {
+            throw PaperPathError.insufficientSelection(
+                "This form contains too many pages to inspect safely."
+            )
         }
 
         let catalog = catalogFeatures(in: url)
@@ -25,19 +34,29 @@ struct PDFFormInspectionService: Sendable {
         for pageIndex in 0..<document.pageCount {
             try Task.checkCancellation()
             guard let page = document.page(at: pageIndex) else {
-                continue
+                throw PaperPathError.invalidPage
             }
             let pageBounds = page.bounds(for: .cropBox)
-            guard pageBounds.width > 0, pageBounds.height > 0 else {
-                continue
+            guard pageBounds.origin.x.isFinite,
+                  pageBounds.origin.y.isFinite,
+                  pageBounds.width.isFinite,
+                  pageBounds.height.isFinite,
+                  pageBounds.width > 0,
+                  pageBounds.height > 0
+            else {
+                throw PaperPathError.invalidPage
             }
             let annotations = page.annotations
-            annotationCount += annotations.count
-            guard annotationCount <= maximumAnnotationsScanned else {
+            let (nextAnnotationCount, overflow) = annotationCount
+                .addingReportingOverflow(annotations.count)
+            guard !overflow,
+                  nextAnnotationCount <= maximumAnnotationsScanned
+            else {
                 throw PaperPathError.insufficientSelection(
                     "This PDF contains too many annotations to inspect safely."
                 )
             }
+            annotationCount = nextAnnotationCount
             var placedSignatureBounds: [CGRect] = []
             placedSignatureBounds.reserveCapacity(
                 min(annotations.count, 32)
@@ -90,7 +109,12 @@ struct PDFFormInspectionService: Sendable {
         if automation.unsupportedJavaScriptCount > 0 {
             let count = automation.unsupportedJavaScriptCount
             issues.append(
-                "\(count) custom field script\(count == 1 ? "" : "s") require\(count == 1 ? "s" : "") a compatible PDF reader."
+                AppLocalization.format(
+                    "%lld custom field script%@ require%@ a compatible PDF reader.",
+                    count,
+                    count == 1 ? "" : "s",
+                    count == 1 ? "s" : ""
+                )
             )
         }
         let pendingCalculations = automation.fields.filter {
@@ -99,16 +123,28 @@ struct PDFFormInspectionService: Sendable {
                 && $0.validationIssue == nil
         }
         if !pendingCalculations.isEmpty {
+            let count = pendingCalculations.count
             issues.append(
-                "\(pendingCalculations.count) calculated field\(pendingCalculations.count == 1 ? "" : "s") need\(pendingCalculations.count == 1 ? "s" : "") a local refresh."
+                AppLocalization.format(
+                    "%lld calculated field%@ need%@ a local refresh.",
+                    count,
+                    count == 1 ? "" : "s",
+                    count == 1 ? "s" : ""
+                )
             )
         }
         let invalidAutomation = automation.fields.filter {
             $0.validationIssue != nil
         }
         if !invalidAutomation.isEmpty {
+            let count = invalidAutomation.count
             issues.append(
-                "\(invalidAutomation.count) field value\(invalidAutomation.count == 1 ? "" : "s") fail\(invalidAutomation.count == 1 ? "s" : "") format or calculation validation."
+                AppLocalization.format(
+                    "%lld field value%@ fail%@ format or calculation validation.",
+                    count,
+                    count == 1 ? "" : "s",
+                    count == 1 ? "s" : ""
+                )
             )
         }
         if catalog.needsAppearances {
@@ -123,14 +159,25 @@ struct PDFFormInspectionService: Sendable {
             Set(values.map(\.kind)).count > 1
         }
         if !duplicateTypeConflicts.isEmpty {
+            let count = duplicateTypeConflicts.count
             issues.append(
-                "\(duplicateTypeConflicts.count) field name conflict\(duplicateTypeConflicts.count == 1 ? "" : "s") use different field types."
+                AppLocalization.format(
+                    "%lld field name conflict%@ use different field types.",
+                    count,
+                    count == 1 ? "" : "s"
+                )
             )
         }
         let fieldIssues = fields.compactMap(\.issue)
         if !fieldIssues.isEmpty {
+            let count = fieldIssues.count
             issues.append(
-                "\(fieldIssues.count) field\(fieldIssues.count == 1 ? "" : "s") need\(fieldIssues.count == 1 ? "s" : "") compatibility review."
+                AppLocalization.format(
+                    "%lld field%@ need%@ compatibility review.",
+                    count,
+                    count == 1 ? "" : "s",
+                    count == 1 ? "s" : ""
+                )
             )
         }
 
@@ -157,7 +204,7 @@ struct PDFFormInspectionService: Sendable {
         )
     }
 
-    private func snapshot(
+    func snapshot(
         _ annotation: PDFAnnotation,
         annotationIndex: Int,
         pageIndex: Int,
@@ -183,43 +230,56 @@ struct PDFFormInspectionService: Sendable {
             ?? annotation.value(
                 forAnnotationKey: .textLabel
             ) as? String
-        let name = storedName?
+        let candidateName = storedName?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let fieldName = name?.isEmpty == false
-            ? name!
-            : "Unnamed field \(annotationIndex + 1)"
-        let value: String?
+            .precomposedStringWithCanonicalMapping
+        let name = candidateName.flatMap {
+            isSafeFieldName($0) ? $0 : nil
+        }
+        let fieldName = name
+            ?? AppLocalization.format(
+                "Unnamed field %lld",
+                annotationIndex + 1
+            )
+        let rawValue: String?
         switch kind {
         case .checkbox, .radio, .button:
-            value = annotation.widgetStringValue
+            rawValue = annotation.widgetStringValue
                 ?? annotation.buttonWidgetStateString
         case .signature:
-            let rawValue = annotation.value(
+            let storedValue = annotation.value(
                 forAnnotationKey: .widgetValue
             )
-            if let text = rawValue as? String {
-                value = text
-            } else if let dictionary = rawValue as? NSDictionary,
+            if let text = storedValue as? String {
+                rawValue = text
+            } else if let dictionary = storedValue as? NSDictionary,
                       dictionary.count > 0 {
-                value = "Signed"
+                rawValue = "Signed".localizedUI
             } else if hasPlacedSignature(
                 in: bounds,
                 placedSignatureBounds: placedSignatureBounds
             ) {
-                value = "Signed"
+                rawValue = "Signed".localizedUI
             } else {
-                value = nil
+                rawValue = nil
             }
         default:
-            value = annotation.widgetStringValue
+            rawValue = annotation.widgetStringValue
         }
-        let issue = fieldIssue(
-            annotation,
-            kind: kind,
-            bounds: bounds,
-            pageBounds: pageBounds,
-            name: name
-        )
+        let valueWithinBudget = rawValue.map {
+            $0.count <= maximumFieldValueCharacters
+                && $0.utf8.count <= maximumFieldValueBytes
+        } ?? true
+        let value = valueWithinBudget ? rawValue : nil
+        let issue = valueWithinBudget
+            ? fieldIssue(
+                annotation,
+                kind: kind,
+                bounds: bounds,
+                pageBounds: pageBounds,
+                name: name
+            )
+            : "This field value is too large to inspect safely."
         return PDFFormFieldSnapshot(
             id: "\(pageIndex)-\(annotationIndex)-\(fieldName)",
             pageIndex: pageIndex,
@@ -240,7 +300,7 @@ struct PDFFormInspectionService: Sendable {
         )
     }
 
-    private func fieldKind(
+    func fieldKind(
         _ annotation: PDFAnnotation
     ) -> PDFFormFieldKind {
         switch annotation.widgetFieldType {
@@ -266,7 +326,26 @@ struct PDFFormInspectionService: Sendable {
         }
     }
 
-    private func fieldIssue(
+    func isSafeFieldName(_ value: String) -> Bool {
+        guard !value.isEmpty,
+              value.count <= 160,
+              value.utf8.count <= 640
+        else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                codePoint == 0x061C
+                || codePoint == 0x200E
+                || codePoint == 0x200F
+                || (0x202A...0x202E).contains(codePoint)
+                || (0x2066...0x2069).contains(codePoint)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !isBidirectionalControl
+        }
+    }
+
+    func fieldIssue(
         _ annotation: PDFAnnotation,
         kind: PDFFormFieldKind,
         bounds: CGRect,
@@ -297,7 +376,7 @@ struct PDFFormInspectionService: Sendable {
         return nil
     }
 
-    private func isWidget(_ annotation: PDFAnnotation) -> Bool {
+    func isWidget(_ annotation: PDFAnnotation) -> Bool {
         let normalizedType = annotation.type?
             .trimmingCharacters(
                 in: CharacterSet(charactersIn: "/")
@@ -319,7 +398,7 @@ struct PDFFormInspectionService: Sendable {
         }
     }
 
-    private func isPlacedSignature(
+    func isPlacedSignature(
         _ annotation: PDFAnnotation
     ) -> Bool {
         let normalizedType = annotation.type?
@@ -337,7 +416,7 @@ struct PDFFormInspectionService: Sendable {
             && annotation.contents == "Signature"
     }
 
-    private func hasPlacedSignature(
+    func hasPlacedSignature(
         in fieldBounds: CGRect,
         placedSignatureBounds: [CGRect]
     ) -> Bool {

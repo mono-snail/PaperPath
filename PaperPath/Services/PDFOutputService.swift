@@ -1,4 +1,5 @@
 import CommonCrypto
+import Compression
 import CoreImage
 import CoreText
 import CryptoKit
@@ -7,17 +8,18 @@ import ImageIO
 import PDFKit
 import Security
 import UIKit
+import UniformTypeIdentifiers
 
 typealias PDFProgressHandler = @Sendable (Double) -> Void
 
-private struct PDFReplacementTextLayout {
+struct PDFReplacementTextLayout {
     let font: UIFont
     let lineSpacing: CGFloat
     let lineCount: Int
     let regionTexts: [String]
 }
 
-private struct PDFReplacementFlowMeasurement {
+struct PDFReplacementFlowMeasurement {
     let fits: Bool
     let lineCount: Int
     let regionTexts: [String]
@@ -25,14 +27,31 @@ private struct PDFReplacementFlowMeasurement {
     let splitWordAtRegionBoundary: Bool
 }
 
-private struct PDFReplacementLayoutAttempt {
+struct PDFReplacementLayoutAttempt {
     let layout: PDFReplacementTextLayout?
     let minimumFontSize: CGFloat
     let consumedUTF16Length: Int
     let splitWordAtRegionBoundary: Bool
 }
 
-private struct PDFBookletSignaturePlan {
+private struct PDFExpectedLinkAnnotation {
+    let pageIndex: Int
+    let bounds: PDFNormalizedRect
+    let url: URL
+}
+
+private struct PDFExpectedTextAnnotation {
+    let bounds: PDFNormalizedRect
+    let contents: String
+}
+
+private struct PDFContentOverlayValidation {
+    let annotationAdditionsByPage: [Int: Int]
+    let expectedLinksByPage: [Int: [PDFExpectedLinkAnnotation]]
+    let expectedTextsByPage: [Int: [PDFExpectedTextAnnotation]]
+}
+
+struct PDFBookletSignaturePlan {
     let number: Int
     let startPageIndex: Int
     let sourcePageCount: Int
@@ -125,7 +144,263 @@ enum PDFCompressionQuality:
     }
 }
 
+private extension PDFPageImageExportPreset {
+    var fileExtension: String {
+        self == .png ? "png" : "jpg"
+    }
+
+    var uniformType: UTType {
+        self == .png ? .png : .jpeg
+    }
+
+    var imageDestinationProperties: [CFString: Any] {
+        switch self {
+        case .png:
+            return [:]
+        case .jpegHigh:
+            return [
+                kCGImageDestinationLossyCompressionQuality: 0.9
+            ]
+        case .jpegCompact:
+            return [
+                kCGImageDestinationLossyCompressionQuality: 0.68
+            ]
+        }
+    }
+}
+
 struct PDFOutputService: @unchecked Sendable {
+    private static let maximumPageCount = 100_000
+    private static let maximumTextExportPageBytes =
+        4 * 1_024 * 1_024
+    private static let maximumTextExportBytes =
+        16 * 1_024 * 1_024
+    private static let maximumStructuralRewriteBytes =
+        128 * 1_024 * 1_024
+    private static let maximumImageExportSourceBytes =
+        1_024 * 1_024 * 1_024
+    private static let maximumPageImageExportCount = 1_000
+    private static let maximumPageImagePixels = 16_000_000
+    private static let maximumPageImageBytes = 64 * 1_024 * 1_024
+    private static let maximumPageImageExportBytes =
+        512 * 1_024 * 1_024
+    private static let maximumAnnotationsPerPage = 4_096
+    private static let maximumAnnotationsScanned = 100_000
+
+    private static func checkedProduct(
+        _ left: Int,
+        _ right: Int
+    ) -> Int? {
+        let result = left.multipliedReportingOverflow(by: right)
+        return result.overflow ? nil : result.partialValue
+    }
+
+    private static func requireSupportedPageCount(
+        _ pageCount: Int
+    ) throws {
+        guard pageCount > 0 else {
+            throw PaperPathError.unreadablePDF
+        }
+        guard pageCount <= Self.maximumPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Process PDFs with up to 100,000 pages at a time."
+            )
+        }
+    }
+
+    private static func requireUnchangedSource(
+        at url: URL,
+        initialValues: URLResourceValues
+    ) throws {
+        let finalValues = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .contentModificationDateKey,
+                .fileResourceIdentifierKey
+            ]
+        )
+        guard finalValues.isRegularFile == true,
+              finalValues.isSymbolicLink != true,
+              finalValues.fileSize == initialValues.fileSize,
+              finalValues.contentModificationDate
+                == initialValues.contentModificationDate,
+              fileResourceIdentifiersMatch(
+                initialValues.fileResourceIdentifier,
+                finalValues.fileResourceIdentifier
+              )
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the source PDF changed during image rendering"
+            )
+        }
+    }
+
+    private static func fileResourceIdentifiersMatch(
+        _ first: Any?,
+        _ second: Any?
+    ) -> Bool {
+        switch (first, second) {
+        case (nil, nil):
+            return true
+        case let (first as NSObject, second):
+            return first.isEqual(second)
+        default:
+            return false
+        }
+    }
+
+    private func requireStructuralRewriteFile(
+        at url: URL
+    ) throws {
+        try Task.checkCancellation()
+        let values = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let byteCount = values.fileSize,
+              byteCount > 0,
+              byteCount <= Self.maximumStructuralRewriteBytes
+        else {
+            throw PaperPathError.insufficientSelection(
+                "This structure-preserving update supports PDFs up to 128 MB to protect device memory."
+            )
+        }
+    }
+
+    private func fileSHA256(
+        at url: URL,
+        expectedByteCount: Int
+    ) throws -> String {
+        guard expectedByteCount > 0 else {
+            throw PaperPathError.outputVerificationFailed(
+                "an exported file has an invalid size"
+            )
+        }
+        let values = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              values.fileSize == expectedByteCount
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "an exported file did not retain its encoded size"
+            )
+        }
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        var totalByteCount = 0
+        while true {
+            try Task.checkCancellation()
+            let chunk = try handle.read(upToCount: 1_048_576)
+                ?? Data()
+            guard !chunk.isEmpty else { break }
+            let (nextTotal, overflow) = totalByteCount
+                .addingReportingOverflow(chunk.count)
+            guard !overflow, nextTotal <= expectedByteCount else {
+                throw PaperPathError.outputVerificationFailed(
+                    "an exported file exceeded its encoded size"
+                )
+            }
+            totalByteCount = nextTotal
+            hasher.update(data: chunk)
+        }
+        guard totalByteCount == expectedByteCount else {
+            throw PaperPathError.outputVerificationFailed(
+                "an exported file did not retain its encoded size"
+            )
+        }
+        return hasher.finalize()
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private func requireTemporaryWriteCapacity(
+        at destinationURL: URL,
+        byteCount: Int
+    ) throws {
+        guard byteCount > 0 else {
+            throw PaperPathError.outputVerificationFailed(
+                "an exported file has an invalid size"
+            )
+        }
+        let parentURL = destinationURL.deletingLastPathComponent()
+        let values = try parentURL.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        )
+        guard let available =
+                values.volumeAvailableCapacityForImportantUsage
+        else { return }
+        let required = Int64(byteCount)
+            .addingReportingOverflow(16 * 1_024 * 1_024)
+        guard !required.overflow,
+              available >= required.partialValue
+        else {
+            throw PaperPathError.insufficientStorage
+        }
+    }
+
+    private func writeProtectedData(
+        _ data: Data,
+        to stagingURL: URL,
+        fileManager: FileManager
+    ) throws {
+        guard !data.isEmpty,
+              !fileManager.fileExists(atPath: stagingURL.path),
+              fileManager.createFile(
+                  atPath: stagingURL.path,
+                  contents: nil,
+                  attributes: [
+                      .protectionKey: FileProtectionType.complete
+                  ]
+              )
+        else {
+            throw PaperPathError.storageFailure(
+                "The image export temporary file could not be created."
+            )
+        }
+        let output: FileHandle
+        do {
+            output = try FileHandle(forWritingTo: stagingURL)
+        } catch {
+            try? fileManager.removeItem(at: stagingURL)
+            throw error
+        }
+        do {
+            var offset = data.startIndex
+            while offset < data.endIndex {
+                try Task.checkCancellation()
+                let end = data.index(
+                    offset,
+                    offsetBy: min(
+                        1_048_576,
+                        data.distance(from: offset, to: data.endIndex)
+                    )
+                )
+                try output.write(contentsOf: data[offset..<end])
+                offset = end
+            }
+            try output.synchronize()
+            try output.close()
+        } catch {
+            try? output.close()
+            try? fileManager.removeItem(at: stagingURL)
+            throw error
+        }
+    }
+
     func bookletAssessment(
         sourceURL: URL,
         revisionID: UUID,
@@ -137,6 +412,7 @@ struct PDFOutputService: @unchecked Sendable {
         else {
             throw PaperPathError.unreadablePDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
         guard document.pageCount <= 1_000 else {
             throw PaperPathError.insufficientSelection(
                 "Booklet preparation supports up to 1,000 pages."
@@ -171,14 +447,40 @@ struct PDFOutputService: @unchecked Sendable {
                 )
             }
             pageSizes.append(size)
-            annotationCount += page.annotations.count
+            let pageAnnotationCount = page.annotations.count
+            guard pageAnnotationCount
+                    <= Self.maximumAnnotationsPerPage
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to prepare safely."
+                )
+            }
+            let (nextAnnotationCount, overflow) = annotationCount
+                .addingReportingOverflow(pageAnnotationCount)
+            guard !overflow,
+                  nextAnnotationCount
+                    <= Self.maximumAnnotationsScanned
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "The booklet annotation count exceeded the safe local limit."
+                )
+            }
+            annotationCount = nextAnnotationCount
         }
         let signaturePlans = bookletSignaturePlans(
             sourcePageCount: document.pageCount,
             options: normalizedOptions
         )
-        let paddedPageCount = signaturePlans.reduce(0) {
-            $0 + $1.paddedPageCount
+        var paddedPageCount = 0
+        for plan in signaturePlans {
+            let (nextPageCount, overflow) = paddedPageCount
+                .addingReportingOverflow(plan.paddedPageCount)
+            guard !overflow else {
+                throw PaperPathError.insufficientSelection(
+                    "The booklet page plan exceeded the safe local limit."
+                )
+            }
+            paddedPageCount = nextPageCount
         }
         let spreads = bookletSpreads(
             signaturePlans: signaturePlans,
@@ -227,9 +529,27 @@ struct PDFOutputService: @unchecked Sendable {
             throw PaperPathError.unreadablePDF
         }
 
-        try? FileManager.default.removeItem(at: destination)
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The booklet destination already exists."
+            )
+        }
+        let stagingURL = destination
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".booklet-\(UUID().uuidString).pdf"
+            )
+        var publishedDestination = false
+        var completed = false
+        defer {
+            try? fileManager.removeItem(at: stagingURL)
+            if publishedDestination, !completed {
+                try? fileManager.removeItem(at: destination)
+            }
+        }
         guard let consumer = CGDataConsumer(
-            url: destination as CFURL
+            url: stagingURL as CFURL
         ) else {
             throw PaperPathError.storageFailure(
                 "The booklet destination could not be created."
@@ -253,7 +573,14 @@ struct PDFOutputService: @unchecked Sendable {
                 "The booklet PDF context could not be created."
             )
         }
+        var didCloseContext = false
+        defer {
+            if !didCloseContext {
+                context.closePDF()
+            }
+        }
 
+        var lastReportedPercent = -1
         progress(0.02)
         for (offset, spread) in assessment.spreads.enumerated() {
             try Task.checkCancellation()
@@ -263,6 +590,11 @@ struct PDFOutputService: @unchecked Sendable {
                 width: spread.sheetWidth,
                 height: spread.sheetHeight
             )
+            guard Self.hasValidPageBounds(sheetBounds) else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a booklet sheet has invalid geometry"
+                )
+            }
             let pageInfo = [
                 kCGPDFContextMediaBox as String: sheetBounds,
                 kCGPDFContextCropBox as String: sheetBounds
@@ -297,15 +629,20 @@ struct PDFOutputService: @unchecked Sendable {
                 )
             }
             context.endPDFPage()
-            progress(
-                0.84 * Double(offset + 1)
-                    / Double(assessment.spreads.count)
-            )
+            let fraction = 0.84 * Double(offset + 1)
+                / Double(assessment.spreads.count)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
+            }
         }
         context.closePDF()
+        didCloseContext = true
         try Task.checkCancellation()
+        try LocalFileSecurity.requireCompleteProtection(to: stagingURL)
 
-        guard let output = PDFDocument(url: destination),
+        guard let output = PDFDocument(url: stagingURL),
               output.pageCount == assessment.outputPageCount
         else {
             throw PaperPathError.outputVerificationFailed(
@@ -318,7 +655,8 @@ struct PDFOutputService: @unchecked Sendable {
                 throw PaperPathError.invalidPage
             }
             let bounds = page.bounds(for: .mediaBox)
-            guard abs(
+            guard Self.hasValidPageBounds(bounds),
+            abs(
                 Double(bounds.width) - firstSpread.sheetWidth
             ) <= 1,
             abs(
@@ -333,13 +671,16 @@ struct PDFOutputService: @unchecked Sendable {
                     )
                 )
             }
-            progress(
-                0.84
-                    + 0.14 * Double(pageIndex + 1)
-                    / Double(output.pageCount)
-            )
+            let fraction = 0.84
+                + 0.14 * Double(pageIndex + 1)
+                / Double(output.pageCount)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
+            }
         }
-        let outputByteCount = try destination.resourceValues(
+        let outputByteCount = try stagingURL.resourceValues(
             forKeys: [.fileSizeKey]
         ).fileSize ?? 0
         guard outputByteCount > 0,
@@ -347,7 +688,12 @@ struct PDFOutputService: @unchecked Sendable {
         else {
             throw PaperPathError.fileTooLarge
         }
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try Task.checkCancellation()
+        try fileManager.moveItem(at: stagingURL, to: destination)
+        publishedDestination = true
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        LocalFileSecurity.excludeFromBackup(destination)
+        completed = true
         progress(1)
     }
 
@@ -378,6 +724,9 @@ struct PDFOutputService: @unchecked Sendable {
                 throw PaperPathError.invalidPage
             }
             let bounds = page.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(bounds) else {
+                throw PaperPathError.invalidPage
+            }
             let rotation = ((page.rotation % 360) + 360) % 360
             let swapsEdges = rotation == 90 || rotation == 270
             let sourceWidth = Double(
@@ -411,7 +760,25 @@ struct PDFOutputService: @unchecked Sendable {
                     )
                 )
             )
-            annotationCount += page.annotations.count
+            let pageAnnotationCount = page.annotations.count
+            guard pageAnnotationCount
+                    <= Self.maximumAnnotationsPerPage
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to prepare safely."
+                )
+            }
+            let (nextAnnotationCount, overflow) = annotationCount
+                .addingReportingOverflow(pageAnnotationCount)
+            guard !overflow,
+                  nextAnnotationCount
+                    <= Self.maximumAnnotationsScanned
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "The print annotation count exceeded the safe local limit."
+                )
+            }
+            annotationCount = nextAnnotationCount
         }
         return PDFPrintPreparationAssessment(
             revisionID: revisionID,
@@ -446,6 +813,9 @@ struct PDFOutputService: @unchecked Sendable {
         }
 
         let firstBounds = firstPage.bounds(for: .cropBox)
+        guard Self.hasValidPageBounds(firstBounds) else {
+            throw PaperPathError.invalidPage
+        }
         let firstRotation =
             ((firstPage.rotation % 360) + 360) % 360
         let firstSwapsEdges =
@@ -465,9 +835,27 @@ struct PDFOutputService: @unchecked Sendable {
             options: options
         )
 
-        try? FileManager.default.removeItem(at: destination)
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The print-ready destination already exists."
+            )
+        }
+        let stagingURL = destination
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".print-ready-\(UUID().uuidString).pdf"
+            )
+        var publishedDestination = false
+        var completed = false
+        defer {
+            try? fileManager.removeItem(at: stagingURL)
+            if publishedDestination, !completed {
+                try? fileManager.removeItem(at: destination)
+            }
+        }
         guard let consumer = CGDataConsumer(
-            url: destination as CFURL
+            url: stagingURL as CFURL
         ) else {
             throw PaperPathError.storageFailure(
                 "The print-ready destination could not be created."
@@ -491,7 +879,14 @@ struct PDFOutputService: @unchecked Sendable {
                 "The print-ready PDF context could not be created."
             )
         }
+        var didCloseContext = false
+        defer {
+            if !didCloseContext {
+                context.closePDF()
+            }
+        }
 
+        var lastReportedPercent = -1
         progress(0.02)
         for pageNumber in 1...source.numberOfPages {
             try Task.checkCancellation()
@@ -499,10 +894,12 @@ struct PDFOutputService: @unchecked Sendable {
             guard let sourcePage = source.page(at: pageNumber),
                   let kitPage = sourceDocument.page(at: pageIndex)
             else {
-                context.closePDF()
                 throw PaperPathError.invalidPage
             }
             let bounds = kitPage.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(bounds) else {
+                throw PaperPathError.invalidPage
+            }
             let rotation =
                 ((kitPage.rotation % 360) + 360) % 360
             let swapsEdges = rotation == 90 || rotation == 270
@@ -522,6 +919,11 @@ struct PDFOutputService: @unchecked Sendable {
                 width: plan.outputWidth,
                 height: plan.outputHeight
             )
+            guard Self.hasValidPageBounds(pageBounds) else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a print-ready page has invalid geometry"
+                )
+            }
             let pageInfo = [
                 kCGPDFContextMediaBox as String: pageBounds,
                 kCGPDFContextCropBox as String: pageBounds
@@ -557,16 +959,21 @@ struct PDFOutputService: @unchecked Sendable {
             }
             context.restoreGState()
             context.endPDFPage()
-            progress(
-                0.84 * Double(pageNumber)
-                    / Double(source.numberOfPages)
-            )
+            let fraction = 0.84 * Double(pageNumber)
+                / Double(source.numberOfPages)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
+            }
         }
         context.closePDF()
+        didCloseContext = true
         try Task.checkCancellation()
+        try LocalFileSecurity.requireCompleteProtection(to: stagingURL)
         progress(0.88)
 
-        guard let output = PDFDocument(url: destination),
+        guard let output = PDFDocument(url: stagingURL),
               output.pageCount == sourceDocument.pageCount
         else {
             throw PaperPathError.outputVerificationFailed(
@@ -581,6 +988,9 @@ struct PDFOutputService: @unchecked Sendable {
                 throw PaperPathError.invalidPage
             }
             let sourceBounds = sourcePage.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(sourceBounds) else {
+                throw PaperPathError.invalidPage
+            }
             let rotation =
                 ((sourcePage.rotation % 360) + 360) % 360
             let swapsEdges = rotation == 90 || rotation == 270
@@ -599,7 +1009,8 @@ struct PDFOutputService: @unchecked Sendable {
                 options: options
             )
             let actual = outputPage.bounds(for: .mediaBox)
-            guard abs(Double(actual.width) - expected.outputWidth)
+            guard Self.hasValidPageBounds(actual),
+                  abs(Double(actual.width) - expected.outputWidth)
                     <= 1,
                   abs(Double(actual.height) - expected.outputHeight)
                     <= 1,
@@ -612,13 +1023,16 @@ struct PDFOutputService: @unchecked Sendable {
                     )
                 )
             }
-            progress(
-                0.88
-                    + 0.1 * Double(pageIndex + 1)
-                    / Double(output.pageCount)
-            )
+            let fraction = 0.88
+                + 0.1 * Double(pageIndex + 1)
+                / Double(output.pageCount)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
+            }
         }
-        let outputByteCount = try destination.resourceValues(
+        let outputByteCount = try stagingURL.resourceValues(
             forKeys: [.fileSizeKey]
         ).fileSize ?? 0
         guard outputByteCount > 0,
@@ -626,7 +1040,12 @@ struct PDFOutputService: @unchecked Sendable {
         else {
             throw PaperPathError.fileTooLarge
         }
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try Task.checkCancellation()
+        try fileManager.moveItem(at: stagingURL, to: destination)
+        publishedDestination = true
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        LocalFileSecurity.excludeFromBackup(destination)
+        completed = true
         progress(1)
     }
 
@@ -653,10 +1072,12 @@ struct PDFOutputService: @unchecked Sendable {
 
         for index in sampleIndices {
             try Task.checkCancellation()
-            guard let page = document.page(at: index) else { continue }
+            guard let page = document.page(at: index) else {
+                throw PaperPathError.invalidPage
+            }
             let byteCount: Int? = autoreleasepool {
                 let bounds = page.bounds(for: .cropBox)
-                guard bounds.width > 0, bounds.height > 0 else {
+                guard Self.hasValidPageBounds(bounds) else {
                     return nil
                 }
                 let size = fittedSize(
@@ -667,8 +1088,19 @@ struct PDFOutputService: @unchecked Sendable {
                     .jpegData(compressionQuality: quality.jpegQuality)?
                     .count
             }
-            guard let byteCount else { continue }
-            encodedByteCount += Int64(byteCount)
+            guard let byteCount else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a sampled page could not be encoded for the compression estimate"
+                )
+            }
+            let (nextByteCount, overflow) = encodedByteCount
+                .addingReportingOverflow(Int64(byteCount))
+            guard !overflow else {
+                throw PaperPathError.insufficientSelection(
+                    "The compression estimate exceeded the safe local limit."
+                )
+            }
+            encodedByteCount = nextByteCount
             sampledPageCount += 1
         }
 
@@ -677,10 +1109,24 @@ struct PDFOutputService: @unchecked Sendable {
         }
         let averagePageBytes = encodedByteCount
             / Int64(sampledPageCount)
-        let estimatedByteCount = averagePageBytes
-            * Int64(document.pageCount)
-            + Int64(document.pageCount * 2_048)
-            + 8_192
+        let pageCount = Int64(document.pageCount)
+        let (encodedEstimate, encodedOverflow) = averagePageBytes
+            .multipliedReportingOverflow(by: pageCount)
+        let (overheadEstimate, overheadOverflow) = pageCount
+            .multipliedReportingOverflow(by: 2_048)
+        let (subtotal, subtotalOverflow) = encodedEstimate
+            .addingReportingOverflow(overheadEstimate)
+        let (estimatedByteCount, totalOverflow) = subtotal
+            .addingReportingOverflow(8_192)
+        guard !encodedOverflow,
+              !overheadOverflow,
+              !subtotalOverflow,
+              !totalOverflow
+        else {
+            throw PaperPathError.insufficientSelection(
+                "The compression estimate exceeded the safe local limit."
+            )
+        }
         return PDFCompressionEstimate(
             sourceByteCount: sourceByteCount,
             estimatedByteCount: estimatedByteCount,
@@ -887,7 +1333,7 @@ struct PDFOutputService: @unchecked Sendable {
         return result
     }
 
-    private func edgeInsets(
+    func edgeInsets(
         inner: CGRect,
         outer: CGRect
     ) -> PDFPageCropInsets {
@@ -900,7 +1346,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func bleedAllowancePoints(
+    func bleedAllowancePoints(
         trimBox: CGRect,
         bleedBox: CGRect
     ) -> [Double] {
@@ -915,7 +1361,7 @@ struct PDFOutputService: @unchecked Sendable {
         ].map { max(0, $0) }
     }
 
-    private func nearestDistance(
+    func nearestDistance(
         from contentBounds: CGRect,
         toInsideOf trimBox: CGRect
     ) -> Double {
@@ -930,11 +1376,11 @@ struct PDFOutputService: @unchecked Sendable {
         ].min() ?? .infinity
     }
 
-    private func standardized(_ rect: CGRect) -> CGRect {
+    func standardized(_ rect: CGRect) -> CGRect {
         rect.standardized
     }
 
-    private func rectsNearlyEqual(
+    func rectsNearlyEqual(
         _ first: CGRect,
         _ second: CGRect,
         tolerance: CGFloat
@@ -945,7 +1391,7 @@ struct PDFOutputService: @unchecked Sendable {
             && abs(first.height - second.height) <= tolerance
     }
 
-    private func normalizedBookletOptions(
+    func normalizedBookletOptions(
         _ options: PDFBookletOptions
     ) -> PDFBookletOptions {
         var result = options
@@ -962,7 +1408,7 @@ struct PDFOutputService: @unchecked Sendable {
         return result
     }
 
-    private func bookletSignaturePlans(
+    func bookletSignaturePlans(
         sourcePageCount: Int,
         options: PDFBookletOptions
     ) -> [PDFBookletSignaturePlan] {
@@ -996,13 +1442,14 @@ struct PDFOutputService: @unchecked Sendable {
         return plans
     }
 
-    private func bookletSpreads(
+    func bookletSpreads(
         signaturePlans: [PDFBookletSignaturePlan],
         pageSizes: [CGSize],
         options: PDFBookletOptions
     ) -> [PDFBookletSpread] {
         let target = options.paperTarget.portraitSize
-            ?? PDFPrintPaperTarget.a4.portraitSize!
+            ?? PDFPrintPaperTarget.a4.portraitSize
+            ?? (width: 595.28, height: 841.89)
         let sheetWidth = target.height
         let sheetHeight = target.width
         let slotBounds = bookletSlotBounds(
@@ -1310,10 +1757,19 @@ struct PDFOutputService: @unchecked Sendable {
         permissions: PDFProtectionPermissions = .restricted,
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
+        try Task.checkCancellation()
         progress(0.08)
         guard (8...128).contains(password.count) else {
             throw PaperPathError.invalidPassword
         }
+        guard sourceURL.standardizedFileURL
+                != destination.standardizedFileURL
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Create a separate protected copy instead of replacing the source PDF."
+            )
+        }
+        try requireStructuralRewriteFile(at: sourceURL)
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked
         else {
@@ -1365,6 +1821,13 @@ struct PDFOutputService: @unchecked Sendable {
         defer {
             try? FileManager.default.removeItem(at: encryptedBase)
         }
+        var didWriteDestination = false
+        var didComplete = false
+        defer {
+            if didWriteDestination, !didComplete {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
         guard document.write(
             to: encryptedBase,
             withOptions: options
@@ -1373,10 +1836,13 @@ struct PDFOutputService: @unchecked Sendable {
                 "The protected PDF could not be written."
             )
         }
+        try Task.checkCancellation()
+        try requireStructuralRewriteFile(at: encryptedBase)
         let encryptedData = try Data(
             contentsOf: encryptedBase,
             options: .mappedIfSafe
         )
+        try Task.checkCancellation()
         let protectedData = try PDFCatalogStructureAppender(
             data: encryptedData
         ).appending(
@@ -1384,7 +1850,10 @@ struct PDFOutputService: @unchecked Sendable {
             pageLabels: pageLabels,
             encryptionPassword: password
         )
+        try Task.checkCancellation()
         try protectedData.write(to: destination, options: .atomic)
+        didWriteDestination = true
+        try Task.checkCancellation()
         guard let reopened = PDFDocument(url: destination),
               reopened.isLocked,
               reopened.unlock(withPassword: password)
@@ -1420,6 +1889,7 @@ struct PDFOutputService: @unchecked Sendable {
                 "the protected copy permissions did not persist"
             )
         }
+        try Task.checkCancellation()
         let outputStructure = try structureService
             .preservationSignature(
                 in: destination,
@@ -1432,8 +1902,10 @@ struct PDFOutputService: @unchecked Sendable {
                 "attachments, page labels, review objects, or outlines changed while adding password protection"
             )
         }
+        try Task.checkCancellation()
         progress(0.92)
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        didComplete = true
         progress(1)
     }
 
@@ -1444,6 +1916,14 @@ struct PDFOutputService: @unchecked Sendable {
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
         try Task.checkCancellation()
+        guard sourceURL.standardizedFileURL
+                != destination.standardizedFileURL
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Create a separate editable copy when removing a password."
+            )
+        }
+        try requireStructuralRewriteFile(at: sourceURL)
         guard !password.isEmpty,
               let document = PDFDocument(url: sourceURL),
               document.isLocked,
@@ -1451,13 +1931,6 @@ struct PDFOutputService: @unchecked Sendable {
               document.pageCount > 0
         else {
             throw PaperPathError.lockedPDF
-        }
-        guard sourceURL.standardizedFileURL
-                != destination.standardizedFileURL
-        else {
-            throw PaperPathError.insufficientSelection(
-                "Create a separate editable copy when removing a password."
-            )
         }
         let structureService = PDFDocumentStructureService()
         let sourceStructure = try structureService
@@ -1517,17 +1990,22 @@ struct PDFOutputService: @unchecked Sendable {
                 "The editable PDF copy could not be written."
             )
         }
+        try Task.checkCancellation()
+        try requireStructuralRewriteFile(at: editableBase)
         let editableData = try Data(
             contentsOf: editableBase,
             options: .mappedIfSafe
         )
+        try Task.checkCancellation()
         let restoredData = try PDFCatalogStructureAppender(
             data: editableData
         ).appending(
             attachmentPayloads: attachmentPayloads,
             pageLabels: pageLabels
         )
+        try Task.checkCancellation()
         try restoredData.write(to: destination, options: .atomic)
+        try Task.checkCancellation()
         progress(0.68)
         guard let reopened = PDFDocument(url: destination),
               !reopened.isLocked,
@@ -1541,18 +2019,23 @@ struct PDFOutputService: @unchecked Sendable {
         }
         for pageIndex in 0..<reopened.pageCount {
             try Task.checkCancellation()
-            guard let page = reopened.page(at: pageIndex),
-                  page.thumbnail(
+            let canRender = autoreleasepool {
+                guard let page = reopened.page(at: pageIndex) else {
+                    return false
+                }
+                return page.thumbnail(
                     of: CGSize(width: 180, height: 240),
                     for: .cropBox
-                  ).cgImage != nil
-            else {
+                ).cgImage != nil
+            }
+            guard canRender else {
                 try? FileManager.default.removeItem(at: destination)
                 throw PaperPathError.outputVerificationFailed(
                     "page \(pageIndex + 1) could not be reopened"
                 )
             }
         }
+        try Task.checkCancellation()
         let outputStructure = try structureService
             .preservationSignature(
                 in: destination,
@@ -1563,7 +2046,8 @@ struct PDFOutputService: @unchecked Sendable {
                 "attachments, page labels, review objects, or outline entries changed while removing the password"
             )
         }
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try Task.checkCancellation()
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
         didComplete = true
         progress(1)
     }
@@ -1584,29 +2068,35 @@ struct PDFOutputService: @unchecked Sendable {
               sourceDocument.pageCount > 0,
               let provider = CGDataProvider(url: sourceURL as CFURL),
               let source = CGPDFDocument(provider),
-              let firstPage = source.page(at: 1),
-              let consumer = CGDataConsumer(url: destination as CFURL)
+              source.numberOfPages == sourceDocument.pageCount,
+              let firstPage = source.page(at: 1)
         else {
             throw PaperPathError.unreadablePDF
         }
-        guard overlays.allSatisfy({
-            $0.pageIndex >= 0 && $0.pageIndex < source.numberOfPages
-        }) else {
-            throw PaperPathError.invalidPage
-        }
-        let imageByteCount = overlays.reduce(0) { result, overlay in
-            guard case .image(_, _, let data) = overlay else {
-                return result
-            }
-            return result + data.count
-        }
-        guard imageByteCount <= 24 * 1_024 * 1_024 else {
+        try Self.requireSupportedPageCount(sourceDocument.pageCount)
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path),
+              let consumer = CGDataConsumer(url: destination as CFURL)
+        else {
             throw PaperPathError.storageFailure(
-                "The added images are too large. Choose smaller images."
+                "The edited PDF destination could not be created."
             )
         }
+        var completed = false
+        defer {
+            if !completed {
+                try? fileManager.removeItem(at: destination)
+            }
+        }
+        let overlayValidation = try validateContentOverlays(
+            overlays,
+            pageCount: source.numberOfPages
+        )
 
         var defaultBox = firstPage.getBoxRect(.mediaBox)
+        guard Self.hasValidPageBounds(defaultBox) else {
+            throw PaperPathError.invalidPage
+        }
         guard let context = CGContext(
             consumer: consumer,
             mediaBox: &defaultBox,
@@ -1616,18 +2106,30 @@ struct PDFOutputService: @unchecked Sendable {
                 "The edited PDF context could not be created."
             )
         }
+        var didCloseContext = false
+        defer {
+            if !didCloseContext {
+                context.closePDF()
+            }
+        }
         let overlaysByPage = Dictionary(
             grouping: overlays,
             by: \.pageIndex
         )
+        var lastReportedPercent = -1
         progress(0.02)
         for pageNumber in 1...source.numberOfPages {
             try Task.checkCancellation()
             guard let sourcePage = source.page(at: pageNumber) else {
-                continue
+                throw PaperPathError.invalidPage
             }
             let mediaBox = sourcePage.getBoxRect(.mediaBox)
             let cropBox = sourcePage.getBoxRect(.cropBox)
+            guard Self.hasValidPageBounds(mediaBox),
+                  Self.hasValidPageBounds(cropBox)
+            else {
+                throw PaperPathError.invalidPage
+            }
             let pageInfo = [
                 kCGPDFContextMediaBox as String: mediaBox,
                 kCGPDFContextCropBox as String: cropBox
@@ -1654,12 +2156,16 @@ struct PDFOutputService: @unchecked Sendable {
                 }
             }
             context.endPDFPage()
-            progress(
-                0.7 * Double(pageNumber)
-                    / Double(max(1, source.numberOfPages))
-            )
+            let fraction = 0.7 * Double(pageNumber)
+                / Double(source.numberOfPages)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
+            }
         }
         context.closePDF()
+        didCloseContext = true
         try Task.checkCancellation()
 
         guard let outputDocument = PDFDocument(url: destination),
@@ -1673,14 +2179,25 @@ struct PDFOutputService: @unchecked Sendable {
             try Task.checkCancellation()
             guard let sourcePage = sourceDocument.page(at: pageIndex),
                   let outputPage = outputDocument.page(at: pageIndex)
-            else { continue }
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "an edited PDF page could not be reopened"
+                )
+            }
             for annotation in sourcePage.annotations {
                 guard let copy = annotation.copy() as? PDFAnnotation else {
-                    continue
+                    throw PaperPathError.outputVerificationFailed(
+                        "an existing annotation could not be preserved"
+                    )
                 }
                 outputPage.addAnnotation(copy)
             }
             let pageBounds = outputPage.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(pageBounds) else {
+                throw PaperPathError.outputVerificationFailed(
+                    "an edited PDF page has invalid geometry"
+                )
+            }
             for overlay in overlaysByPage[pageIndex, default: []] {
                 switch overlay {
                 case .text(_, let bounds, let text, let fontSize, let color):
@@ -1702,11 +2219,14 @@ struct PDFOutputService: @unchecked Sendable {
                     break
                 }
             }
-            progress(
-                0.7
-                    + 0.22 * Double(pageIndex + 1)
-                    / Double(max(1, sourceDocument.pageCount))
-            )
+            let fraction = 0.7
+                + 0.22 * Double(pageIndex + 1)
+                / Double(sourceDocument.pageCount)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
+            }
         }
         let finalizedURL = destination.deletingLastPathComponent()
             .appendingPathComponent(".\(UUID().uuidString)-edited.pdf")
@@ -1716,12 +2236,71 @@ struct PDFOutputService: @unchecked Sendable {
                 "The added content could not be encoded."
             )
         }
-        LocalFileSecurity.applyCompleteProtection(to: finalizedURL)
-        _ = try FileManager.default.replaceItemAt(
+        try LocalFileSecurity.requireCompleteProtection(to: finalizedURL)
+        guard let finalizedDocument = PDFDocument(url: finalizedURL),
+              !finalizedDocument.isLocked,
+              finalizedDocument.pageCount == sourceDocument.pageCount
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the finalized edited PDF could not be reopened"
+            )
+        }
+        for pageIndex in 0..<finalizedDocument.pageCount {
+            try Task.checkCancellation()
+            guard let sourcePage = sourceDocument.page(at: pageIndex),
+                  let page = finalizedDocument.page(at: pageIndex),
+                  Self.hasValidPageBounds(page.bounds(for: .mediaBox)),
+                  Self.hasValidPageBounds(page.bounds(for: .cropBox))
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a finalized edited PDF page has invalid geometry"
+                )
+            }
+            let expectedAnnotationCount = sourcePage.annotations.count
+                + overlayValidation.annotationAdditionsByPage[
+                    pageIndex,
+                    default: 0
+                ]
+            guard page.annotations.count == expectedAnnotationCount else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the finalized edited PDF did not preserve every annotation"
+                )
+            }
+            for expectedLink in overlayValidation.expectedLinksByPage[
+                pageIndex,
+                default: []
+            ] {
+                guard hasExpectedLink(
+                    expectedLink,
+                    on: page
+                ) else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "an added web link did not preserve its verified target"
+                    )
+                }
+            }
+            for expectedText in overlayValidation.expectedTextsByPage[
+                pageIndex,
+                default: []
+            ] {
+                guard hasExpectedText(
+                    expectedText,
+                    on: page
+                ) else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "added text did not preserve its content or placement"
+                    )
+                }
+            }
+        }
+        try Task.checkCancellation()
+        _ = try fileManager.replaceItemAt(
             destination,
             withItemAt: finalizedURL
         )
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        LocalFileSecurity.excludeFromBackup(destination)
+        completed = true
         progress(1)
     }
 
@@ -1747,10 +2326,10 @@ struct PDFOutputService: @unchecked Sendable {
         sourceURL: URL,
         destination: URL,
         mutation: PDFLinkMutation,
+        expectedLink: PDFLinkAnnotationSnapshot? = nil,
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
         let service = PDFMutationService()
-        let sourceLinks = try service.links(in: sourceURL)
         let identity: (pageIndex: Int, annotationIndex: Int)
         switch mutation {
         case .update(let payload):
@@ -1761,12 +2340,26 @@ struct PDFOutputService: @unchecked Sendable {
         case .remove(let pageIndex, let annotationIndex):
             identity = (pageIndex, annotationIndex)
         }
-        guard sourceLinks.contains(where: {
+        let sourceLinks = try service.links(
+            in: sourceURL,
+            pageIndex: identity.pageIndex
+        )
+        guard let sourceLink = sourceLinks.first(where: {
             $0.pageIndex == identity.pageIndex
                 && $0.annotationIndex == identity.annotationIndex
-        }) else {
+        })
+        else {
             throw PaperPathError.insufficientSelection(
-                "The selected link is no longer available."
+                "The selected link changed before the copy was created."
+            )
+        }
+        let expectedLinkMatches = expectedLink.map {
+            $0 == sourceLink
+        } ?? true
+        guard expectedLinkMatches
+        else {
+            throw PaperPathError.insufficientSelection(
+                "The selected link changed before the copy was created."
             )
         }
         try Task.checkCancellation()
@@ -1775,7 +2368,7 @@ struct PDFOutputService: @unchecked Sendable {
                 at: sourceURL,
                 to: destination
             )
-            LocalFileSecurity.applyCompleteProtection(to: destination)
+            try LocalFileSecurity.requireCompleteProtection(to: destination)
             progress(0.32)
             try Task.checkCancellation()
             try service.applyLinkMutation(
@@ -1793,7 +2386,10 @@ struct PDFOutputService: @unchecked Sendable {
                     "the link-edited copy could not be reopened"
                 )
             }
-            let outputLinks = try service.links(in: destination)
+            let outputLinks = try service.links(
+                in: destination,
+                pageIndex: identity.pageIndex
+            )
             switch mutation {
             case .remove:
                 guard outputLinks.count == sourceLinks.count - 1 else {
@@ -1834,12 +2430,25 @@ struct PDFOutputService: @unchecked Sendable {
         pageIndices: [Int],
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
+        guard sourceURL.standardizedFileURL.path
+                != destination.standardizedFileURL.path
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Create a separate outlined copy instead of replacing the source PDF."
+            )
+        }
+        guard pageIndices.count <= Self.maximumPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Bookmark up to 100,000 pages at a time."
+            )
+        }
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
         let pages = Array(
             Set(
                 pageIndices.filter {
@@ -1881,12 +2490,33 @@ struct PDFOutputService: @unchecked Sendable {
             )
         }
         document.outlineRoot = root
-        guard document.write(to: destination) else {
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The outlined PDF destination already exists."
+            )
+        }
+        let stagingURL = destination.deletingLastPathComponent()
+            .appendingPathComponent(
+                ".outlined-\(UUID().uuidString).pdf"
+            )
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        var publishedDestination = false
+        var completed = false
+        defer {
+            if publishedDestination,
+               !completed,
+               fileManager.fileExists(atPath: destination.path) {
+                try? fileManager.removeItem(at: destination)
+            }
+        }
+        guard document.write(to: stagingURL) else {
             throw PaperPathError.storageFailure(
                 "The outlined PDF copy could not be written."
             )
         }
-        guard let reopened = PDFDocument(url: destination),
+        try LocalFileSecurity.requireCompleteProtection(to: stagingURL)
+        guard let reopened = PDFDocument(url: stagingURL),
               reopened.pageCount == document.pageCount,
               let reopenedRoot = reopened.outlineRoot,
               (0..<reopenedRoot.numberOfChildren).contains(where: {
@@ -1896,12 +2526,16 @@ struct PDFOutputService: @unchecked Sendable {
                       && candidate.numberOfChildren == pages.count
               })
         else {
-            try? FileManager.default.removeItem(at: destination)
             throw PaperPathError.outputVerificationFailed(
                 "the embedded bookmark outline did not persist"
             )
         }
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try Task.checkCancellation()
+        try fileManager.moveItem(at: stagingURL, to: destination)
+        publishedDestination = true
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        LocalFileSecurity.excludeFromBackup(destination)
+        completed = true
         progress(1)
     }
 
@@ -1911,11 +2545,26 @@ struct PDFOutputService: @unchecked Sendable {
         rules: [PDFPageLabelRule],
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
+        guard sourceURL.standardizedFileURL
+                != destination.standardizedFileURL
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Create a separate page-labeled copy instead of replacing the source PDF."
+            )
+        }
+        try requireStructuralRewriteFile(at: sourceURL)
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
+        }
+        var didWriteDestination = false
+        var didComplete = false
+        defer {
+            if didWriteDestination, !didComplete {
+                try? FileManager.default.removeItem(at: destination)
+            }
         }
         let normalizedRules = try validatedPageLabelRules(
             rules,
@@ -1972,6 +2621,7 @@ struct PDFOutputService: @unchecked Sendable {
                     "This PDF structure cannot be normalized for page labels."
                 )
             }
+            try requireStructuralRewriteFile(at: normalizedURL)
             let normalizedData = try Data(
                 contentsOf: normalizedURL,
                 options: .mappedIfSafe
@@ -1985,8 +2635,10 @@ struct PDFOutputService: @unchecked Sendable {
             }
         }
         progress(0.72)
+        try Task.checkCancellation()
         try outputData.write(to: destination, options: .atomic)
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        didWriteDestination = true
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
 
         guard let reopened = PDFDocument(url: destination),
               reopened.pageCount == document.pageCount
@@ -2023,6 +2675,7 @@ struct PDFOutputService: @unchecked Sendable {
                 "attachments, review objects, or outline entries changed while adding page labels"
             )
         }
+        didComplete = true
         progress(1)
     }
 
@@ -2049,6 +2702,21 @@ struct PDFOutputService: @unchecked Sendable {
                 "Calculated field updates exceed the safe local limit."
             )
         }
+        guard sourceURL.standardizedFileURL
+                != destination.standardizedFileURL
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Create a separate calculated-field copy instead of replacing the source PDF."
+            )
+        }
+        try requireStructuralRewriteFile(at: sourceURL)
+        var didWriteDestination = false
+        var didComplete = false
+        defer {
+            if didWriteDestination, !didComplete {
+                try? FileManager.default.removeItem(at: destination)
+            }
+        }
         let sourceReport = try PDFFormInspectionService()
             .inspect(url: sourceURL)
         var normalizedValues: [String: String] = [:]
@@ -2066,7 +2734,7 @@ struct PDFOutputService: @unchecked Sendable {
             contentsOf: sourceURL,
             options: .mappedIfSafe
         )
-        var structure = try PDFImageObjectDocument(
+        let structure = try PDFImageObjectDocument(
             data: sourceData
         )
         let objects = structure.allObjects()
@@ -2133,10 +2801,10 @@ struct PDFOutputService: @unchecked Sendable {
             .union([needAppearancesObject.number])
             .sorted()
 
-        var outputData = sourceData
+        var replacements: [PDFObjectReplacement] = []
+        replacements.reserveCapacity(objectNumbers.count)
         for number in objectNumbers {
             try Task.checkCancellation()
-            structure = try PDFImageObjectDocument(data: outputData)
             let generation = targetValues[number]?.generation
                 ?? appearanceObjects[number]
                 ?? needAppearancesObject.generation
@@ -2174,15 +2842,23 @@ struct PDFOutputService: @unchecked Sendable {
                 )
             }
             if replacement != objectData {
-                outputData = try structure.replacingObject(
-                    object,
-                    with: replacement
+                replacements.append(
+                    PDFObjectReplacement(
+                        object: object,
+                        data: replacement
+                    )
                 )
             }
         }
+        let outputData = replacements.isEmpty
+            ? sourceData
+            : try structure.replacingObjects(replacements)
 
+        try Task.checkCancellation()
         try outputData.write(to: destination, options: .atomic)
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        didWriteDestination = true
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        try Task.checkCancellation()
         let outputReport: PDFFormInspectionReport
         do {
             outputReport = try PDFFormInspectionService()
@@ -2209,6 +2885,7 @@ struct PDFOutputService: @unchecked Sendable {
                 "calculated values or standard form scripts did not survive the structural rewrite"
             )
         }
+        didComplete = true
     }
 
     private func formLogicSignature(
@@ -2236,7 +2913,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func copyOutline(
+    func copyOutline(
         from source: PDFDocument,
         to destination: PDFDocument
     ) {
@@ -2291,7 +2968,7 @@ struct PDFOutputService: @unchecked Sendable {
         }
     }
 
-    private func validatedPageLabelRules(
+    func validatedPageLabelRules(
         _ rules: [PDFPageLabelRule],
         pageCount: Int
     ) throws -> [PDFPageLabelRule] {
@@ -2339,7 +3016,7 @@ struct PDFOutputService: @unchecked Sendable {
         return sorted
     }
 
-    private func pdfPageLabelDictionary(
+    func pdfPageLabelDictionary(
         rules: [PDFPageLabelRule]
     ) -> Data {
         let values = rules.map { rule in
@@ -2360,7 +3037,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func expectedPageLabel(
+    func expectedPageLabel(
         pageIndex: Int,
         rules: [PDFPageLabelRule]
     ) -> String {
@@ -2379,6 +3056,9 @@ struct PDFOutputService: @unchecked Sendable {
     ) throws {
         guard snapshot.isSafelyReplaceable,
               replacementData.count <= 12 * 1_024 * 1_024,
+              Self.hasSafeReplacementImageProperties(
+                  replacementData
+              ),
               let replacementImage = UIImage(data: replacementData)
         else {
             throw PaperPathError.insufficientSelection(
@@ -2516,7 +3196,7 @@ struct PDFOutputService: @unchecked Sendable {
         }
         progress(0.62)
         try outputData.write(to: destination, options: .atomic)
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
 
         let removedOriginalJPEG = snapshot.storage != .jpeg
             || outputData.range(of: snapshot.sourceStreamData) == nil
@@ -2570,25 +3250,7 @@ struct PDFOutputService: @unchecked Sendable {
         let trimmed = replacement.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard let document = PDFDocument(url: sourceURL),
-              !document.isLocked
-        else {
-            throw PaperPathError.unreadablePDF
-        }
         let pageIndices = selection.pageIndices
-        let pages = Dictionary(
-            pageIndices.compactMap {
-                index -> (Int, PDFPage)? in
-                guard let page = document.page(at: index) else {
-                    return nil
-                }
-                return (index, page)
-            },
-            uniquingKeysWith: { current, _ in current }
-        )
-        guard pages.count == pageIndices.count else {
-            throw PaperPathError.invalidPage
-        }
         guard zip(pageIndices, pageIndices.dropFirst()).allSatisfy({
             pair in pair.1 == pair.0 + 1
         }) else {
@@ -2612,11 +3274,23 @@ struct PDFOutputService: @unchecked Sendable {
                 alignment: alignment
             )
         }
-        guard selection.pageRotation % 360 == 0,
-              pages.values.allSatisfy({ $0.rotation % 360 == 0 })
+        guard selection.lineCount <= 96,
+              selection.flowRegions.count <= 16,
+              pageIndices.count <= 4,
+              selection.originalText.count <= 16_000,
+              trimmed.count <= 16_000
         else {
             return blockedTextReplacement(
-                "Rotate every selected page upright before replacing text.",
+                "Reflow no more than 96 lines, sixteen text boxes, four pages, or 16,000 characters at a time.",
+                fontStyle: fontStyle,
+                alignment: alignment
+            )
+        }
+        guard !pageIndices.isEmpty,
+              !selection.flowRegions.isEmpty
+        else {
+            return blockedTextReplacement(
+                "Select at least one complete text line before replacing text.",
                 fontStyle: fontStyle,
                 alignment: alignment
             )
@@ -2635,14 +3309,30 @@ struct PDFOutputService: @unchecked Sendable {
                 alignment: alignment
             )
         }
-        guard selection.lineCount <= 96,
-              selection.flowRegions.count <= 16,
-              pageIndices.count <= 4,
-              selection.originalText.count <= 16_000,
-              trimmed.count <= 16_000
+        try Task.checkCancellation()
+        guard let document = PDFDocument(url: sourceURL),
+              !document.isLocked
+        else {
+            throw PaperPathError.unreadablePDF
+        }
+        let pages = Dictionary(
+            pageIndices.compactMap {
+                index -> (Int, PDFPage)? in
+                guard let page = document.page(at: index) else {
+                    return nil
+                }
+                return (index, page)
+            },
+            uniquingKeysWith: { current, _ in current }
+        )
+        guard pages.count == pageIndices.count else {
+            throw PaperPathError.invalidPage
+        }
+        guard selection.pageRotation % 360 == 0,
+              pages.values.allSatisfy({ $0.rotation % 360 == 0 })
         else {
             return blockedTextReplacement(
-                "Reflow no more than 96 lines, sixteen text boxes, four pages, or 16,000 characters at a time.",
+                "Rotate every selected page upright before replacing text.",
                 fontStyle: fontStyle,
                 alignment: alignment
             )
@@ -2800,10 +3490,16 @@ struct PDFOutputService: @unchecked Sendable {
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
         try Task.checkCancellation()
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The replacement PDF destination already exists."
+            )
+        }
         var didComplete = false
         defer {
             if !didComplete {
-                try? FileManager.default.removeItem(at: destination)
+                try? fileManager.removeItem(at: destination)
             }
         }
         guard assessment.isReady,
@@ -2811,12 +3507,14 @@ struct PDFOutputService: @unchecked Sendable {
               !sourceDocument.isLocked,
               let provider = CGDataProvider(url: sourceURL as CFURL),
               let source = CGPDFDocument(provider),
+              source.numberOfPages == sourceDocument.pageCount,
               let firstPage = source.page(at: 1)
         else {
             throw PaperPathError.outputVerificationFailed(
                 "the selected text is no longer safe to replace"
             )
         }
+        try Self.requireSupportedPageCount(sourceDocument.pageCount)
         let verifiedAssessment = try assessTextReplacement(
             sourceURL: sourceURL,
             selection: selection,
@@ -2878,6 +3576,9 @@ struct PDFOutputService: @unchecked Sendable {
         }
 
         var defaultBox = firstPage.getBoxRect(.mediaBox)
+        guard Self.hasValidPageBounds(defaultBox) else {
+            throw PaperPathError.invalidPage
+        }
         guard let context = CGContext(
             consumer: consumer,
             mediaBox: &defaultBox,
@@ -2887,14 +3588,25 @@ struct PDFOutputService: @unchecked Sendable {
                 "The replacement PDF context could not be created."
             )
         }
+        var didCloseContext = false
+        defer {
+            if !didCloseContext {
+                context.closePDF()
+            }
+        }
         progress(0.03)
         for pageNumber in 1...source.numberOfPages {
             try Task.checkCancellation()
             guard let sourcePage = source.page(at: pageNumber) else {
-                continue
+                throw PaperPathError.invalidPage
             }
             let mediaBox = sourcePage.getBoxRect(.mediaBox)
             let cropBox = sourcePage.getBoxRect(.cropBox)
+            guard Self.hasValidPageBounds(mediaBox),
+                  Self.hasValidPageBounds(cropBox)
+            else {
+                throw PaperPathError.invalidPage
+            }
             let pageInfo = [
                 kCGPDFContextMediaBox as String: mediaBox,
                 kCGPDFContextCropBox as String: cropBox
@@ -2907,7 +3619,6 @@ struct PDFOutputService: @unchecked Sendable {
                       let renderingPage = selectedPage.copy() as? PDFPage
                 else {
                     context.endPDFPage()
-                    context.closePDF()
                     throw PaperPathError.outputVerificationFailed(
                         "the edited page could not be copied"
                     )
@@ -2923,7 +3634,6 @@ struct PDFOutputService: @unchecked Sendable {
                     for: .cropBox
                 ).cgImage else {
                     context.endPDFPage()
-                    context.closePDF()
                     throw PaperPathError.outputVerificationFailed(
                         "the edited page could not be rendered"
                     )
@@ -2987,6 +3697,7 @@ struct PDFOutputService: @unchecked Sendable {
             )
         }
         context.closePDF()
+        didCloseContext = true
         try Task.checkCancellation()
 
         guard let output = PDFDocument(url: destination),
@@ -3000,11 +3711,18 @@ struct PDFOutputService: @unchecked Sendable {
             try Task.checkCancellation()
             guard let sourcePage = sourceDocument.page(at: pageIndex),
                   let outputPage = output.page(at: pageIndex)
-            else { continue }
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a replacement PDF page could not be reopened"
+                )
+            }
             for annotation in sourcePage.annotations {
-                if let copy = annotation.copy() as? PDFAnnotation {
-                    outputPage.addAnnotation(copy)
+                guard let copy = annotation.copy() as? PDFAnnotation else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "an existing annotation could not be preserved"
+                    )
                 }
+                outputPage.addAnnotation(copy)
             }
         }
         let finalizedURL = destination.deletingLastPathComponent()
@@ -3017,13 +3735,32 @@ struct PDFOutputService: @unchecked Sendable {
             )
         }
         try Task.checkCancellation()
-        LocalFileSecurity.applyCompleteProtection(to: finalizedURL)
+        try LocalFileSecurity.requireCompleteProtection(to: finalizedURL)
+        guard let finalized = PDFDocument(url: finalizedURL),
+              !finalized.isLocked,
+              finalized.pageCount == sourceDocument.pageCount
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the finalized replacement PDF could not be reopened"
+            )
+        }
+        for pageIndex in 0..<finalized.pageCount {
+            try Task.checkCancellation()
+            guard let page = finalized.page(at: pageIndex),
+                  Self.hasValidPageBounds(page.bounds(for: .mediaBox)),
+                  Self.hasValidPageBounds(page.bounds(for: .cropBox))
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a finalized replacement PDF page has invalid geometry"
+                )
+            }
+        }
         try Task.checkCancellation()
-        _ = try FileManager.default.replaceItemAt(
+        _ = try fileManager.replaceItemAt(
             destination,
             withItemAt: finalizedURL
         )
-        LocalFileSecurity.applyCompleteProtection(to: destination)
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
         try Task.checkCancellation()
         progress(0.94)
 
@@ -3101,6 +3838,13 @@ struct PDFOutputService: @unchecked Sendable {
         byteProgress: @escaping PDFByteProgressHandler = { _ in },
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws -> PDFOfficeRuntimeEvidence? {
+        guard sourceURL.standardizedFileURL
+                != destination.standardizedFileURL
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Create a separate export instead of replacing the source PDF."
+            )
+        }
         if format == .wordDocument {
             do {
                 let evidence = try DOCXExportService().export(
@@ -3112,7 +3856,9 @@ struct PDFOutputService: @unchecked Sendable {
                     byteProgress: byteProgress,
                     progress: progress
                 )
-                LocalFileSecurity.applyCompleteProtection(to: destination)
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: destination
+                )
                 return evidence
             } catch is CancellationError {
                 throw CancellationError()
@@ -3135,7 +3881,9 @@ struct PDFOutputService: @unchecked Sendable {
                     byteProgress: byteProgress,
                     progress: progress
                 )
-                LocalFileSecurity.applyCompleteProtection(to: destination)
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: destination
+                )
                 return evidence
             } catch is CancellationError {
                 throw CancellationError()
@@ -3158,7 +3906,9 @@ struct PDFOutputService: @unchecked Sendable {
                     byteProgress: byteProgress,
                     progress: progress
                 )
-                LocalFileSecurity.applyCompleteProtection(to: destination)
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: destination
+                )
                 return evidence
             } catch is CancellationError {
                 throw CancellationError()
@@ -3178,6 +3928,7 @@ struct PDFOutputService: @unchecked Sendable {
         guard !pages.isEmpty else {
             throw PaperPathError.missingRecognizedText
         }
+        var didWriteDestination = false
         do {
             let data: Data
             switch format {
@@ -3205,6 +3956,14 @@ struct PDFOutputService: @unchecked Sendable {
                 data = try richTextData(title: title, pages: pages)
             }
             progress(0.86)
+            try Task.checkCancellation()
+            try requireTemporaryWriteCapacity(
+                at: destination,
+                byteCount: data.count
+            )
+            let expectedDigest = SHA256.hash(data: data)
+                .map { String(format: "%02x", $0) }
+                .joined()
             byteProgress(
                 PDFByteProgressUpdate(
                     stage: .packaging,
@@ -3213,6 +3972,7 @@ struct PDFOutputService: @unchecked Sendable {
                 )
             )
             try data.write(to: destination, options: .atomic)
+            didWriteDestination = true
             byteProgress(
                 PDFByteProgressUpdate(
                     stage: .packaging,
@@ -3220,9 +3980,33 @@ struct PDFOutputService: @unchecked Sendable {
                     totalBytes: Int64(data.count)
                 )
             )
-            LocalFileSecurity.applyCompleteProtection(to: destination)
+            try LocalFileSecurity.requireCompleteProtection(
+                to: destination
+            )
+            let writtenDigest = try fileSHA256(
+                at: destination,
+                expectedByteCount: data.count
+            )
+            guard writtenDigest == expectedDigest else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the exported text did not retain its encoded bytes"
+                )
+            }
             progress(1)
+        } catch is CancellationError {
+            if didWriteDestination {
+                try? FileManager.default.removeItem(at: destination)
+            }
+            throw CancellationError()
+        } catch let error as PaperPathError {
+            if didWriteDestination {
+                try? FileManager.default.removeItem(at: destination)
+            }
+            throw error
         } catch {
+            if didWriteDestination {
+                try? FileManager.default.removeItem(at: destination)
+            }
             throw PaperPathError.storageFailure(
                 "The \(format.title.lowercased()) export could not be written."
             )
@@ -3236,26 +4020,85 @@ struct PDFOutputService: @unchecked Sendable {
         preset: PDFPageImageExportPreset,
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws -> [URL] {
+        let fileManager = FileManager.default
+        let sourceValues = try sourceURL.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .contentModificationDateKey,
+                .fileResourceIdentifierKey
+            ]
+        )
+        guard sourceValues.isRegularFile == true,
+              sourceValues.isSymbolicLink != true,
+              let sourceByteCount = sourceValues.fileSize,
+              sourceByteCount > 0,
+              sourceByteCount <= Self.maximumImageExportSourceBytes
+        else {
+            throw PaperPathError.fileTooLarge
+        }
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
         }
-        try FileManager.default.createDirectory(
+        guard document.pageCount <= Self.maximumPageImageExportCount else {
+            throw PaperPathError.insufficientSelection(
+                "Page-image export supports PDFs up to 1,000 pages."
+            )
+        }
+        let createdDirectory = !fileManager.fileExists(
+            atPath: directory.path
+        )
+        try fileManager.createDirectory(
             at: directory,
             withIntermediateDirectories: true
         )
-        LocalFileSecurity.applyCompleteProtection(to: directory)
         var urls: [URL] = []
         urls.reserveCapacity(document.pageCount)
+        var completed = false
+        defer {
+            if !completed {
+                for url in urls {
+                    try? fileManager.removeItem(at: url)
+                }
+                if createdDirectory {
+                    try? fileManager.removeItem(at: directory)
+                }
+            }
+        }
+        let directoryValues = try directory.resourceValues(
+            forKeys: [
+                .isDirectoryKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard directoryValues.isDirectory == true,
+              directoryValues.isSymbolicLink != true
+        else {
+            throw PaperPathError.storageFailure(
+                "The page-image export folder is invalid."
+            )
+        }
+        try LocalFileSecurity.requireCompleteProtection(
+            to: directory,
+            fileManager: fileManager
+        )
+        LocalFileSecurity.excludeFromBackup(directory)
+        var totalByteCount = 0
+        var lastReportedPercent = -1
         for index in 0..<document.pageCount {
             try Task.checkCancellation()
-            let url: URL? = try autoreleasepool {
+            let result: (url: URL, byteCount: Int) = try autoreleasepool {
                 guard let page = document.page(at: index) else {
-                    return nil
+                    throw PaperPathError.invalidPage
                 }
                 let bounds = page.bounds(for: .cropBox)
+                guard Self.hasValidPageBounds(bounds) else {
+                    throw PaperPathError.invalidPage
+                }
                 let longestEdge: CGFloat = preset == .jpegCompact
                     ? 1_600
                     : 2_400
@@ -3264,39 +4107,151 @@ struct PDFOutputService: @unchecked Sendable {
                     longestEdge: longestEdge
                 )
                 let image = page.thumbnail(of: size, for: .cropBox)
-                let fileExtension: String
-                let data: Data?
-                switch preset {
-                case .png:
-                    fileExtension = "png"
-                    data = image.pngData()
-                case .jpegHigh:
-                    fileExtension = "jpg"
-                    data = image.jpegData(compressionQuality: 0.9)
-                case .jpegCompact:
-                    fileExtension = "jpg"
-                    data = image.jpegData(compressionQuality: 0.68)
+                guard let cgImage = image.cgImage,
+                      cgImage.width > 0,
+                      cgImage.height > 0,
+                      let pixelCount = Self.checkedProduct(
+                          cgImage.width,
+                          cgImage.height
+                      ),
+                      pixelCount <= Self.maximumPageImagePixels,
+                      let decodedByteCount = Self.checkedProduct(
+                          pixelCount,
+                          4
+                      )
+                else {
+                    throw PaperPathError.unreadableImage
                 }
-                guard let data else { return nil }
-                let url = directory.appendingPathComponent(
+                let outputURL = directory.appendingPathComponent(
                     String(
                         format: "Page-%03d.%@",
                         index + 1,
-                        fileExtension
+                        preset.fileExtension
                     )
                 )
-                try data.write(to: url, options: .atomic)
-                LocalFileSecurity.applyCompleteProtection(to: url)
-                return url
+                guard !fileManager.fileExists(
+                    atPath: outputURL.path
+                ) else {
+                    throw PaperPathError.storageFailure(
+                        "A page-image export file already exists."
+                    )
+                }
+                let stagingURL = directory.appendingPathComponent(
+                    ".PaperPath-PageImage-\(UUID().uuidString).tmp"
+                )
+                defer { try? fileManager.removeItem(at: stagingURL) }
+                try requireTemporaryWriteCapacity(
+                    at: stagingURL,
+                    byteCount: decodedByteCount
+                )
+                try Task.checkCancellation()
+                guard fileManager.createFile(
+                    atPath: stagingURL.path,
+                    contents: nil,
+                    attributes: [
+                        .protectionKey: FileProtectionType.complete
+                    ]
+                ) else {
+                    throw PaperPathError.storageFailure(
+                        "The image export temporary file could not be created."
+                    )
+                }
+                let properties = preset.imageDestinationProperties
+                guard let destination = CGImageDestinationCreateWithURL(
+                    stagingURL as CFURL,
+                    preset.uniformType.identifier as CFString,
+                    1,
+                    nil
+                ) else {
+                    throw PaperPathError.storageFailure(
+                        "The page image encoder could not be created."
+                    )
+                }
+                CGImageDestinationAddImage(
+                    destination,
+                    cgImage,
+                    properties as CFDictionary
+                )
+                guard CGImageDestinationFinalize(destination) else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "a PDF page image could not be encoded safely"
+                    )
+                }
+                try Task.checkCancellation()
+                let byteCount = try Self
+                    .verifiedExportedPageImageByteCount(
+                        at: stagingURL,
+                        preset: preset,
+                        expectedPixelWidth: cgImage.width,
+                        expectedPixelHeight: cgImage.height
+                    )
+                let (nextTotal, totalOverflow) = totalByteCount
+                    .addingReportingOverflow(byteCount)
+                guard !totalOverflow,
+                      nextTotal
+                        <= Self.maximumPageImageExportBytes
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "The page-image export exceeded the 512 MB safe local limit."
+                    )
+                }
+                var movedToOutput = false
+                var published = false
+                defer {
+                    if movedToOutput, !published {
+                        try? fileManager.removeItem(at: outputURL)
+                    }
+                }
+                do {
+                    try fileManager.moveItem(
+                        at: stagingURL,
+                        to: outputURL
+                    )
+                    movedToOutput = true
+                    try LocalFileSecurity.requireCompleteProtection(
+                        to: outputURL,
+                        fileManager: fileManager
+                    )
+                    LocalFileSecurity.excludeFromBackup(outputURL)
+                    let verifiedByteCount = try Self
+                        .verifiedExportedPageImageByteCount(
+                            at: outputURL,
+                            preset: preset,
+                            expectedPixelWidth: cgImage.width,
+                            expectedPixelHeight: cgImage.height
+                        )
+                    guard verifiedByteCount == byteCount else {
+                        throw PaperPathError.outputVerificationFailed(
+                            "a PDF page image did not retain its encoded bytes"
+                        )
+                    }
+                    published = true
+                } catch {
+                    throw error
+                }
+                return (outputURL, nextTotal)
             }
-            if let url {
-                urls.append(url)
+            totalByteCount = result.byteCount
+            urls.append(result.url)
+            let fraction = Double(index + 1)
+                / Double(document.pageCount)
+            let percent = Int((fraction * 100).rounded(.down))
+            if percent > lastReportedPercent {
+                lastReportedPercent = percent
+                progress(fraction)
             }
-            progress(
-                Double(index + 1)
-                    / Double(max(1, document.pageCount))
+        }
+        try Task.checkCancellation()
+        try Self.requireUnchangedSource(
+            at: sourceURL,
+            initialValues: sourceValues
+        )
+        guard urls.count == document.pageCount else {
+            throw PaperPathError.outputVerificationFailed(
+                "the page image export did not contain every PDF page"
             )
         }
+        completed = true
         return urls
     }
 
@@ -3306,10 +4261,21 @@ struct PDFOutputService: @unchecked Sendable {
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws -> PDFEmbeddedImageExportResult {
         let fileManager = FileManager.default
-        let sourceByteCount = try sourceURL.resourceValues(
-            forKeys: [.fileSizeKey]
-        ).fileSize ?? 0
-        guard sourceByteCount <= 512 * 1_024 * 1_024 else {
+        let sourceValues = try sourceURL.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .contentModificationDateKey,
+                .fileResourceIdentifierKey
+            ]
+        )
+        guard sourceValues.isRegularFile == true,
+              sourceValues.isSymbolicLink != true,
+              let sourceByteCount = sourceValues.fileSize,
+              sourceByteCount > 0,
+              sourceByteCount <= 512 * 1_024 * 1_024
+        else {
             throw PaperPathError.fileTooLarge
         }
         guard let pdfDocument = PDFDocument(url: sourceURL),
@@ -3322,24 +4288,42 @@ struct PDFOutputService: @unchecked Sendable {
             throw PaperPathError.unreadablePDF
         }
 
+        let createdDirectory = !fileManager.fileExists(
+            atPath: directory.path
+        )
+        var exportedURLs: [URL] = []
         do {
             try fileManager.createDirectory(
                 at: directory,
                 withIntermediateDirectories: true
             )
-            LocalFileSecurity.applyCompleteProtection(
+            let directoryValues = try directory.resourceValues(
+                forKeys: [
+                    .isDirectoryKey,
+                    .isSymbolicLinkKey
+                ]
+            )
+            guard directoryValues.isDirectory == true,
+                  directoryValues.isSymbolicLink != true
+            else {
+                throw PaperPathError.storageFailure(
+                    "The embedded-image export folder is invalid."
+                )
+            }
+            try LocalFileSecurity.requireCompleteProtection(
                 to: directory,
                 fileManager: fileManager
             )
+            LocalFileSecurity.excludeFromBackup(directory)
 
             let inspector = PDFImageObjectInspector()
-            var exportedURLs: [URL] = []
             var exportedDigests: Set<String> = []
             var exportedByteCount = 0
             var occurrenceCount = 0
             var unsupportedOccurrenceCount = 0
             var originalStreamFileCount = 0
             var losslessPNGFileCount = 0
+            var lastReportedPercent = -1
             exportedURLs.reserveCapacity(
                 min(pdfDocument.pageCount * 2, 64)
             )
@@ -3347,7 +4331,7 @@ struct PDFOutputService: @unchecked Sendable {
             for pageIndex in 0..<document.numberOfPages {
                 try Task.checkCancellation()
                 guard let page = document.page(at: pageIndex + 1) else {
-                    continue
+                    throw PaperPathError.invalidPage
                 }
                 let scan = autoreleasepool {
                     inspector.scanReport(
@@ -3355,10 +4339,28 @@ struct PDFOutputService: @unchecked Sendable {
                         pageIndex: pageIndex
                     )
                 }
-                occurrenceCount += scan.encounteredImageCount
-                unsupportedOccurrenceCount +=
-                    scan.unsupportedImageCount
-                    + scan.omittedImageCount
+                let (nextOccurrenceCount, occurrenceOverflow) =
+                    occurrenceCount.addingReportingOverflow(
+                        scan.encounteredImageCount
+                    )
+                let (unsupportedOnPage, unsupportedPageOverflow) =
+                    scan.unsupportedImageCount.addingReportingOverflow(
+                        scan.omittedImageCount
+                    )
+                let (nextUnsupportedCount, unsupportedOverflow) =
+                    unsupportedOccurrenceCount.addingReportingOverflow(
+                        unsupportedOnPage
+                    )
+                guard !occurrenceOverflow,
+                      !unsupportedPageOverflow,
+                      !unsupportedOverflow
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "The embedded-image report exceeded the safe local limit."
+                    )
+                }
+                occurrenceCount = nextOccurrenceCount
+                unsupportedOccurrenceCount = nextUnsupportedCount
 
                 for (imageIndex, use) in scan.uses.enumerated() {
                     try Task.checkCancellation()
@@ -3368,9 +4370,13 @@ struct PDFOutputService: @unchecked Sendable {
                     guard !exportedDigests.contains(digest) else {
                         continue
                     }
+                    let (nextExportedByteCount, byteCountOverflow) =
+                        exportedByteCount.addingReportingOverflow(
+                            use.data.count
+                        )
                     guard exportedURLs.count < 256,
-                          exportedByteCount + use.data.count
-                            <= 192 * 1_024 * 1_024
+                          !byteCountOverflow,
+                          nextExportedByteCount <= 192 * 1_024 * 1_024
                     else {
                         throw PaperPathError.insufficientSelection(
                             "Embedded-image export supports up to 256 unique images or 192 MB per PDF."
@@ -3412,29 +4418,67 @@ struct PDFOutputService: @unchecked Sendable {
                     )
                     let outputURL = directory
                         .appendingPathComponent(fileName)
-                    try use.data.write(
-                        to: outputURL,
-                        options: .atomic
+                    guard !fileManager.fileExists(
+                        atPath: outputURL.path
+                    ) else {
+                        throw PaperPathError.storageFailure(
+                            "An embedded-image export file already exists."
+                        )
+                    }
+                    let stagingURL = directory.appendingPathComponent(
+                        ".PaperPath-EmbeddedImage-\(UUID().uuidString).tmp"
                     )
-                    LocalFileSecurity.applyCompleteProtection(
-                        to: outputURL,
+                    defer {
+                        try? fileManager.removeItem(at: stagingURL)
+                    }
+                    try requireTemporaryWriteCapacity(
+                        at: stagingURL,
+                        byteCount: use.data.count
+                    )
+                    try writeProtectedData(
+                        use.data,
+                        to: stagingURL,
                         fileManager: fileManager
                     )
-                    let verifiedData = try Data(
-                        contentsOf: outputURL,
-                        options: .mappedIfSafe
+                    let verifiedDigest = try fileSHA256(
+                        at: stagingURL,
+                        expectedByteCount: use.data.count
                     )
-                    guard verifiedData == use.data,
-                          PDFImageObjectInspector.digest(
-                              verifiedData
-                          ) == digest
-                    else {
+                    guard verifiedDigest == digest else {
                         throw PaperPathError.outputVerificationFailed(
                             "an exported image did not match its original PDF stream"
                         )
                     }
+                    try Task.checkCancellation()
+                    var movedToOutput = false
+                    var published = false
+                    defer {
+                        if movedToOutput, !published {
+                            try? fileManager.removeItem(at: outputURL)
+                        }
+                    }
+                    try fileManager.moveItem(
+                        at: stagingURL,
+                        to: outputURL
+                    )
+                    movedToOutput = true
+                    try LocalFileSecurity.requireCompleteProtection(
+                        to: outputURL,
+                        fileManager: fileManager
+                    )
+                    LocalFileSecurity.excludeFromBackup(outputURL)
+                    let finalDigest = try fileSHA256(
+                        at: outputURL,
+                        expectedByteCount: use.data.count
+                    )
+                    guard finalDigest == digest else {
+                        throw PaperPathError.outputVerificationFailed(
+                            "an exported image changed while it was published"
+                        )
+                    }
+                    published = true
                     exportedDigests.insert(digest)
-                    exportedByteCount += verifiedData.count
+                    exportedByteCount = nextExportedByteCount
                     exportedURLs.append(outputURL)
                     if use.kind.isOriginalStream {
                         originalStreamFileCount += 1
@@ -3442,10 +4486,13 @@ struct PDFOutputService: @unchecked Sendable {
                         losslessPNGFileCount += 1
                     }
                 }
-                progress(
-                    Double(pageIndex + 1)
-                        / Double(max(1, document.numberOfPages))
-                )
+                let fraction = Double(pageIndex + 1)
+                    / Double(document.numberOfPages)
+                let percent = Int((fraction * 100).rounded(.down))
+                if percent > lastReportedPercent {
+                    lastReportedPercent = percent
+                    progress(fraction)
+                }
             }
 
             guard !exportedURLs.isEmpty else {
@@ -3454,6 +4501,11 @@ struct PDFOutputService: @unchecked Sendable {
                     : "This PDF uses image encodings or color spaces that cannot be exported safely."
                 throw PaperPathError.insufficientSelection(message)
             }
+            try Task.checkCancellation()
+            try Self.requireUnchangedSource(
+                at: sourceURL,
+                initialValues: sourceValues
+            )
             return PDFEmbeddedImageExportResult(
                 urls: exportedURLs,
                 occurrenceCount: occurrenceCount,
@@ -3462,7 +4514,13 @@ struct PDFOutputService: @unchecked Sendable {
                 losslessPNGFileCount: losslessPNGFileCount
             )
         } catch {
-            try? fileManager.removeItem(at: directory)
+            if createdDirectory {
+                try? fileManager.removeItem(at: directory)
+            } else {
+                for url in exportedURLs {
+                    try? fileManager.removeItem(at: url)
+                }
+            }
             throw error
         }
     }
@@ -3472,28 +4530,59 @@ struct PDFOutputService: @unchecked Sendable {
         textIndex: DocumentTextIndex?,
         progress: @escaping PDFProgressHandler
     ) throws -> [(pageIndex: Int, text: String)] {
-        let indexed = (textIndex?.pages ?? []).reduce(
-            into: [Int: String]()
-        ) { result, page in
-            guard page.pageIndex >= 0 else { return }
-            let candidate = page.text.trimmingCharacters(
-                in: .whitespacesAndNewlines
-            )
-            guard !candidate.isEmpty else { return }
-            if let existing = result[page.pageIndex],
-               existing.count >= candidate.count {
-                return
-            }
-            result[page.pageIndex] = candidate
-        }
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
+
+        let indexedPages = textIndex?.pages ?? []
+        guard indexedPages.count <= Self.maximumPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Text export supports up to 100,000 indexed pages."
+            )
+        }
+        var indexed: [Int: String] = [:]
+        var indexedTextBytes = 0
+        for page in indexedPages {
+            try Task.checkCancellation()
+            guard page.pageIndex >= 0,
+                  page.pageIndex < document.pageCount
+            else { continue }
+            let candidate = page.text.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            guard !candidate.isEmpty else { continue }
+            let candidateBytes = candidate.utf8.count
+            guard candidateBytes <= Self.maximumTextExportPageBytes else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too much text to export safely."
+                )
+            }
+            if let existing = indexed[page.pageIndex],
+               existing.count >= candidate.count {
+                continue
+            }
+            let existingBytes = indexed[page.pageIndex]?.utf8.count ?? 0
+            let baseBytes = indexedTextBytes - existingBytes
+            let (nextBytes, overflow) = baseBytes
+                .addingReportingOverflow(candidateBytes)
+            guard !overflow,
+                  nextBytes <= Self.maximumTextExportBytes
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "Text export supports up to 16 MB of extracted text at a time."
+                )
+            }
+            indexed[page.pageIndex] = candidate
+            indexedTextBytes = nextBytes
+        }
+
         var pages: [(pageIndex: Int, text: String)] = []
-        pages.reserveCapacity(document.pageCount)
+        pages.reserveCapacity(min(document.pageCount, 1_024))
+        var exportedTextBytes = 0
         for index in 0..<document.pageCount {
             try Task.checkCancellation()
             let text = indexed[index]
@@ -3503,7 +4592,19 @@ struct PDFOutputService: @unchecked Sendable {
                 in: .whitespacesAndNewlines
             )
             if !trimmed.isEmpty {
+                let pageBytes = trimmed.utf8.count
+                let (nextBytes, overflow) = exportedTextBytes
+                    .addingReportingOverflow(pageBytes)
+                guard pageBytes <= Self.maximumTextExportPageBytes,
+                      !overflow,
+                      nextBytes <= Self.maximumTextExportBytes
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "Text export supports up to 16 MB of extracted text at a time."
+                    )
+                }
                 pages.append((index, trimmed))
+                exportedTextBytes = nextBytes
             }
             progress(
                 Double(index + 1)
@@ -3586,11 +4687,53 @@ struct PDFOutputService: @unchecked Sendable {
         redactions: [PDFRedactionMark],
         progress: @escaping PDFProgressHandler
     ) throws {
+        let sourceValues = try sourceURL.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey,
+                .contentModificationDateKey,
+                .fileResourceIdentifierKey
+            ]
+        )
+        guard sourceValues.isRegularFile == true,
+              sourceValues.isSymbolicLink != true,
+              let sourceByteCount = sourceValues.fileSize,
+              sourceByteCount > 0,
+              sourceByteCount <= Self.maximumImageExportSourceBytes
+        else {
+            throw PaperPathError.fileTooLarge
+        }
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
+        }
+        guard document.pageCount <= Self.maximumPageImageExportCount else {
+            throw PaperPathError.insufficientSelection(
+                "Rasterized output supports PDFs up to 1,000 pages."
+            )
+        }
+        guard redactions.count <= 10_000,
+              redactions.allSatisfy({
+                  $0.pageIndex >= 0
+                      && $0.pageIndex < document.pageCount
+                      && $0.normalizedX.isFinite
+                      && $0.normalizedY.isFinite
+                      && $0.normalizedWidth.isFinite
+                      && $0.normalizedHeight.isFinite
+                      && $0.normalizedX >= 0
+                      && $0.normalizedY >= 0
+                      && $0.normalizedWidth >= 0.001
+                      && $0.normalizedHeight >= 0.001
+                      && $0.normalizedX + $0.normalizedWidth <= 1.001
+                      && $0.normalizedY + $0.normalizedHeight <= 1.001
+              })
+        else {
+            throw PaperPathError.insufficientSelection(
+                "The redaction areas could not be processed safely."
+            )
         }
         let format = UIGraphicsPDFRendererFormat()
         format.documentInfo = [:]
@@ -3602,18 +4745,41 @@ struct PDFOutputService: @unchecked Sendable {
             grouping: redactions,
             by: \.pageIndex
         )
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The output PDF destination already exists."
+            )
+        }
+        let stagingURL = destination
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".rasterized-\(UUID().uuidString).pdf"
+            )
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        var publishedDestination = false
+        var renderingError: PaperPathError?
         var lastReportedPercent = -1
         progress(0.02)
 
         do {
-            try renderer.writePDF(to: destination) { context in
+            try renderer.writePDF(to: stagingURL) { context in
                 for index in 0..<document.pageCount {
-                    if Task.isCancelled { return }
+                    if Task.isCancelled || renderingError != nil {
+                        return
+                    }
                     autoreleasepool {
                         guard let page = document.page(at: index) else {
+                            renderingError = .invalidPage
                             return
                         }
                         let pageBounds = page.bounds(for: .cropBox)
+                        guard Self.hasValidPageBounds(pageBounds) else {
+                            renderingError = .outputVerificationFailed(
+                                "a source PDF page has invalid geometry"
+                            )
+                            return
+                        }
                         let outputBounds = CGRect(
                             origin: .zero,
                             size: pageBounds.size
@@ -3631,28 +4797,54 @@ struct PDFOutputService: @unchecked Sendable {
                             of: imageSize,
                             for: .cropBox
                         )
-                        let compressed = rendered.jpegData(
-                            compressionQuality: jpegQuality
-                        )
-                        let image = compressed.flatMap(UIImage.init(data:))
-                            ?? rendered
-                        image.draw(in: outputBounds)
-
-                        UIColor.black.setFill()
-                        for mark in marksByPage[index, default: []] {
-                            let rect = CGRect(
-                                x: mark.normalizedX * outputBounds.width,
-                                y: (
-                                    1
-                                    - mark.normalizedY
-                                    - mark.normalizedHeight
-                                ) * outputBounds.height,
-                                width: mark.normalizedWidth * outputBounds.width,
-                                height: mark.normalizedHeight * outputBounds.height
-                            ).insetBy(dx: -2, dy: -1)
-                            context.cgContext.fill(rect)
+                        let pageMarks = marksByPage[index, default: []]
+                        let sanitized: UIImage
+                        if pageMarks.isEmpty {
+                            sanitized = rendered
+                        } else {
+                            let format = UIGraphicsImageRendererFormat()
+                            format.scale = 1
+                            format.opaque = true
+                            let bitmap = UIGraphicsImageRenderer(size: imageSize, format: format)
+                            sanitized = bitmap.image { bitmapContext in
+                                let pixelBounds = CGRect(origin: .zero, size: imageSize)
+                                rendered.draw(in: pixelBounds)
+                                bitmapContext.cgContext.setFillColor(UIColor.black.cgColor)
+                                for (markIndex, mark) in pageMarks.enumerated() {
+                                    if markIndex.isMultiple(of: 64), Task.isCancelled {
+                                        return
+                                    }
+                                    let rect = CGRect(
+                                        x: mark.normalizedX * imageSize.width,
+                                        y: (1 - mark.normalizedY - mark.normalizedHeight) * imageSize.height,
+                                        width: mark.normalizedWidth * imageSize.width,
+                                        height: mark.normalizedHeight * imageSize.height
+                                    ).insetBy(
+                                        dx: -2 * imageSize.width / outputBounds.width,
+                                        dy: -imageSize.height / outputBounds.height
+                                    )
+                                    bitmapContext.cgContext.fill(rect)
+                                }
+                            }
                         }
+                        guard !Task.isCancelled else { return }
+                        // Encode only sanitized pixels; never embed the source behind an overlay.
+                        guard let compressed = sanitized.jpegData(
+                            compressionQuality: jpegQuality
+                        ),
+                              !compressed.isEmpty,
+                              compressed.count
+                                <= Self.maximumPageImageBytes,
+                              let image = UIImage(data: compressed)
+                        else {
+                            renderingError = .outputVerificationFailed(
+                                "a rasterized PDF page could not be encoded safely"
+                            )
+                            return
+                        }
+                        image.draw(in: outputBounds)
                     }
+                    if renderingError != nil { return }
                     let fraction = Double(index + 1)
                         / Double(max(1, document.pageCount))
                     let percent = Int((fraction * 100).rounded(.down))
@@ -3662,14 +4854,80 @@ struct PDFOutputService: @unchecked Sendable {
                     }
                 }
             }
+            if let renderingError {
+                throw renderingError
+            }
             try Task.checkCancellation()
-            LocalFileSecurity.applyCompleteProtection(to: destination)
+            try LocalFileSecurity.requireCompleteProtection(
+                to: stagingURL
+            )
+            try verifyRasterizedOutput(
+                at: stagingURL,
+                expectedPageCount: document.pageCount
+            )
+            try Task.checkCancellation()
+            try Self.requireUnchangedSource(
+                at: sourceURL,
+                initialValues: sourceValues
+            )
+            try fileManager.moveItem(at: stagingURL, to: destination)
+            publishedDestination = true
+            try LocalFileSecurity.requireCompleteProtection(to: destination)
+            LocalFileSecurity.excludeFromBackup(destination)
         } catch is CancellationError {
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
             throw CancellationError()
+        } catch let error as PaperPathError {
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
+            throw error
         } catch {
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
             throw PaperPathError.storageFailure(
                 "The output PDF could not be rendered."
             )
+        }
+    }
+
+    private func verifyRasterizedOutput(
+        at url: URL,
+        expectedPageCount: Int
+    ) throws {
+        let values = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let byteCount = values.fileSize,
+              byteCount > 0,
+              byteCount <= 1_024 * 1_024 * 1_024,
+              let document = PDFDocument(url: url),
+              !document.isLocked,
+              document.pageCount == expectedPageCount
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the rasterized PDF could not be reopened with every page"
+            )
+        }
+        for pageIndex in 0..<document.pageCount {
+            try Task.checkCancellation()
+            guard let page = document.page(at: pageIndex),
+                  Self.hasValidPageBounds(page.bounds(for: .mediaBox)),
+                  Self.hasValidPageBounds(page.bounds(for: .cropBox))
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a rasterized PDF page has invalid geometry"
+                )
+            }
         }
     }
 
@@ -3686,16 +4944,412 @@ struct PDFOutputService: @unchecked Sendable {
         ).intersection(pageBounds)
     }
 
+    private static func hasValidPageBounds(_ bounds: CGRect) -> Bool {
+        bounds.origin.x.isFinite
+            && bounds.origin.y.isFinite
+            && bounds.width.isFinite
+            && bounds.height.isFinite
+            && bounds.width > 0
+            && bounds.height > 0
+    }
+
+    private func validateContentOverlays(
+        _ overlays: [PDFContentOverlay],
+        pageCount: Int
+    ) throws -> PDFContentOverlayValidation {
+        guard overlays.count <= 128 else {
+            throw PaperPathError.insufficientSelection(
+                "Add no more than 128 content items at once."
+            )
+        }
+        var imageByteCount = 0
+        var annotationAdditionsByPage: [Int: Int] = [:]
+        var expectedLinksByPage: [Int: [PDFExpectedLinkAnnotation]] = [:]
+        var expectedTextsByPage: [
+            Int: [PDFExpectedTextAnnotation]
+        ] = [:]
+
+        for (index, overlay) in overlays.enumerated() {
+            if index.isMultiple(of: 16) {
+                try Task.checkCancellation()
+            }
+            guard overlay.pageIndex >= 0,
+                  overlay.pageIndex < pageCount
+            else {
+                throw PaperPathError.invalidPage
+            }
+
+            switch overlay {
+            case .text(
+                let pageIndex,
+                let bounds,
+                let text,
+                let fontSize,
+                let color
+            ):
+                guard Self.isValidNormalizedRect(bounds),
+                      Self.isSafeEditableText(
+                          text,
+                          maximumCharacters: 2_000,
+                          maximumBytes: 8 * 1_024
+                      ),
+                      fontSize.isFinite,
+                      (8...72).contains(fontSize),
+                      Self.isValid(color)
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "The added text exceeds the safe local limit."
+                    )
+                }
+                annotationAdditionsByPage[pageIndex, default: 0] += 1
+                expectedTextsByPage[pageIndex, default: []].append(
+                    PDFExpectedTextAnnotation(
+                        bounds: bounds,
+                        contents: text
+                    )
+                )
+            case .link(
+                let pageIndex,
+                let bounds,
+                let title,
+                let url
+            ):
+                guard Self.isValidNormalizedRect(bounds),
+                      Self.isSafeEditableText(
+                          title,
+                          maximumCharacters: 240,
+                          maximumBytes: 1_024
+                      ),
+                      Self.isSupportedWebURL(url)
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "Use a valid HTTP or HTTPS link with a label up to 240 characters."
+                    )
+                }
+                annotationAdditionsByPage[pageIndex, default: 0] += 2
+                expectedLinksByPage[pageIndex, default: []].append(
+                    PDFExpectedLinkAnnotation(
+                        pageIndex: pageIndex,
+                        bounds: bounds,
+                        url: url
+                    )
+                )
+                expectedTextsByPage[pageIndex, default: []].append(
+                    PDFExpectedTextAnnotation(
+                        bounds: bounds,
+                        contents: title
+                    )
+                )
+            case .image(let pageIndex, let bounds, let data):
+                guard Self.isValidNormalizedRect(bounds),
+                      try Self.hasSafeImageProperties(data)
+                else {
+                    throw PaperPathError.insufficientSelection(
+                        "The added image exceeds the safe size or pixel limit."
+                    )
+                }
+                let (nextByteCount, overflow) = imageByteCount
+                    .addingReportingOverflow(data.count)
+                guard !overflow,
+                      nextByteCount <= 24 * 1_024 * 1_024
+                else {
+                    throw PaperPathError.storageFailure(
+                        "The added images are too large. Choose smaller images."
+                    )
+                }
+                imageByteCount = nextByteCount
+                annotationAdditionsByPage[pageIndex, default: 0] += 0
+            }
+        }
+
+        return PDFContentOverlayValidation(
+            annotationAdditionsByPage: annotationAdditionsByPage,
+            expectedLinksByPage: expectedLinksByPage,
+            expectedTextsByPage: expectedTextsByPage
+        )
+    }
+
+    private func hasExpectedText(
+        _ expected: PDFExpectedTextAnnotation,
+        on page: PDFPage
+    ) -> Bool {
+        let expectedBounds = pdfBounds(
+            expected.bounds,
+            pageBounds: page.bounds(for: .cropBox)
+        )
+        return page.annotations.contains { annotation in
+            let type = annotation.type?
+                .trimmingCharacters(
+                    in: CharacterSet(charactersIn: "/")
+                )
+            let freeTextType = PDFAnnotationSubtype.freeText.rawValue
+                .trimmingCharacters(
+                    in: CharacterSet(charactersIn: "/")
+                )
+            return type?.caseInsensitiveCompare(freeTextType)
+                    == .orderedSame
+                && annotation.contents == expected.contents
+                && annotation.shouldPrint
+                && annotation.userName == "PaperPath"
+                && Self.approximatelyEqual(
+                    annotation.bounds,
+                    expectedBounds
+                )
+        }
+    }
+
+    private func hasExpectedLink(
+        _ expected: PDFExpectedLinkAnnotation,
+        on page: PDFPage
+    ) -> Bool {
+        let expectedBounds = pdfBounds(
+            expected.bounds,
+            pageBounds: page.bounds(for: .cropBox)
+        )
+        return page.annotations.contains { annotation in
+            let type = annotation.type?
+                .trimmingCharacters(
+                    in: CharacterSet(charactersIn: "/")
+                )
+            let linkType = PDFAnnotationSubtype.link.rawValue
+                .trimmingCharacters(
+                    in: CharacterSet(charactersIn: "/")
+                )
+            let isLink = type?.caseInsensitiveCompare(
+                linkType
+            ) == .orderedSame
+            let targetURL = (
+                annotation.action as? PDFActionURL
+            )?.url ?? annotation.url
+            return isLink
+                && targetURL?.absoluteString
+                    == expected.url.absoluteString
+                && !annotation.shouldPrint
+                && Self.approximatelyEqual(
+                    annotation.bounds,
+                    expectedBounds
+                )
+        }
+    }
+
+    private static func isValidNormalizedRect(
+        _ bounds: PDFNormalizedRect
+    ) -> Bool {
+        let values = [
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height
+        ]
+        return values.allSatisfy(\.isFinite)
+            && bounds.x >= 0
+            && bounds.y >= 0
+            && bounds.width >= 0.01
+            && bounds.height >= 0.01
+            && bounds.x + bounds.width <= 1.001
+            && bounds.y + bounds.height <= 1.001
+    }
+
+    private static func isValid(_ color: PDFInkColor) -> Bool {
+        let components = [
+            color.red,
+            color.green,
+            color.blue,
+            color.alpha
+        ]
+        return components.allSatisfy {
+            $0.isFinite && (0...1).contains($0)
+        }
+    }
+
+    private static func isSafeEditableText(
+        _ value: String,
+        maximumCharacters: Int,
+        maximumBytes: Int
+    ) -> Bool {
+        let trimmed = value.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        guard !trimmed.isEmpty,
+              trimmed.count <= maximumCharacters,
+              trimmed.utf8.count <= maximumBytes
+        else { return false }
+        return trimmed.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+            let isAllowedWhitespace = scalar == "\n" || scalar == "\t"
+            return !CharacterSet.illegalCharacters.contains(scalar)
+                && (!CharacterSet.controlCharacters.contains(scalar)
+                    || isAllowedWhitespace)
+                && !isBidirectionalControl
+        }
+    }
+
+    private static func isSupportedWebURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host,
+              !host.isEmpty,
+              host.utf8.count <= 253,
+              url.user == nil,
+              url.password == nil,
+              url.absoluteString.utf8.count <= 4_096
+        else { return false }
+        return url.absoluteString.unicodeScalars.allSatisfy {
+            !CharacterSet.controlCharacters.contains($0)
+                && !CharacterSet.illegalCharacters.contains($0)
+        }
+    }
+
+    private static func hasSafeImageProperties(
+        _ data: Data
+    ) throws -> Bool {
+        guard !data.isEmpty,
+              data.count <= 12 * 1_024 * 1_024,
+              let imageSource = CGImageSourceCreateWithData(
+                  data as CFData,
+                  nil
+              ),
+              CGImageSourceGetCount(imageSource) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  imageSource,
+                  0,
+                  nil
+              ) as? [CFString: Any],
+              let width = (
+                  properties[kCGImagePropertyPixelWidth] as? NSNumber
+              )?.int64Value,
+              let height = (
+                  properties[kCGImagePropertyPixelHeight] as? NSNumber
+              )?.int64Value,
+              width > 0,
+              height > 0,
+              width <= 16_384,
+              height <= 16_384
+        else { return false }
+        let (pixelCount, overflow) = width
+            .multipliedReportingOverflow(by: height)
+        return !overflow && pixelCount <= 50_000_000
+    }
+
+    private static func hasSafeReplacementImageProperties(
+        _ data: Data
+    ) -> Bool {
+        guard !data.isEmpty,
+              data.count <= 12 * 1_024 * 1_024,
+              let imageSource = CGImageSourceCreateWithData(
+                  data as CFData,
+                  [
+                      kCGImageSourceShouldCache: false
+                  ] as CFDictionary
+              ),
+              CGImageSourceGetCount(imageSource) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  imageSource,
+                  0,
+                  nil
+              ) as? [CFString: Any],
+              let width = (
+                  properties[kCGImagePropertyPixelWidth] as? NSNumber
+              )?.int64Value,
+              let height = (
+                  properties[kCGImagePropertyPixelHeight] as? NSNumber
+              )?.int64Value,
+              width > 0,
+              height > 0,
+              width <= 8_192,
+              height <= 8_192
+        else { return false }
+        let (pixelCount, overflow) = width
+            .multipliedReportingOverflow(by: height)
+        return !overflow && pixelCount <= 16_000_000
+    }
+
+    private static func verifiedExportedPageImageByteCount(
+        at url: URL,
+        preset: PDFPageImageExportPreset,
+        expectedPixelWidth: Int,
+        expectedPixelHeight: Int
+    ) throws -> Int {
+        let values = try url.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              let byteCount = values.fileSize,
+              byteCount > 0,
+              byteCount <= maximumPageImageBytes,
+              let source = CGImageSourceCreateWithURL(
+                  url as CFURL,
+                  [
+                      kCGImageSourceShouldCache: false
+                  ] as CFDictionary
+              ),
+              CGImageSourceGetCount(source) == 1,
+              let typeIdentifier = CGImageSourceGetType(source),
+              let type = UTType(typeIdentifier as String),
+              let properties = CGImageSourceCopyPropertiesAtIndex(
+                  source,
+                  0,
+                  nil
+              ) as? [CFString: Any],
+              let width = (
+                  properties[kCGImagePropertyPixelWidth] as? NSNumber
+              )?.int64Value,
+              let height = (
+                  properties[kCGImagePropertyPixelHeight] as? NSNumber
+              )?.int64Value,
+              width > 0,
+              height > 0,
+              width == Int64(expectedPixelWidth),
+              height == Int64(expectedPixelHeight),
+              width <= 8_192,
+              height <= 8_192
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "a PDF page image failed format or size verification"
+            )
+        }
+        let (pixelCount, overflow) = width
+            .multipliedReportingOverflow(by: height)
+        guard type.conforms(to: preset.uniformType),
+              !overflow,
+              pixelCount <= Int64(maximumPageImagePixels)
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "a PDF page image failed format or size verification"
+            )
+        }
+        return byteCount
+    }
+
+    private static func approximatelyEqual(
+        _ left: CGRect,
+        _ right: CGRect
+    ) -> Bool {
+        let tolerance: CGFloat = 0.75
+        return abs(left.minX - right.minX) <= tolerance
+            && abs(left.minY - right.minY) <= tolerance
+            && abs(left.width - right.width) <= tolerance
+            && abs(left.height - right.height) <= tolerance
+    }
+
     private func drawImage(
         _ data: Data,
         in bounds: CGRect,
         context: CGContext
     ) throws {
         guard data.count <= 12 * 1_024 * 1_024,
+              Self.hasSafeReplacementImageProperties(data),
               let image = UIImage(data: data),
               let cgImage = image.cgImage,
-              bounds.width > 0,
-              bounds.height > 0
+              Self.hasValidPageBounds(bounds)
         else {
             throw PaperPathError.storageFailure(
                 "An added image could not be decoded."
@@ -3778,6 +5432,7 @@ struct PDFOutputService: @unchecked Sendable {
             withProperties: nil
         )
         link.contents = label
+        link.url = url
         link.action = PDFActionURL(url: url)
         let border = PDFBorder()
         border.lineWidth = 0
@@ -3788,7 +5443,7 @@ struct PDFOutputService: @unchecked Sendable {
         page.addAnnotation(link)
     }
 
-    private func blockedTextReplacement(
+    func blockedTextReplacement(
         _ detail: String,
         fontStyle: PDFTextReplacementFontStyle,
         alignment: PDFTextReplacementAlignment
@@ -3809,7 +5464,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func textSelectionBounds(
+    func textSelectionBounds(
         _ selection: PDFTextSelectionSnapshot,
         pageBounds: CGRect
     ) -> CGRect {
@@ -3826,7 +5481,7 @@ struct PDFOutputService: @unchecked Sendable {
         ).intersection(pageBounds)
     }
 
-    private func textFlowBounds(
+    func textFlowBounds(
         _ region: PDFTextFlowRegion,
         pageBounds: CGRect
     ) -> CGRect {
@@ -3843,7 +5498,7 @@ struct PDFOutputService: @unchecked Sendable {
         ).intersection(pageBounds)
     }
 
-    private func textFlowRegionsAreOrdered(
+    func textFlowRegionsAreOrdered(
         _ regions: [PDFTextFlowRegion]
     ) -> Bool {
         var previousPageIndex = -1
@@ -3867,7 +5522,7 @@ struct PDFOutputService: @unchecked Sendable {
         return true
     }
 
-    private func fittingReplacementLayout(
+    func fittingReplacementLayout(
         text: String,
         selection: PDFTextSelectionSnapshot,
         bounds: [CGRect],
@@ -3939,7 +5594,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func replacementFlowMeasurement(
+    func replacementFlowMeasurement(
         text: String,
         bounds: [CGRect],
         font: UIFont,
@@ -4055,7 +5710,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func replacementBoundarySplitsWord(
+    func replacementBoundarySplitsWord(
         _ text: String,
         utf16Offset: Int
     ) -> Bool {
@@ -4071,7 +5726,7 @@ struct PDFOutputService: @unchecked Sendable {
             && !text[boundary].isWhitespace
     }
 
-    private func textAlignment(
+    func textAlignment(
         _ alignment: PDFTextReplacementAlignment
     ) -> NSTextAlignment {
         switch alignment {
@@ -4258,7 +5913,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func matchingTextRange(
+    func matchingTextRange(
         in page: PDFPage,
         snapshot: PDFTextSelectionSnapshot
     ) -> NSRange? {
@@ -4285,7 +5940,7 @@ struct PDFOutputService: @unchecked Sendable {
                     ? 0
                     : intersection.width * intersection.height
                         / max(1, expected.width * expected.height)
-                if best == nil || score > best!.score {
+                if score > (best?.score ?? -.infinity) {
                     best = (found, score)
                 }
             }
@@ -4469,7 +6124,7 @@ struct PDFOutputService: @unchecked Sendable {
         }
     }
 
-    private func drawInvisibleText(
+    func drawInvisibleText(
         _ text: String,
         bounds: CGRect,
         context: CGContext
@@ -4500,7 +6155,7 @@ struct PDFOutputService: @unchecked Sendable {
         context.restoreGState()
     }
 
-    private func occurrenceCount(
+    func occurrenceCount(
         of needle: String,
         in haystack: String
     ) -> Int {
@@ -4518,7 +6173,7 @@ struct PDFOutputService: @unchecked Sendable {
         return count
     }
 
-    private func normalizedOccurrenceCount(
+    func normalizedOccurrenceCount(
         of needle: String,
         in haystack: String
     ) -> Int {
@@ -4528,7 +6183,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private func normalizedVerificationText(_ value: String) -> String {
+    func normalizedVerificationText(_ value: String) -> String {
         value
             .replacingOccurrences(of: "\u{00a0}", with: " ")
             .replacingOccurrences(of: "\u{00ad}", with: "")
@@ -4536,7 +6191,7 @@ struct PDFOutputService: @unchecked Sendable {
             .joined(separator: " ")
     }
 
-    private func fittedSize(
+    func fittedSize(
         _ size: CGSize,
         longestEdge: CGFloat
     ) -> CGSize {
@@ -4551,7 +6206,7 @@ struct PDFOutputService: @unchecked Sendable {
         )
     }
 
-    private static func rectsMatch(
+    static func rectsMatch(
         _ left: PDFNormalizedRect,
         _ right: PDFNormalizedRect
     ) -> Bool {
@@ -4622,9 +6277,16 @@ private func pdfRGBASamples(
     }
     let width = cgImage.width
     let height = cgImage.height
-    var rgba = Data(count: width * height * 4)
-    var rgb = Data(count: width * height * 3)
-    var alpha = Data(count: width * height)
+    guard let pixelCount = pdfCheckedProduct(width, height),
+          pixelCount <= 16_000_000,
+          let rgbaByteCount = pdfCheckedProduct(pixelCount, 4),
+          let rgbByteCount = pdfCheckedProduct(pixelCount, 3)
+    else {
+        throw PaperPathError.fileTooLarge
+    }
+    var rgba = Data(count: rgbaByteCount)
+    var rgb = Data(count: rgbByteCount)
+    var alpha = Data(count: pixelCount)
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     let extracted = rgba.withUnsafeMutableBytes {
         rgbaBytes in
@@ -4654,7 +6316,11 @@ private func pdfRGBASamples(
                           to: UInt8.self
                       ).baseAddress
                 else { return false }
-                for index in 0..<(width * height) {
+                for index in 0..<pixelCount {
+                    if index.isMultiple(of: 262_144),
+                       Task.isCancelled {
+                        return false
+                    }
                     let input = index * 4
                     let output = index * 3
                     let alphaValue = preserveAlpha
@@ -4692,6 +6358,7 @@ private func pdfRGBASamples(
         }
     }
     guard extracted else {
+        try Task.checkCancellation()
         throw PaperPathError.unreadableImage
     }
     return PDFRGBASamples(
@@ -4709,7 +6376,9 @@ private func pdfFlateImageObject(
     rgbData: Data,
     softMask: PDFImageObjectReference?
 ) throws -> Data {
-    guard rgbData.count == width * height * 3,
+    guard let pixelCount = pdfCheckedProduct(width, height),
+          let expectedByteCount = pdfCheckedProduct(pixelCount, 3),
+          rgbData.count == expectedByteCount,
           let compressed = pdfDeflateZlib(rgbData)
     else {
         throw PaperPathError.outputVerificationFailed(
@@ -4736,7 +6405,8 @@ private func pdfFlateMaskObject(
     height: Int,
     alphaData: Data
 ) throws -> Data {
-    guard alphaData.count == width * height,
+    guard let expectedByteCount = pdfCheckedProduct(width, height),
+          alphaData.count == expectedByteCount,
           let compressed = pdfDeflateZlib(alphaData)
     else {
         throw PaperPathError.outputVerificationFailed(
@@ -4773,6 +6443,8 @@ private func pdfDeflateZlib(_ data: Data) -> Data? {
     result.append(UInt8(checksum & 0xff))
     return result
 }
+
+private let pdfMaximumCapturedImageBytes = 64 * 1_024 * 1_024
 
 private final class PDFImageScanState {
     let pageIndex: Int
@@ -4811,20 +6483,42 @@ private final class PDFImageScanState {
     }
 
     func merge(_ child: PDFImageScanState) {
-        encounteredImageCount += child.encounteredImageCount
-        unsupportedImageCount += child.unsupportedImageCount
-        omittedImageCount += child.omittedImageCount
+        encounteredImageCount = Self.saturatingAdd(
+            encounteredImageCount,
+            child.encounteredImageCount
+        )
+        unsupportedImageCount = Self.saturatingAdd(
+            unsupportedImageCount,
+            child.unsupportedImageCount
+        )
+        omittedImageCount = Self.saturatingAdd(
+            omittedImageCount,
+            child.omittedImageCount
+        )
         for use in child.uses {
+            let (nextByteCount, overflow) = capturedByteCount
+                .addingReportingOverflow(use.retainedByteCount)
             guard uses.count < 32,
-                  capturedByteCount + use.data.count
-                    <= 32 * 1_024 * 1_024
+                  !overflow,
+                  nextByteCount <= pdfMaximumCapturedImageBytes
             else {
-                omittedImageCount += 1
+                omittedImageCount = Self.saturatingAdd(
+                    omittedImageCount,
+                    1
+                )
                 continue
             }
             uses.append(use)
-            capturedByteCount += use.data.count
+            capturedByteCount = nextByteCount
         }
+    }
+
+    private static func saturatingAdd(
+        _ left: Int,
+        _ right: Int
+    ) -> Int {
+        let (value, overflow) = left.addingReportingOverflow(right)
+        return overflow ? Int.max : value
     }
 }
 
@@ -4858,6 +6552,7 @@ private struct PDFScannedImageUse {
     let data: Data
     let sourceStreamData: Data
     let softMaskStreamData: Data?
+    let retainedByteCount: Int
     let kind: PDFScannedImageKind
 }
 
@@ -5000,7 +6695,14 @@ private let pdfDrawXObject: CGPDFOperatorCallback = {
     guard CGPDFDictionaryGetInteger(dictionary, "Width", &width),
           CGPDFDictionaryGetInteger(dictionary, "Height", &height),
           width > 0,
-          height > 0
+          height > 0,
+          width <= 20_000,
+          height <= 20_000,
+          let pixelCount = pdfCheckedProduct(
+              Int(width),
+              Int(height)
+          ),
+          pixelCount <= 16_000_000
     else {
         state.omittedImageCount += 1
         return
@@ -5063,11 +6765,32 @@ private let pdfDrawXObject: CGPDFOperatorCallback = {
         state.unsupportedImageCount += 1
         return
     }
+    let retainedByteCount: Int
+    switch payload.kind {
+    case .originalJPEG, .originalJPEG2000:
+        retainedByteCount = payload.data.count
+    case .losslessPNG:
+        let (imageAndSourceBytes, firstOverflow) = payload.data.count
+            .addingReportingOverflow(payload.sourceStreamData.count)
+        let (totalRetainedBytes, secondOverflow) =
+            imageAndSourceBytes.addingReportingOverflow(
+                payload.softMaskStreamData?.count ?? 0
+            )
+        guard !firstOverflow, !secondOverflow else {
+            state.omittedImageCount += 1
+            return
+        }
+        retainedByteCount = totalRetainedBytes
+    }
+    let (nextCapturedByteCount, byteCountOverflow) =
+        state.capturedByteCount.addingReportingOverflow(
+            retainedByteCount
+        )
     guard !payload.data.isEmpty,
           payload.data.count <= 32 * 1_024 * 1_024,
           state.uses.count < 32,
-          state.capturedByteCount + payload.data.count
-            <= 32 * 1_024 * 1_024
+          !byteCountOverflow,
+          nextCapturedByteCount <= pdfMaximumCapturedImageBytes
     else {
         state.omittedImageCount += 1
         return
@@ -5093,10 +6816,11 @@ private let pdfDrawXObject: CGPDFOperatorCallback = {
             data: payload.data,
             sourceStreamData: payload.sourceStreamData,
             softMaskStreamData: payload.softMaskStreamData,
+            retainedByteCount: retainedByteCount,
             kind: payload.kind
         )
     )
-    state.capturedByteCount += payload.data.count
+    state.capturedByteCount = nextCapturedByteCount
 }
 
 private func pdfFormMatrix(
@@ -5174,6 +6898,8 @@ private func pdfDecodedImagePayload(
           height > 0,
           width <= 20_000,
           height <= 20_000,
+          let pixelCount = pdfCheckedProduct(width, height),
+          pixelCount <= 16_000_000,
           rawData.count <= 64 * 1_024 * 1_024
     else { return nil }
     var imageMask: CGPDFBoolean = 0
@@ -5335,7 +7061,11 @@ private func pdfSoftMaskData(
           format == .raw
     else { return nil }
     let data = copied as Data
-    guard data.count == expectedWidth * expectedHeight else {
+    guard let expectedByteCount = pdfCheckedProduct(
+        expectedWidth,
+        expectedHeight
+    ),
+          data.count == expectedByteCount else {
         return nil
     }
     return data
@@ -5347,8 +7077,12 @@ private func pdfImage(
 ) -> CGImage? {
     let width = baseImage.width
     let height = baseImage.height
-    guard alphaData.count == width * height else { return nil }
-    var rgba = Data(count: width * height * 4)
+    guard let pixelCount = pdfCheckedProduct(width, height),
+          pixelCount <= 16_000_000,
+          alphaData.count == pixelCount,
+          let rgbaByteCount = pdfCheckedProduct(pixelCount, 4)
+    else { return nil }
+    var rgba = Data(count: rgbaByteCount)
     let colorSpace = CGColorSpaceCreateDeviceRGB()
     return rgba.withUnsafeMutableBytes { rgbaBytes -> CGImage? in
         guard let context = CGContext(
@@ -5365,6 +7099,7 @@ private func pdfImage(
             baseImage,
             in: CGRect(x: 0, y: 0, width: width, height: height)
         )
+        var wasCancelled = false
         alphaData.withUnsafeBytes { alphaBytes in
             guard let pixels = rgbaBytes.bindMemory(
                 to: UInt8.self
@@ -5373,7 +7108,12 @@ private func pdfImage(
                       to: UInt8.self
                   ).baseAddress
             else { return }
-            for index in 0..<(width * height) {
+            for index in 0..<pixelCount {
+                if index.isMultiple(of: 262_144),
+                   Task.isCancelled {
+                    wasCancelled = true
+                    return
+                }
                 let pixel = index * 4
                 let alphaValue = UInt16(alpha[index])
                 pixels[pixel] = UInt8(
@@ -5388,8 +7128,15 @@ private func pdfImage(
                 pixels[pixel + 3] = UInt8(alphaValue)
             }
         }
+        guard !wasCancelled else { return nil }
         return context.makeImage()
     }
+}
+
+private func pdfCheckedProduct(_ lhs: Int, _ rhs: Int) -> Int? {
+    guard lhs >= 0, rhs >= 0 else { return nil }
+    let (product, overflow) = lhs.multipliedReportingOverflow(by: rhs)
+    return overflow ? nil : product
 }
 
 private struct PDFImageObjectInspector {
@@ -5430,19 +7177,32 @@ private struct PDFImageObjectInspector {
                 where index != pageIndex {
                 try Task.checkCancellation()
                 guard let page = document.page(at: index + 1) else {
-                    continue
+                    throw PaperPathError.invalidPage
                 }
-                autoreleasepool {
-                    for use in scan(
+                let uses = autoreleasepool {
+                    scan(
                         page: page,
                         pageIndex: index
-                    ) where use.kind == .originalJPEG
-                        || use.kind == .losslessPNG {
-                        let digest = Self.digest(use.data)
-                        if candidateDigests.contains(digest) {
-                            usageCountByDigest[digest, default: 0] += 1
-                        }
+                    )
+                }
+                for use in uses where use.kind == .originalJPEG
+                    || use.kind == .losslessPNG {
+                    let digest = Self.digest(use.data)
+                    guard candidateDigests.contains(digest) else {
+                        continue
                     }
+                    let currentCount = usageCountByDigest[
+                        digest,
+                        default: 0
+                    ]
+                    let (nextCount, overflow) = currentCount
+                        .addingReportingOverflow(1)
+                    guard !overflow else {
+                        throw PaperPathError.insufficientSelection(
+                            "The image reference count exceeded the safe local limit."
+                        )
+                    }
+                    usageCountByDigest[digest] = nextCount
                 }
             }
         }
@@ -5607,13 +7367,161 @@ private struct PDFImageObjectInspector {
     }
 }
 
-private struct PDFImageObjectReference {
+struct PDFImageObjectReference {
     let number: Int
     let generation: Int
     let offset: Int
 }
 
-private func pdfObjectDictionary(_ objectData: Data) -> String? {
+struct PDFObjectReplacement {
+    let object: PDFImageObjectReference
+    let data: Data
+}
+
+struct PDFObjectReplacementPlan {
+    let object: PDFImageObjectReference
+    let data: Data
+    let endOffset: Int
+
+    var byteDelta: Int {
+        data.count - (endOffset - object.offset)
+    }
+}
+
+func pdfObjectReplacementPlans(
+    in data: Data,
+    before startXRef: Int,
+    orderedObjects: [PDFImageObjectReference],
+    replacements: [PDFObjectReplacement]
+) throws -> [PDFObjectReplacementPlan] {
+    guard !replacements.isEmpty, replacements.count <= 128 else {
+        throw PaperPathError.insufficientSelection(
+            "The PDF object update exceeds the safe local limit."
+        )
+    }
+    var objectsByNumber: [Int: PDFImageObjectReference] = [:]
+    for object in orderedObjects {
+        guard objectsByNumber[object.number] == nil else {
+            throw PaperPathError.outputVerificationFailed(
+                "the PDF contains duplicate object references"
+            )
+        }
+        objectsByNumber[object.number] = object
+    }
+    var seenNumbers: Set<Int> = []
+    var plans: [PDFObjectReplacementPlan] = []
+    plans.reserveCapacity(replacements.count)
+    for replacement in replacements {
+        try Task.checkCancellation()
+        let requested = replacement.object
+        guard seenNumbers.insert(requested.number).inserted,
+              !replacement.data.isEmpty,
+              let stored = objectsByNumber[requested.number],
+              stored.generation == requested.generation,
+              stored.offset == requested.offset
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "a PDF object changed before the structural update"
+            )
+        }
+        let upperBound = orderedObjects.first(where: {
+            $0.offset > stored.offset
+        })?.offset ?? startXRef
+        guard stored.offset >= 0,
+              stored.offset < upperBound,
+              upperBound <= data.count,
+              let endOffset = data[stored.offset..<upperBound]
+                .range(
+                    of: Data("endobj".utf8),
+                    options: .backwards
+                )?.upperBound
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the source object boundaries could not be verified"
+            )
+        }
+        plans.append(
+            PDFObjectReplacementPlan(
+                object: stored,
+                data: replacement.data,
+                endOffset: endOffset
+            )
+        )
+    }
+    plans.sort { $0.object.offset < $1.object.offset }
+    for index in 1..<plans.count
+    where plans[index - 1].endOffset > plans[index].object.offset {
+        throw PaperPathError.outputVerificationFailed(
+            "the PDF object update contains overlapping ranges"
+        )
+    }
+    return plans
+}
+
+func pdfBodyReplacingObjects(
+    in data: Data,
+    before startXRef: Int,
+    orderedObjects: [PDFImageObjectReference],
+    plans: [PDFObjectReplacementPlan]
+) throws -> (body: Data, offsets: [Int: Int]) {
+    var projectedByteCount = startXRef
+    for plan in plans {
+        let (nextCount, overflow) = projectedByteCount
+            .addingReportingOverflow(plan.byteDelta)
+        guard !overflow, nextCount >= 0, nextCount < Int.max else {
+            throw PaperPathError.storageFailure(
+                "The rewritten PDF exceeds the safe local limit."
+            )
+        }
+        projectedByteCount = nextCount
+    }
+
+    var body = Data()
+    body.reserveCapacity(projectedByteCount + 1)
+    var cursor = 0
+    for plan in plans {
+        try Task.checkCancellation()
+        body.append(data[cursor..<plan.object.offset])
+        body.append(plan.data)
+        cursor = plan.endOffset
+    }
+    body.append(data[cursor..<startXRef])
+    if body.last != 0x0a {
+        body.append(0x0a)
+    }
+
+    var offsets: [Int: Int] = [:]
+    offsets.reserveCapacity(orderedObjects.count)
+    var planIndex = 0
+    var offsetDelta = 0
+    for object in orderedObjects {
+        while planIndex < plans.count,
+              plans[planIndex].endOffset <= object.offset {
+            let (nextDelta, overflow) = offsetDelta
+                .addingReportingOverflow(
+                    plans[planIndex].byteDelta
+                )
+            guard !overflow else {
+                throw PaperPathError.storageFailure(
+                    "The rewritten PDF exceeds the safe local limit."
+                )
+            }
+            offsetDelta = nextDelta
+            planIndex += 1
+        }
+        let (newOffset, overflow) = object.offset
+            .addingReportingOverflow(offsetDelta)
+        guard !overflow, newOffset >= 0 else {
+            throw PaperPathError.storageFailure(
+                "The rewritten PDF exceeds the safe local limit."
+            )
+        }
+        offsets[object.number] = newOffset
+    }
+    return (body, offsets)
+}
+
+func pdfObjectDictionary(_ objectData: Data) -> String? {
     guard let range = pdfFirstDictionaryRange(in: objectData)
     else { return nil }
     return String(
@@ -5622,7 +7530,7 @@ private func pdfObjectDictionary(_ objectData: Data) -> String? {
     )
 }
 
-private func pdfObjectReference(
+func pdfObjectReference(
     following key: String,
     in objectData: Data
 ) -> (number: Int, generation: Int)? {
@@ -5640,9 +7548,12 @@ private func pdfObjectReference(
 }
 
 private func pdfInflatedObjectStream(
-    _ objectData: Data
+    _ objectData: Data,
+    maximumOutputByteCount: Int
 ) -> Data? {
-    guard let dictionary = pdfObjectDictionary(objectData),
+    guard maximumOutputByteCount > 0,
+          maximumOutputByteCount <= 64 * 1_024 * 1_024,
+          let dictionary = pdfObjectDictionary(objectData),
           dictionary.contains("/Subtype /Image"),
           dictionary.contains("/Filter /FlateDecode")
             || dictionary.contains("/Filter/FlateDecode")
@@ -5676,24 +7587,222 @@ private func pdfInflatedObjectStream(
           length <= objectData.count - start
     else { return nil }
     let encoded = Data(objectData[start..<(start + length)])
-    guard encoded.count > 6 else { return nil }
-    let raw = Data(encoded.dropFirst(2).dropLast(4))
-    return try? (raw as NSData)
-        .decompressed(using: .zlib) as Data
+    return pdfInflateZlib(
+        encoded,
+        maximumOutputByteCount: maximumOutputByteCount
+    )
 }
 
-private func pdfInteger(
+func pdfInteger(
     following key: String,
     in value: String
 ) -> Int? {
-    guard let keyRange = value.range(of: key) else { return nil }
-    return value[keyRange.upperBound...]
-        .split(whereSeparator: { !$0.isNumber })
-        .compactMap { Int($0) }
-        .first
+    pdfParsedInteger(following: key, in: value)
 }
 
-private func pdfUTF16HexString(_ value: String) -> String {
+private func pdfParsedInteger(
+    following key: String,
+    in value: String
+) -> Int? {
+    guard !key.isEmpty else { return nil }
+    var searchStart = value.startIndex
+    while searchStart < value.endIndex,
+          let keyRange = value.range(
+              of: key,
+              range: searchStart..<value.endIndex
+          ) {
+        let valueStart = keyRange.upperBound
+        guard valueStart == value.endIndex
+                || pdfIsStringTokenDelimiter(value[valueStart])
+        else {
+            searchStart = valueStart
+            continue
+        }
+
+        var index = valueStart
+        while index < value.endIndex,
+              value[index].isWhitespace {
+            index = value.index(after: index)
+        }
+        let numberStart = index
+        if index < value.endIndex,
+           value[index] == "-" || value[index] == "+" {
+            index = value.index(after: index)
+        }
+        let digitStart = index
+        while index < value.endIndex,
+              pdfIsASCIIDigit(value[index]) {
+            index = value.index(after: index)
+        }
+        guard index > digitStart,
+              index == value.endIndex
+                || pdfIsStringTokenDelimiter(value[index])
+        else {
+            searchStart = valueStart
+            continue
+        }
+        return Int(value[numberStart..<index])
+    }
+    return nil
+}
+
+private func pdfIsASCIIDigit(_ character: Character) -> Bool {
+    guard character.unicodeScalars.count == 1,
+          let scalar = character.unicodeScalars.first
+    else { return false }
+    return (48...57).contains(scalar.value)
+}
+
+private func pdfIsStringTokenDelimiter(
+    _ character: Character
+) -> Bool {
+    character.isWhitespace
+        || "()<>[]{}/%".contains(character)
+}
+
+private func pdfInflateZlib(
+    _ data: Data,
+    maximumOutputByteCount: Int
+) -> Data? {
+    guard data.count > 6,
+          maximumOutputByteCount > 0,
+          maximumOutputByteCount <= 64 * 1_024 * 1_024
+    else { return nil }
+
+    let compressionMethod = data[data.startIndex]
+    let flags = data[data.index(after: data.startIndex)]
+    let header = UInt16(compressionMethod) << 8 | UInt16(flags)
+    guard compressionMethod & 0x0f == 8,
+          header.isMultiple(of: 31),
+          flags & 0x20 == 0
+    else { return nil }
+
+    let checksumStart = data.index(data.endIndex, offsetBy: -4)
+    let expectedChecksum = data[checksumStart...].reduce(UInt32.zero) {
+        ($0 << 8) | UInt32($1)
+    }
+    let payloadStart = data.index(data.startIndex, offsetBy: 2)
+    let payload = data[payloadStart..<checksumStart]
+    guard !payload.isEmpty else { return nil }
+
+    let initialDestination = UnsafeMutablePointer<UInt8>.allocate(
+        capacity: 1
+    )
+    let initialSource = UnsafeMutablePointer<UInt8>.allocate(
+        capacity: 1
+    )
+    defer {
+        initialDestination.deallocate()
+        initialSource.deallocate()
+    }
+    var stream = compression_stream(
+        dst_ptr: initialDestination,
+        dst_size: 0,
+        src_ptr: UnsafePointer(initialSource),
+        src_size: 0,
+        state: nil
+    )
+    guard compression_stream_init(
+        &stream,
+        COMPRESSION_STREAM_DECODE,
+        COMPRESSION_ZLIB
+    ) != COMPRESSION_STATUS_ERROR else {
+        return nil
+    }
+    defer { compression_stream_destroy(&stream) }
+
+    let chunkByteCount = min(
+        64 * 1_024,
+        maximumOutputByteCount + 1
+    )
+    var destination = [UInt8](
+        repeating: 0,
+        count: chunkByteCount
+    )
+    var output = Data()
+    output.reserveCapacity(
+        min(
+            maximumOutputByteCount,
+            max(payload.count, 64 * 1_024)
+        )
+    )
+
+    return payload.withUnsafeBytes { sourceBytes -> Data? in
+        guard let source = sourceBytes.bindMemory(
+            to: UInt8.self
+        ).baseAddress else {
+            return nil
+        }
+        stream.src_ptr = source
+        stream.src_size = payload.count
+
+        while true {
+            let remaining = maximumOutputByteCount - output.count
+            let destinationByteCount = min(
+                destination.count,
+                remaining + 1
+            )
+            let previousSourceSize = stream.src_size
+            let status = destination.withUnsafeMutableBytes {
+                destinationBytes -> compression_status in
+                guard let destinationPointer =
+                        destinationBytes.bindMemory(
+                    to: UInt8.self
+                ).baseAddress else {
+                    return COMPRESSION_STATUS_ERROR
+                }
+                stream.dst_ptr = destinationPointer
+                stream.dst_size = destinationByteCount
+                return compression_stream_process(
+                    &stream,
+                    Int32(COMPRESSION_STREAM_FINALIZE.rawValue)
+                )
+            }
+            let produced = destinationByteCount - stream.dst_size
+            guard produced <= remaining else { return nil }
+            if produced > 0 {
+                output.append(contentsOf: destination[..<produced])
+            }
+
+            switch status {
+            case COMPRESSION_STATUS_END:
+                guard stream.src_size == 0,
+                      pdfAdler32(output) == expectedChecksum
+                else { return nil }
+                return output
+            case COMPRESSION_STATUS_OK:
+                guard produced > 0
+                        || stream.src_size < previousSourceSize
+                else { return nil }
+            default:
+                return nil
+            }
+        }
+    }
+}
+
+private func pdfAdler32(_ data: Data) -> UInt32 {
+    let modulus: UInt64 = 65_521
+    let reductionStride = 5_552
+    var first: UInt64 = 1
+    var second: UInt64 = 0
+    var pendingCount = 0
+    for byte in data {
+        first += UInt64(byte)
+        second += first
+        pendingCount += 1
+        if pendingCount == reductionStride {
+            first %= modulus
+            second %= modulus
+            pendingCount = 0
+        }
+    }
+    first %= modulus
+    second %= modulus
+    return UInt32((second << 16) | first)
+}
+
+func pdfUTF16HexString(_ value: String) -> String {
     var bytes: [UInt8] = [0xfe, 0xff]
     bytes.reserveCapacity(2 + value.utf16.count * 2)
     for codeUnit in value.utf16 {
@@ -5705,7 +7814,7 @@ private func pdfUTF16HexString(_ value: String) -> String {
         + ">"
 }
 
-private func pdfCatalogObject(
+func pdfCatalogObject(
     _ objectData: Data,
     replacingPageLabelsWith pageLabels: Data
 ) throws -> Data {
@@ -5741,7 +7850,7 @@ private func pdfCatalogObject(
     return result
 }
 
-private func pdfObject(
+func pdfObject(
     _ objectData: Data,
     setting key: String,
     to value: Data
@@ -5778,7 +7887,7 @@ private func pdfObject(
     return result
 }
 
-private func pdfObject(
+func pdfObject(
     _ objectData: Data,
     removing key: String
 ) throws -> Data {
@@ -5826,7 +7935,7 @@ private func pdfObject(
     return result
 }
 
-private func pdfTopLevelString(
+func pdfTopLevelString(
     for key: String,
     in objectData: Data
 ) -> String? {
@@ -5842,7 +7951,7 @@ private func pdfTopLevelString(
     return pdfDecodedString(Data(objectData[valueRange]))
 }
 
-private func pdfDecodedString(_ value: Data) -> String? {
+func pdfDecodedString(_ value: Data) -> String? {
     guard let first = value.first, let last = value.last else {
         return nil
     }
@@ -5947,7 +8056,7 @@ private func pdfDecodedString(_ value: Data) -> String? {
         ?? String(bytes: bytes, encoding: .isoLatin1)
 }
 
-private func pdfFirstDictionaryRange(
+func pdfFirstDictionaryRange(
     in data: Data
 ) -> Range<Int>? {
     guard let start = data.range(of: Data("<<".utf8))?.lowerBound,
@@ -5961,7 +8070,7 @@ private func pdfFirstDictionaryRange(
     return start..<end
 }
 
-private func pdfTopLevelValueRange(
+func pdfTopLevelValueRange(
     for key: String,
     in data: Data,
     dictionaryRange: Range<Int>
@@ -6053,7 +8162,7 @@ private func pdfTopLevelValueRange(
     return nil
 }
 
-private func pdfObjectValueEnd(
+func pdfObjectValueEnd(
     in data: Data,
     start: Int,
     limit: Int
@@ -6138,7 +8247,7 @@ private func pdfObjectValueEnd(
     return firstEnd
 }
 
-private func pdfCompositeEnd(
+func pdfCompositeEnd(
     in data: Data,
     start: Int,
     opening: (UInt8, UInt8),
@@ -6198,7 +8307,7 @@ private func pdfCompositeEnd(
     return nil
 }
 
-private func pdfArrayEnd(
+func pdfArrayEnd(
     in data: Data,
     start: Int,
     limit: Int
@@ -6254,7 +8363,7 @@ private func pdfArrayEnd(
     return nil
 }
 
-private func pdfLiteralStringEnd(
+func pdfLiteralStringEnd(
     in data: Data,
     start: Int,
     limit: Int
@@ -6277,7 +8386,7 @@ private func pdfLiteralStringEnd(
     return limit
 }
 
-private func pdfHexStringEnd(
+func pdfHexStringEnd(
     in data: Data,
     start: Int,
     limit: Int
@@ -6290,7 +8399,7 @@ private func pdfHexStringEnd(
     return limit
 }
 
-private func pdfCommentEnd(
+func pdfCommentEnd(
     in data: Data,
     start: Int,
     limit: Int
@@ -6304,7 +8413,7 @@ private func pdfCommentEnd(
     return index
 }
 
-private func pdfSkipWhitespaceAndComments(
+func pdfSkipWhitespaceAndComments(
     in data: Data,
     start: Int,
     limit: Int
@@ -6326,7 +8435,7 @@ private func pdfSkipWhitespaceAndComments(
     return index
 }
 
-private func pdfTokenEnd(
+func pdfTokenEnd(
     in data: Data,
     start: Int,
     limit: Int
@@ -6338,7 +8447,7 @@ private func pdfTokenEnd(
     return index
 }
 
-private func pdfIsWhitespace(_ byte: UInt8) -> Bool {
+func pdfIsWhitespace(_ byte: UInt8) -> Bool {
     byte == 0x00
         || byte == 0x09
         || byte == 0x0a
@@ -6347,7 +8456,7 @@ private func pdfIsWhitespace(_ byte: UInt8) -> Bool {
         || byte == 0x20
 }
 
-private func pdfIsDelimiter(_ byte: UInt8) -> Bool {
+func pdfIsDelimiter(_ byte: UInt8) -> Bool {
     pdfIsWhitespace(byte)
         || byte == 0x28
         || byte == 0x29
@@ -6361,7 +8470,7 @@ private func pdfIsDelimiter(_ byte: UInt8) -> Bool {
         || byte == 0x25
 }
 
-private enum PDFImageObjectDocument {
+enum PDFImageObjectDocument {
     case classic(PDFClassicXRefDocument)
     case xrefStream(PDFXRefStreamDocument)
 
@@ -6461,6 +8570,17 @@ private enum PDFImageObjectDocument {
         }
     }
 
+    func replacingObjects(
+        _ replacements: [PDFObjectReplacement]
+    ) throws -> Data {
+        switch self {
+        case .classic(let document):
+            return try document.replacingObjects(replacements)
+        case .xrefStream(let document):
+            return try document.replacingObjects(replacements)
+        }
+    }
+
     func object(
         number: Int,
         generation: Int
@@ -6510,7 +8630,9 @@ private enum PDFImageObjectDocument {
     }
 }
 
-private struct PDFXRefStreamDocument {
+struct PDFXRefStreamDocument {
+    private static let maximumEntryCount = 500_000
+
     private struct Entry {
         let type: UInt64
         let field1: UInt64
@@ -6561,6 +8683,7 @@ private struct PDFXRefStreamDocument {
                   in: dictionary
               ),
               size > 0,
+              size <= Self.maximumEntryCount,
               let length = Self.integer(
                   following: "/Length",
                   in: dictionary
@@ -6600,6 +8723,61 @@ private struct PDFXRefStreamDocument {
                 "the cross-reference stream object header is invalid"
             )
         }
+        let indexValues = Self.integerArray(
+            following: "/Index",
+            in: dictionary
+        ) ?? [0, size]
+        guard indexValues.count.isMultiple(of: 2),
+              indexValues.count <= 2_048
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the cross-reference index is malformed"
+            )
+        }
+        let recordWidth = widths.reduce(0, +)
+        guard recordWidth > 0 else {
+            throw PaperPathError.outputVerificationFailed(
+                "the cross-reference entry width is invalid"
+            )
+        }
+        var indexedEntryCount = 0
+        for pairIndex in stride(
+            from: 0,
+            to: indexValues.count,
+            by: 2
+        ) {
+            let first = indexValues[pairIndex]
+            let count = indexValues[pairIndex + 1]
+            let (nextEntryCount, entryCountOverflow) =
+                indexedEntryCount.addingReportingOverflow(count)
+            guard first >= 0,
+                  count >= 0,
+                  first <= size,
+                  count <= size - first,
+                  !entryCountOverflow,
+                  nextEntryCount <= Self.maximumEntryCount
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the cross-reference index exceeds its declared size"
+                )
+            }
+            indexedEntryCount = nextEntryCount
+        }
+        let (
+            decodedByteCount,
+            decodedByteCountOverflow
+        ) = indexedEntryCount.multipliedReportingOverflow(
+            by: recordWidth
+        )
+        guard indexedEntryCount > 0,
+              !decodedByteCountOverflow,
+              decodedByteCount > 0,
+              decodedByteCount <= 24 * 1_024 * 1_024
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the cross-reference stream exceeds the safe local limit"
+            )
+        }
         let streamStart = Self.streamPayloadStart(
             after: streamMarker.upperBound,
             in: data
@@ -6614,29 +8792,19 @@ private struct PDFXRefStreamDocument {
         let encoded = Data(
             data[streamStart..<(streamStart + length)]
         )
-        guard let decoded = Self.inflateZlib(encoded) else {
+        guard let decoded = pdfInflateZlib(
+            encoded,
+            maximumOutputByteCount: decodedByteCount
+        ),
+              decoded.count == decodedByteCount
+        else {
             throw PaperPathError.outputVerificationFailed(
                 "the cross-reference stream could not be decoded"
             )
         }
-        let indexValues = Self.integerArray(
-            following: "/Index",
-            in: dictionary
-        ) ?? [0, size]
-        guard indexValues.count.isMultiple(of: 2) else {
-            throw PaperPathError.outputVerificationFailed(
-                "the cross-reference index is malformed"
-            )
-        }
-
-        let recordWidth = widths.reduce(0, +)
-        guard recordWidth > 0 else {
-            throw PaperPathError.outputVerificationFailed(
-                "the cross-reference entry width is invalid"
-            )
-        }
         var cursor = 0
         var parsedEntries: [Int: Entry] = [:]
+        parsedEntries.reserveCapacity(indexedEntryCount)
         for pairIndex in stride(
             from: 0,
             to: indexValues.count,
@@ -6653,6 +8821,12 @@ private struct PDFXRefStreamDocument {
                 )
             }
             for itemIndex in 0..<count {
+                let objectNumber = first + itemIndex
+                guard parsedEntries[objectNumber] == nil else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the cross-reference index contains overlapping entries"
+                    )
+                }
                 let type = widths[0] == 0
                     ? UInt64(1)
                     : Self.bigEndianInteger(
@@ -6673,12 +8847,17 @@ private struct PDFXRefStreamDocument {
                     width: widths[2]
                 )
                 cursor += widths[2]
-                parsedEntries[first + itemIndex] = Entry(
+                parsedEntries[objectNumber] = Entry(
                     type: type,
                     field1: field1,
                     field2: field2
                 )
             }
+        }
+        guard cursor == decoded.count else {
+            throw PaperPathError.outputVerificationFailed(
+                "the cross-reference stream contains trailing data"
+            )
         }
         let xrefObjectNumber = headerNumbers[0]
         let xrefGeneration = headerNumbers[1]
@@ -6706,34 +8885,46 @@ private struct PDFXRefStreamDocument {
     func imageObject(
         matching imageData: Data
     ) -> PDFImageObjectReference? {
+        guard !imageData.isEmpty else { return nil }
         let ordered = uncompressedReferences
-        let matches = ordered.enumerated().compactMap {
-            index,
-            entry -> PDFImageObjectReference? in
+        var match: PDFImageObjectReference?
+        for (index, entry) in ordered.enumerated() {
             let upperBound = index + 1 < ordered.count
                 ? ordered[index + 1].offset
                 : startXRef
-            guard entry.offset < upperBound else { return nil }
+            guard entry.offset < upperBound else { continue }
             let objectData = data[entry.offset..<upperBound]
             guard objectData.range(of: imageData) != nil,
                   objectData.range(of: Data("/Subtype /Image".utf8))
                     != nil
-            else { return nil }
-            return entry
+            else { continue }
+            guard match == nil else { return nil }
+            match = entry
         }
-        return matches.count == 1 ? matches[0] : nil
+        return match
     }
 
     func imageObject(
         matchingDecodedStream streamData: Data
     ) -> PDFImageObjectReference? {
-        let matches = uncompressedReferences.filter { entry in
-            guard let objectData = objectData(for: entry) else {
-                return false
+        let ordered = uncompressedReferences
+        var match: PDFImageObjectReference?
+        for (index, entry) in ordered.enumerated() {
+            let upperBound = index + 1 < ordered.count
+                ? ordered[index + 1].offset
+                : startXRef
+            guard entry.offset < upperBound else { continue }
+            let objectData = Data(data[entry.offset..<upperBound])
+            guard pdfInflatedObjectStream(
+                objectData,
+                maximumOutputByteCount: streamData.count
+            ) == streamData else {
+                continue
             }
-            return pdfInflatedObjectStream(objectData) == streamData
+            guard match == nil else { return nil }
+            match = entry
         }
-        return matches.count == 1 ? matches[0] : nil
+        return match
     }
 
     func referencedObject(
@@ -6791,35 +8982,51 @@ private struct PDFXRefStreamDocument {
         _ object: PDFImageObjectReference,
         with replacement: Data
     ) throws -> Data {
+        try replacingObjects([
+            PDFObjectReplacement(
+                object: object,
+                data: replacement
+            )
+        ])
+    }
+
+    func replacingObjects(
+        _ replacements: [PDFObjectReplacement]
+    ) throws -> Data {
         let ordered = uncompressedReferences
-        let objectUpperBound = ordered.first(where: {
-            $0.offset > object.offset
-        })?.offset ?? startXRef
-        guard object.offset < objectUpperBound,
-              let endObject = data[object.offset..<objectUpperBound]
-                .range(
-                    of: Data("endobj".utf8),
-                    options: .backwards
-                )?.upperBound
-        else {
-            throw PaperPathError.outputVerificationFailed(
-                "the source object boundaries could not be verified"
+        let plans = try pdfObjectReplacementPlans(
+            in: data,
+            before: startXRef,
+            orderedObjects: ordered,
+            replacements: replacements
+        )
+        let rewritten = try pdfBodyReplacingObjects(
+            in: data,
+            before: startXRef,
+            orderedObjects: ordered,
+            plans: plans
+        )
+        var replacementEntries = entries
+        for object in ordered {
+            guard let offset = rewritten.offsets[object.number],
+                  let entry = replacementEntries[object.number]
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the rebuilt cross-reference entry is missing"
+                )
+            }
+            replacementEntries[object.number] = Entry(
+                type: entry.type,
+                field1: UInt64(offset),
+                field2: entry.field2
             )
         }
-        var body = Data()
-        body.append(data[..<object.offset])
-        body.append(replacement)
-        body.append(data[endObject..<startXRef])
-        if body.last != 0x0a {
-            body.append(0x0a)
-        }
-        let delta = replacement.count - (endObject - object.offset)
+        var body = rewritten.body
         let newXRefOffset = body.count
-        let replacementEntries = rebuiltEntries(
-            replacing: object,
-            objectEnd: endObject,
-            offsetDelta: delta,
-            newXRefOffset: newXRefOffset
+        replacementEntries[xrefObjectNumber] = Entry(
+            type: 1,
+            field1: UInt64(newXRefOffset),
+            field2: UInt64(xrefGeneration)
         )
         let xrefBytes = Self.xrefBytes(
             entries: replacementEntries,
@@ -6907,38 +9114,6 @@ private struct PDFXRefStreamDocument {
               upperBound <= data.count
         else { return nil }
         return Data(data[object.offset..<upperBound])
-    }
-
-    private func rebuiltEntries(
-        replacing object: PDFImageObjectReference,
-        objectEnd: Int,
-        offsetDelta: Int,
-        newXRefOffset: Int
-    ) -> [Int: Entry] {
-        var result = entries
-        for (number, entry) in entries where entry.type == 1 {
-            if number == xrefObjectNumber {
-                result[number] = Entry(
-                    type: 1,
-                    field1: UInt64(newXRefOffset),
-                    field2: UInt64(xrefGeneration)
-                )
-            } else if number == object.number {
-                result[number] = Entry(
-                    type: 1,
-                    field1: UInt64(object.offset),
-                    field2: UInt64(object.generation)
-                )
-            } else if entry.field1 >= UInt64(objectEnd) {
-                let shifted = Int(entry.field1) + offsetDelta
-                result[number] = Entry(
-                    type: 1,
-                    field1: UInt64(max(0, shifted)),
-                    field2: entry.field2
-                )
-            }
-        }
-        return result
     }
 
     private static func xrefBytes(
@@ -7044,11 +9219,7 @@ private struct PDFXRefStreamDocument {
         following key: String,
         in value: String
     ) -> Int? {
-        guard let keyRange = value.range(of: key) else { return nil }
-        return value[keyRange.upperBound...]
-            .split(whereSeparator: { !$0.isNumber })
-            .compactMap { Int($0) }
-            .first
+        pdfParsedInteger(following: key, in: value)
     }
 
     private static func integerArray(
@@ -7111,14 +9282,7 @@ private struct PDFXRefStreamDocument {
         }
     }
 
-    private static func inflateZlib(_ data: Data) -> Data? {
-        guard data.count > 6 else { return nil }
-        let raw = Data(data.dropFirst(2).dropLast(4))
-        return try? (raw as NSData)
-            .decompressed(using: .zlib) as Data
-    }
-
-    private static func deflateZlib(_ data: Data) -> Data? {
+    static func deflateZlib(_ data: Data) -> Data? {
         guard let raw = try? (data as NSData)
             .compressed(using: .zlib) as Data
         else { return nil }
@@ -7140,6 +9304,11 @@ private struct PDFXRefStreamDocument {
 }
 
 private struct PDFCatalogStructureAppender {
+    private static let maximumAttachmentCount = 256
+    private static let maximumAttachmentBytes =
+        64 * 1_024 * 1_024
+    private static let maximumXRefEntryCount = 500_000
+
     private let data: Data
     private let startXRef: Int
     private let size: Int
@@ -7174,13 +9343,21 @@ private struct PDFCatalogStructureAppender {
                 "the PDF cross-reference offset is invalid"
             )
         }
+        let xrefByteCount = data.count - startXRef
+        guard xrefByteCount <= 32 * 1_024 * 1_024 else {
+            throw PaperPathError.insufficientSelection(
+                "This PDF cross-reference table exceeds the safe local limit."
+            )
+        }
         let xrefText = String(
             decoding: data[startXRef..<data.count],
             as: UTF8.self
         )
-        var lines = xrefText.components(separatedBy: .newlines)
-        guard !lines.isEmpty,
-              lines.removeFirst().trimmingCharacters(
+        let lines = xrefText.components(separatedBy: .newlines)
+        guard let firstLine = lines.first,
+              lines.count
+                <= Self.maximumXRefEntryCount + 4_096,
+              firstLine.trimmingCharacters(
                 in: .whitespaces
               ) == "xref"
         else {
@@ -7190,12 +9367,15 @@ private struct PDFCatalogStructureAppender {
         }
 
         var parsedEntries: [Int: PDFImageObjectReference] = [:]
-        var trailerLines: [String] = []
-        while !lines.isEmpty {
-            let line = lines.removeFirst()
+        var declaredEntryCount = 0
+        var lineIndex = 1
+        var trailerStartIndex: Int?
+        while lineIndex < lines.count {
+            let line = lines[lineIndex]
                 .trimmingCharacters(in: .whitespaces)
+            lineIndex += 1
             if line == "trailer" {
-                trailerLines = lines
+                trailerStartIndex = lineIndex
                 break
             }
             if line.isEmpty { continue }
@@ -7203,16 +9383,23 @@ private struct PDFCatalogStructureAppender {
             guard header.count == 2,
                   let firstObject = Int(header[0]),
                   let count = Int(header[1]),
+                  firstObject >= 0,
                   count >= 0,
-                  lines.count >= count
+                  firstObject <= Self.maximumXRefEntryCount,
+                  count <= Self.maximumXRefEntryCount - firstObject,
+                  count
+                    <= Self.maximumXRefEntryCount - declaredEntryCount,
+                  count <= lines.count - lineIndex
             else {
                 throw PaperPathError.outputVerificationFailed(
                     "the PDF cross-reference table is malformed"
                 )
             }
+            declaredEntryCount += count
             for index in 0..<count {
-                let fields = lines.removeFirst()
+                let fields = lines[lineIndex]
                     .split(whereSeparator: \.isWhitespace)
+                lineIndex += 1
                 guard fields.count >= 3,
                       let offset = Int(fields[0]),
                       let generation = Int(fields[1])
@@ -7222,24 +9409,38 @@ private struct PDFCatalogStructureAppender {
                     )
                 }
                 if fields[2] == "n" {
-                    parsedEntries[firstObject + index] =
-                        PDFImageObjectReference(
-                            number: firstObject + index,
-                            generation: generation,
-                            offset: offset
+                    let number = firstObject + index
+                    guard parsedEntries[number] == nil else {
+                        throw PaperPathError.outputVerificationFailed(
+                            "the PDF cross-reference table contains duplicate entries"
                         )
+                    }
+                    parsedEntries[number] = PDFImageObjectReference(
+                        number: number,
+                        generation: generation,
+                        offset: offset
+                    )
                 }
             }
         }
-        let trailerText = trailerLines.joined(separator: "\n")
+        guard let trailerStartIndex else {
+            throw PaperPathError.outputVerificationFailed(
+                "the PDF trailer is missing"
+            )
+        }
+        let trailerText = lines[trailerStartIndex...]
+            .joined(separator: "\n")
         guard let trailer = Self.firstDictionary(in: trailerText),
               let parsedSize = Self.signedInteger(
                   following: "/Size",
                   in: trailer
               ),
               parsedSize > 0,
-              parsedEntries.values.allSatisfy({
-                  $0.offset > 0 && $0.offset < startXRef
+              parsedSize <= Self.maximumXRefEntryCount,
+              parsedEntries.allSatisfy({
+                  $0.key < parsedSize
+                      && $0.value.offset > 0
+                      && $0.value.offset < startXRef
               })
         else {
             throw PaperPathError.outputVerificationFailed(
@@ -7262,13 +9463,36 @@ private struct PDFCatalogStructureAppender {
         guard !attachmentPayloads.isEmpty || !explicitLabels.isEmpty else {
             return data
         }
-        guard attachmentPayloads.allSatisfy({
-            $0.snapshot.origin == .document
-                && $0.data != nil
-        }) else {
+        guard attachmentPayloads.count
+                <= Self.maximumAttachmentCount
+        else {
             throw PaperPathError.insufficientSelection(
-                "This PDF contains attachment structures that cannot be safely preserved."
+                "This PDF contains too many embedded files to preserve safely."
             )
+        }
+        var attachmentByteCount = 0
+        for payload in attachmentPayloads {
+            try Task.checkCancellation()
+            guard payload.snapshot.origin == .document,
+                  let attachmentData = payload.data,
+                  payload.snapshot.byteCount == attachmentData.count,
+                  Self.digest(attachmentData)
+                    == payload.snapshot.checksum
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This PDF contains attachment structures that cannot be safely preserved."
+                )
+            }
+            let (nextByteCount, overflow) = attachmentByteCount
+                .addingReportingOverflow(attachmentData.count)
+            guard !overflow,
+                  nextByteCount <= Self.maximumAttachmentBytes
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "Structure-preserving updates support up to 64 MB of embedded files."
+                )
+            }
+            attachmentByteCount = nextByteCount
         }
         let rootReference = try reference(
             following: "/Root",
@@ -7301,6 +9525,7 @@ private struct PDFCatalogStructureAppender {
         if !attachmentPayloads.isEmpty {
             var namesEntries: [String] = []
             for payload in attachmentPayloads {
+                try Task.checkCancellation()
                 guard let attachmentData = payload.data else {
                     throw PaperPathError.outputVerificationFailed(
                         "an embedded file payload is unavailable"
@@ -7534,6 +9759,12 @@ private struct PDFCatalogStructureAppender {
             )
         )
         return result
+    }
+
+    private static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func encryptionContext(
@@ -7844,10 +10075,13 @@ private struct PDFAESV2EncryptionContext {
         )
         let randomStatus = initializationVector
             .withUnsafeMutableBytes { bytes in
-                SecRandomCopyBytes(
+                guard let baseAddress = bytes.baseAddress else {
+                    return errSecParam
+                }
+                return SecRandomCopyBytes(
                     kSecRandomDefault,
                     bytes.count,
-                    bytes.baseAddress!
+                    baseAddress
                 )
             }
         guard randomStatus == errSecSuccess
@@ -7893,7 +10127,9 @@ private struct PDFAESV2EncryptionContext {
     }
 }
 
-private struct PDFClassicXRefDocument {
+struct PDFClassicXRefDocument {
+    private static let maximumEntryCount = 500_000
+
     private let data: Data
     private let startXRef: Int
     private let size: Int
@@ -7931,13 +10167,20 @@ private struct PDFClassicXRefDocument {
                 "the PDF cross-reference offset is invalid"
             )
         }
+        let xrefByteCount = data.count - startXRef
+        guard xrefByteCount <= 32 * 1_024 * 1_024 else {
+            throw PaperPathError.insufficientSelection(
+                "This PDF cross-reference table exceeds the safe local limit."
+            )
+        }
         let xrefText = String(
             decoding: data[startXRef..<data.count],
             as: UTF8.self
         )
-        var lines = xrefText.components(separatedBy: .newlines)
-        guard !lines.isEmpty,
-              lines.removeFirst().trimmingCharacters(
+        let lines = xrefText.components(separatedBy: .newlines)
+        guard let firstLine = lines.first,
+              lines.count <= Self.maximumEntryCount + 4_096,
+              firstLine.trimmingCharacters(
                   in: .whitespaces
               ) == "xref"
         else {
@@ -7947,29 +10190,38 @@ private struct PDFClassicXRefDocument {
         }
 
         var parsedEntries: [Int: PDFImageObjectReference] = [:]
-        var trailerLines: [String] = []
-        while !lines.isEmpty {
-            let line = lines.removeFirst()
+        var declaredEntryCount = 0
+        var lineIndex = 1
+        var trailerStartIndex: Int?
+        while lineIndex < lines.count {
+            let line = lines[lineIndex]
                 .trimmingCharacters(in: .whitespaces)
+            lineIndex += 1
             if line == "trailer" {
-                trailerLines = lines
+                trailerStartIndex = lineIndex
                 break
             }
             if line.isEmpty { continue }
-            let header = line.split(separator: " ")
+            let header = line.split(whereSeparator: \.isWhitespace)
             guard header.count == 2,
                   let firstObject = Int(header[0]),
                   let count = Int(header[1]),
+                  firstObject >= 0,
                   count >= 0,
-                  lines.count >= count
+                  firstObject <= Self.maximumEntryCount,
+                  count <= Self.maximumEntryCount - firstObject,
+                  count <= Self.maximumEntryCount - declaredEntryCount,
+                  count <= lines.count - lineIndex
             else {
                 throw PaperPathError.outputVerificationFailed(
                     "the PDF cross-reference table is malformed"
                 )
             }
+            declaredEntryCount += count
             for index in 0..<count {
-                let entryLine = lines.removeFirst()
-                let fields = entryLine.split(separator: " ")
+                let fields = lines[lineIndex]
+                    .split(whereSeparator: \.isWhitespace)
+                lineIndex += 1
                 guard fields.count >= 3,
                       let offset = Int(fields[0]),
                       let generation = Int(fields[1])
@@ -7980,6 +10232,11 @@ private struct PDFClassicXRefDocument {
                 }
                 if fields[2] == "n" {
                     let number = firstObject + index
+                    guard parsedEntries[number] == nil else {
+                        throw PaperPathError.outputVerificationFailed(
+                            "the PDF cross-reference table contains duplicate entries"
+                        )
+                    }
                     parsedEntries[number] = PDFImageObjectReference(
                         number: number,
                         generation: generation,
@@ -7988,7 +10245,13 @@ private struct PDFClassicXRefDocument {
                 }
             }
         }
-        let trailerText = trailerLines.joined(separator: "\n")
+        guard let trailerStartIndex else {
+            throw PaperPathError.outputVerificationFailed(
+                "the PDF trailer is missing"
+            )
+        }
+        let trailerText = lines[trailerStartIndex...]
+            .joined(separator: "\n")
         guard let trailer = Self.firstDictionary(in: trailerText),
               !trailer.contains("/Prev"),
               !trailer.contains("/Encrypt"),
@@ -7998,8 +10261,11 @@ private struct PDFClassicXRefDocument {
                   in: trailer
               ),
               parsedSize > 0,
-              parsedEntries.values.allSatisfy({
-                  $0.offset > 0 && $0.offset < startXRef
+              parsedSize <= Self.maximumEntryCount,
+              parsedEntries.allSatisfy({
+                  $0.key < parsedSize
+                      && $0.value.offset > 0
+                      && $0.value.offset < startXRef
               })
         else {
             throw PaperPathError.insufficientSelection(
@@ -8016,29 +10282,44 @@ private struct PDFClassicXRefDocument {
     func imageObject(
         matching jpegData: Data
     ) -> PDFImageObjectReference? {
+        guard !jpegData.isEmpty else { return nil }
         let ordered = entries.values.sorted { $0.offset < $1.offset }
-        let matches = ordered.enumerated().compactMap {
-            index, entry -> PDFImageObjectReference? in
+        var match: PDFImageObjectReference?
+        for (index, entry) in ordered.enumerated() {
             let upperBound = index + 1 < ordered.count
                 ? ordered[index + 1].offset
                 : startXRef
-            guard entry.offset < upperBound else { return nil }
-            return data[entry.offset..<upperBound]
-                .range(of: jpegData) == nil
-                ? nil
-                : entry
+            guard entry.offset < upperBound,
+                  data[entry.offset..<upperBound]
+                    .range(of: jpegData) != nil
+            else { continue }
+            guard match == nil else { return nil }
+            match = entry
         }
-        return matches.count == 1 ? matches[0] : nil
+        return match
     }
 
     func imageObject(
         matchingDecodedStream streamData: Data
     ) -> PDFImageObjectReference? {
-        let matches = entries.values.filter { entry in
-            pdfInflatedObjectStream(objectData(for: entry))
-                == streamData
+        let ordered = entries.values.sorted {
+            $0.offset < $1.offset
         }
-        return matches.count == 1 ? matches[0] : nil
+        var match: PDFImageObjectReference?
+        for (index, entry) in ordered.enumerated() {
+            let upperBound = index + 1 < ordered.count
+                ? ordered[index + 1].offset
+                : startXRef
+            guard entry.offset < upperBound,
+                  pdfInflatedObjectStream(
+                Data(data[entry.offset..<upperBound]),
+                maximumOutputByteCount: streamData.count
+            ) == streamData
+            else { continue }
+            guard match == nil else { return nil }
+            match = entry
+        }
+        return match
     }
 
     func referencedObject(
@@ -8093,30 +10374,31 @@ private struct PDFClassicXRefDocument {
         _ object: PDFImageObjectReference,
         with replacement: Data
     ) throws -> Data {
-        let ordered = entries.values.sorted { $0.offset < $1.offset }
-        let objectUpperBound = ordered.first(where: {
-            $0.offset > object.offset
-        })?.offset ?? startXRef
-        guard object.offset < objectUpperBound,
-              let endObjectRange = data[object.offset..<objectUpperBound]
-                .range(
-                    of: Data("endobj".utf8),
-                    options: .backwards
-                )
-        else {
-            throw PaperPathError.outputVerificationFailed(
-                "the source object boundaries could not be verified"
+        try replacingObjects([
+            PDFObjectReplacement(
+                object: object,
+                data: replacement
             )
-        }
-        let objectEnd = endObjectRange.upperBound
-        var body = Data()
-        body.append(data[..<object.offset])
-        body.append(replacement)
-        body.append(data[objectEnd..<startXRef])
-        if body.last != 0x0a {
-            body.append(0x0a)
-        }
-        let delta = replacement.count - (objectEnd - object.offset)
+        ])
+    }
+
+    func replacingObjects(
+        _ replacements: [PDFObjectReplacement]
+    ) throws -> Data {
+        let ordered = entries.values.sorted { $0.offset < $1.offset }
+        let plans = try pdfObjectReplacementPlans(
+            in: data,
+            before: startXRef,
+            orderedObjects: ordered,
+            replacements: replacements
+        )
+        let rewritten = try pdfBodyReplacingObjects(
+            in: data,
+            before: startXRef,
+            orderedObjects: ordered,
+            plans: plans
+        )
+        var body = rewritten.body
         let xrefOffset = body.count
         body.append(Data("xref\n0 \(size)\n".utf8))
         for number in 0..<size {
@@ -8128,13 +10410,10 @@ private struct PDFClassicXRefDocument {
                 body.append(Data("0000000000 00000 f \n".utf8))
                 continue
             }
-            let offset: Int
-            if entry.number == object.number {
-                offset = object.offset
-            } else if entry.offset >= objectEnd {
-                offset = entry.offset + delta
-            } else {
-                offset = entry.offset
+            guard let offset = rewritten.offsets[entry.number] else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the rebuilt cross-reference entry is missing"
+                )
             }
             body.append(
                 Data(
@@ -8171,7 +10450,7 @@ private struct PDFClassicXRefDocument {
         return entry
     }
 
-    private func dataForObject(
+    func dataForObject(
         _ object: PDFImageObjectReference
     ) -> Data {
         let orderedOffsets = entries.values.map(\.offset).sorted()
@@ -8256,10 +10535,6 @@ private struct PDFClassicXRefDocument {
         following key: String,
         in value: String
     ) -> Int? {
-        guard let keyRange = value.range(of: key) else { return nil }
-        return value[keyRange.upperBound...]
-            .split(whereSeparator: { !$0.isNumber })
-            .compactMap { Int($0) }
-            .first
+        pdfParsedInteger(following: key, in: value)
     }
 }

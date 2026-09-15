@@ -9,6 +9,11 @@ struct PDFFormAutomationInspection: Sendable {
 
 struct PDFFormAutomationService: Sendable {
     private let maximumAutomationWidgets = 20_000
+    private let maximumAutomationPages = 20_000
+    private let maximumAnnotationsPerPage = 4_096
+    private let maximumScriptBytes = 256 * 1_024
+    private let maximumScriptCharacters = 128 * 1_024
+    private let maximumCalculationDepth = 128
 
     private struct RawAutomation {
         let fieldName: String
@@ -22,6 +27,18 @@ struct PDFFormAutomationService: Sendable {
     private struct ScriptCall {
         let name: String
         let arguments: [String]
+    }
+
+    private enum JavaScriptPayload {
+        case source(String)
+        case unsupported
+
+        var sourceForInspection: String {
+            switch self {
+            case .source(let value): return value
+            case .unsupported: return ""
+            }
+        }
     }
 
     private struct EvaluationFailure: Error {
@@ -42,6 +59,11 @@ struct PDFFormAutomationService: Sendable {
                 unsupportedJavaScriptCount: 0
             )
         }
+        guard document.numberOfPages <= maximumAutomationPages else {
+            throw PaperPathError.insufficientSelection(
+                "This form contains too many pages to inspect scripted fields safely."
+            )
+        }
         let rawFields = try rawAutomations(in: document)
         let fieldsByName = Dictionary(
             grouping: fields,
@@ -58,19 +80,45 @@ struct PDFFormAutomationService: Sendable {
             if let cached = numericCache[key] {
                 return cached
             }
-            guard !stack.contains(key) else {
+            guard stack.count < maximumCalculationDepth else {
                 return .failure(
                     EvaluationFailure(
-                        message:
-                            "Calculation cycle includes “\(name)”."
+                        message: AppLocalization.format(
+                            "Calculation dependency for “%@” is too deep to evaluate safely.",
+                            name
+                        )
                     )
                 )
             }
-            guard let sourceField = fieldsByName[key]?.first else {
+            guard !stack.contains(key) else {
                 return .failure(
                     EvaluationFailure(
-                        message:
-                            "Calculation source “\(name)” is missing."
+                        message: AppLocalization.format(
+                            "Calculation cycle includes “%@”.",
+                            name
+                        )
+                    )
+                )
+            }
+            guard let matchingFields = fieldsByName[key],
+                  let sourceField = matchingFields.first
+            else {
+                return .failure(
+                    EvaluationFailure(
+                        message: AppLocalization.format(
+                            "Calculation source “%@” is missing.",
+                            name
+                        )
+                    )
+                )
+            }
+            guard matchingFields.count == 1 else {
+                return .failure(
+                    EvaluationFailure(
+                        message: AppLocalization.format(
+                            "Calculation source “%@” is ambiguous because the field name is repeated.",
+                            name
+                        )
                     )
                 )
             }
@@ -95,30 +143,23 @@ struct PDFFormAutomationService: Sendable {
                 }
                 guard !values.isEmpty else {
                     let failure = EvaluationFailure(
-                        message:
-                            "Calculation “\(sourceField.name)” has no numeric source values."
+                        message: AppLocalization.format(
+                            "Calculation “%@” has no numeric source values.",
+                            sourceField.name
+                        )
                     )
                     numericCache[key] = .failure(failure)
                     return .failure(failure)
                 }
-                let value: Double
-                switch calculation.operation {
-                case .sum:
-                    value = values.reduce(0, +)
-                case .product:
-                    value = values.reduce(1, *)
-                case .average:
-                    value = values.reduce(0, +)
-                        / Double(values.count)
-                case .minimum:
-                    value = values.min() ?? 0
-                case .maximum:
-                    value = values.max() ?? 0
-                }
-                guard value.isFinite else {
+                guard let value = evaluatedValue(
+                    calculation.operation,
+                    values: values
+                ) else {
                     let failure = EvaluationFailure(
-                        message:
-                            "Calculation “\(sourceField.name)” produced a non-finite value."
+                        message: AppLocalization.format(
+                            "Calculation “%@” produced a non-finite value.",
+                            sourceField.name
+                        )
                     )
                     numericCache[key] = .failure(failure)
                     return .failure(failure)
@@ -132,8 +173,10 @@ struct PDFFormAutomationService: Sendable {
                 format: rawFields[key]?.format
             ) else {
                 let failure = EvaluationFailure(
-                    message:
-                        "“\(sourceField.name)” needs a valid number before calculations can run."
+                    message: AppLocalization.format(
+                        "“%@” needs a valid number before calculations can run.",
+                        sourceField.name
+                    )
                 )
                 numericCache[key] = .failure(failure)
                 return .failure(failure)
@@ -169,16 +212,33 @@ struct PDFFormAutomationService: Sendable {
                     ) {
                     case .success(let value):
                         expectedValue = canonicalNumber(value)
-                        formattedPreview = raw.format.map {
-                            formattedValue(value, format: $0)
-                        } ?? expectedValue
-                        if let current = parseNumericValue(
-                            field.value,
-                            format: raw.format
-                        ) {
-                            needsUpdate = !numbersMatch(current, value)
+                        if let format = raw.format {
+                            if let preview = formattedValue(
+                                value,
+                                format: format
+                            ) {
+                                formattedPreview = preview
+                            } else {
+                                validationIssue = AppLocalization.format(
+                                    "Calculation “%@” is too large for its display format.",
+                                    field.name
+                                )
+                            }
                         } else {
-                            needsUpdate = true
+                            formattedPreview = expectedValue
+                        }
+                        if validationIssue == nil {
+                            if let current = parseNumericValue(
+                                field.value,
+                                format: raw.format
+                            ) {
+                                needsUpdate = !numbersMatch(
+                                    current,
+                                    value
+                                )
+                            } else {
+                                needsUpdate = true
+                            }
                         }
                     case .failure(let failure):
                         validationIssue = failure.message
@@ -197,13 +257,23 @@ struct PDFFormAutomationService: Sendable {
                         value,
                         format: format
                     ) {
-                        formattedPreview = formattedValue(
+                        if let preview = formattedValue(
                             number,
                             format: format
-                        )
+                        ) {
+                            formattedPreview = preview
+                        } else {
+                            validationIssue = AppLocalization.format(
+                                "“%@” is too large for its display format.",
+                                field.name
+                            )
+                        }
                     } else {
-                        validationIssue =
-                            "“\(field.name)” is not a valid \(format.kind.title.lowercased())."
+                        validationIssue = AppLocalization.format(
+                            "“%@” is not a valid %@.",
+                            field.name,
+                            format.kind.title.localizedUI.lowercased()
+                        )
                     }
                 case .date, .time:
                     if let normalized = normalizedDateOrTime(
@@ -212,8 +282,12 @@ struct PDFFormAutomationService: Sendable {
                     ) {
                         formattedPreview = normalized
                     } else {
-                        validationIssue =
-                            "“\(field.name)” does not match \(format.pattern ?? format.kind.title)."
+                        validationIssue = AppLocalization.format(
+                            "“%@” does not match %@.",
+                            field.name,
+                            format.pattern
+                                ?? format.kind.title.localizedUI
+                        )
                     }
                 }
             }
@@ -226,20 +300,28 @@ struct PDFFormAutomationService: Sendable {
                ) {
                 if let minimum = range.minimum,
                    value < minimum {
-                    validationIssue =
-                        "“\(field.name)” must be at least \(canonicalNumber(minimum))."
+                    validationIssue = AppLocalization.format(
+                        "“%@” must be at least %@.",
+                        field.name,
+                        canonicalNumber(minimum)
+                    )
                 } else if let maximum = range.maximum,
                           value > maximum {
-                    validationIssue =
-                        "“\(field.name)” must be at most \(canonicalNumber(maximum))."
+                    validationIssue = AppLocalization.format(
+                        "“%@” must be at most %@.",
+                        field.name,
+                        canonicalNumber(maximum)
+                    )
                 }
             } else if validationIssue == nil,
                       raw.rangeValidation != nil,
                       field.value?.trimmingCharacters(
                           in: .whitespacesAndNewlines
                       ).isEmpty == false {
-                validationIssue =
-                    "“\(field.name)” needs a valid number for range validation."
+                validationIssue = AppLocalization.format(
+                    "“%@” needs a valid number for range validation.",
+                    field.name
+                )
             }
             automationFields.append(
                 PDFFormAutomationFieldSnapshot(
@@ -279,7 +361,7 @@ struct PDFFormAutomationService: Sendable {
             try Task.checkCancellation()
             guard let page = document.page(at: pageNumber),
                   let dictionary = page.dictionary
-            else { continue }
+            else { throw PaperPathError.invalidPage }
             var annotations: CGPDFArrayRef?
             guard CGPDFDictionaryGetArray(
                 dictionary,
@@ -288,7 +370,12 @@ struct PDFFormAutomationService: Sendable {
             ),
                   let annotations
             else { continue }
-            let count = min(CGPDFArrayGetCount(annotations), 4_096)
+            let count = CGPDFArrayGetCount(annotations)
+            guard count <= maximumAnnotationsPerPage else {
+                throw PaperPathError.insufficientSelection(
+                    "A form page contains too many annotations to inspect scripted fields safely."
+                )
+            }
             for index in 0..<count {
                 if index.isMultiple(of: 64) {
                     try Task.checkCancellation()
@@ -304,14 +391,7 @@ struct PDFFormAutomationService: Sendable {
                           in: annotation,
                           key: "Subtype"
                       )?.caseInsensitiveCompare("Widget")
-                        == .orderedSame,
-                      let fieldName = inheritedString(
-                          in: annotation,
-                          key: "T"
-                      )?.trimmingCharacters(
-                          in: .whitespacesAndNewlines
-                      ),
-                      !fieldName.isEmpty
+                        == .orderedSame
                 else { continue }
                 scannedWidgetCount += 1
                 guard scannedWidgetCount <= maximumAutomationWidgets else {
@@ -319,6 +399,19 @@ struct PDFFormAutomationService: Sendable {
                         "This form contains too many scripted fields to inspect safely."
                     )
                 }
+                guard
+                      let fieldName = inheritedString(
+                          in: annotation,
+                          key: "T"
+                      )?.trimmingCharacters(
+                          in: .whitespacesAndNewlines
+                      ),
+                      isSafeSingleLineText(
+                          fieldName,
+                          maximumCharacters: 160,
+                          maximumBytes: 640
+                      )
+                else { continue }
                 let scripts = inheritedScripts(in: annotation)
                 let parsed = parsedAutomation(
                     fieldName: fieldName,
@@ -404,20 +497,23 @@ struct PDFFormAutomationService: Sendable {
             ) {
                 for key in ["C", "F", "V", "K"]
                     where scripts[key] == nil {
-                    if let script = javaScript(
+                    if let payload = javaScript(
                         in: additionalActions,
                         key: key
                     ) {
-                        scripts[key] = script
+                        scripts[key] = payload.sourceForInspection
                     }
                 }
             }
             if scripts["A"] == nil,
-               let script = javaScript(in: node, key: "A") {
-                scripts["A"] = script
+               let payload = javaScript(in: node, key: "A") {
+                scripts["A"] = payload.sourceForInspection
             }
             current = pdfDictionary(in: node, key: "Parent")
             depth += 1
+        }
+        if current != nil {
+            scripts["A"] = scripts["A"] ?? ""
         }
         return scripts
     }
@@ -441,7 +537,7 @@ struct PDFFormAutomationService: Sendable {
     private func javaScript(
         in dictionary: CGPDFDictionaryRef,
         key: String
-    ) -> String? {
+    ) -> JavaScriptPayload? {
         guard let action = pdfDictionary(
             in: dictionary,
             key: key
@@ -451,7 +547,9 @@ struct PDFFormAutomationService: Sendable {
                 == .orderedSame
         else { return nil }
         if let value = pdfString(in: action, key: "JS") {
-            return value
+            return boundedScript(value)
+                .map(JavaScriptPayload.source)
+                ?? .unsupported
         }
         var stream: CGPDFStreamRef?
         guard CGPDFDictionaryGetStream(
@@ -459,16 +557,22 @@ struct PDFFormAutomationService: Sendable {
             "JS",
             &stream
         ),
-              let stream
-        else { return nil }
-        var format = CGPDFDataFormat.raw
-        guard let copied = CGPDFStreamCopyData(stream, &format) else {
-            return nil
-        }
-        return decodedScript(copied as Data)
+              stream != nil
+        else { return .unsupported }
+        // Core Graphics only exposes decoded stream bytes as one allocation.
+        // Preserve stream-backed JavaScript without inspecting it so a
+        // compressed payload cannot create an unbounded memory spike.
+        return .unsupported
     }
 
-    private func decodedScript(_ data: Data) -> String? {
+    func boundedScript(_ value: String) -> String? {
+        guard value.count <= maximumScriptCharacters,
+              value.utf8.count <= maximumScriptBytes
+        else { return nil }
+        return value
+    }
+
+    func decodedScript(_ data: Data) -> String? {
         if data.starts(with: [0xfe, 0xff]) {
             let values = stride(
                 from: 2,
@@ -493,7 +597,7 @@ struct PDFFormAutomationService: Sendable {
             ?? String(data: data, encoding: .isoLatin1)
     }
 
-    private func parseCalculation(
+    func parseCalculation(
         _ script: String
     ) -> PDFFormCalculationRule? {
         guard let call = singleCall(script),
@@ -510,7 +614,11 @@ struct PDFFormAutomationService: Sendable {
               ),
               (1...64).contains(sources.count),
               sources.allSatisfy({
-                  !$0.isEmpty && $0.count <= 160
+                  isSafeSingleLineText(
+                      $0,
+                      maximumCharacters: 160,
+                      maximumBytes: 640
+                  )
               })
         else { return nil }
         return PDFFormCalculationRule(
@@ -519,7 +627,7 @@ struct PDFFormAutomationService: Sendable {
         )
     }
 
-    private func calculationOperation(
+    func calculationOperation(
         _ value: String
     ) -> PDFFormCalculationOperation? {
         switch value {
@@ -532,7 +640,7 @@ struct PDFFormAutomationService: Sendable {
         }
     }
 
-    private func parseFormat(
+    func parseFormat(
         _ script: String
     ) -> PDFFormFormatRule? {
         guard let call = singleCall(script) else { return nil }
@@ -550,7 +658,12 @@ struct PDFFormAutomationService: Sendable {
                   let currency = javaScriptString(
                       call.arguments[4]
                   ),
-                  currency.count <= 12,
+                  isSafeSingleLineText(
+                      currency,
+                      maximumCharacters: 12,
+                      maximumBytes: 48,
+                      allowsEmpty: true
+                  ),
                   let precedes = boolean(call.arguments[5])
             else { return nil }
             return PDFFormFormatRule(
@@ -604,7 +717,7 @@ struct PDFFormAutomationService: Sendable {
         }
     }
 
-    private func parseRangeValidation(
+    func parseRangeValidation(
         _ script: String
     ) -> PDFFormRangeValidationRule? {
         guard let call = singleCall(script),
@@ -622,7 +735,7 @@ struct PDFFormAutomationService: Sendable {
         )
     }
 
-    private func isRecognizedKeystroke(
+    func isRecognizedKeystroke(
         _ script: String
     ) -> Bool {
         guard let call = singleCall(script) else { return false }
@@ -642,7 +755,12 @@ struct PDFFormAutomationService: Sendable {
                     (0...1).contains($0)
                 } == true
                 && javaScriptString(call.arguments[4]).map {
-                    $0.count <= 12
+                    isSafeSingleLineText(
+                        $0,
+                        maximumCharacters: 12,
+                        maximumBytes: 48,
+                        allowsEmpty: true
+                    )
                 } == true
                 && boolean(call.arguments[5]) != nil
         case "AFPercent_Keystroke":
@@ -721,18 +839,18 @@ struct PDFFormAutomationService: Sendable {
               value[value.index(after: close)...]
                 .trimmingCharacters(
                     in: .whitespacesAndNewlines
-                ).isEmpty
+                ).isEmpty,
+              let arguments = splitArguments(
+                  String(value[value.index(after: open)..<close])
+              )
         else { return nil }
-        let arguments = splitArguments(
-            String(value[value.index(after: open)..<close])
-        )
         return ScriptCall(
             name: String(name),
             arguments: arguments
         )
     }
 
-    private func splitArguments(_ value: String) -> [String] {
+    private func splitArguments(_ value: String) -> [String]? {
         guard !value.trimmingCharacters(
             in: .whitespacesAndNewlines
         ).isEmpty else { return [] }
@@ -758,14 +876,17 @@ struct PDFFormAutomationService: Sendable {
             } else if character == "(" {
                 parenthesisDepth += 1
             } else if character == ")" {
+                guard parenthesisDepth > 0 else { return nil }
                 parenthesisDepth -= 1
             } else if character == "[" {
                 arrayDepth += 1
             } else if character == "]" {
+                guard arrayDepth > 0 else { return nil }
                 arrayDepth -= 1
             } else if character == ",",
                       parenthesisDepth == 0,
                       arrayDepth == 0 {
+                guard result.count < 128 else { return nil }
                 result.append(
                     String(value[start..<index])
                         .trimmingCharacters(
@@ -776,6 +897,12 @@ struct PDFFormAutomationService: Sendable {
             }
             index = value.index(after: index)
         }
+        guard quote == nil,
+              !escaped,
+              parenthesisDepth == 0,
+              arrayDepth == 0,
+              result.count < 128
+        else { return nil }
         result.append(
             String(value[start...])
                 .trimmingCharacters(
@@ -785,7 +912,7 @@ struct PDFFormAutomationService: Sendable {
         return result
     }
 
-    private func javaScriptStringArray(
+    func javaScriptStringArray(
         _ value: String
     ) -> [String]? {
         let trimmed = value.trimmingCharacters(
@@ -805,12 +932,14 @@ struct PDFFormAutomationService: Sendable {
         } else {
             return nil
         }
-        let arguments = splitArguments(inner)
+        guard let arguments = splitArguments(inner) else {
+            return nil
+        }
         let values = arguments.compactMap(javaScriptString)
         return values.count == arguments.count ? values : nil
     }
 
-    private func javaScriptString(
+    func javaScriptString(
         _ value: String
     ) -> String? {
         let trimmed = value.trimmingCharacters(
@@ -848,7 +977,7 @@ struct PDFFormAutomationService: Sendable {
         return escaped ? nil : result
     }
 
-    private func integer(_ value: String) -> Int? {
+    func integer(_ value: String) -> Int? {
         Int(
             value.trimmingCharacters(
                 in: .whitespacesAndNewlines
@@ -856,15 +985,18 @@ struct PDFFormAutomationService: Sendable {
         )
     }
 
-    private func double(_ value: String) -> Double? {
-        Double(
+    func double(_ value: String) -> Double? {
+        guard let result = Double(
             value.trimmingCharacters(
                 in: .whitespacesAndNewlines
             )
-        )
+        ),
+              result.isFinite
+        else { return nil }
+        return result
     }
 
-    private func boolean(_ value: String) -> Bool? {
+    func boolean(_ value: String) -> Bool? {
         switch value.trimmingCharacters(
             in: .whitespacesAndNewlines
         ).lowercased() {
@@ -874,7 +1006,7 @@ struct PDFFormAutomationService: Sendable {
         }
     }
 
-    private func normalizedName(_ value: String) -> String {
+    func normalizedName(_ value: String) -> String {
         value.trimmingCharacters(
             in: .whitespacesAndNewlines
         ).folding(
@@ -883,18 +1015,91 @@ struct PDFFormAutomationService: Sendable {
         )
     }
 
-    private func numbersMatch(
+    func isSafeSingleLineText(
+        _ value: String,
+        maximumCharacters: Int,
+        maximumBytes: Int,
+        allowsEmpty: Bool = false
+    ) -> Bool {
+        guard allowsEmpty || !value.isEmpty,
+              value.count <= maximumCharacters,
+              value.utf8.count <= maximumBytes
+        else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                codePoint == 0x061C
+                || codePoint == 0x200E
+                || codePoint == 0x200F
+                || (0x202A...0x202E).contains(codePoint)
+                || (0x2066...0x2069).contains(codePoint)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !isBidirectionalControl
+        }
+    }
+
+    func evaluatedValue(
+        _ operation: PDFFormCalculationOperation,
+        values: [Double]
+    ) -> Double? {
+        guard !values.isEmpty,
+              values.allSatisfy(\.isFinite)
+        else { return nil }
+        switch operation {
+        case .sum:
+            return finiteSum(values)
+        case .product:
+            var result = 1.0
+            for value in values {
+                result *= value
+                guard result.isFinite else { return nil }
+            }
+            return result
+        case .average:
+            let divisor = Double(values.count)
+            return finiteSum(values.map { $0 / divisor })
+        case .minimum:
+            return values.min()
+        case .maximum:
+            return values.max()
+        }
+    }
+
+    func finiteSum(_ values: [Double]) -> Double? {
+        var result = 0.0
+        for value in values {
+            result += value
+            guard result.isFinite else { return nil }
+        }
+        return result
+    }
+
+    func numbersMatch(
         _ left: Double,
         _ right: Double
     ) -> Bool {
-        abs(left - right)
+        guard left.isFinite, right.isFinite else { return false }
+        let difference = abs(left - right)
+        guard difference.isFinite else { return false }
+        return difference
             <= max(0.000_000_1, abs(right) * 0.000_000_1)
     }
 
-    private func canonicalNumber(_ value: Double) -> String {
-        if abs(value.rounded() - value) < 0.000_000_001,
-           abs(value) <= Double(Int64.max) {
+    func canonicalNumber(_ value: Double) -> String {
+        guard value.isFinite else { return "" }
+        let magnitude = abs(value)
+        if value.rounded() == value,
+           magnitude <= Double(Int64.max) {
             return String(Int64(value.rounded()))
+        }
+        if magnitude >= 1_000_000_000_000_000
+            || (magnitude > 0 && magnitude < 0.000_000_001) {
+            return String(
+                format: "%.17g",
+                locale: Locale(identifier: "en_US_POSIX"),
+                value
+            )
         }
         return String(
             format: "%.10f",
@@ -907,7 +1112,7 @@ struct PDFFormAutomationService: Sendable {
         )
     }
 
-    private func parseNumericValue(
+    func parseNumericValue(
         _ rawValue: String?,
         format: PDFFormFormatRule?
     ) -> Double? {
@@ -917,23 +1122,32 @@ struct PDFFormAutomationService: Sendable {
             ),
               !value.isEmpty
         else { return nil }
-        var isNegative = false
-        if value.hasPrefix("("), value.hasSuffix(")") {
-            isNegative = true
-            value.removeFirst()
-            value.removeLast()
-        }
         if let symbol = format?.currencySymbol,
            !symbol.isEmpty {
             value = value.replacingOccurrences(
                 of: symbol,
                 with: ""
             )
+            let compactSymbol = symbol.trimmingCharacters(
+                in: .whitespacesAndNewlines
+            )
+            if !compactSymbol.isEmpty, compactSymbol != symbol {
+                value = value.replacingOccurrences(
+                    of: compactSymbol,
+                    with: ""
+                )
+            }
         }
         let containsPercent = value.contains("%")
         value = value.replacingOccurrences(of: "%", with: "")
             .replacingOccurrences(of: "\u{00a0}", with: "")
             .replacingOccurrences(of: " ", with: "")
+        var isNegative = false
+        if value.hasPrefix("("), value.hasSuffix(")") {
+            isNegative = true
+            value.removeFirst()
+            value.removeLast()
+        }
 
         let separatorStyle = format?.separatorStyle
         switch separatorStyle {
@@ -949,7 +1163,10 @@ struct PDFFormAutomationService: Sendable {
             break
         default:
             if value.contains(","), value.contains(".") {
-                if value.lastIndex(of: ",")! > value.lastIndex(of: ".")! {
+                guard let comma = value.lastIndex(of: ","),
+                      let period = value.lastIndex(of: ".")
+                else { return nil }
+                if comma > period {
                     value = value.replacingOccurrences(of: ".", with: "")
                     value = value.replacingOccurrences(of: ",", with: ".")
                 } else {
@@ -970,10 +1187,11 @@ struct PDFFormAutomationService: Sendable {
         return number
     }
 
-    private func formattedValue(
+    func formattedValue(
         _ value: Double,
         format: PDFFormFormatRule
-    ) -> String {
+    ) -> String? {
+        guard value.isFinite else { return nil }
         switch format.kind {
         case .date, .time:
             return canonicalNumber(value)
@@ -981,6 +1199,7 @@ struct PDFFormAutomationService: Sendable {
             let displayValue = format.kind == .percent
                 ? value * 100
                 : value
+            guard displayValue.isFinite else { return nil }
             let formatter = NumberFormatter()
             formatter.locale = Locale(identifier: "en_US_POSIX")
             formatter.numberStyle = .decimal
@@ -999,29 +1218,36 @@ struct PDFFormAutomationService: Sendable {
                 formatter.groupingSeparator = ","
                 formatter.decimalSeparator = "."
             }
-            let absolute = formatter.string(
+            guard let absolute = formatter.string(
                 from: NSNumber(value: abs(displayValue))
-            ) ?? canonicalNumber(abs(displayValue))
-            var result: String
-            if displayValue < 0, format.negativeStyle >= 2 {
-                result = "(\(absolute))"
-            } else if displayValue < 0 {
-                result = "-\(absolute)"
-            } else {
-                result = absolute
-            }
+            ),
+                  absolute.count <= 256,
+                  absolute.utf8.count <= 1_024
+            else { return nil }
+            var decorated = absolute
             if format.kind == .percent {
-                result += "%"
+                decorated += "%"
             } else if !format.currencySymbol.isEmpty {
-                result = format.currencyPrecedesValue
-                    ? format.currencySymbol + result
-                    : result + format.currencySymbol
+                decorated = format.currencyPrecedesValue
+                    ? format.currencySymbol + decorated
+                    : decorated + format.currencySymbol
             }
+            let result: String
+            if displayValue < 0, format.negativeStyle >= 2 {
+                result = "(\(decorated))"
+            } else if displayValue < 0 {
+                result = "-\(decorated)"
+            } else {
+                result = decorated
+            }
+            guard result.count <= 272,
+                  result.utf8.count <= 1_088
+            else { return nil }
             return result
         }
     }
 
-    private func normalizedDateOrTime(
+    func normalizedDateOrTime(
         _ value: String,
         format: PDFFormFormatRule
     ) -> String? {
@@ -1043,7 +1269,7 @@ struct PDFFormAutomationService: Sendable {
         return formatter.string(from: date)
     }
 
-    private func supportedDatePattern(
+    func supportedDatePattern(
         _ pattern: String,
         isTime: Bool
     ) -> String? {

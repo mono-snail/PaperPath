@@ -29,6 +29,12 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
         )
     }
 
+    private func quickLookServiceUnavailable(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == NSCocoaErrorDomain
+            && nsError.code == 4_097
+    }
+
     func testImportPDF_sparse256MiBUsesBoundedMemory_BitsUT()
         async throws {
         let source = temporaryDirectory
@@ -83,6 +89,79 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
             UInt64(192 * Self.mebibyte),
             "256 MiB import exceeded 192 MiB peak RSS growth"
         )
+    }
+
+    func testImportPDF_trailingPaddingPreservesBytesAndDeepProfile_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("trailing-padding.pdf")
+        try PDFTestFixtureFactory.makeTrailingPaddedPDF(
+            at: source,
+            paddingBytes: Int64(9 * Self.mebibyte)
+        )
+        let sourceData = try Data(
+            contentsOf: source,
+            options: .mappedIfSafe
+        )
+        let expectedFingerprint = SHA256.hash(data: sourceData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("TrailingPaddingStore"),
+            availableCapacity: { _ in
+                Int64(512 * 1_024 * 1_024)
+            }
+        )
+
+        let record = try await store.importPDF(
+            from: source,
+            preserveSourceLocation: false
+        )
+        let privateURL = await store.url(for: record)
+
+        XCTAssertEqual(record.profile.pageCount, 1)
+        XCTAssertEqual(record.profile.sampledPageCount, 1)
+        XCTAssertGreaterThan(record.profile.textCharacterCount, 0)
+        XCTAssertEqual(
+            record.profile.byteCount,
+            Int64(sourceData.count)
+        )
+        XCTAssertEqual(record.contentFingerprint, expectedFingerprint)
+        XCTAssertEqual(
+            try Data(
+                contentsOf: privateURL,
+                options: .mappedIfSafe
+            ),
+            sourceData
+        )
+    }
+
+    func testMetadataOnlyInspection_detectsFormWithoutReadingContentStreams_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("metadata-only-form.pdf")
+        try PDFTestFixtureFactory.makeAcroFormAutomationPDF(
+            at: source
+        )
+        let byteCount = Int64(
+            try XCTUnwrap(
+                source.resourceValues(forKeys: [.fileSizeKey])
+                    .fileSize
+            )
+        )
+
+        let profile = try PDFInspectionService()
+            .inspectMetadataOnly(
+                url: source,
+                byteCount: byteCount
+            )
+
+        XCTAssertEqual(profile.pageCount, 1)
+        XCTAssertEqual(profile.formFieldCount, 3)
+        XCTAssertEqual(profile.kind, .form)
+        XCTAssertEqual(profile.sampledPageCount, 0)
+        XCTAssertEqual(profile.byteCount, byteCount)
     }
 
     func testImportPDF_cancelledSparseCopyLeavesNoRecord_BitsUT()
@@ -467,9 +546,19 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
                 scale: 1,
                 representationTypes: .thumbnail
             )
-            let representation = try await QLThumbnailGenerator
-                .shared
-                .generateBestRepresentation(for: request)
+            let representation: QLThumbnailRepresentation
+            do {
+                representation = try await QLThumbnailGenerator
+                    .shared
+                    .generateBestRepresentation(for: request)
+            } catch {
+                if quickLookServiceUnavailable(error) {
+                    throw XCTSkip(
+                        "Quick Look thumbnail service unavailable in this simulator"
+                    )
+                }
+                throw error
+            }
             XCTAssertEqual(
                 representation.type,
                 .thumbnail,
@@ -567,6 +656,11 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
                     .shared
                     .generateBestRepresentation(for: request)
             } catch {
+                if quickLookServiceUnavailable(error) {
+                    throw XCTSkip(
+                        "Quick Look thumbnail service unavailable in this simulator"
+                    )
+                }
                 XCTFail(
                     "\(document.path) Quick Look failed: \(error)"
                 )
@@ -704,6 +798,115 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
         XCTAssertFalse(attachment.isExtractable)
         XCTAssertTrue(attachment.checksum.isEmpty)
         XCTAssertNotNil(attachment.limitation)
+    }
+
+    func testDocumentStructure_compressedAttachmentWithoutDecodedSizeFailsClosed_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("untrusted-compressed-attachment.pdf")
+        try PDFTestFixtureFactory.makeStructurePDF(
+            at: source,
+            attachment: .init(
+                fileName: "compressed.bin",
+                data: Data([0x78, 0x9c, 0x03, 0x00]),
+                includesDeclaredSize: false,
+                filterName: "FlateDecode"
+            )
+        )
+
+        let payload = try XCTUnwrap(
+            PDFDocumentStructureService()
+                .attachmentPayloads(in: source)
+                .first
+        )
+
+        XCTAssertFalse(payload.snapshot.isExtractable)
+        XCTAssertNil(payload.data)
+        XCTAssertTrue(payload.snapshot.checksum.isEmpty)
+        XCTAssertEqual(
+            payload.snapshot.limitation,
+            "Compressed attachment is missing a trusted decoded size"
+        )
+    }
+
+    func testDocumentStructure_compressedAttachmentWithSmallDeclaredSizeFailsClosed_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("compressed-size-bypass.pdf")
+        try PDFTestFixtureFactory.makeStructurePDF(
+            at: source,
+            attachment: .init(
+                fileName: "compressed.bin",
+                data: Data(repeating: 0, count: 1_024),
+                declaredSize: 1,
+                filterName: "FlateDecode"
+            )
+        )
+
+        let payload = try XCTUnwrap(
+            PDFDocumentStructureService()
+                .attachmentPayloads(in: source)
+                .first
+        )
+
+        XCTAssertEqual(payload.snapshot.byteCount, 1)
+        XCTAssertFalse(payload.snapshot.isExtractable)
+        XCTAssertNil(payload.data)
+        XCTAssertTrue(payload.snapshot.checksum.isEmpty)
+        XCTAssertEqual(
+            payload.snapshot.limitation,
+            "Compressed attachments cannot be decoded within the local safety limit"
+        )
+    }
+
+    func testDocumentStructure_unfilteredAttachmentCopyRequiresBoundedSource_BitsUT() {
+        XCTAssertTrue(
+            PDFDocumentStructureService
+                .unfilteredAttachmentCopyIsBounded(
+                    sourceByteCount: 4 * Self.mebibyte
+                )
+        )
+        XCTAssertFalse(
+            PDFDocumentStructureService
+                .unfilteredAttachmentCopyIsBounded(
+                    sourceByteCount: 64 * Self.mebibyte + 1
+                )
+        )
+        XCTAssertFalse(
+            PDFDocumentStructureService
+                .unfilteredAttachmentCopyIsBounded(
+                    sourceByteCount: 0
+                )
+        )
+    }
+
+    func testDocumentStructure_declaredAttachmentSizeMismatchFailsClosed_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("mismatched-attachment.pdf")
+        try PDFTestFixtureFactory.makeStructurePDF(
+            at: source,
+            attachment: .init(
+                fileName: "mismatch.bin",
+                data: Data([1, 2, 3, 4]),
+                declaredSize: 12
+            )
+        )
+
+        let payload = try XCTUnwrap(
+            PDFDocumentStructureService()
+                .attachmentPayloads(in: source)
+                .first
+        )
+
+        XCTAssertFalse(payload.snapshot.isExtractable)
+        XCTAssertNil(payload.data)
+        XCTAssertTrue(payload.snapshot.checksum.isEmpty)
+        XCTAssertEqual(payload.snapshot.byteCount, 4)
+        XCTAssertEqual(
+            payload.snapshot.limitation,
+            "Decoded attachment size does not match its PDF declaration"
+        )
     }
 
     func testFormAutomation_calculatesFormatsAndRefreshes_BitsUT()
@@ -1008,6 +1211,100 @@ final class PDFBoundaryBehaviorTests: XCTestCase {
         XCTAssertEqual(snapshot.color.red, 1, accuracy: 0.025)
         XCTAssertEqual(snapshot.color.green, 0.2, accuracy: 0.025)
         XCTAssertEqual(snapshot.color.blue, 0, accuracy: 0.025)
+    }
+
+    func testStructuralRewrites_rejectSamePathWithoutChangingSource_BitsUT()
+        throws {
+        let service = PDFOutputService()
+        let source = temporaryDirectory
+            .appendingPathComponent("same-path-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1
+        )
+        let original = try Data(contentsOf: source)
+
+        for operation in [
+            {
+                try service.protect(
+                    sourceURL: source,
+                    destination: source,
+                    password: "Secure123"
+                )
+            },
+            {
+                try service.applyPageLabels(
+                    sourceURL: source,
+                    destination: source,
+                    rules: [
+                        PDFPageLabelRule(
+                            startPageIndex: 0,
+                            style: .decimal
+                        )
+                    ]
+                )
+            }
+        ] {
+            XCTAssertThrowsError(try operation()) { error in
+                guard case PaperPathError.insufficientSelection =
+                        error
+                else {
+                    return XCTFail(
+                        "Unexpected same-path error: \(error)"
+                    )
+                }
+            }
+            XCTAssertEqual(try Data(contentsOf: source), original)
+        }
+
+        let form = temporaryDirectory
+            .appendingPathComponent("same-path-form.pdf")
+        try PDFTestFixtureFactory.makeAcroFormAutomationPDF(
+            at: form
+        )
+        let originalForm = try Data(contentsOf: form)
+        XCTAssertThrowsError(
+            try service.applyFormFieldValues(
+                sourceURL: form,
+                destination: form,
+                values: ["Amount A": "42"]
+            )
+        ) { error in
+            guard case PaperPathError.insufficientSelection = error
+            else {
+                return XCTFail(
+                    "Unexpected same-path form error: \(error)"
+                )
+            }
+        }
+        XCTAssertEqual(try Data(contentsOf: form), originalForm)
+
+        let protected = temporaryDirectory
+            .appendingPathComponent("same-path-protected.pdf")
+        try service.protect(
+            sourceURL: source,
+            destination: protected,
+            password: "Secure123"
+        )
+        let originalProtected = try Data(contentsOf: protected)
+        XCTAssertThrowsError(
+            try service.removePassword(
+                sourceURL: protected,
+                destination: protected,
+                password: "Secure123"
+            )
+        ) { error in
+            guard case PaperPathError.insufficientSelection = error
+            else {
+                return XCTFail(
+                    "Unexpected same-path unlock error: \(error)"
+                )
+            }
+        }
+        XCTAssertEqual(
+            try Data(contentsOf: protected),
+            originalProtected
+        )
     }
 
     func testProtect_permissionMatrixRoundTrips_BitsUT() throws {
@@ -1686,7 +1983,9 @@ final class PDFStabilityContractTests: XCTestCase {
         )
 
         do {
-            try await store.save(Data([1, 2, 3, 4]))
+            try await store.save(
+                PDFTestFixtureFactory.makeSignaturePNG(seed: 1)
+            )
             XCTFail(
                 "Signature save should fail when protection cannot be applied"
             )
@@ -1702,7 +2001,7 @@ final class PDFStabilityContractTests: XCTestCase {
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: libraryURL.path)
         )
-        let storedSignature = await store.load()
+        let storedSignature = try await store.load()
         XCTAssertNil(storedSignature)
     }
 
@@ -1710,7 +2009,7 @@ final class PDFStabilityContractTests: XCTestCase {
         async throws {
         let root = temporaryDirectory
             .appendingPathComponent("ExistingSignatureStore")
-        let original = Data([9, 8, 7, 6])
+        let original = PDFTestFixtureFactory.makeSignaturePNG(seed: 9)
         try await SignatureStore(rootURL: root).save(original)
 
         let fileManager = ProtectionFailingFileManager()
@@ -1721,7 +2020,9 @@ final class PDFStabilityContractTests: XCTestCase {
         )
 
         do {
-            try await failingStore.save(Data([1, 2, 3, 4]))
+            try await failingStore.save(
+                PDFTestFixtureFactory.makeSignaturePNG(seed: 1)
+            )
             XCTFail(
                 "Signature update should fail when protection is denied"
             )
@@ -1731,7 +2032,8 @@ final class PDFStabilityContractTests: XCTestCase {
             XCTFail("Unexpected protection error: \(error)")
         }
 
-        let storedSignature = await failingStore.load()
+        fileManager.deniedPathFragment = nil
+        let storedSignature = try await failingStore.load()
         XCTAssertEqual(storedSignature, original)
     }
 
@@ -1774,7 +2076,7 @@ final class PDFStabilityContractTests: XCTestCase {
             sharedContainerURL: sharedContainer
         )
         XCTAssertEqual(pending.count, 1)
-        XCTAssertEqual(pending[0].preferredName, "Shared contract")
+        XCTAssertEqual(pending.first?.preferredName, "Shared contract")
 
         try ExternalPDFInbox.remove(
             item,
@@ -1893,7 +2195,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             XCTFail("Unexpected empty-signature error: \(error)")
         }
 
-        let library = await store.loadLibrary()
+        let library = try await store.loadLibrary()
         XCTAssertTrue(library.entries.isEmpty)
         XCTAssertNil(library.selectedID)
         XCTAssertFalse(
@@ -1910,32 +2212,35 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let root = temporaryDirectory
             .appendingPathComponent("BoundedSignatureStore")
         let store = SignatureStore(rootURL: root)
-        for value in 0..<6 {
-            _ = try await store.add(Data([UInt8(value)]))
+        let signatures = (0..<6).map {
+            PDFTestFixtureFactory.makeSignaturePNG(seed: $0)
+        }
+        for signature in signatures {
+            _ = try await store.add(signature)
         }
 
-        var library = await store.loadLibrary()
+        var library = try await store.loadLibrary()
         XCTAssertEqual(
             library.entries.count,
             SignatureStore.maximumSignatureCount
         )
-        XCTAssertEqual(library.entries.first?.data, Data([5]))
+        XCTAssertEqual(library.entries.first?.data, signatures[5])
         XCTAssertEqual(library.selectedID, library.entries.first?.id)
 
         let originalID = try XCTUnwrap(
             library.entries.first {
-                $0.data == Data([3])
+                $0.data == signatures[3]
             }?.id
         )
-        library = try await store.add(Data([3]))
+        library = try await store.add(signatures[3])
         XCTAssertEqual(library.entries.count, 5)
         XCTAssertEqual(library.entries.first?.id, originalID)
-        XCTAssertEqual(library.entries.first?.data, Data([3]))
+        XCTAssertEqual(library.entries.first?.data, signatures[3])
 
         library = try await store.remove(id: originalID)
         XCTAssertEqual(library.entries.count, 4)
         XCTAssertEqual(library.selectedID, library.entries.first?.id)
-        let loaded = await store.load()
+        let loaded = try await store.load()
         XCTAssertEqual(loaded, library.entries.first?.data)
     }
 
@@ -1950,16 +2255,17 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let legacyURL = root.appendingPathComponent(
             "saved-signature.data"
         )
-        let legacy = Data([7, 8, 9])
+        let legacy = PDFTestFixtureFactory.makeSignaturePNG(seed: 7)
+        let added = PDFTestFixtureFactory.makeSignaturePNG(seed: 1)
         try legacy.write(to: legacyURL)
         let store = SignatureStore(rootURL: root)
 
-        let loaded = await store.load()
+        let loaded = try await store.load()
         XCTAssertEqual(loaded, legacy)
-        let library = try await store.add(Data([1, 2, 3]))
+        let library = try await store.add(added)
 
         XCTAssertEqual(library.entries.count, 2)
-        XCTAssertEqual(library.entries.first?.data, Data([1, 2, 3]))
+        XCTAssertEqual(library.entries.first?.data, added)
         XCTAssertEqual(library.entries.last?.data, legacy)
         XCTAssertFalse(
             FileManager.default.fileExists(atPath: legacyURL.path)
@@ -2072,6 +2378,122 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(indices[record.id], originalIndex)
         XCTAssertEqual(results[record.id], originalOCR)
         XCTAssertEqual(records.first?.brief, originalBrief)
+    }
+
+    func testSearchTextIndices_metadataHitSkipsUnavailableSidecar_BitsUT()
+        async throws {
+        let root = temporaryDirectory
+            .appendingPathComponent("MetadataFirstSearchStore")
+        let recordID = UUID()
+        let sidecarURL = root
+            .appendingPathComponent("TextIndex", isDirectory: true)
+            .appendingPathComponent(
+                "\(recordID.uuidString).json",
+                isDirectory: true
+            )
+        try FileManager.default.createDirectory(
+            at: sidecarURL,
+            withIntermediateDirectories: true
+        )
+        let store = DocumentStore(rootURL: root)
+        let candidate = DocumentStoreTextSearchCandidate(
+            recordID: recordID,
+            metadataCorpus: DocumentSearchNormalization.text(
+                "Quarterly Review"
+            ),
+            pageCount: 1,
+            hasAnalysis: true
+        )
+
+        let metadataMatch = try await store.searchTextIndices(
+            query: "quarterly review",
+            candidates: [candidate]
+        )
+        XCTAssertEqual(
+            metadataMatch.matchingRecordIDs,
+            Set([recordID])
+        )
+        XCTAssertTrue(metadataMatch.matchesByRecordID.isEmpty)
+
+        let missingBodyMatch = try await store.searchTextIndices(
+            query: "body-only needle",
+            candidates: [candidate]
+        )
+        XCTAssertTrue(missingBodyMatch.matchingRecordIDs.isEmpty)
+        XCTAssertTrue(missingBodyMatch.matchesByRecordID.isEmpty)
+    }
+
+    func testBootstrapSnapshot_restoresOnlyEightRecentAnalyses_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("bootstrap-analysis.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1
+        )
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("BootstrapAnalysisStore")
+        )
+        var recordIDs: [UUID] = []
+        for index in 0..<10 {
+            var record = try await store.importPDF(
+                from: source,
+                preferredName: "Analysis \(index)",
+                preserveSourceLocation: false
+            )
+            let text = "Indexed content \(index)"
+            let textIndex = DocumentTextIndex(
+                source: .vision,
+                pages: [
+                    IndexedPageText(
+                        pageIndex: 0,
+                        text: text
+                    )
+                ],
+                indexedAt: Date(
+                    timeIntervalSince1970: Double(index)
+                )
+            )
+            record = try await store.saveAnalysis(
+                record,
+                brief: DocumentBrief(
+                    category: .general,
+                    summary: text,
+                    entities: [],
+                    suggestedSteps: [],
+                    indexedAt: textIndex.indexedAt,
+                    textSource: .vision,
+                    indexedCharacterCount: text.count
+                ),
+                textIndex: textIndex,
+                ocrResult: OCRResult(
+                    pages: [
+                        OCRPageResult(
+                            pageIndex: 0,
+                            text: text,
+                            confidence: 0.9
+                        )
+                    ]
+                )
+            )
+            _ = try await store.updateReadingPosition(
+                recordID: record.id,
+                pageIndex: 0,
+                expectedRevisionID: record.contentRevisionID,
+                viewedAt: Date(
+                    timeIntervalSince1970: Double(1_000 + index)
+                )
+            )
+            recordIDs.append(record.id)
+        }
+
+        let snapshot = try await store.loadBootstrapSnapshot()
+        let expectedIDs = Set(recordIDs.suffix(8))
+
+        XCTAssertEqual(snapshot.documents.count, 10)
+        XCTAssertEqual(Set(snapshot.textIndices.keys), expectedIDs)
+        XCTAssertEqual(Set(snapshot.ocrResults.keys), expectedIDs)
     }
 
     func testExternalPDFInbox_rejectsInvalidAndIgnoresTamperedPayload_BitsUT()
@@ -2258,18 +2680,28 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         run.segments[1].status = .completed
         run.segments[1].fractionCompleted = 1
         run.segments[1].receiptID = UUID()
+        let availableReceiptIDs = Set(
+            run.segments.compactMap(\.receiptID)
+        )
 
-        let resumed = run.restored(currentRevisionID: revisionID)
+        let resumed = run.restored(
+            currentRevisionID: revisionID,
+            availableReceiptIDs: availableReceiptIDs
+        )
         XCTAssertEqual(resumed.status, .paused)
         XCTAssertEqual(resumed.segments[0].status, .queued)
         XCTAssertEqual(resumed.segments[0].fractionCompleted, 0)
         XCTAssertEqual(resumed.segments[1].status, .completed)
 
-        let changed = run.restored(currentRevisionID: UUID())
-        XCTAssertEqual(changed.status, .partial)
+        let changed = run.restored(
+            currentRevisionID: UUID(),
+            availableReceiptIDs: availableReceiptIDs
+        )
+        XCTAssertEqual(changed.status, .failed)
         XCTAssertEqual(changed.segments[0].status, .failed)
         XCTAssertEqual(changed.segments[0].fractionCompleted, 1)
-        XCTAssertEqual(changed.segments[1].status, .completed)
+        XCTAssertEqual(changed.segments[1].status, .failed)
+        XCTAssertEqual(changed.segments[1].fractionCompleted, 1)
     }
 
     func testOfficeProductionQueue_restoresAndBoundsHistory_BitsUT() {
@@ -2710,7 +3142,8 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
                 "Five",
                 "Six",
                 "Seven"
-            ]
+            ],
+            expectedTags: record.tags
         )
         XCTAssertEqual(record.tags.count, 8)
         XCTAssertEqual(record.tags.first, "Legal")
@@ -2728,12 +3161,14 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(record.bookmarkedPages, [1, 3])
         record = try await store.updatePrivateNote(
             record,
-            note: "  \(String(repeating: "n", count: 1_200))  "
+            note: "  \(String(repeating: "n", count: 1_200))  ",
+            expectedNote: record.privateNote
         )
         XCTAssertEqual(record.privateNote?.count, 1_000)
         record = try await store.updateReadingPosition(
-            record,
-            pageIndex: 99
+            recordID: record.id,
+            pageIndex: 99,
+            expectedRevisionID: record.contentRevisionID
         )
         XCTAssertEqual(record.lastPageIndex, 3)
 
@@ -2743,6 +3178,45 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(reopened.bookmarkedPages, [1, 3])
         XCTAssertEqual(reopened.privateNote?.count, 1_000)
         XCTAssertEqual(reopened.lastPageIndex, 3)
+    }
+
+    func testReadingPosition_ignoresOlderEvents_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("reading-events.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 4
+        )
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ReadingEventStore")
+        )
+        let record = try await store.importPDF(
+            from: source,
+            preserveSourceLocation: false
+        )
+        let newestEvent = Date(timeIntervalSince1970: 300)
+        _ = try await store.updateReadingPosition(
+            recordID: record.id,
+            pageIndex: 3,
+            expectedRevisionID: record.contentRevisionID,
+            viewedAt: newestEvent
+        )
+
+        let staleResult = try await store.updateReadingPosition(
+            recordID: record.id,
+            pageIndex: 0,
+            expectedRevisionID: record.contentRevisionID,
+            viewedAt: Date(timeIntervalSince1970: 200)
+        )
+        let loaded = try await store.load()
+        let persisted = try XCTUnwrap(loaded.first)
+
+        XCTAssertEqual(staleResult.lastPageIndex, 3)
+        XCTAssertEqual(staleResult.lastViewedAt, newestEvent)
+        XCTAssertEqual(persisted.lastPageIndex, 3)
+        XCTAssertEqual(persisted.lastViewedAt, newestEvent)
     }
 
     func testDocumentStore_trashRestoreAndPurgeLifecycle_BitsUT()
@@ -2860,9 +3334,11 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let imported = try await store.importPDF(
             from: source,
             deliveryReceipt: receipt,
+            sourceDocumentID: UUID(),
             contentRevisionID: revisionID,
             preserveSourceLocation: false
         )
+        XCTAssertTrue(imported.isDeliveryArtifact)
         XCTAssertTrue(imported.hasCurrentDeliveryReceipt)
 
         var mismatched = imported
@@ -2926,12 +3402,15 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let imported = try await store.importPDF(
             from: source,
             deliveryReceipt: receipt,
+            sourceDocumentID: UUID(),
             contentRevisionID: revisionID,
             preserveSourceLocation: false
         )
+        XCTAssertTrue(imported.isDeliveryArtifact)
         let recovery = try await store.createVersionSnapshot(
             for: imported,
-            label: "Before edit"
+            label: "Before edit",
+            allowsDeliveryArtifact: true
         )
         XCTAssertTrue(recovery.matchesDeliveryReceipt(receipt))
         XCTAssertFalse(recovery.isPinnedMilestone)
@@ -2976,9 +3455,98 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertTrue(protected.matchesDeliveryReceipt(receipt))
     }
 
+    func testBulkUnpin_persistsOfficeAndVersionState_BitsUT()
+        async throws {
+        let root = temporaryDirectory
+            .appendingPathComponent("BulkUnpinStore")
+        let store = DocumentStore(rootURL: root)
+        var pinnedRecordIDs: [UUID] = []
+
+        for index in 0..<2 {
+            let source = temporaryDirectory
+                .appendingPathComponent("bulk-unpin-\(index).pdf")
+            try PDFTestFixtureFactory.makeTextPDF(
+                at: source,
+                pageCount: index + 1
+            )
+            let record = try await store.importPDF(
+                from: source,
+                preserveSourceLocation: false
+            )
+            let officeURL = temporaryDirectory
+                .appendingPathComponent("bulk-unpin-\(index).docx")
+            let officeData = Data("office-\(index)".utf8)
+            try officeData.write(to: officeURL)
+            let receipt = PDFOfficeExportReceipt(
+                format: .wordDocument,
+                fileName: officeURL.lastPathComponent,
+                fileSizeBytes: Int64(officeData.count),
+                plan: PDFOfficeExportFormatPlan.plan(
+                    for: .wordDocument,
+                    profile: record.profile
+                ),
+                budgetPlan: PDFOfficeVisualBudgetPlan(
+                    profile: record.profile
+                )
+            )
+            let retained = try await store.retainOfficeExport(
+                receipt,
+                sourceURL: officeURL,
+                for: record
+            )
+            let pinned = try await store.setOfficeExportPinned(
+                receiptID: retained.receipt.id,
+                pinned: true,
+                for: retained.record
+            )
+            XCTAssertTrue(
+                pinned.officeReceipts.contains(where: \.isPinned)
+            )
+            pinnedRecordIDs.append(record.id)
+
+            let snapshot = try await store.createVersionSnapshot(
+                for: pinned,
+                label: "Pinned \(index)"
+            )
+            let versions = try await store.updateVersionMilestone(
+                snapshotID: snapshot.id,
+                recordID: record.id,
+                name: "Milestone \(index)",
+                pinned: true,
+                linkedDeliveryReceiptID: nil
+            )
+            XCTAssertTrue(
+                versions.contains {
+                    $0.id == snapshot.id && $0.isPinnedMilestone
+                }
+            )
+        }
+
+        let updated = try await store.unpinAllOfficeExports()
+        XCTAssertEqual(Set(updated.map(\.id)), Set(pinnedRecordIDs))
+        XCTAssertTrue(
+            updated.allSatisfy {
+                $0.officeReceipts.allSatisfy { !$0.isPinned }
+            }
+        )
+        let persistedRecords = try await store.load()
+        XCTAssertTrue(
+            persistedRecords.allSatisfy {
+                $0.officeReceipts.allSatisfy { !$0.isPinned }
+            }
+        )
+
+        let unpinnedVersionCount =
+            try await store.unpinAllVersionMilestones()
+        XCTAssertEqual(unpinnedVersionCount, 2)
+        let pinnedVersions =
+            try await store.pinnedVersionMilestones()
+        XCTAssertTrue(pinnedVersions.isEmpty)
+    }
+
     @MainActor
     func testMetadataSync_clearRemovesCloudAndShadowPayloads_BitsUT()
-        throws {
+        async throws {
         let cloud = CriticalMetadataKeyValueStore(
             isCloudBacked: true
         )
@@ -2990,7 +3558,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             shadowStore: shadow,
             now: { Date(timeIntervalSince1970: 100) }
         )
-        _ = try service.synchronize(records: [])
+        _ = try await service.synchronize(records: [])
         XCTAssertFalse(cloud.storage.isEmpty)
         XCTAssertFalse(shadow.storage.isEmpty)
 
@@ -3042,11 +3610,15 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         async let first = model.createCompressedCopy(
             recordID: imported.id,
             quality: .compact,
+            expectedContentRevisionID:
+                imported.contentRevisionID,
             presentsFeedback: false
         )
         async let second = model.createCompressedCopy(
             recordID: imported.id,
             quality: .compact,
+            expectedContentRevisionID:
+                imported.contentRevisionID,
             presentsFeedback: false
         )
         let results = await (first, second)
@@ -3060,6 +3632,122 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             1
         )
         XCTAssertFalse(model.isProcessing(imported.id))
+    }
+
+    @MainActor
+    func testModel_concurrentBootstrapYieldsAndLoadsOnce_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("concurrent-bootstrap-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 8
+        )
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ConcurrentBootstrapStore")
+        )
+        let imported = try await store.importPDF(
+            from: source,
+            preserveSourceLocation: false
+        )
+        let previousSync = UserDefaults.standard.object(
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        UserDefaults.standard.set(
+            false,
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        defer {
+            if let previousSync {
+                UserDefaults.standard.set(
+                    previousSync,
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                )
+            } else {
+                UserDefaults.standard.removeObject(
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                )
+            }
+        }
+        let model = PaperPathModel(store: store)
+        let heartbeat = expectation(
+            description: "Main actor remains responsive"
+        )
+        Task { @MainActor in
+            await Task.yield()
+            heartbeat.fulfill()
+        }
+
+        async let firstBootstrap: Void = model.bootstrap()
+        async let secondBootstrap: Void = model.bootstrap()
+        await fulfillment(of: [heartbeat], timeout: 2)
+        _ = await (firstBootstrap, secondBootstrap)
+
+        XCTAssertFalse(model.isLoading)
+        XCTAssertEqual(model.documents.map(\.id), [imported.id])
+        XCTAssertFalse(model.hasActiveLocalDataOperations)
+    }
+
+    @MainActor
+    func testModel_cancelledCompressionReleasesProcessingState_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("cancelled-compression-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 80
+        )
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("CancelledCompressionStore")
+        )
+        let imported = try await store.importPDF(
+            from: source,
+            preserveSourceLocation: false
+        )
+        let previousSync = UserDefaults.standard.object(
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        UserDefaults.standard.set(
+            false,
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        defer {
+            if let previousSync {
+                UserDefaults.standard.set(
+                    previousSync,
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                )
+            } else {
+                UserDefaults.standard.removeObject(
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                )
+            }
+        }
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+
+        let operation = Task { @MainActor in
+            await model.createCompressedCopy(
+                recordID: imported.id,
+                quality: .compact,
+                expectedContentRevisionID:
+                    imported.contentRevisionID,
+                presentsFeedback: false
+            )
+        }
+        for _ in 0..<100 where !model.isProcessing(imported.id) {
+            await Task.yield()
+        }
+        operation.cancel()
+        _ = await operation.value
+        for _ in 0..<100 where model.isProcessing(imported.id) {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        XCTAssertFalse(model.isProcessing(imported.id))
+        XCTAssertFalse(model.hasActiveLocalDataOperations)
     }
 
     func testOfficeBatchArchive_roundTripsAndRejectsUnsafeNames_BitsUT()
@@ -3142,7 +3830,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
                 .appendingPathComponent("SigningStore"),
             signingPrivateKeyProvider: { signingKey }
         )
-        let createdAt = Date(timeIntervalSince1970: 100)
+        let createdAt = PDFOfficeTimeAnchor.process.trustedDate()
         let payload = PDFOfficeVerificationPayload(
             schema: "PaperPath Office Delivery V34",
             packageID: UUID(),
@@ -3180,6 +3868,38 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(verified.trustStatus, .thisDevice)
         XCTAssertEqual(verified.outputCount, 1)
 
+        let identityURL = try await store
+            .makeOfficeDeliverySigningIdentityCardFile()
+        let identityCard = try await store
+            .loadOfficeSignerIdentityCard(at: identityURL)
+        let localSigningKeyID = try await store
+            .officeDeliverySigningKeyID()
+        XCTAssertEqual(identityCard.keyID, localSigningKeyID)
+
+        let verifyingStore = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ForeignSigningStore"),
+            signingPrivateKeyProvider: {
+                Curve25519.Signing.PrivateKey()
+            }
+        )
+        let unknownSigner = try await verifyingStore
+            .verifyOfficeDeliveryReport(at: signedURL)
+        XCTAssertEqual(unknownSigner.trustStatus, .unknown)
+        var trustedSigners = try await verifyingStore
+            .trustOfficeReportSigner(unknownSigner)
+        XCTAssertEqual(trustedSigners.first?.keyID, identityCard.keyID)
+        let trustedReport = try await verifyingStore
+            .verifyOfficeDeliveryReport(at: signedURL)
+        XCTAssertEqual(trustedReport.trustStatus, .trusted)
+        XCTAssertEqual(trustedReport.trustedSignerName, trustedSigners.first?.displayName)
+        trustedSigners = try await verifyingStore
+            .removeOfficeTrustedSigner(identityCard.keyID)
+        XCTAssertTrue(trustedSigners.isEmpty)
+        trustedSigners = try await verifyingStore
+            .trustOfficeSignerIdentity(identityCard)
+        XCTAssertEqual(trustedSigners.first?.verificationCount, 0)
+
         let tamperedPayload = PDFOfficeVerificationPayload(
             schema: "PaperPath Office Delivery V34",
             packageID: payload.packageID,
@@ -3204,6 +3924,118 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
         XCTAssertEqual(rejected.status, .invalid)
         XCTAssertEqual(rejected.trustStatus, .invalid)
+    }
+
+    func testDeliveryPackageVerification_materializesExactPDF_BitsUT()
+        async throws {
+        let package = try await makeSignedDeliveryPackage(
+            name: "verified-received",
+            tampersSignature: false
+        )
+        let extractionDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "PaperPath-VerifiedDelivery-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try LocalFileSecurity.prepareProtectedDirectory(
+            at: extractionDirectory
+        )
+        defer {
+            try? FileManager.default.removeItem(at: extractionDirectory)
+        }
+
+        let report = try PDFVersionArchiveVerificationService()
+            .verifyDeliveryPackage(
+                archiveURL: package.archiveURL,
+                extractionDirectory: extractionDirectory
+            )
+
+        XCTAssertEqual(report.status, .verified)
+        XCTAssertTrue(report.canOpenArtifact)
+        XCTAssertEqual(
+            report.verifiedArtifactURL?.lastPathComponent,
+            package.artifactName
+        )
+        let extractedURL = try XCTUnwrap(
+            report.verifiedArtifactURL
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: extractedURL),
+            package.artifactData
+        )
+
+        let storeKey = Curve25519.Signing.PrivateKey()
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("VerifiedDeliveryStore"),
+            signingPrivateKeyProvider: { storeKey }
+        )
+        let unknownTrust = try await store
+            .resolveDeliveryPackageTrust(report)
+        XCTAssertEqual(unknownTrust.trustStatus, .unknown)
+        let trustedDeliverySigners = try await store
+            .trustDeliveryPackageSigner(unknownTrust)
+        XCTAssertEqual(
+            trustedDeliverySigners.first?.keyID,
+            report.signerKeyID
+        )
+        let trustedReport = try await store
+            .resolveDeliveryPackageTrust(report)
+        XCTAssertEqual(trustedReport.trustStatus, .trusted)
+        let shareCopy = try await store
+            .prepareVerifiedDeliveryArtifactShareCopy(report)
+        XCTAssertEqual(
+            try Data(contentsOf: shareCopy),
+            package.artifactData
+        )
+        let imported = try await store
+            .importVerifiedDeliveryArtifact(report)
+        let importedAgain = try await store
+            .importVerifiedDeliveryArtifact(report)
+        XCTAssertEqual(importedAgain.id, imported.id)
+        let importedURL = await store.url(for: imported)
+        XCTAssertEqual(
+            try Data(contentsOf: importedURL),
+            package.artifactData
+        )
+    }
+
+    func testDeliveryPackageVerification_removesPDFForInvalidSignature_BitsUT()
+        async throws {
+        let package = try await makeSignedDeliveryPackage(
+            name: "tampered-signature",
+            tampersSignature: true
+        )
+        let extractionDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.verifiedDeliveryPackagePrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try LocalFileSecurity.prepareProtectedDirectory(
+            at: extractionDirectory
+        )
+        defer {
+            try? FileManager.default.removeItem(
+                at: extractionDirectory
+            )
+        }
+
+        let report = try PDFVersionArchiveVerificationService()
+            .verifyDeliveryPackage(
+                archiveURL: package.archiveURL,
+                extractionDirectory: extractionDirectory
+            )
+
+        XCTAssertEqual(report.status, .failed)
+        XCTAssertEqual(report.signatureStatus, .invalid)
+        XCTAssertFalse(report.canOpenArtifact)
+        XCTAssertNil(report.verifiedArtifactURL)
+        XCTAssertTrue(
+            try FileManager.default.contentsOfDirectory(
+                at: extractionDirectory,
+                includingPropertiesForKeys: nil
+            ).isEmpty
+        )
     }
 
     func testOfficeExportRetention_verifiesCurrentArtifactAndTamper_BitsUT()
@@ -3251,6 +4083,33 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(verified.status, .verified)
         XCTAssertEqual(verified.url, retained.url)
 
+        let shareDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.officeSharePrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+        let shareURL = shareDirectory.appendingPathComponent(
+            retained.receipt.fileName
+        )
+        defer {
+            _ = PaperPathTemporaryArtifact.removeManagedItem(
+                containing: shareDirectory,
+                allowedPrefixes: [
+                    PaperPathTemporaryArtifact.officeSharePrefix
+                ]
+            )
+        }
+        let preparedShare = try await store.prepareOfficeExportShareCopy(
+            receiptID: retained.receipt.id,
+            for: verified.record,
+            destinationURL: shareURL
+        )
+        XCTAssertEqual(preparedShare.url, shareURL)
+        XCTAssertEqual(
+            try Data(contentsOf: preparedShare.url),
+            officeData
+        )
+
         try Data(repeating: 0x58, count: officeData.count).write(
             to: retained.url
         )
@@ -3266,21 +4125,64 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         async throws {
         let root = temporaryDirectory
             .appendingPathComponent("DeliveryRetentionStore")
-        let store = DocumentStore(rootURL: root)
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let store = DocumentStore(
+            rootURL: root,
+            signingPrivateKeyProvider: { signingKey }
+        )
         let archiveURL = temporaryDirectory
             .appendingPathComponent("delivery.zip")
         let reportURL = temporaryDirectory
             .appendingPathComponent("delivery-report.json")
         let archiveData = Data("verified-archive".utf8)
-        let reportData = Data("verified-report".utf8)
         try archiveData.write(to: archiveURL)
+        let receiptID = UUID()
+        var package = PDFOfficeDeliveryPackage(
+            entries: [
+                PDFOfficeDeliveryEntry(
+                    sourceRecordID: UUID(),
+                    sourceRevisionID: UUID(),
+                    sourceName: "Verified report",
+                    receiptID: receiptID,
+                    format: .wordDocument,
+                    archiveName: "verified-report.docx",
+                    byteCount: Int64(archiveData.count),
+                    sha256: sha256(archiveData)
+                )
+            ]
+        )
+        let signedReport = try await store.signOfficeDeliveryPayload(
+            PDFOfficeVerificationPayload(
+                schema: "PaperPath Office Delivery V34",
+                packageID: package.id,
+                createdAt: package.createdAt,
+                expiresAt: package.expiresAt,
+                verifiedOutputs: package.entries.count,
+                files: package.entries
+            )
+        )
+        package.signerKeyID = signedReport.signature.keyID
+        let reportEncoder = JSONEncoder()
+        reportEncoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        reportEncoder.dateEncodingStrategy = .iso8601
+        let reportData = try reportEncoder.encode(signedReport)
         try reportData.write(to: reportURL)
-        let package = PDFOfficeDeliveryPackage(entries: [])
 
         let first = try await store.retainOfficeDeliveryPackage(
             package,
             archiveURL: archiveURL,
             reportURL: reportURL
+        )
+        XCTAssertTrue(first.0.isStructurallyValid)
+        let initiallyPublished = try await store
+            .officeDeliveryPackageURLs(for: first.0)
+        XCTAssertEqual(
+            try Data(contentsOf: initiallyPublished.archive),
+            archiveData
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: initiallyPublished.report),
+            reportData
         )
         do {
             _ = try await store.retainOfficeDeliveryPackage(
@@ -3310,6 +4212,22 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             try Data(contentsOf: published.report),
             reportData
         )
+        let loadedPackages = try await store
+            .loadOfficeDeliveryPackages()
+        XCTAssertEqual(loadedPackages.map(\.id), [package.id])
+        let pinned = try await store.setOfficeDeliveryPackagePinned(
+            package.id,
+            pinned: true
+        )
+        XCTAssertNotNil(pinned.first?.pinnedAt)
+        let unpinned = try await store.setOfficeDeliveryPackagePinned(
+            package.id,
+            pinned: false
+        )
+        XCTAssertNil(unpinned.first?.pinnedAt)
+        let remainingPackages = try await store
+            .deleteOfficeDeliveryPackage(package.id)
+        XCTAssertTrue(remainingPackages.isEmpty)
     }
 
     func testRestoreVersion_sidecarCleanupFailureRollsBack_BitsUT()
@@ -3387,7 +4305,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
     }
 
     @MainActor
-    func testMetadataSync_clearFailureIsObservable_BitsUT() throws {
+    func testMetadataSync_clearFailureIsObservable_BitsUT() async throws {
         let cloud = CriticalMetadataKeyValueStore(
             isCloudBacked: true
         )
@@ -3398,7 +4316,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             cloudStore: cloud,
             shadowStore: shadow
         )
-        _ = try service.synchronize(records: [])
+        _ = try await service.synchronize(records: [])
         cloud.synchronizeResult = false
 
         XCTAssertThrowsError(
@@ -3467,13 +4385,113 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
     }
 
+    func testWorkingCopyTransaction_recoversAfterRollbackFailure_BitsUT()
+        async throws {
+        let root = temporaryDirectory
+            .appendingPathComponent("WorkingCopyRecoveryStore")
+        let source = temporaryDirectory
+            .appendingPathComponent("recovery-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 2
+        )
+        let fileManager = ProtectionFailingFileManager()
+        let store = DocumentStore(
+            rootURL: root,
+            fileManager: fileManager
+        )
+        let record = try await store.importPDF(
+            from: source,
+            preserveSourceLocation: false
+        )
+        let workingCopyURL = await store.url(for: record)
+        let originalData = try Data(contentsOf: workingCopyURL)
+        let preparedURL = temporaryDirectory
+            .appendingPathComponent("recovery-prepared.pdf")
+        try FileManager.default.copyItem(
+            at: workingCopyURL,
+            to: preparedURL
+        )
+        try PDFMutationService().addStamp(
+            .draft,
+            toPageAt: 0,
+            in: preparedURL
+        )
+        XCTAssertNotEqual(
+            try Data(contentsOf: preparedURL),
+            originalData
+        )
+
+        fileManager.deniedPathFragment = workingCopyURL.path
+        do {
+            _ = try await store.replaceWorkingCopies(
+                with: [
+                    PreparedPDFWorkingCopy(
+                        recordID: record.id,
+                        sourceRevisionID: record.contentRevisionID,
+                        preparedURL: preparedURL
+                    )
+                ],
+                invalidateAnalysis: true,
+                requiresMatchingPageCount: true
+            )
+            XCTFail("A denied publication must fail")
+        } catch {
+            // The recovery journal must remain available after rollback fails.
+        }
+        fileManager.deniedPathFragment = nil
+
+        let journalURL = root.appendingPathComponent(
+            "active-working-copy-transaction.json"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: journalURL.path)
+        )
+
+        let recoveredStore = DocumentStore(
+            rootURL: root,
+            fileManager: fileManager
+        )
+        let recoveredRecords = try await recoveredStore.load()
+        let recoveredRecord = try XCTUnwrap(recoveredRecords.first)
+        let recoveredURL = await recoveredStore.url(
+            for: recoveredRecord
+        )
+        let recoveredData = try Data(contentsOf: recoveredURL)
+        XCTAssertEqual(
+            recoveredRecord.contentRevisionID,
+            record.contentRevisionID
+        )
+        XCTAssertEqual(recoveredData, originalData)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: journalURL.path)
+        )
+        let documentEntries = try FileManager.default
+            .contentsOfDirectory(
+                at: root.appendingPathComponent(
+                    "Documents",
+                    isDirectory: true
+                ),
+                includingPropertiesForKeys: nil
+            )
+        XCTAssertFalse(
+            documentEntries.contains {
+                $0.lastPathComponent.hasPrefix(".batch-")
+                    || $0.lastPathComponent.hasPrefix(
+                        ".batch-rollback-"
+                    )
+            }
+        )
+    }
+
     func testSignatureStore_unknownSelectionAndRemovalAreIdempotent_BitsUT()
         async throws {
         let store = SignatureStore(
             rootURL: temporaryDirectory
                 .appendingPathComponent("IdempotentSignatureStore")
         )
-        let initial = try await store.add(Data([1, 2, 3]))
+        let signature = PDFTestFixtureFactory.makeSignaturePNG(seed: 3)
+        let initial = try await store.add(signature)
         let selected = try await store.select(UUID())
         let removed = try await store.remove(id: UUID())
 
@@ -3481,8 +4499,8 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(selected.selectedID, initial.selectedID)
         XCTAssertEqual(removed.entries, initial.entries)
         XCTAssertEqual(removed.selectedID, initial.selectedID)
-        let loaded = await store.load()
-        XCTAssertEqual(loaded, Data([1, 2, 3]))
+        let loaded = try await store.load()
+        XCTAssertEqual(loaded, signature)
     }
 
     func testExternalPDFInbox_roundTripsNameAndLifecycle_BitsUT()
@@ -3538,6 +4556,127 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
     }
 
+    func testExternalPDFInbox_rejectsSymlinkAndOversizedPayloads_BitsUT()
+        throws {
+        let sharedContainer = temporaryDirectory
+            .appendingPathComponent("InboxBoundaryContainer")
+        let source = temporaryDirectory
+            .appendingPathComponent("inbox-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1
+        )
+        let symlink = temporaryDirectory
+            .appendingPathComponent("inbox-source-link.pdf")
+        try FileManager.default.createSymbolicLink(
+            at: symlink,
+            withDestinationURL: source
+        )
+
+        XCTAssertThrowsError(
+            try ExternalPDFInbox.stagePDF(
+                from: symlink,
+                sharedContainerURL: sharedContainer,
+                protectionHandler: { _ in }
+            )
+        ) { error in
+            guard case ExternalPDFInboxError.invalidPDF = error else {
+                return XCTFail("Unexpected symlink error: \(error)")
+            }
+        }
+
+        let oversized = temporaryDirectory
+            .appendingPathComponent("oversized-inbox.pdf")
+        try PDFTestFixtureFactory.makeSparsePDF(
+            at: oversized,
+            paddingBytes: Int64(1_024 * 1_024 * 1_024)
+        )
+        XCTAssertThrowsError(
+            try ExternalPDFInbox.stagePDF(
+                from: oversized,
+                sharedContainerURL: sharedContainer,
+                protectionHandler: { _ in }
+            )
+        ) { error in
+            guard case ExternalPDFInboxError.fileTooLarge = error else {
+                return XCTFail("Unexpected size error: \(error)")
+            }
+        }
+        XCTAssertTrue(
+            try ExternalPDFInbox.pendingItems(
+                sharedContainerURL: sharedContainer
+            ).isEmpty
+        )
+    }
+
+    func testExternalPDFInbox_boundsMetadataBeforeDecoding_BitsUT()
+        throws {
+        let sharedContainer = temporaryDirectory
+            .appendingPathComponent("InboxMetadataContainer")
+        let source = temporaryDirectory
+            .appendingPathComponent("metadata-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1
+        )
+        let item = try ExternalPDFInbox.stagePDF(
+            from: source,
+            suggestedName: "Sensitive contract.pdf",
+            sharedContainerURL: sharedContainer,
+            protectionHandler: { _ in }
+        )
+        try Data(
+            repeating: 0x41,
+            count: 64 * 1_024 + 1
+        ).write(
+            to: item.containerURL
+                .appendingPathComponent("metadata.json"),
+            options: .atomic
+        )
+
+        let pending = try ExternalPDFInbox.pendingItems(
+            sharedContainerURL: sharedContainer
+        )
+        let sourceData = try Data(contentsOf: source)
+        let expectedFingerprint = SHA256.hash(data: sourceData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let pendingItem = try XCTUnwrap(
+            pending.first,
+            "Oversized metadata should be repaired without discarding its PDF"
+        )
+        XCTAssertEqual(pending.count, 1)
+        XCTAssertEqual(pendingItem.preferredName, "Shared PDF")
+        XCTAssertEqual(pendingItem.fileURL, item.fileURL)
+        XCTAssertEqual(pendingItem.byteCount, Int64(sourceData.count))
+        XCTAssertEqual(
+            pendingItem.expectedSHA256,
+            expectedFingerprint
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: pendingItem.fileURL),
+            sourceData
+        )
+
+        let repairedMetadata = try Data(
+            contentsOf: item.containerURL
+                .appendingPathComponent("metadata.json")
+        )
+        XCTAssertLessThanOrEqual(repairedMetadata.count, 64 * 1_024)
+        let reparsed = try ExternalPDFInbox.pendingItems(
+            sharedContainerURL: sharedContainer
+        )
+        let reparsedItem = try XCTUnwrap(
+            reparsed.first,
+            "Repaired metadata should remain readable"
+        )
+        XCTAssertEqual(reparsed.count, 1)
+        XCTAssertEqual(
+            reparsedItem.expectedSHA256,
+            expectedFingerprint
+        )
+    }
+
     func testOfficeFormatPlan_limitsLockedAndOversizedSources_BitsUT() {
         var oversized = makeProfile(pageCount: 1_201)
         oversized.byteCount = 320 * 1_024 * 1_024
@@ -3567,7 +4706,11 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             profile: locked
         )
         XCTAssertEqual(lockedPlan.readiness, .limited)
-        XCTAssertTrue(lockedPlan.riskEvidence.contains("Locked"))
+        XCTAssertTrue(
+            lockedPlan.riskEvidence.contains(
+                "Locked source".localizedUI
+            )
+        )
     }
 
     func testGeneratedPageMarks_roundTripAndRemoveIndependently_BitsUT()
@@ -4195,6 +5338,28 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertTrue(current.isCurrent)
         XCTAssertEqual(current.currentCount, 2)
         XCTAssertEqual(current.trustStatus, .thisDevice)
+        let exportedReceiptURL = try await store
+            .exportBatesBatchReceipt(receiptID: receipt.id)
+        let externalStore = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ExternalBatesReceiptStore"),
+            signingPrivateKeyProvider: {
+                Curve25519.Signing.PrivateKey()
+            }
+        )
+        let externalInspection = try await externalStore
+            .inspectExternalBatesBatchReceipt(at: exportedReceiptURL)
+        XCTAssertEqual(
+            externalInspection.report.signatureStatus,
+            .verified
+        )
+        XCTAssertEqual(externalInspection.report.trustStatus, .unknown)
+        let retainedExternal = try await externalStore
+            .retainExternalBatesBatchReceipt(receipt)
+        XCTAssertEqual(retainedExternal.first?.id, receipt.id)
+        let deletedExternal = try await externalStore
+            .deleteBatesBatchReceipt(receiptID: receipt.id)
+        XCTAssertTrue(deletedExternal.isEmpty)
 
         var numberedURLs: [URL] = []
         for record in committed.records {
@@ -4277,7 +5442,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
                 .appendingPathComponent("OfficeMatchStore"),
             signingPrivateKeyProvider: { signingKey }
         )
-        let createdAt = Date(timeIntervalSince1970: 100)
+        let createdAt = PDFOfficeTimeAnchor.process.trustedDate()
         let payload = PDFOfficeVerificationPayload(
             schema: "PaperPath Office Delivery V34",
             packageID: UUID(),
@@ -4352,7 +5517,7 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             recordID: record.id
         )
         let archiveName = "01-approved-source.pdf"
-        let createdAt = Date(timeIntervalSince1970: 100)
+        let createdAt = Date()
         let manifest = PDFVersionArchiveManifest(
             schema: "PaperPath Version Archive V49",
             createdAt: createdAt,
@@ -4396,8 +5561,22 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             destination: archiveURL
         )
 
+        let extractionDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.verifiedVersionArchivePrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try LocalFileSecurity.prepareProtectedDirectory(
+            at: extractionDirectory
+        )
+        defer {
+            try? FileManager.default.removeItem(at: extractionDirectory)
+        }
         let rawReport = try PDFVersionArchiveVerificationService()
-            .verify(archiveURL: archiveURL)
+            .verify(
+                archiveURL: archiveURL,
+                extractionDirectory: extractionDirectory
+            )
         XCTAssertEqual(rawReport.status, .verified)
         XCTAssertEqual(rawReport.signatureStatus, .verified)
         XCTAssertEqual(rawReport.trustStatus, .unknown)
@@ -4406,6 +5585,32 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
         XCTAssertEqual(trustedReport.trustStatus, .thisDevice)
         XCTAssertEqual(trustedReport.verifiedCount, 1)
+
+        let foreignKey = Curve25519.Signing.PrivateKey()
+        let foreignStore = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ForeignVersionArchiveStore"),
+            signingPrivateKeyProvider: { foreignKey }
+        )
+        let unknownReport = try await foreignStore
+            .resolveVersionArchiveTrust(rawReport)
+        XCTAssertEqual(unknownReport.trustStatus, .unknown)
+        let trustedSigners = try await foreignStore
+            .trustVersionArchiveSigner(unknownReport)
+        XCTAssertEqual(
+            trustedSigners.first?.keyID,
+            rawReport.signerKeyID
+        )
+        let externallyTrusted = try await foreignStore
+            .resolveVersionArchiveTrust(rawReport)
+        XCTAssertEqual(externallyTrusted.trustStatus, .trusted)
+        let recovered = try await foreignStore
+            .importVerifiedVersionArchiveArtifact(
+                externallyTrusted,
+                itemID: snapshot.id
+            )
+        XCTAssertEqual(recovered.profile.pageCount, 2)
+        XCTAssertEqual(recovered.contentFingerprint, snapshot.contentFingerprint)
     }
 
     func testPageGeometryRedactionAndStorageModelsClampInputs_BitsUT() {
@@ -4466,9 +5671,10 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             deliveryCacheBytes: 5,
             officeExportBytes: 6,
             officeDeliveryBytes: 7,
-            metadataBytes: 8
+            changeReportBytes: 8,
+            metadataBytes: 9
         )
-        XCTAssertEqual(storage.totalBytes, 36)
+        XCTAssertEqual(storage.totalBytes, 45)
         XCTAssertTrue(
             PDFPinnedVersionStorageSummary(
                 milestoneCount: 28,
@@ -4524,9 +5730,5828 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
     }
 
+    func testTaskAndActionPlannersPrioritizeResumeAndDeliveryState_BitsUT()
+        throws {
+        var formProfile = makeProfile(pageCount: 2)
+        formProfile.kind = .form
+        formProfile.formFieldCount = 3
+        let checkpoint = DocumentTaskCheckpoint(
+            stage: .sign,
+            pageIndex: 12,
+            fieldName: "  Approval signature  ",
+            normalizedBounds: PDFNormalizedRect(
+                x: 0.2,
+                y: 0.2,
+                width: 0.4,
+                height: 0.1
+            ),
+            updatedAt: Date(timeIntervalSince1970: 1_000)
+        )
+        let record = DocumentRecord(
+            displayName: "Client agreement",
+            fileName: "agreement.pdf",
+            profile: formProfile,
+            workflowStatus: .reviewing,
+            completedActions: [.reviewForm],
+            taskCheckpoint: checkpoint
+        )
+
+        XCTAssertEqual(record.taskCheckpoint?.pageIndex, 1)
+        XCTAssertEqual(record.taskCheckpoint?.fieldName, "Approval signature")
+        XCTAssertEqual(
+            DocumentActionPlanner.actions(
+                for: record,
+                hasRecognizedText: false
+            ).first,
+            .sign
+        )
+        XCTAssertFalse(
+            DocumentActionPlanner.actions(
+                for: record,
+                hasRecognizedText: false
+            ).contains(.reviewForm)
+        )
+        let packageRecommendation = try XCTUnwrap(
+            PDFTaskPackagePlanner.recommendation(
+                for: record,
+                hasRecognizedText: false
+            )
+        )
+        XCTAssertEqual(packageRecommendation.task, .signPDF)
+        XCTAssertEqual(packageRecommendation.title, "Continue signing")
+        XCTAssertTrue(
+            packageRecommendation.reason.contains("Approval signature")
+        )
+
+        let revisionID = UUID()
+        let fingerprint = String(repeating: "a", count: 64)
+        let deliveryReceipt = PDFDeliveryReceipt(
+            id: UUID(),
+            operation: .safeShare,
+            createdAt: Date(timeIntervalSince1970: 1_000),
+            sourcePageCount: 1,
+            outputPageCount: 1,
+            renderedPageCount: 1,
+            sourceByteCount: 2_048,
+            outputByteCount: 2_048,
+            unexpectedBlankPageIndices: [],
+            annotationCount: 0,
+            textCharacterCount: 12,
+            personalMetadataEntryCount: 0,
+            isEncrypted: false,
+            sha256: fingerprint,
+            checks: [
+                PDFDeliveryCheck(
+                    id: "reopened",
+                    title: "Reopened",
+                    detail: "Every output page reopened.",
+                    status: .passed
+                )
+            ],
+            sourceRevisionID: nil,
+            outputRevisionID: revisionID
+        )
+        var deliveryProfile = makeProfile(pageCount: 1)
+        deliveryProfile.byteCount = 2_048
+        let deliveryArtifact = DocumentRecord(
+            displayName: "Signed copy",
+            fileName: "signed.pdf",
+            contentRevisionID: revisionID,
+            profile: deliveryProfile,
+            deliveryReceipt: deliveryReceipt,
+            sourceDocumentID: UUID(),
+            contentFingerprint: fingerprint
+        )
+
+        XCTAssertTrue(deliveryArtifact.isDeliveryArtifact)
+        XCTAssertTrue(deliveryArtifact.hasCurrentDeliveryReceipt)
+        XCTAssertEqual(
+            DocumentActionPlanner.actions(
+                for: deliveryArtifact,
+                hasRecognizedText: false
+            ),
+            [.shareCopy, .inspect]
+        )
+        XCTAssertEqual(
+            PDFTaskPackagePlanner.recommendation(
+                for: deliveryArtifact,
+                hasRecognizedText: false
+            )?.title,
+            "Share verified PDF"
+        )
+    }
+
+    func testDocumentRecordDecodingAndCandidateRelationContracts_BitsUT()
+        throws {
+        let base = Date(timeIntervalSince1970: 94_000)
+        let sourceID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000101")
+        )
+        let parentID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000102")
+        )
+        let legacyRecord = DocumentRecord(
+            id: sourceID,
+            displayName: "Legacy agreement",
+            fileName: "legacy.pdf",
+            importedAt: base,
+            modifiedAt: base.addingTimeInterval(5),
+            contentRevisionID: UUID(),
+            profile: makeProfile(pageCount: 3),
+            workflowStatus: .reviewing,
+            isPinned: true,
+            tags: ["legal"],
+            bookmarkedPages: [2],
+            lastPageIndex: 99,
+            lastViewedAt: base.addingTimeInterval(8),
+            completedActions: [.inspect],
+            taskCheckpoint: DocumentTaskCheckpoint(
+                stage: .sign,
+                pageIndex: 99,
+                fieldName: "  Approval  ",
+                updatedAt: base.addingTimeInterval(10)
+            ),
+            sourceDocumentID: parentID,
+            sourceImportedFingerprint: String(repeating: "a", count: 64),
+            contentFingerprint: String(repeating: "b", count: 64),
+            deletedAt: base.addingTimeInterval(11),
+            dueAt: base.addingTimeInterval(12),
+            privateNote: "Internal note",
+            bookmarkNames: [2: "Signature"],
+            sharedImportID: UUID()
+        )
+
+        let encoded = try JSONEncoder().encode(legacyRecord)
+        var object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        [
+            "contentRevisionID",
+            "workflowStatus",
+            "isPinned",
+            "tags",
+            "bookmarkedPages",
+            "lastViewedAt",
+            "completedActions",
+            "officeReceipts",
+            "sourceDocumentID",
+            "sourceImportedFingerprint",
+            "contentFingerprint",
+            "deletedAt",
+            "dueAt",
+            "privateNote",
+            "bookmarkNames",
+            "sharedImportID"
+        ].forEach { object.removeValue(forKey: $0) }
+        object["lastPageIndex"] = 99
+        if var checkpoint = object["taskCheckpoint"] as? [String: Any] {
+            checkpoint["pageIndex"] = 99
+            object["taskCheckpoint"] = checkpoint
+        }
+        let legacyData = try JSONSerialization.data(withJSONObject: object)
+
+        let decoded = try JSONDecoder().decode(
+            DocumentRecord.self,
+            from: legacyData
+        )
+        XCTAssertEqual(decoded.contentRevisionID, decoded.id)
+        XCTAssertEqual(decoded.workflowStatus, .inbox)
+        XCTAssertFalse(decoded.isPinned)
+        XCTAssertTrue(decoded.tags.isEmpty)
+        XCTAssertTrue(decoded.bookmarkedPages.isEmpty)
+        XCTAssertNil(decoded.lastViewedAt)
+        XCTAssertTrue(decoded.completedActions.isEmpty)
+        XCTAssertTrue(decoded.officeReceipts.isEmpty)
+        XCTAssertNil(decoded.sourceDocumentID)
+        XCTAssertNil(decoded.contentFingerprint)
+        XCTAssertNil(decoded.deletedAt)
+        XCTAssertNil(decoded.dueAt)
+        XCTAssertNil(decoded.privateNote)
+        XCTAssertTrue(decoded.bookmarkNames.isEmpty)
+        XCTAssertNil(decoded.sharedImportID)
+        XCTAssertEqual(decoded.lastPageIndex, 2)
+        XCTAssertEqual(decoded.taskCheckpoint?.pageIndex, 2)
+        XCTAssertEqual(decoded.taskCheckpoint?.fieldName, "Approval")
+
+        let source = DocumentRecord(
+            id: sourceID,
+            displayName: "Matter source",
+            fileName: "source.pdf",
+            modifiedAt: base,
+            profile: makeProfile(pageCount: 2),
+            sourceDocumentID: parentID
+        )
+        let directChildID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000103")
+        )
+        let directChild = DocumentRecord(
+            id: directChildID,
+            displayName: "Verified output",
+            fileName: "child.pdf",
+            modifiedAt: base,
+            profile: makeProfile(pageCount: 2),
+            lastViewedAt: base.addingTimeInterval(10),
+            sourceDocumentID: source.id
+        )
+        let parent = DocumentRecord(
+            id: parentID,
+            displayName: "Original parent",
+            fileName: "parent.pdf",
+            modifiedAt: base,
+            profile: makeProfile(pageCount: 2),
+            lastViewedAt: base.addingTimeInterval(5)
+        )
+        let siblingID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000104")
+        )
+        let sibling = DocumentRecord(
+            id: siblingID,
+            displayName: "Sibling export",
+            fileName: "sibling.pdf",
+            modifiedAt: base,
+            profile: makeProfile(pageCount: 2),
+            lastViewedAt: base.addingTimeInterval(1_000),
+            sourceDocumentID: parentID
+        )
+        let unrelatedID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000105")
+        )
+        let unrelated = DocumentRecord(
+            id: unrelatedID,
+            displayName: "Recently viewed unrelated",
+            fileName: "unrelated.pdf",
+            modifiedAt: base,
+            profile: makeProfile(pageCount: 2),
+            lastViewedAt: base.addingTimeInterval(2_000)
+        )
+        let alphaID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000106")
+        )
+        let alpha = DocumentRecord(
+            id: alphaID,
+            displayName: "Alpha appendix",
+            fileName: "alpha.pdf",
+            modifiedAt: base,
+            profile: makeProfile(pageCount: 2)
+        )
+        let bravoID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000107")
+        )
+        let bravo = DocumentRecord(
+            id: bravoID,
+            displayName: "Bravo appendix",
+            fileName: "bravo.pdf",
+            modifiedAt: base.addingTimeInterval(100),
+            profile: makeProfile(pageCount: 2)
+        )
+        var lockedProfile = makeProfile(pageCount: 2)
+        lockedProfile.isLocked = true
+        let lockedRelated = DocumentRecord(
+            displayName: "Locked related",
+            fileName: "locked.pdf",
+            profile: lockedProfile,
+            sourceDocumentID: source.id
+        )
+
+        let ordered = DocumentComparisonCandidates.ordered(
+            from: [
+                unrelated,
+                sibling,
+                source,
+                bravo,
+                directChild,
+                lockedRelated,
+                alpha,
+                parent
+            ],
+            sourceID: source.id
+        )
+        XCTAssertEqual(
+            ordered.map(\.id),
+            [directChildID, parentID, siblingID, unrelatedID, alphaID, bravoID]
+        )
+        XCTAssertFalse(ordered.contains { $0.profile.isLocked })
+        XCTAssertFalse(ordered.contains { $0.id == source.id })
+    }
+
+    func testQuickTaskSearchSupportAndPackageHomeOrdering_BitsUT() {
+        XCTAssertEqual(
+            PDFTaskPackagePlanner.homePackages(for: []),
+            [
+                .prepareToSend,
+                .makeSearchable,
+                .convertForWork,
+                .compressForEmail,
+                .fixPages
+            ]
+        )
+        XCTAssertEqual(PDFQuickTask.exportText.matchScore("PDF to Office"), 100)
+        XCTAssertTrue(PDFQuickTask.exportText.matches("word excel"))
+        XCTAssertNil(PDFQuickTask.redactPDF.matchScore("scan camera"))
+        XCTAssertEqual(DocumentTool.find.matchScore("Find"), 1_210)
+        XCTAssertTrue(DocumentTool.bates.matches("legal exhibit"))
+        XCTAssertFalse(DocumentTool.protect.matches("ocr scan"))
+
+        var lockedProfile = makeProfile(pageCount: 3)
+        lockedProfile.isLocked = true
+        let lockedRecord = DocumentRecord(
+            displayName: "Locked",
+            fileName: "locked.pdf",
+            profile: lockedProfile
+        )
+
+        XCTAssertFalse(PDFQuickTask.safeShare.supports(lockedRecord))
+        XCTAssertFalse(PDFTaskPackage.prepareToSend.supports(lockedRecord))
+        XCTAssertEqual(
+            DocumentActionPlanner.actions(
+                for: lockedRecord,
+                hasRecognizedText: false
+            ),
+            [.inspect, .shareCopy]
+        )
+    }
+
+    func testOfficePortfolioRoutesAndReceiptAvailability_BitsUT() {
+        var protectedScan = makeProfile(pageCount: 640)
+        protectedScan.kind = .scan
+        protectedScan.sampledPageCount = 10
+        protectedScan.imageDominantPageCount = 9
+        protectedScan.byteCount = 300 * 1_024 * 1_024
+        protectedScan.isEncrypted = true
+        protectedScan.isLocked = true
+        protectedScan.allowsCopying = false
+
+        let portfolio = PDFOfficeExportPortfolio(profile: protectedScan)
+        XCTAssertEqual(portfolio.routeConfidence, .weak)
+        XCTAssertEqual(portfolio.productionSLA, .constrained)
+        XCTAssertGreaterThanOrEqual(portfolio.limitedSignalCount, 2)
+        XCTAssertEqual(portfolio.preflightSignals.count, 4)
+        XCTAssertEqual(portfolio.suggestedSegmentCount, 3)
+        XCTAssertTrue(
+            portfolio.outputBoundaryLine.contains("640")
+        )
+        XCTAssertTrue(
+            portfolio.recoveryActions.map(\.id).contains("permissions")
+        )
+        XCTAssertTrue(
+            portfolio.recoveryActions.map(\.id).contains("ocr")
+        )
+        XCTAssertEqual(
+            PDFOfficeExportFormatPlan.plan(
+                for: .powerPointPresentation,
+                profile: protectedScan
+            ).readiness,
+            .limited
+        )
+
+        let revisionID = UUID()
+        let now = Date(timeIntervalSince1970: 10_000)
+        let budgetPlan = PDFOfficeVisualBudgetPlan(
+            profile: makeProfile(pageCount: 2)
+        )
+        let plan = PDFOfficeExportFormatPlan(
+            format: .wordDocument,
+            readiness: .review,
+            editabilityScore: 70,
+            appearanceScore: 68,
+            sizeScore: 90,
+            primaryEvidence: "70% text",
+            riskEvidence: "Local rebuild",
+            preferredUse: "Contracts",
+            fallbackFormat: .plainText
+        )
+        var receipt = PDFOfficeExportReceipt(
+            format: .wordDocument,
+            fileName: "Agreement.docx",
+            fileSizeBytes: 4_096,
+            plan: plan,
+            budgetPlan: budgetPlan
+        )
+        receipt.sourceRevisionID = revisionID
+        receipt.retainedFileName = "Agreement.docx"
+        receipt.reusableUntil = now.addingTimeInterval(60)
+        receipt.artifactSHA256 = "abcdef123456" + String(repeating: "0", count: 52)
+
+        XCTAssertEqual(
+            receipt.artifactAvailability(for: revisionID, now: now),
+            .reusable
+        )
+        XCTAssertEqual(
+            receipt.artifactAvailability(for: UUID(), now: now),
+            .sourceChanged
+        )
+        XCTAssertEqual(
+            receipt.artifactAvailability(
+                for: revisionID,
+                now: now.addingTimeInterval(120)
+            ),
+            .expired
+        )
+        XCTAssertEqual(receipt.shortArtifactFingerprint, "abcd ef12 3456")
+        XCTAssertEqual(receipt.embeddedEvidenceLabel, "App receipt")
+        XCTAssertTrue(
+            receipt.qualityGateSummary.contains(
+                "\(receipt.routeScore)"
+            )
+        )
+        receipt.pinnedAt = now
+        XCTAssertEqual(
+            receipt.artifactAvailability(
+                for: revisionID,
+                now: now.addingTimeInterval(120)
+            ),
+            .reusable
+        )
+        receipt.integrityStatus = .mismatch
+        XCTAssertEqual(receipt.integritySummary, "Hash mismatch")
+    }
+
+    func testProgressAndBatchStateClampValues_BitsUT() {
+        let stalledDate = Date(timeIntervalSince1970: 200)
+        let stalledProgress = PDFOfficeIntegrityProgress(
+            completedCount: 1,
+            totalCount: 4,
+            currentSourceName: "Large.pdf",
+            processedBytes: 32,
+            totalBytes: 1_024,
+            bytesPerSecond: 256,
+            estimatedRemainingSeconds: 125.1,
+            activity: .checksumming,
+            throughputHistory: [128, 256],
+            lastByteUpdateAt: stalledDate.addingTimeInterval(-2.1)
+        )
+        XCTAssertEqual(stalledProgress.fractionCompleted, 0.03125)
+        XCTAssertEqual(stalledProgress.counter, "1/4")
+        XCTAssertEqual(stalledProgress.remainingSummary, "2m 6s")
+        XCTAssertNotNil(stalledProgress.byteSummary)
+        XCTAssertNotNil(stalledProgress.throughputSummary)
+        XCTAssertTrue(stalledProgress.isStalled(at: stalledDate))
+
+        let overComplete = PDFOfficeIntegrityProgress(
+            completedCount: 9,
+            totalCount: 3,
+            currentSourceName: "Done.pdf"
+        )
+        XCTAssertEqual(overComplete.fractionCompleted, 1)
+        XCTAssertFalse(overComplete.isStalled(at: stalledDate))
+
+        let batchProgress = PDFBatesBatchProgress(
+            stage: .committing,
+            completedDocumentCount: 99,
+            totalDocumentCount: 1,
+            completedPageCount: 99,
+            totalPageCount: 10,
+            currentDocumentName: "Batch.pdf"
+        )
+        XCTAssertEqual(batchProgress.fractionCompleted, 1)
+        XCTAssertEqual(
+            PDFOperationProgress(
+                label: "Write",
+                fractionCompleted: 0.456,
+                processedBytes: 1_024,
+                totalBytes: 2_048,
+                bytesPerSecond: 512,
+                estimatedRemainingSeconds: 0.2,
+                lastByteUpdateAt: stalledDate.addingTimeInterval(-3)
+            ).remainingSummary,
+            "1s"
+        )
+    }
+
+    func testOfficeVerificationAndMatchPayloadsRejectTampering_BitsUT() {
+        let now = Date(timeIntervalSince1970: 20_000)
+        let packageID = UUID()
+        let receiptID = UUID()
+        let hash = String(repeating: "b", count: 64)
+        let entry = PDFOfficeDeliveryEntry(
+            sourceRecordID: UUID(),
+            sourceRevisionID: UUID(),
+            sourceName: "Quarterly report",
+            receiptID: receiptID,
+            format: .wordDocument,
+            archiveName: "QuarterlyReport.docx",
+            byteCount: 2_048,
+            sha256: hash
+        )
+        let payload = PDFOfficeVerificationPayload(
+            schema: "PaperPath Office Delivery V34",
+            packageID: packageID,
+            createdAt: now,
+            expiresAt: now.addingTimeInterval(3_600),
+            verifiedOutputs: 1,
+            files: [entry]
+        )
+        XCTAssertTrue(payload.isStructurallyValid(at: now.addingTimeInterval(60)))
+        XCTAssertTrue(payload.isActive(at: now.addingTimeInterval(60)))
+        XCTAssertFalse(payload.isActive(at: now.addingTimeInterval(3_601)))
+
+        let unsafeEntry = PDFOfficeDeliveryEntry(
+            sourceRecordID: entry.sourceRecordID,
+            sourceRevisionID: entry.sourceRevisionID,
+            sourceName: entry.sourceName,
+            receiptID: entry.receiptID,
+            format: entry.format,
+            archiveName: "../QuarterlyReport.docx",
+            byteCount: entry.byteCount,
+            sha256: entry.sha256
+        )
+        XCTAssertFalse(
+            PDFOfficeVerificationPayload(
+                schema: payload.schema,
+                packageID: packageID,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(3_600),
+                verifiedOutputs: 1,
+                files: [unsafeEntry]
+            ).isStructurallyValid(at: now.addingTimeInterval(60))
+        )
+
+        let signature = PDFOfficeVerificationSignature(
+            algorithm: "Ed25519",
+            keyID: "0123456789abcdef",
+            publicKeyBase64: "public",
+            signatureBase64: "signature"
+        )
+        let candidate = PDFOfficeExternalCandidate(
+            id: UUID(),
+            fileName: "QuarterlyReport.docx",
+            fileExtension: "docx",
+            byteCount: entry.byteCount,
+            sha256: entry.sha256
+        )
+        let reportID = UUID()
+        let checkedAt = now.addingTimeInterval(120)
+        let validReport = PDFOfficeExternalMatchReport(
+            id: reportID,
+            packageID: packageID,
+            checkedAt: checkedAt,
+            matches: [
+                PDFOfficeExternalEntryMatch(
+                    entry: entry,
+                    status: .exact,
+                    candidates: [candidate]
+                )
+            ],
+            extraCandidates: [],
+            totalCandidateCount: 1,
+            totalCandidateBytes: candidate.byteCount
+        )
+        let signedDelivery = PDFOfficeSignedVerificationReport(
+            payload: payload,
+            signature: signature
+        )
+        XCTAssertTrue(
+            PDFOfficeMatchReportPayload(
+                schema: PDFOfficeMatchReportPayload.schema,
+                reportID: reportID,
+                createdAt: checkedAt,
+                deliveryReport: signedDelivery,
+                matchReport: validReport
+            ).isStructurallyValid(at: checkedAt.addingTimeInterval(1))
+        )
+
+        let tamperedStatusReport = PDFOfficeExternalMatchReport(
+            id: reportID,
+            packageID: packageID,
+            checkedAt: checkedAt,
+            matches: [
+                PDFOfficeExternalEntryMatch(
+                    entry: entry,
+                    status: .ambiguous,
+                    candidates: [candidate]
+                )
+            ],
+            extraCandidates: [],
+            totalCandidateCount: 1,
+            totalCandidateBytes: candidate.byteCount
+        )
+        XCTAssertFalse(
+            PDFOfficeMatchReportPayload(
+                schema: PDFOfficeMatchReportPayload.schema,
+                reportID: reportID,
+                createdAt: checkedAt,
+                deliveryReport: signedDelivery,
+                matchReport: tamperedStatusReport
+            ).isStructurallyValid(at: checkedAt.addingTimeInterval(1))
+        )
+    }
+
+    func testBatesReceiptAndExternalMatchPayloadsValidateLinkage_BitsUT()
+        throws {
+        let now = Date(timeIntervalSince1970: 30_000)
+        let sourceA = String(repeating: "1", count: 64)
+        let outputA = String(repeating: "2", count: 64)
+        let sourceB = String(repeating: "3", count: 64)
+        let outputB = String(repeating: "4", count: 64)
+        let clearedA = String(repeating: "5", count: 64)
+        let clearedB = String(repeating: "6", count: 64)
+        let recordA = makeRecord(name: "A.pdf", pageCount: 2)
+        let recordB = makeRecord(name: "B.pdf", pageCount: 1)
+        let entryA = makeBatesEntry(
+            record: recordA,
+            outputRevisionID: UUID(),
+            start: 1,
+            end: 2,
+            sourceHash: sourceA,
+            outputHash: outputA
+        )
+        let entryB = makeBatesEntry(
+            record: recordB,
+            outputRevisionID: UUID(),
+            start: 3,
+            end: 3,
+            sourceHash: sourceB,
+            outputHash: outputB
+        )
+        let batchID = UUID()
+        let payload = PDFBatesBatchReceiptPayload(
+            schema: PDFBatesBatchReceiptPayload.schema,
+            batchID: batchID,
+            createdAt: now,
+            digitCount: 4,
+            prefix: "CASE-",
+            suffix: "",
+            position: .bottomRight,
+            totalPageCount: 3,
+            firstIdentifier: "CASE-0001",
+            lastIdentifier: "CASE-0003",
+            entries: [entryA, entryB]
+        )
+        XCTAssertTrue(payload.isStructurallyValid(at: now.addingTimeInterval(60)))
+
+        let removalPayload = PDFBatesRemovalReceiptPayload(
+            schema: PDFBatesRemovalReceiptPayload.schema,
+            removalID: UUID(),
+            batesBatchID: batchID,
+            createdAt: now.addingTimeInterval(10),
+            totalPageCount: 3,
+            entries: [
+                PDFBatesRemovalReceiptEntry(
+                    recordID: entryA.recordID,
+                    displayName: entryA.displayName,
+                    pageCount: entryA.pageCount,
+                    numberedRevisionID: entryA.outputRevisionID,
+                    clearedRevisionID: UUID(),
+                    numberedSHA256: entryA.outputSHA256,
+                    clearedSHA256: clearedA
+                ),
+                PDFBatesRemovalReceiptEntry(
+                    recordID: entryB.recordID,
+                    displayName: entryB.displayName,
+                    pageCount: entryB.pageCount,
+                    numberedRevisionID: entryB.outputRevisionID,
+                    clearedRevisionID: UUID(),
+                    numberedSHA256: entryB.outputSHA256,
+                    clearedSHA256: clearedB
+                )
+            ]
+        )
+        XCTAssertTrue(
+            removalPayload.isLinked(
+                to: payload,
+                at: now.addingTimeInterval(60)
+            )
+        )
+
+        let signature = PDFOfficeVerificationSignature(
+            algorithm: "Ed25519",
+            keyID: "fedcba9876543210",
+            publicKeyBase64: "public",
+            signatureBase64: "signature"
+        )
+        let signedReceipt = PDFSignedBatesBatchReceipt(
+            payload: payload,
+            signature: signature,
+            removal: PDFSignedBatesRemovalReceipt(
+                payload: removalPayload,
+                signature: signature
+            )
+        )
+        let candidateA = PDFBatesExternalCandidate(
+            id: UUID(),
+            fileName: "A-numbered.pdf",
+            byteCount: 10,
+            sha256: outputA
+        )
+        let candidateB = PDFBatesExternalCandidate(
+            id: UUID(),
+            fileName: "B-cleared.pdf",
+            byteCount: 12,
+            sha256: clearedB
+        )
+        let reportID = UUID()
+        let checkedAt = now.addingTimeInterval(20)
+        let report = PDFBatesExternalMatchReport(
+            id: reportID,
+            receiptID: signedReceipt.id,
+            checkedAt: checkedAt,
+            matches: [
+                PDFBatesExternalEntryMatch(
+                    entry: entryA,
+                    status: .outputMatch,
+                    candidates: [candidateA]
+                ),
+                PDFBatesExternalEntryMatch(
+                    entry: entryB,
+                    status: .removedMatch,
+                    candidates: [candidateB]
+                )
+            ],
+            unrecognizedCandidates: [],
+            totalCandidateCount: 2,
+            totalCandidateBytes: candidateA.byteCount + candidateB.byteCount
+        )
+        XCTAssertTrue(
+            PDFBatesMatchReportPayload(
+                schema: PDFBatesMatchReportPayload.schema,
+                reportID: reportID,
+                createdAt: checkedAt,
+                receipt: signedReceipt,
+                report: report
+            ).isStructurallyValid(at: checkedAt.addingTimeInterval(1))
+        )
+
+        let tamperedReport = PDFBatesExternalMatchReport(
+            id: reportID,
+            receiptID: signedReceipt.id,
+            checkedAt: checkedAt,
+            matches: [
+                PDFBatesExternalEntryMatch(
+                    entry: entryA,
+                    status: .missing,
+                    candidates: [candidateA]
+                ),
+                PDFBatesExternalEntryMatch(
+                    entry: entryB,
+                    status: .removedMatch,
+                    candidates: [candidateB]
+                )
+            ],
+            unrecognizedCandidates: [],
+            totalCandidateCount: 2,
+            totalCandidateBytes: candidateA.byteCount + candidateB.byteCount
+        )
+        XCTAssertFalse(
+            PDFBatesMatchReportPayload(
+                schema: PDFBatesMatchReportPayload.schema,
+                reportID: reportID,
+                createdAt: checkedAt,
+                receipt: signedReceipt,
+                report: tamperedReport
+            ).isStructurallyValid(at: checkedAt.addingTimeInterval(1))
+        )
+    }
+
+    func testDeliveryManifestVersionArchiveAndProvenanceContracts_BitsUT() {
+        let now = Date(timeIntervalSince1970: 40_000)
+        let revisionID = UUID()
+        let fingerprint = String(repeating: "c", count: 64)
+        let check = PDFDeliveryCheck(
+            id: "reopened",
+            title: "Reopened",
+            detail: "All pages reopened after rendering.",
+            status: .passed
+        )
+        let receipt = PDFDeliveryReceipt(
+            id: UUID(),
+            operation: .safeShare,
+            createdAt: now,
+            sourcePageCount: 2,
+            outputPageCount: 2,
+            renderedPageCount: 2,
+            sourceByteCount: 8_192,
+            outputByteCount: 8_192,
+            unexpectedBlankPageIndices: [],
+            annotationCount: 1,
+            textCharacterCount: 240,
+            personalMetadataEntryCount: 0,
+            isEncrypted: false,
+            sha256: fingerprint,
+            checks: [check],
+            sourceRevisionID: nil,
+            outputRevisionID: revisionID
+        )
+        let record = DocumentRecord(
+            displayName: "Delivery",
+            fileName: "delivery.pdf",
+            contentRevisionID: revisionID,
+            profile: DocumentProfile(
+                pageCount: 2,
+                sampledPageCount: 2,
+                textCharacterCount: 240,
+                imageDominantPageCount: 0,
+                formFieldCount: 0,
+                byteCount: 8_192,
+                isEncrypted: false,
+                isLocked: false,
+                allowsCopying: true,
+                allowsCommenting: true,
+                kind: .text,
+                recommendedActions: [.inspect, .shareCopy]
+            ),
+            deliveryReceipt: receipt,
+            contentFingerprint: fingerprint
+        )
+
+        XCTAssertTrue(receipt.isVerified(at: now.addingTimeInterval(1)))
+        XCTAssertEqual(receipt.shortFingerprint, "cccc cccc cccc")
+        XCTAssertTrue(record.hasCurrentDeliveryReceipt)
+        let manifest = PDFDeliveryPackageManifest(
+            packageID: UUID(),
+            createdAt: now.addingTimeInterval(1),
+            artifactFileName: "Delivery.pdf",
+            record: record,
+            receipt: receipt
+        )
+        XCTAssertTrue(manifest.isStructurallyValid(at: now.addingTimeInterval(2)))
+        XCTAssertFalse(
+            PDFDeliveryPackageManifest(
+                packageID: UUID(),
+                createdAt: now.addingTimeInterval(1),
+                artifactFileName: "../Delivery.pdf",
+                record: record,
+                receipt: receipt
+            ).isStructurallyValid(at: now.addingTimeInterval(2))
+        )
+
+        let verificationReport = PDFDeliveryPackageVerificationReport(
+            archiveName: "Delivery.zip",
+            archiveByteCount: 10_000,
+            packageID: manifest.packageID,
+            packageCreatedAt: manifest.createdAt,
+            verifiedAt: now.addingTimeInterval(2),
+            artifactFileName: manifest.artifact.fileName,
+            artifactByteCount: manifest.artifact.byteCount,
+            artifactPageCount: manifest.artifact.pageCount,
+            isEncrypted: false,
+            operation: manifest.operation,
+            deliveryReceiptID: manifest.deliveryReceiptID,
+            expectedSHA256: fingerprint,
+            actualSHA256: fingerprint,
+            checks: [check],
+            integrityFailures: [],
+            signatureStatus: .verified,
+            signatureDetail: "Signature verified",
+            signerKeyID: "0123456789abcdef",
+            signerPublicKeyBase64: "public",
+            trustStatus: .unknown,
+            trustedSignerName: nil,
+            verifiedArtifactURL: URL(fileURLWithPath: "/tmp/Delivery.pdf")
+        )
+        XCTAssertEqual(verificationReport.status, .verified)
+        XCTAssertTrue(verificationReport.canTrustSigner)
+        XCTAssertTrue(verificationReport.canPreviewArtifact)
+        XCTAssertEqual(
+            verificationReport.resolvingTrust(
+                .trusted,
+                trustedSignerName: "Legal Ops"
+            ).provenanceTitle,
+            "Legal Ops"
+        )
+        let provenance = PDFReceivedPackageProvenance(
+            report: verificationReport,
+            importedAt: now.addingTimeInterval(3)
+        )
+        XCTAssertTrue(
+            provenance.matchesCurrentBytes(
+                fingerprint: fingerprint.uppercased(),
+                byteCount: manifest.artifact.byteCount
+            )
+        )
+        XCTAssertFalse(
+            provenance.matchesCurrentBytes(
+                fingerprint: String(repeating: "d", count: 64),
+                byteCount: manifest.artifact.byteCount
+            )
+        )
+
+        let versionEntry = PDFVersionArchiveManifest.Entry(
+            fileName: "Delivery.pdf",
+            documentID: record.id,
+            snapshotID: UUID(),
+            title: "Signed delivery",
+            createdAt: now,
+            byteCount: 8_192,
+            pageCount: 2,
+            sha256: fingerprint,
+            linkedDeliveryReceiptID: receipt.id
+        )
+        XCTAssertTrue(
+            PDFVersionArchiveManifest(
+                schema: PDFVersionArchiveManifest.currentSchema,
+                createdAt: now.addingTimeInterval(1),
+                entries: [versionEntry]
+            ).isStructurallyValid(at: now.addingTimeInterval(2))
+        )
+        let unsafeVersionEntry = PDFVersionArchiveManifest.Entry(
+            fileName: ".hidden.pdf",
+            documentID: record.id,
+            snapshotID: UUID(),
+            title: "Signed delivery",
+            createdAt: now,
+            byteCount: 8_192,
+            pageCount: 2,
+            sha256: fingerprint,
+            linkedDeliveryReceiptID: receipt.id
+        )
+        XCTAssertFalse(
+            PDFVersionArchiveManifest(
+                schema: PDFVersionArchiveManifest.currentSchema,
+                createdAt: now.addingTimeInterval(1),
+                entries: [unsafeVersionEntry]
+            ).isStructurallyValid(at: now.addingTimeInterval(2))
+        )
+    }
+
+    func testChangeReviewAndSignedPayloadContracts_BitsUT() {
+        let now = Date(timeIntervalSince1970: 50_000)
+        let sourceRevisionID = UUID()
+        let revisedRevisionID = UUID()
+        let receiptID = UUID()
+        let sourceFingerprint = String(repeating: "a", count: 64)
+        let revisedFingerprint = String(repeating: "B", count: 64)
+        let bodyHash = String(repeating: "c", count: 64)
+        let region = PDFDifferenceRegion(
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.4,
+            intensity: 0.9
+        )
+        let modified = PDFPageChange(
+            pageIndex: 0,
+            sourcePageIndex: 0,
+            revisedPageIndex: 1,
+            matchKind: .modified,
+            sourceExists: true,
+            revisedExists: true,
+            visibleDifference: 0.001,
+            changedPixelRatio: 0.0001,
+            geometryChanged: false,
+            textChanged: true,
+            sourceTextCharacterCount: 18,
+            revisedTextCharacterCount: 24,
+            differenceRegions: [region],
+            sourceTextDifferences: [
+                PDFTextDifferenceEvidence(
+                    kind: .removed,
+                    text: "  Old   clause  ",
+                    region: region
+                )
+            ],
+            revisedTextDifferences: [
+                PDFTextDifferenceEvidence(
+                    kind: .inserted,
+                    text: "New",
+                    region: region,
+                    granularity: .character
+                )
+            ],
+            matchBasis: .textMarker
+        )
+        let inserted = PDFPageChange(
+            pageIndex: 1,
+            sourceExists: false,
+            revisedExists: true,
+            visibleDifference: 0,
+            changedPixelRatio: 0,
+            geometryChanged: false,
+            textChanged: false,
+            sourceTextCharacterCount: 0,
+            revisedTextCharacterCount: 30
+        )
+        let removed = PDFPageChange(
+            pageIndex: 2,
+            sourceExists: true,
+            revisedExists: false,
+            visibleDifference: 0,
+            changedPixelRatio: 0,
+            geometryChanged: false,
+            textChanged: false,
+            sourceTextCharacterCount: 30,
+            revisedTextCharacterCount: 0
+        )
+
+        XCTAssertFalse(modified.isVisibleChange)
+        XCTAssertTrue(modified.isTextOnlyChange)
+        XCTAssertEqual(modified.severity, .major)
+        XCTAssertEqual(modified.resolvedTextDifferenceGranularity, .character)
+        XCTAssertTrue(modified.localizedTextEvidenceCountLabel.contains("1"))
+        XCTAssertTrue(modified.localizedTextEvidenceCountLabel.contains("·"))
+        XCTAssertEqual(
+            modified.textDifferencePreview,
+            "Old clause → New"
+        )
+        XCTAssertEqual(inserted.resolvedMatchKind, .inserted)
+        XCTAssertEqual(removed.resolvedMatchKind, .removed)
+        XCTAssertEqual(removed.preferredOpenSide, .source)
+        XCTAssertEqual(inserted.severity, .critical)
+
+        let review = PDFChangeReview(
+            sourcePageCount: 3,
+            revisedPageCount: 3,
+            comparedPageCount: 3,
+            changes: [modified, inserted, removed],
+            pageMatches: [
+                PDFPageMatch(
+                    id: 0,
+                    sourcePageIndex: 0,
+                    revisedPageIndex: 1,
+                    kind: .modified,
+                    basis: .textMarker
+                ),
+                PDFPageMatch(
+                    id: 1,
+                    sourcePageIndex: 1,
+                    revisedPageIndex: nil,
+                    kind: .removed
+                ),
+                PDFPageMatch(
+                    id: 2,
+                    sourcePageIndex: nil,
+                    revisedPageIndex: 2,
+                    kind: .inserted
+                )
+            ]
+        )
+        XCTAssertEqual(review.visibleChangedPageCount, 2)
+        XCTAssertEqual(review.textChangedPageCount, 1)
+        XCTAssertEqual(review.criticalChanges.count, 2)
+        XCTAssertEqual(review.insertedPages.count, 1)
+        XCTAssertEqual(review.removedPages.count, 1)
+        XCTAssertGreaterThan(review.estimatedCacheByteCount, 256)
+        XCTAssertEqual(review.revisedPage(matchingSourcePage: 0), 1)
+        XCTAssertNil(review.sourcePage(matchingRevisedPage: 0))
+        let lookup = PDFPageMatchLookup(review: review)
+        XCTAssertEqual(lookup.revisedPage(matchingSourcePage: 0), 1)
+        XCTAssertNil(lookup.sourcePage(matchingRevisedPage: 0))
+        let fallbackMatches = PDFChangeReview(
+            sourcePageCount: 2,
+            revisedPageCount: 1,
+            comparedPageCount: 2,
+            changes: []
+        ).resolvedPageMatches
+        XCTAssertEqual(fallbackMatches.map(\.kind), [.unchanged, .removed])
+
+        let payload = PDFChangeReportSignaturePayload(
+            schema: PDFChangeReportSignaturePayload.schema,
+            reportID: UUID(),
+            generatedAt: now,
+            sourceName: "Source.pdf",
+            revisedName: "Revised.pdf",
+            sourceRevisionID: sourceRevisionID,
+            revisedRevisionID: revisedRevisionID,
+            sourceFingerprint: sourceFingerprint,
+            revisedFingerprint: revisedFingerprint,
+            deliveryReceiptID: receiptID,
+            changedPageCount: review.totalChangedPageCount,
+            bodyByteCount: 2_048,
+            bodySHA256: bodyHash
+        )
+        XCTAssertTrue(payload.isStructurallyValid(at: now.addingTimeInterval(1)))
+        XCTAssertFalse(
+            PDFChangeReportSignaturePayload(
+                schema: payload.schema,
+                reportID: payload.reportID,
+                generatedAt: now.addingTimeInterval(6 * 60),
+                sourceName: payload.sourceName,
+                revisedName: payload.revisedName,
+                sourceRevisionID: sourceRevisionID,
+                revisedRevisionID: revisedRevisionID,
+                sourceFingerprint: sourceFingerprint,
+                revisedFingerprint: revisedFingerprint,
+                deliveryReceiptID: receiptID,
+                changedPageCount: review.totalChangedPageCount,
+                bodyByteCount: 2_048,
+                bodySHA256: bodyHash
+            ).isStructurallyValid(at: now)
+        )
+        XCTAssertFalse(
+            PDFChangeReportSignaturePayload(
+                schema: payload.schema,
+                reportID: payload.reportID,
+                generatedAt: now,
+                sourceName: "Source\nName.pdf",
+                revisedName: payload.revisedName,
+                sourceRevisionID: sourceRevisionID,
+                revisedRevisionID: revisedRevisionID,
+                sourceFingerprint: sourceFingerprint,
+                revisedFingerprint: revisedFingerprint,
+                deliveryReceiptID: receiptID,
+                changedPageCount: review.totalChangedPageCount,
+                bodyByteCount: PDFChangeReportSignaturePayload.maximumBodyBytes + 1,
+                bodySHA256: bodyHash
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+    }
+
+    func testTimeAnchoredReportVerificationAndTrustContracts_BitsUT() {
+        let baseDate = Date(timeIntervalSince1970: 60_000)
+        let anchor = PDFOfficeTimeAnchor(
+            referenceDate: baseDate,
+            systemUptime: 100
+        )
+        XCTAssertTrue(
+            anchor.restoreTrustedDate(
+                baseDate.addingTimeInterval(20)
+            )
+        )
+        XCTAssertFalse(
+            anchor.restoreTrustedDate(
+                Date(timeIntervalSince1970: -1)
+            )
+        )
+        XCTAssertEqual(
+            anchor.trustedDate(
+                wallDate: baseDate.addingTimeInterval(10),
+                systemUptime: 130
+            ),
+            baseDate.addingTimeInterval(30)
+        )
+        XCTAssertTrue(
+            anchor.hasWallClockRollback(
+                wallDate: baseDate.addingTimeInterval(10),
+                systemUptime: 130
+            )
+        )
+        XCTAssertNil(
+            anchor.evidenceIssuanceDate(
+                wallDate: baseDate.addingTimeInterval(10),
+                systemUptime: 130
+            )
+        )
+
+        let freshAnchor = PDFOfficeTimeAnchor(
+            referenceDate: baseDate,
+            systemUptime: 100
+        )
+        let verified = PDFOfficeReportVerificationResult(
+            status: .verified,
+            packageID: UUID(),
+            keyID: "0123456789abcdef",
+            sourceCount: 1,
+            outputCount: 1,
+            createdAt: baseDate,
+            expiresAt: baseDate.addingTimeInterval(60),
+            verifiedAt: baseDate.addingTimeInterval(1),
+            timeAnchor: freshAnchor,
+            detail: "Verified",
+            publicKeyBase64: "public",
+            trustStatus: .unknown,
+            trustedSignerName: nil
+        )
+        XCTAssertTrue(
+            verified.canTrustSigner(
+                at: baseDate.addingTimeInterval(10),
+                systemUptime: 105
+            )
+        )
+        XCTAssertEqual(
+            verified.effectiveStatus(
+                at: baseDate.addingTimeInterval(10),
+                systemUptime: 170
+            ),
+            .expired
+        )
+        XCTAssertFalse(
+            verified.canTrustSigner(
+                at: baseDate.addingTimeInterval(10),
+                systemUptime: 170
+            )
+        )
+        XCTAssertEqual(
+            verified.appendingDetail("Signed by Legal").detail,
+            "Verified Signed by Legal"
+        )
+        let trusted = verified.updatingTrust(
+            .trusted,
+            signerName: "Legal Ops"
+        )
+        XCTAssertEqual(trusted.trustStatus, .trusted)
+        XCTAssertEqual(trusted.trustedSignerName, "Legal Ops")
+        XCTAssertFalse(
+            trusted.canTrustSigner(
+                at: baseDate.addingTimeInterval(10),
+                systemUptime: 105
+            )
+        )
+    }
+
+    func testOfficeDeliveryPackageAndBatchRunContracts_BitsUT() {
+        let now = Date(timeIntervalSince1970: 70_000)
+        let packageID = UUID()
+        let hash = String(repeating: "d", count: 64)
+        let receiptID = UUID()
+        let entry = PDFOfficeDeliveryEntry(
+            sourceRecordID: UUID(),
+            sourceRevisionID: UUID(),
+            sourceName: "Board deck",
+            receiptID: receiptID,
+            format: .powerPointPresentation,
+            archiveName: "BoardDeck.pptx",
+            byteCount: 4_096,
+            sha256: hash
+        )
+        var package = PDFOfficeDeliveryPackage(
+            id: packageID,
+            createdAt: now,
+            entries: [entry]
+        )
+        package.expiresAt = now.addingTimeInterval(3_600)
+        package.archiveFileName = "\(packageID.uuidString).zip"
+        package.reportFileName =
+            "\(packageID.uuidString)-verification.json"
+        package.byteCount = 8_192
+        package.sha256 = hash
+        package.reportSHA256 = String(repeating: "e", count: 64)
+        package.signerKeyID = "0123456789abcdef"
+
+        XCTAssertTrue(package.isStructurallyValid(at: now.addingTimeInterval(1)))
+        XCTAssertFalse(package.isExpired(at: now.addingTimeInterval(60)))
+        XCTAssertTrue(package.isExpired(at: now.addingTimeInterval(3_601)))
+        XCTAssertEqual(package.sourceCount, 1)
+        XCTAssertEqual(package.shortFingerprint, String(hash.prefix(12)))
+        package.pinnedAt = now.addingTimeInterval(10)
+        XCTAssertFalse(package.isExpired(at: now.addingTimeInterval(3_601)))
+        XCTAssertTrue(package.isReportExpired(at: now.addingTimeInterval(3_601)))
+        XCTAssertTrue(
+            package.retentionSummary(
+                at: now.addingTimeInterval(3_601)
+            ).contains("Pinned")
+        )
+
+        var mismatchedReport = package
+        mismatchedReport.reportFileName = "unexpected.json"
+        XCTAssertFalse(
+            mismatchedReport.isStructurallyValid(
+                at: now.addingTimeInterval(1)
+            )
+        )
+        var badSigner = package
+        badSigner.signerKeyID = "short"
+        XCTAssertFalse(
+            badSigner.isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+
+        let sourceID = UUID()
+        let outputID = UUID()
+        let item = PDFBatchDeliveryItem(
+            sourceRecordID: sourceID,
+            outputRecordID: outputID,
+            stage: .verified,
+            detail: "Verified",
+            reviewPageIndex: nil,
+            issue: nil
+        )
+        let run = PDFBatchDeliveryRun(
+            id: UUID(),
+            startedAt: now,
+            updatedAt: now.addingTimeInterval(10),
+            sourceRecordIDs: [sourceID],
+            sourceRevisionIDs: [sourceID: UUID()],
+            items: [item]
+        )
+        XCTAssertTrue(run.isStructurallyValid(at: now.addingTimeInterval(20)))
+        XCTAssertFalse(run.needsRecovery)
+        XCTAssertFalse(run.needsAttention)
+        XCTAssertTrue(PDFBatchDeliveryStage.verified.isFinal)
+        XCTAssertTrue(PDFBatchDeliveryStage.verified.isShareable)
+
+        let blocked = PDFBatchDeliveryRun(
+            id: run.id,
+            startedAt: now,
+            updatedAt: now.addingTimeInterval(10),
+            sourceRecordIDs: [sourceID],
+            sourceRevisionIDs: [sourceID: UUID()],
+            items: [
+                PDFBatchDeliveryItem(
+                    sourceRecordID: sourceID,
+                    outputRecordID: nil,
+                    stage: .blocked,
+                    detail: "Needs unlock",
+                    reviewPageIndex: 0,
+                    issue: .blocked("Password required")
+                )
+            ]
+        )
+        XCTAssertTrue(blocked.isStructurallyValid(at: now.addingTimeInterval(20)))
+        XCTAssertFalse(blocked.needsRecovery)
+        XCTAssertTrue(blocked.needsAttention)
+        XCTAssertEqual(
+            PDFBatchDeliveryIssue.cancelled.errorDescription,
+            "Stopped: Processing stopped before this PDF finished"
+        )
+
+        let invalid = PDFBatchDeliveryRun(
+            id: run.id,
+            startedAt: now.addingTimeInterval(10),
+            updatedAt: now,
+            sourceRecordIDs: [sourceID],
+            sourceRevisionIDs: [sourceID: UUID()],
+            items: [
+                PDFBatchDeliveryItem(
+                    sourceRecordID: sourceID,
+                    outputRecordID: sourceID,
+                    stage: .failed,
+                    detail: "Bad\nDetail",
+                    reviewPageIndex: -1,
+                    issue: .savingFailed("Disk full")
+                )
+            ]
+        )
+        XCTAssertFalse(invalid.isStructurallyValid(at: now.addingTimeInterval(20)))
+    }
+
+    func testArchiveNamesVerificationPayloadsAndStoragePressureContracts_BitsUT() {
+        let now = Date(timeIntervalSince1970: 71_000)
+        let packageID = UUID()
+        let hash = String(repeating: "a", count: 64)
+
+        func entry(
+            name: String,
+            receiptID: UUID = UUID(),
+            sourceName: String = "Closing report",
+            format: PDFTextExportFormat = .wordDocument,
+            byteCount: Int64 = 4_096,
+            sha256: String = hash
+        ) -> PDFOfficeDeliveryEntry {
+            PDFOfficeDeliveryEntry(
+                sourceRecordID: UUID(),
+                sourceRevisionID: UUID(),
+                sourceName: sourceName,
+                receiptID: receiptID,
+                format: format,
+                archiveName: name,
+                byteCount: byteCount,
+                sha256: sha256
+            )
+        }
+
+        XCTAssertEqual(
+            paperPathArchiveLeafNameIdentity("Report.DOCX"),
+            "report.docx"
+        )
+        XCTAssertNil(paperPathArchiveLeafNameIdentity(" Report.docx"))
+        XCTAssertNil(paperPathArchiveLeafNameIdentity(".Report.docx"))
+        XCTAssertNil(paperPathArchiveLeafNameIdentity("folder/Report.docx"))
+        XCTAssertNil(paperPathArchiveLeafNameIdentity("Report\u{202E}.docx"))
+
+        let validPayload = PDFOfficeVerificationPayload(
+            schema: "PaperPath Office Delivery V34",
+            packageID: packageID,
+            createdAt: now,
+            expiresAt: now.addingTimeInterval(3_600),
+            verifiedOutputs: 1,
+            files: [entry(name: "ClosingReport.docx")]
+        )
+        XCTAssertTrue(validPayload.isStructurallyValid(at: now.addingTimeInterval(1)))
+        XCTAssertFalse(
+            PDFOfficeVerificationPayload(
+                schema: validPayload.schema,
+                packageID: packageID,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(3_600),
+                verifiedOutputs: 2,
+                files: validPayload.files
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+        XCTAssertFalse(
+            PDFOfficeVerificationPayload(
+                schema: validPayload.schema,
+                packageID: packageID,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(3_600),
+                verifiedOutputs: 2,
+                files: [
+                    entry(name: "Report.docx"),
+                    entry(name: "report.DOCX")
+                ]
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+        XCTAssertFalse(
+            PDFOfficeVerificationPayload(
+                schema: validPayload.schema,
+                packageID: packageID,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(8 * 24 * 60 * 60),
+                verifiedOutputs: 1,
+                files: validPayload.files
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+        let oversizedEntries = (0..<9).map { index in
+            entry(
+                name: "Part\(index).docx",
+                byteCount: PDFOfficeExternalMatchReport.maximumFileBytes
+            )
+        }
+        XCTAssertFalse(
+            PDFOfficeVerificationPayload(
+                schema: validPayload.schema,
+                packageID: packageID,
+                createdAt: now,
+                expiresAt: now.addingTimeInterval(3_600),
+                verifiedOutputs: oversizedEntries.count,
+                files: oversizedEntries
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+
+        var package = PDFOfficeDeliveryPackage(
+            id: packageID,
+            createdAt: now,
+            entries: validPayload.files
+        )
+        package.expiresAt = now.addingTimeInterval(3_600)
+        package.archiveFileName = "\(packageID.uuidString).zip"
+        package.reportFileName = "\(packageID.uuidString)-verification.json"
+        package.byteCount = 8_192
+        package.sha256 = String(repeating: "b", count: 64)
+        package.reportSHA256 = String(repeating: "c", count: 64)
+        package.signerKeyID = "0123456789abcdef"
+        XCTAssertTrue(package.isStructurallyValid(at: now.addingTimeInterval(1)))
+
+        var futurePin = package
+        futurePin.pinnedAt = now.addingTimeInterval(10 * 60)
+        XCTAssertFalse(futurePin.isStructurallyValid(at: now.addingTimeInterval(1)))
+
+        var badArchiveHash = package
+        badArchiveHash.sha256 = String(repeating: "g", count: 64)
+        XCTAssertFalse(badArchiveHash.isStructurallyValid(at: now.addingTimeInterval(1)))
+
+        var oversizedPackage = PDFOfficeDeliveryPackage(
+            id: packageID,
+            createdAt: now,
+            entries: oversizedEntries
+        )
+        oversizedPackage.expiresAt = package.expiresAt
+        oversizedPackage.archiveFileName = package.archiveFileName
+        oversizedPackage.reportFileName = package.reportFileName
+        oversizedPackage.byteCount = PDFOfficeExternalMatchReport.maximumBatchBytes
+        oversizedPackage.sha256 = package.sha256
+        oversizedPackage.reportSHA256 = package.reportSHA256
+        oversizedPackage.signerKeyID = package.signerKeyID
+        XCTAssertFalse(oversizedPackage.isStructurallyValid(at: now.addingTimeInterval(1)))
+
+        let officePressure = PDFOfficePinnedStorageSummary(
+            outputCount: PDFOfficePinnedStorageSummary.maximumOutputCount - 4,
+            byteCount: PDFOfficePinnedStorageSummary.maximumByteCount * 4 / 5
+        )
+        XCTAssertTrue(officePressure.isNearCapacity)
+        XCTAssertFalse(officePressure.isAtCapacity)
+        XCTAssertEqual(officePressure.remainingOutputCount, 4)
+        XCTAssertEqual(
+            officePressure.remainingByteCount,
+            PDFOfficePinnedStorageSummary.maximumByteCount - officePressure.byteCount
+        )
+        XCTAssertFalse(
+            PDFOfficePinnedStorageSummary(
+                outputCount: PDFOfficePinnedStorageSummary.maximumOutputCount,
+                byteCount: 0
+            ).canAdd(bytes: 1)
+        )
+        XCTAssertFalse(
+            PDFOfficePinnedStorageSummary(
+                outputCount: 1,
+                byteCount: Int64.max
+            ).canAdd(bytes: 1)
+        )
+
+        let versionPressure = PDFPinnedVersionStorageSummary(
+            milestoneCount: PDFPinnedVersionStorageSummary.maximumMilestoneCount,
+            byteCount: -1
+        )
+        XCTAssertTrue(versionPressure.isAtCapacity)
+        XCTAssertEqual(versionPressure.usageFraction, 0)
+        XCTAssertEqual(versionPressure.remainingMilestoneCount, 0)
+        XCTAssertFalse(versionPressure.canAdd(bytes: 0))
+    }
+
+    func testVersionSnapshotStorageAndArchiveVerificationContracts_BitsUT() {
+        let now = Date(timeIntervalSince1970: 80_000)
+        let documentID = UUID()
+        let revisionID = UUID()
+        let fingerprint = String(repeating: "f", count: 64)
+        let receipt = PDFDeliveryReceipt(
+            id: UUID(),
+            operation: .safeShare,
+            createdAt: now,
+            sourcePageCount: 2,
+            outputPageCount: 2,
+            renderedPageCount: 2,
+            sourceByteCount: 2_048,
+            outputByteCount: 2_048,
+            unexpectedBlankPageIndices: [],
+            annotationCount: 0,
+            textCharacterCount: 80,
+            personalMetadataEntryCount: 0,
+            isEncrypted: false,
+            sha256: fingerprint,
+            checks: [
+                PDFDeliveryCheck(
+                    id: "reopened",
+                    title: "Reopened",
+                    detail: "All pages opened.",
+                    status: .passed
+                )
+            ],
+            outputRevisionID: revisionID
+        )
+        let snapshot = PDFVersionSnapshot(
+            id: UUID(),
+            documentID: documentID,
+            createdAt: now,
+            label: "Import",
+            fileName: "import.pdf",
+            byteCount: 2_048,
+            pageCount: 2,
+            contentRevisionID: revisionID,
+            contentFingerprint: fingerprint.uppercased(),
+            bookmarkedPages: [0, 1],
+            bookmarkNames: [0: "Cover"],
+            lastPageIndex: 9,
+            milestoneName: "   ",
+            isPinned: nil,
+            linkedDeliveryReceiptID: nil,
+            linkedDeliveryReceipt: nil
+        )
+        XCTAssertNil(snapshot.resolvedMilestoneName)
+        XCTAssertEqual(
+            snapshot.displayTitle,
+            AppLocalization.format("Before %@", snapshot.label.localizedUI)
+        )
+        XCTAssertTrue(snapshot.matchesDeliveryReceipt(receipt))
+        XCTAssertEqual(snapshot.updatingMeasuredByteCount(-1).byteCount, 0)
+
+        let pinned = snapshot.updatingMilestone(
+            name: "  Closing package  ",
+            pinned: true,
+            linkedDeliveryReceiptID: receipt.id,
+            deliveryReceipt: receipt
+        )
+        XCTAssertTrue(pinned.isPinnedMilestone)
+        XCTAssertEqual(pinned.resolvedMilestoneName, "Closing package")
+        XCTAssertNotNil(pinned.archivedDeliveryReceipt)
+        let unpinned = pinned.updatingMilestone(
+            name: nil,
+            pinned: false,
+            linkedDeliveryReceiptID: receipt.id,
+            deliveryReceipt: receipt
+        )
+        XCTAssertFalse(unpinned.isPinnedMilestone)
+        XCTAssertNil(unpinned.archivedDeliveryReceipt)
+
+        let measured = PDFPinnedVersionStorageSummary.measuring([
+            pinned,
+            snapshot.updatingMeasuredByteCount(-128)
+        ])
+        XCTAssertEqual(measured.milestoneCount, 2)
+        XCTAssertEqual(measured.byteCount, pinned.byteCount)
+        XCTAssertTrue(
+            PDFPinnedVersionStorageSummary(
+                milestoneCount: 31,
+                byteCount: 1
+            ).isNearCapacity
+        )
+        XCTAssertFalse(
+            PDFPinnedVersionStorageSummary(
+                milestoneCount: 32,
+                byteCount: 0
+            ).canAdd(bytes: 1)
+        )
+
+        let item = PDFVersionArchiveVerificationItem(
+            id: UUID(),
+            documentID: documentID,
+            fileName: "import.pdf",
+            title: "Closing package",
+            byteCount: 2_048,
+            pageCount: 2,
+            expectedSHA256: fingerprint,
+            actualSHA256: fingerprint,
+            linkedDeliveryReceiptID: receipt.id,
+            status: .verified,
+            detail: "Verified"
+        )
+        let artifactURL = URL(fileURLWithPath: "/tmp/import.pdf")
+        let report = PDFVersionArchiveVerificationReport(
+            archiveName: "versions.zip",
+            archiveByteCount: 4_096,
+            schema: PDFVersionArchiveManifest.currentSchema,
+            archiveCreatedAt: now,
+            verifiedAt: now.addingTimeInterval(1),
+            manifestEntryCount: 1,
+            archiveEntryCount: 1,
+            items: [item],
+            structuralFailures: [],
+            signatureStatus: .verified,
+            signatureDetail: "Signature verified",
+            signerKeyID: "0123456789abcdef",
+            signerPublicKeyBase64: "public",
+            trustStatus: .unknown,
+            trustedSignerName: nil,
+            verifiedArtifacts: [
+                PDFVersionArchiveVerifiedArtifact(
+                    item: item,
+                    url: artifactURL
+                )
+            ]
+        )
+        XCTAssertEqual(report.status, .verified)
+        XCTAssertEqual(report.verifiedCount, 1)
+        XCTAssertEqual(report.failedCount, 0)
+        XCTAssertTrue(report.canTrustSigner)
+        XCTAssertTrue(report.canRecoverArtifacts)
+        XCTAssertEqual(report.verifiedArtifact(for: item.id)?.url, artifactURL)
+        XCTAssertEqual(
+            report.resolvingTrust(
+                .trusted,
+                trustedSignerName: "Legal Ops"
+            ).provenanceTitle,
+            "Legal Ops"
+        )
+        XCTAssertFalse(report.removingVerifiedArtifacts().canRecoverArtifacts)
+
+        let invalidSignatureReport = PDFVersionArchiveVerificationReport(
+            archiveName: "versions.zip",
+            archiveByteCount: 4_096,
+            schema: PDFVersionArchiveManifest.currentSchema,
+            archiveCreatedAt: now,
+            verifiedAt: now.addingTimeInterval(1),
+            manifestEntryCount: 1,
+            archiveEntryCount: 1,
+            items: [item],
+            structuralFailures: [],
+            signatureStatus: .invalid,
+            signatureDetail: "Signature mismatch",
+            signerKeyID: "0123456789abcdef",
+            signerPublicKeyBase64: "public",
+            trustStatus: .invalid,
+            trustedSignerName: nil
+        )
+        XCTAssertEqual(invalidSignatureReport.status, .failed)
+        XCTAssertEqual(invalidSignatureReport.failedCount, 1)
+        XCTAssertEqual(
+            invalidSignatureReport.provenanceTitle,
+            "Invalid source signature"
+        )
+        XCTAssertEqual(
+            PDFVersionArchiveVerificationReport(
+                archiveName: "legacy.zip",
+                archiveByteCount: 2_048,
+                schema: "PaperPath Version Archive V47",
+                archiveCreatedAt: now,
+                verifiedAt: now.addingTimeInterval(1),
+                manifestEntryCount: 1,
+                archiveEntryCount: 1,
+                items: [item],
+                structuralFailures: []
+            ).provenanceTitle,
+            "Unsigned legacy archive"
+        )
+    }
+
+    func testDocumentBriefProfileAndNoticeContracts_BitsUT() {
+        let recordID = UUID()
+        XCTAssertEqual(
+            AppNoticeAction.restoreTrash(recordIDs: [recordID]).title,
+            "Restore"
+        )
+        XCTAssertEqual(
+            AppNoticeAction.undoPageChange(recordID: recordID).title,
+            "Undo"
+        )
+        XCTAssertEqual(
+            DocumentRoute(
+                recordID: recordID,
+                pageIndex: 4,
+                quickTask: .signPDF
+            ),
+            DocumentRoute(
+                recordID: recordID,
+                pageIndex: 4,
+                quickTask: .signPDF
+            )
+        )
+        XCTAssertEqual(PDFQuickTaskGroup.finish.title, "Finish & protect")
+        XCTAssertFalse(PDFQuickTask.mergePDFs.requiresDocument)
+        XCTAssertTrue(PDFQuickTask.safeShare.requiresDocument)
+        XCTAssertEqual(PDFQuickTask.redactPDF.group, .finish)
+
+        XCTAssertEqual(DocumentCategory.invoice.title, "Invoice")
+        XCTAssertEqual(DocumentCategory.invoice.symbol, "doc.text.below.ecg")
+        XCTAssertEqual(IndexedTextSource.searchableCopy.title, "Searchable PDF text")
+        XCTAssertEqual(DocumentUnderstandingConfidence.medium.symbol, "circle.lefthalf.filled")
+        XCTAssertTrue(DetectedEntity.Kind.email.isSensitive)
+        XCTAssertFalse(DetectedEntity.Kind.amount.isSensitive)
+        XCTAssertEqual(SuggestedStep.Kind.reviewSignature.symbol, "signature")
+
+        let brief = DocumentBrief(
+            category: .invoice,
+            summary: "",
+            entities: [
+                DetectedEntity(kind: .email, value: "legal@example.com"),
+                DetectedEntity(kind: .amount, value: "$400")
+            ],
+            suggestedSteps: [
+                SuggestedStep(
+                    kind: .reviewAmount,
+                    title: "Review amount",
+                    evidence: "$400",
+                    evidencePageIndex: 0
+                )
+            ],
+            indexedAt: Date(timeIntervalSince1970: 90_000),
+            textSource: .vision,
+            indexedCharacterCount: 0,
+            confidence: nil
+        )
+        XCTAssertTrue(brief.hasUsefulContent)
+        XCTAssertEqual(brief.resolvedConfidence, .low)
+        XCTAssertEqual(brief.sensitiveEntityCount, 1)
+
+        let emptyBrief = DocumentBrief(
+            category: .general,
+            summary: "",
+            entities: [],
+            suggestedSteps: [],
+            indexedAt: Date(timeIntervalSince1970: 90_001),
+            textSource: nil,
+            indexedCharacterCount: 0,
+            confidence: .high
+        )
+        XCTAssertFalse(emptyBrief.hasUsefulContent)
+        XCTAssertEqual(emptyBrief.resolvedConfidence, .high)
+
+        var lockedProfile = makeProfile(pageCount: 1)
+        lockedProfile.isLocked = true
+        XCTAssertEqual(
+            lockedProfile.summary,
+            "Unlock this PDF before PaperPath can inspect its contents."
+                .localizedUI
+        )
+        var singleFieldProfile = makeProfile(pageCount: 1)
+        singleFieldProfile.kind = .form
+        singleFieldProfile.formFieldCount = 1
+        XCTAssertFalse(singleFieldProfile.summary.isEmpty)
+        XCTAssertTrue(singleFieldProfile.summary.contains("1"))
+    }
+
+    func testOfficeResourceForecastRuntimeAndVisualBudgetContracts_BitsUT() {
+        XCTAssertEqual(PDFOfficeResourceSnapshot.initial.formattedAvailableCapacity, "Checking")
+        let resource = PDFOfficeResourceSnapshot(
+            mode: .conserving,
+            thermalLevel: .fair,
+            isLowPowerModeEnabled: true,
+            availableCapacityBytes: 2_048,
+            capturedAt: Date(timeIntervalSince1970: 91_000),
+            detail: "Device is warm"
+        )
+        XCTAssertEqual(resource.mode.title, "Conserving")
+        XCTAssertEqual(resource.mode.symbol, "leaf.fill")
+        XCTAssertEqual(resource.thermalLevel.title, "Device warm")
+        XCTAssertEqual(resource.powerTitle, "Low Power")
+        XCTAssertFalse(resource.formattedAvailableCapacity.isEmpty)
+
+        let forecast = PDFOfficeStorageForecast(
+            sourceCount: 3,
+            packageCount: 2,
+            estimatedOutputBytes: 10 * 1_024,
+            requiredWorkingBytes: 90 * 1_024,
+            availableCapacityBytes: 80 * 1_024
+        )
+        XCTAssertFalse(forecast.hasCapacity)
+        XCTAssertTrue(
+            PDFOfficeStorageForecast(
+                sourceCount: 1,
+                packageCount: 1,
+                estimatedOutputBytes: 1,
+                requiredWorkingBytes: 2,
+                availableCapacityBytes: nil
+            ).hasCapacity
+        )
+        XCTAssertTrue(forecast.contract.contains("streamed commit".localizedUI))
+        XCTAssertEqual(PDFOfficeIntegrityStatus.mismatch.title, "Hash mismatch")
+        XCTAssertEqual(PDFOfficeIntegrityStatus.verified.symbol, "checkmark.shield.fill")
+        XCTAssertTrue(PDFOfficeIntegrityStatus.verified.isVerified)
+        XCTAssertFalse(PDFOfficeIntegrityStatus.sourceChanged.isVerified)
+        XCTAssertEqual(
+            PDFOfficeIntegrityReport(
+                checkedCount: 2,
+                verifiedCount: 2,
+                failedCount: 0,
+                checkedAt: Date(timeIntervalSince1970: 91_100)
+            ).summary,
+            AppLocalization.format(
+                "%lld/%lld outputs verified",
+                2,
+                2
+            )
+        )
+        XCTAssertFalse(
+            PDFOfficeIntegrityReport(
+                checkedCount: 0,
+                verifiedCount: 0,
+                failedCount: 0,
+                checkedAt: Date(timeIntervalSince1970: 91_101)
+            ).isVerified
+        )
+
+        let runtimeEvidence = PDFOfficeRuntimeEvidence(
+            sourcePageCount: 2,
+            outputPageCount: 5,
+            primaryUnitLabel: "paragraphs",
+            primaryUnitCount: 12,
+            characterCount: 200,
+            searchablePageCount: 4,
+            assetCount: 2,
+            assetByteCount: 9,
+            assetBudgetByteCount: 6,
+            assetCompressionFallbackCount: 1,
+            assetMinimumQualityPercent: 46
+        )
+        XCTAssertEqual(runtimeEvidence.pageYieldPercent, 100)
+        XCTAssertEqual(runtimeEvidence.searchableCoveragePercent, 80)
+        XCTAssertEqual(runtimeEvidence.assetBudgetUsePercent, 100)
+        XCTAssertEqual(runtimeEvidence.yieldSummary, "5/2 页 · 产出率 100%")
+        XCTAssertEqual(
+            PDFOfficeRuntimeEvidence(
+                sourcePageCount: 0,
+                outputPageCount: 0,
+                primaryUnitLabel: "pages",
+                primaryUnitCount: 0,
+                characterCount: 0,
+                searchablePageCount: 0,
+                assetCount: 0,
+                assetByteCount: 0,
+                assetBudgetByteCount: 0,
+                assetCompressionFallbackCount: 0,
+                assetMinimumQualityPercent: 0
+            ).formattedAssetBudget,
+            "No visual budget"
+        )
+
+        XCTAssertEqual(PDFOfficeVisualBudgetMode(pageCount: 24), .highDetail)
+        XCTAssertEqual(PDFOfficeVisualBudgetMode(pageCount: 25), .balanced)
+        XCTAssertEqual(PDFOfficeVisualBudgetMode(pageCount: 101), .bounded)
+        XCTAssertEqual(PDFOfficeVisualBudgetMode(pageCount: 301), .largeDocument)
+        XCTAssertEqual(
+            PDFOfficeVisualBudgetPressure(
+                estimatedVisualBytes: 35,
+                totalBudgetBytes: 100
+            ),
+            .relaxed
+        )
+        XCTAssertEqual(
+            PDFOfficeVisualBudgetPressure(
+                estimatedVisualBytes: 36,
+                totalBudgetBytes: 100
+            ),
+            .managed
+        )
+        XCTAssertEqual(
+            PDFOfficeVisualBudgetPressure(
+                estimatedVisualBytes: 74,
+                totalBudgetBytes: 100
+            ),
+            .tight
+        )
+
+        var scanProfile = makeProfile(pageCount: 12)
+        scanProfile.sampledPageCount = 12
+        scanProfile.imageDominantPageCount = 12
+        XCTAssertEqual(PDFOfficeVisualAnchorPolicy(profile: scanProfile), .scanFirst)
+
+        var imageProfile = makeProfile(pageCount: 12)
+        imageProfile.sampledPageCount = 12
+        imageProfile.imageDominantPageCount = 2
+        XCTAssertEqual(PDFOfficeVisualAnchorPolicy(profile: imageProfile), .imageFirst)
+
+        var mixedProfile = makeProfile(pageCount: 12)
+        mixedProfile.sampledPageCount = 10
+        mixedProfile.imageDominantPageCount = 6
+        XCTAssertEqual(PDFOfficeVisualAnchorPolicy(profile: mixedProfile), .tableAware)
+        XCTAssertEqual(
+            PDFOfficeVisualAnchorPolicy(profile: makeProfile(pageCount: 12)),
+            .structureFirst
+        )
+
+        let largePlan = PDFOfficeVisualBudgetPlan(profile: makeProfile(pageCount: 640))
+        XCTAssertEqual(largePlan.mode, .largeDocument)
+        XCTAssertEqual(largePlan.chunkCount, 6)
+        XCTAssertEqual(largePlan.maximumBytesPerPage, 160 * 1_024)
+        XCTAssertTrue(
+            largePlan.memoryGuardSummary.contains(
+                PDFOfficeVisualBudgetMode.largeDocument.title.localizedUI
+            )
+        )
+        XCTAssertEqual(
+            PDFOfficeProductionSLA(
+                pageCount: 10,
+                sourceBytes: 1_024,
+                visualBudgetPlan: PDFOfficeVisualBudgetPlan(
+                    profile: makeProfile(pageCount: 10)
+                ),
+                isProtected: false
+            ),
+            .quick
+        )
+        XCTAssertEqual(
+            PDFOfficeProductionSLA(
+                pageCount: 320,
+                sourceBytes: 1_024,
+                visualBudgetPlan: largePlan,
+                isProtected: false
+            ),
+            .heavy
+        )
+        XCTAssertEqual(
+            PDFOfficeProductionSLA(
+                pageCount: 1,
+                sourceBytes: 1,
+                visualBudgetPlan: largePlan,
+                isProtected: true
+            ),
+            .constrained
+        )
+    }
+
+    func testTextImagePrintAndBookletPureContracts_BitsUT() {
+        XCTAssertEqual(PDFTextReplacementFontStyle.monospaced.pdfFontName, "Menlo-Regular")
+        XCTAssertEqual(PDFTextReplacementAlignment.center.symbol, "text.aligncenter")
+        let color = PDFInkColor(red: 1, green: 1, blue: 1, alpha: 1)
+        let readyAssessment = PDFTextReplacementAssessment(
+            status: .ready,
+            title: "Ready",
+            detail: "Two lines",
+            resolvedFontName: "Helvetica",
+            resolvedFontSize: 13,
+            resolvedLineSpacing: 3,
+            reflowedLineCount: 2,
+            backgroundColor: color,
+            regionBackgroundColors: [color, color],
+            flowRegionTexts: ["First", "Second"],
+            fontStyle: .sans,
+            alignment: .left
+        )
+        XCTAssertTrue(readyAssessment.isReady)
+        XCTAssertFalse(
+            PDFTextReplacementAssessment(
+                status: .ready,
+                title: "Blocked",
+                detail: "Missing background",
+                resolvedFontName: nil,
+                resolvedFontSize: 0,
+                resolvedLineSpacing: 0,
+                reflowedLineCount: 0,
+                backgroundColor: nil,
+                regionBackgroundColors: [],
+                flowRegionTexts: ["Text"],
+                fontStyle: .serif,
+                alignment: .right
+            ).isReady
+        )
+
+        let bounds = PDFNormalizedRect(x: 0, y: 0, width: 1, height: 1)
+        let image = PDFImageObjectSnapshot(
+            pageIndex: 0,
+            objectNumber: 7,
+            generation: 0,
+            resourceName: "Im0",
+            normalizedBounds: bounds,
+            pixelWidth: 200,
+            pixelHeight: 100,
+            jpegData: Data([1]),
+            sourceStreamData: Data([2]),
+            softMaskStreamData: nil,
+            softMaskObjectNumber: nil,
+            softMaskGeneration: nil,
+            storage: .jpeg,
+            sourceDigest: "digest",
+            usageCount: 2
+        )
+        XCTAssertEqual(image.id, "7-0-0-Im0")
+        XCTAssertTrue(image.isSafelyReplaceable)
+        XCTAssertTrue(image.replacesMultipleUses)
+        XCTAssertFalse(
+            PDFImageObjectSnapshot(
+                pageIndex: 0,
+                objectNumber: 8,
+                generation: 0,
+                resourceName: "Im1",
+                normalizedBounds: bounds,
+                pixelWidth: 200,
+                pixelHeight: 100,
+                jpegData: Data([1]),
+                sourceStreamData: Data([2]),
+                softMaskStreamData: nil,
+                softMaskObjectNumber: nil,
+                softMaskGeneration: nil,
+                storage: .flateWithSoftMask,
+                sourceDigest: "digest",
+                usageCount: 1
+            ).isSafelyReplaceable
+        )
+
+        XCTAssertEqual(
+            PDFPrintPreparationOptions(
+                paperTarget: .letter,
+                orientation: .landscape,
+                scaleMode: .fill,
+                marginPoints: 96
+            ).clampedMarginPoints,
+            72
+        )
+        let riskEvidence = PDFPrintProductionEvidence(
+            pageIndex: 0,
+            trimBoxInsetPoints: PDFPageCropInsets(
+                top: 1,
+                right: 2,
+                bottom: 3,
+                left: 4
+            ),
+            bleedInsetPoints: .none,
+            requiredBleedPoints: 3,
+            requiredSafeAreaPoints: 18,
+            nearestContentToTrimPoints: 12,
+            hasExplicitTrimBox: true,
+            hasBleedAllowance: false,
+            safeAreaRisk: .clear,
+            bleedRisk: .risk
+        )
+        XCTAssertEqual(riskEvidence.overallRisk, .risk)
+        XCTAssertEqual(
+            riskEvidence.trimSummary,
+            AppLocalization.format(
+                "T%.0f R%.0f B%.0f L%.0f pt",
+                1.0,
+                2.0,
+                3.0,
+                4.0
+            )
+        )
+        XCTAssertEqual(riskEvidence.bleedSummary, "Missing")
+        XCTAssertEqual(
+            riskEvidence.safeAreaSummary,
+            AppLocalization.format("%.0f pt", 12.0)
+        )
+        let clearEvidence = PDFPrintProductionEvidence(
+            pageIndex: 1,
+            trimBoxInsetPoints: .none,
+            bleedInsetPoints: .none,
+            requiredBleedPoints: 0,
+            requiredSafeAreaPoints: 0,
+            nearestContentToTrimPoints: nil,
+            hasExplicitTrimBox: false,
+            hasBleedAllowance: true,
+            safeAreaRisk: .clear,
+            bleedRisk: .clear
+        )
+        XCTAssertEqual(clearEvidence.overallRisk, .clear)
+        XCTAssertEqual(clearEvidence.trimSummary, "Crop box")
+        XCTAssertEqual(clearEvidence.safeAreaSummary, "No text/fields")
+
+        let riskPage = PDFPrintPreparationPage(
+            pageIndex: 0,
+            sourceWidth: 612,
+            sourceHeight: 792,
+            outputWidth: 612,
+            outputHeight: 792,
+            printableWidth: 560,
+            printableHeight: 740,
+            renderedWidth: 550,
+            renderedHeight: 700,
+            scale: 0.95,
+            visibleFraction: 0.96,
+            productionEvidence: riskEvidence
+        )
+        XCTAssertTrue(riskPage.hasClipping)
+        XCTAssertTrue(riskPage.isScaled)
+        XCTAssertTrue(riskPage.hasPadding)
+        XCTAssertEqual(riskPage.outcomeTitle, "Preflight risk")
+        let actualPage = PDFPrintPreparationPage(
+            pageIndex: 1,
+            sourceWidth: 612,
+            sourceHeight: 792,
+            outputWidth: 612,
+            outputHeight: 792,
+            printableWidth: 612,
+            printableHeight: 792,
+            renderedWidth: 612,
+            renderedHeight: 792,
+            scale: 1,
+            visibleFraction: 1,
+            productionEvidence: clearEvidence
+        )
+        XCTAssertEqual(actualPage.outcomeTitle, "Actual size")
+        let printAssessment = PDFPrintPreparationAssessment(
+            revisionID: UUID(),
+            options: .standard,
+            annotationCount: 1,
+            pages: [riskPage, actualPage]
+        )
+        XCTAssertEqual(printAssessment.clippedPageCount, 1)
+        XCTAssertEqual(printAssessment.scaledPageCount, 1)
+        XCTAssertEqual(printAssessment.paddedPageCount, 1)
+        XCTAssertEqual(printAssessment.productionRiskPageCount, 1)
+        XCTAssertEqual(printAssessment.productionReviewPageCount, 1)
+        XCTAssertEqual(printAssessment.averageScalePercent, 98)
+
+        let pageItem = PDFPagePreparationItem(
+            pageIndex: 0,
+            widthPoints: 842,
+            heightPoints: 595,
+            rotation: 90,
+            paperClass: .a4,
+            detectedInsets: PDFPageCropInsets(
+                top: 0.02,
+                right: 0.03,
+                bottom: 0.04,
+                left: 0.05
+            ),
+            confidence: .high,
+            inkCoverage: 0.12
+        )
+        XCTAssertTrue(pageItem.isLandscape)
+        XCTAssertEqual(pageItem.orientationTitle, "Landscape")
+        XCTAssertTrue(pageItem.isSuggested(safetyPadding: 0))
+        let preparation = PDFPagePreparationAssessment(
+            revisionID: UUID(),
+            pages: [pageItem]
+        )
+        XCTAssertEqual(preparation.geometryVariantCount, 1)
+        XCTAssertEqual(preparation.suggestedPageCount(safetyPadding: 0), 1)
+        XCTAssertEqual(
+            PDFExternalPageSource(
+                id: UUID(),
+                url: URL(fileURLWithPath: "/tmp/external.pdf"),
+                displayName: "External",
+                byteCount: 1_024,
+                assessment: preparation
+            ).pageCount,
+            1
+        )
+
+        let bookletOptions = PDFBookletOptions(
+            paperTarget: .letter,
+            bindingEdge: .right,
+            outerMarginPoints: 1,
+            gutterPoints: 99,
+            showsFoldMarks: true,
+            signatureSheetLimit: 99,
+            creepCompensationPoints: -4
+        )
+        XCTAssertEqual(bookletOptions.clampedOuterMarginPoints, 12)
+        XCTAssertEqual(bookletOptions.clampedGutterPoints, 48)
+        XCTAssertEqual(bookletOptions.normalizedSignatureSheetLimit, 32)
+        XCTAssertEqual(bookletOptions.clampedCreepCompensationPoints, 0)
+        let slot = PDFBookletSlot(
+            sourcePageIndex: 3,
+            scale: 0.96,
+            visibleFraction: 1,
+            creepOffsetPoints: -2.4
+        )
+        let blank = PDFBookletSlot(
+            sourcePageIndex: nil,
+            scale: 1,
+            visibleFraction: 1,
+            creepOffsetPoints: 0
+        )
+        let spread = PDFBookletSpread(
+            outputPageIndex: 0,
+            signatureNumber: 1,
+            signatureSheetCount: 2,
+            sheetNumber: 1,
+            side: .front,
+            left: slot,
+            right: blank,
+            sheetWidth: 792,
+            sheetHeight: 612
+        )
+        XCTAssertTrue(spread.hasBlankSlot)
+        XCTAssertEqual(spread.pageOrderLabel, "4 · Blank")
+        let bookletAssessment = PDFBookletAssessment(
+            revisionID: UUID(),
+            options: bookletOptions,
+            sourcePageCount: 5,
+            paddedPageCount: 8,
+            annotationCount: 1,
+            spreads: [spread]
+        )
+        XCTAssertEqual(bookletAssessment.signatureCount, 1)
+        XCTAssertEqual(bookletAssessment.insertedBlankCount, 3)
+        XCTAssertEqual(bookletAssessment.sheetCount, 2)
+        XCTAssertEqual(bookletAssessment.outputPageCount, 1)
+        XCTAssertEqual(bookletAssessment.maximumCreepOffsetPoints, 2)
+        XCTAssertEqual(bookletAssessment.largestSignatureSheetCount, 2)
+        XCTAssertEqual(bookletAssessment.averageScalePercent, 96)
+    }
+
+    func testOverlayFormAnnotationAndPageLabelContracts_BitsUT()
+        throws {
+        let clamped = PDFNormalizedRect(
+            x: -0.5,
+            y: 2,
+            width: 0.01,
+            height: 3
+        )
+        XCTAssertEqual(clamped.x, 0)
+        XCTAssertEqual(clamped.y, 0)
+        XCTAssertEqual(clamped.width, 0.08)
+        XCTAssertEqual(clamped.height, 1)
+
+        let webURL = try XCTUnwrap(URL(string: "https://example.com/sign"))
+        XCTAssertEqual(
+            PDFContentOverlay.text(
+                pageIndex: 3,
+                bounds: clamped,
+                text: "Approved",
+                fontSize: 12,
+                color: PDFInkColor(red: 0, green: 0, blue: 0, alpha: 1)
+            ).pageIndex,
+            3
+        )
+        XCTAssertEqual(PDFLinkTarget.web(webURL).title, webURL.absoluteString)
+        XCTAssertEqual(PDFLinkTarget.page(4).title, "Page 5")
+        XCTAssertFalse(PDFLinkTarget.unsupported("Launch action").isEditable)
+        XCTAssertEqual(
+            PDFLinkAnnotationSnapshot(
+                pageIndex: 2,
+                annotationIndex: 5,
+                normalizedBounds: clamped,
+                title: "Clause",
+                target: .page(0)
+            ).id,
+            "2-5"
+        )
+        XCTAssertEqual(PDFSignatureSize.large.pageWidthFraction, 0.54)
+        XCTAssertEqual(PDFSignaturePosition.center.title, "Center")
+        XCTAssertEqual(
+            PDFInkPayload(
+                pageIndex: 1,
+                strokes: [
+                    PDFInkStroke(
+                        points: [PDFInkPoint(x: 0.1, y: 0.2)],
+                        color: PDFInkColor(red: 0, green: 0, blue: 1, alpha: 1),
+                        normalizedLineWidth: 0.02
+                    )
+                ],
+                placement: .signature,
+                signaturePosition: .right,
+                signatureSize: .compact,
+                normalizedBounds: clamped
+            ).signatureSize,
+            .compact
+        )
+
+        XCTAssertTrue(PDFFormFieldKind.signature.canCreate)
+        XCTAssertFalse(PDFFormFieldKind.button.canCreate)
+        XCTAssertEqual(PDFFormCompatibility.limited.symbol, "exclamationmark.triangle")
+        XCTAssertEqual(PDFFormCalculationOperation.average.title, "Average")
+        XCTAssertEqual(PDFFormFormatKind.percent.title, "Percent")
+
+        let required = PDFFormFieldSnapshot(
+            id: "required",
+            pageIndex: 0,
+            annotationIndex: 0,
+            name: "Approval",
+            kind: .text,
+            value: "   ",
+            normalizedBounds: clamped,
+            isRequired: true,
+            isReadOnly: true,
+            isMultiline: false,
+            maximumLength: 80,
+            optionCount: 0,
+            hasAppearanceStream: false,
+            issue: "Read only"
+        )
+        let optional = PDFFormFieldSnapshot(
+            id: "optional",
+            pageIndex: 0,
+            annotationIndex: 1,
+            name: "Total",
+            kind: .choice,
+            value: nil,
+            normalizedBounds: clamped,
+            isRequired: false,
+            isReadOnly: false,
+            isMultiline: false,
+            maximumLength: nil,
+            optionCount: 3,
+            hasAppearanceStream: true,
+            issue: nil
+        )
+        let complete = PDFFormFieldSnapshot(
+            id: "complete",
+            pageIndex: 0,
+            annotationIndex: 2,
+            name: "Accepted",
+            kind: .checkbox,
+            value: "Yes",
+            normalizedBounds: clamped,
+            isRequired: false,
+            isReadOnly: false,
+            isMultiline: false,
+            maximumLength: nil,
+            optionCount: 0,
+            hasAppearanceStream: true,
+            issue: nil
+        )
+        let calculation = PDFFormCalculationRule(
+            operation: .sum,
+            sourceFieldNames: ["Subtotal", "Tax"]
+        )
+        let format = PDFFormFormatRule(
+            kind: .number,
+            decimalPlaces: 2,
+            separatorStyle: 0,
+            negativeStyle: 0,
+            currencySymbol: "$",
+            currencyPrecedesValue: true,
+            pattern: nil
+        )
+        let range = PDFFormRangeValidationRule(minimum: 0, maximum: 100)
+        let automation = PDFFormAutomationFieldSnapshot(
+            fieldID: optional.id,
+            fieldName: "Total",
+            calculation: calculation,
+            format: format,
+            rangeValidation: range,
+            expectedValue: "128",
+            formattedPreview: "$128.00",
+            needsUpdate: true,
+            validationIssue: nil,
+            unsupportedActionCount: 0
+        )
+        let invalidAutomation = PDFFormAutomationFieldSnapshot(
+            fieldID: required.id,
+            fieldName: "Approval",
+            calculation: nil,
+            format: nil,
+            rangeValidation: range,
+            expectedValue: nil,
+            formattedPreview: nil,
+            needsUpdate: false,
+            validationIssue: "Out of range",
+            unsupportedActionCount: 1
+        )
+        let unsupportedAutomation = PDFFormAutomationFieldSnapshot(
+            fieldID: "script",
+            fieldName: "Legacy script",
+            calculation: nil,
+            format: nil,
+            rangeValidation: nil,
+            expectedValue: nil,
+            formattedPreview: nil,
+            needsUpdate: true,
+            validationIssue: nil,
+            unsupportedActionCount: 2
+        )
+        let report = PDFFormInspectionReport(
+            fields: [required, optional, complete],
+            automationFields: [automation, invalidAutomation, unsupportedAutomation],
+            compatibility: .limited,
+            issues: ["XFA fallback"],
+            hasXFA: true,
+            hasJavaScript: true,
+            needsAppearances: true,
+            unsupportedJavaScriptCount: 1
+        )
+        XCTAssertEqual(report.incompleteRequiredFields.map(\.id), [required.id])
+        XCTAssertEqual(report.incompleteOptionalFields.map(\.id), [optional.id])
+        XCTAssertEqual(report.editableFieldCount, 2)
+        XCTAssertEqual(report.fieldsNeedingAutomationUpdate.map(\.id), [optional.id])
+        XCTAssertEqual(report.invalidAutomationFields.map(\.id), [required.id])
+        XCTAssertEqual(report.supportedAutomationFields.count, 2)
+        XCTAssertEqual(report.automation(for: optional)?.fieldName, "Total")
+        XCTAssertFalse(report.isReadyForVerifiedOutput)
+        XCTAssertTrue(report.requiresCompatibleReader)
+        XCTAssertFalse(PDFFormInspectionReport.empty.isReadyForVerifiedOutput)
+
+        let color = PDFInkColor(red: 1, green: 0.8, blue: 0.1, alpha: 1)
+        let annotation = PDFAnnotationSnapshot(
+            pageIndex: 1,
+            annotationIndex: 2,
+            type: "Highlight",
+            contents: "Review",
+            generatedKind: .pageNumber,
+            color: color,
+            lineWidth: 2,
+            hasAppearanceStream: true,
+            canEditContents: false,
+            canEditStyle: true,
+            canRemove: true
+        )
+        XCTAssertEqual(annotation.id, "1-2-Highlight")
+        XCTAssertTrue(annotation.canEdit)
+        XCTAssertEqual(
+            PDFAnnotationRemovalTarget(annotation: annotation).expectedGeneratedKind,
+            .pageNumber
+        )
+        XCTAssertEqual(
+            PDFGeneratedAnnotationKind.resolve(author: PDFGeneratedAnnotationKind.watermark.author),
+            .watermark
+        )
+        let attachment = PDFEmbeddedAttachmentSnapshot(
+            id: "attachment-1",
+            fileName: "evidence.csv",
+            contentType: "text/csv",
+            byteCount: 1_536,
+            checksum: String(repeating: "a", count: 64),
+            description: nil,
+            pageIndex: 1,
+            origin: .pageAnnotation,
+            isExtractable: true,
+            limitation: nil
+        )
+        XCTAssertEqual(attachment.origin.title, "Page attachment")
+        XCTAssertFalse(attachment.formattedSize.isEmpty)
+
+        XCTAssertEqual(PDFPageLabelStyle.uppercaseRoman.formattedNumber(4), "IV")
+        XCTAssertEqual(
+            PDFPageLabelStyle.uppercaseRoman.formattedNumber(4_000),
+            "MMMCMXCIX"
+        )
+        XCTAssertEqual(PDFPageLabelStyle.lowercaseLetters.formattedNumber(27), "aa")
+        XCTAssertNil(PDFPageLabelStyle.prefixOnly.pdfName)
+        let rule = PDFPageLabelRule(
+            startPageIndex: 2,
+            style: .uppercaseLetters,
+            prefix: "A-",
+            startNumber: 27
+        )
+        XCTAssertEqual(rule.label(for: 1), "A-AA")
+        XCTAssertEqual(rule.label(for: 3), "A-AB")
+        XCTAssertEqual(PDFWatermarkPreset.internalUse.defaultText, "INTERNAL USE")
+        XCTAssertEqual(PDFWatermarkLayout.diagonal.rotationDegrees, 315)
+        XCTAssertEqual(PDFWatermarkIntensity.bold.scale, 1.16)
+    }
+
+    func testCommandSourceStorageAndOCRContracts_BitsUT()
+        throws {
+        XCTAssertEqual(DocumentWorkflowStatus.archived.symbol, "archivebox")
+        XCTAssertEqual(DocumentTaskStage.verify.action, .safeShare)
+        XCTAssertEqual(DocumentTaskStage.verify.quickTask, .safeShare)
+        XCTAssertEqual(
+            DocumentTaskCheckpoint(
+                stage: .verify,
+                pageIndex: 2,
+                updatedAt: Date(timeIntervalSince1970: 1)
+            ).resumeReason,
+            "Check the final copy before sharing on page 3"
+        )
+        XCTAssertEqual(
+            DocumentTaskCheckpoint(
+                stage: .sign,
+                pageIndex: 1,
+                fieldName: "Approval signature",
+                updatedAt: Date(timeIntervalSince1970: 1)
+            ).resumeReason,
+            AppLocalization.format(
+                "%@ · page %lld",
+                "Approval signature",
+                2
+            )
+        )
+        XCTAssertEqual(DocumentCommandReadiness.blocked.symbol, "xmark.octagon.fill")
+        let commandProfile = DocumentCommandProfile(
+            readiness: .review,
+            score: 82,
+            primaryTitle: "Review evidence",
+            primaryDetail: "One receipt changed",
+            primarySymbol: "exclamationmark.triangle.fill",
+            officeRoute: "DOCX",
+            officeDetail: "Segmented export",
+            signals: [
+                DocumentCommandSignal(
+                    id: "receipt",
+                    title: "Receipt",
+                    value: "Stale",
+                    detail: "Output changed",
+                    symbol: "clock.badge.exclamationmark",
+                    readiness: .review
+                )
+            ]
+        )
+        XCTAssertEqual(commandProfile.scoreLabel, "82")
+        XCTAssertEqual(commandProfile.compactLine, "Review 82 · DOCX")
+
+        let emptySummary = LibraryCommandSummary(
+            readiness: .ready,
+            score: 100,
+            totalCount: 0,
+            readyCount: 0,
+            attentionCount: 0,
+            verifiedCount: 0,
+            staleReceiptCount: 0,
+            officeReviewCount: 0,
+            lockedCount: 0,
+            scansNeedingOCRCount: 0,
+            dueNowCount: 0,
+            batchEligibleCount: 0
+        )
+        XCTAssertEqual(emptySummary.headline, "Private workspace ready")
+        XCTAssertEqual(
+            emptySummary.detail,
+            "Import, scan, or create a local paper PDF."
+        )
+        XCTAssertEqual(
+            LibraryCommandSummary(
+                readiness: .review,
+                score: 61,
+                totalCount: 3,
+                readyCount: 2,
+                attentionCount: 0,
+                verifiedCount: 1,
+                staleReceiptCount: 1,
+                officeReviewCount: 0,
+                lockedCount: 0,
+                scansNeedingOCRCount: 0,
+                dueNowCount: 0,
+                batchEligibleCount: 0
+            ).headline,
+            "Re-verify changed outputs"
+        )
+        XCTAssertEqual(
+            LibraryCommandSummary(
+                readiness: .review,
+                score: 72,
+                totalCount: 3,
+                readyCount: 2,
+                attentionCount: 1,
+                verifiedCount: 1,
+                staleReceiptCount: 0,
+                officeReviewCount: 1,
+                lockedCount: 0,
+                scansNeedingOCRCount: 0,
+                dueNowCount: 0,
+                batchEligibleCount: 0
+            ).headline,
+            "Review active evidence"
+        )
+
+        let health = PDFVersionStorageHealth(
+            indexedVersionCount: 4,
+            pinnedMilestoneCount: 2,
+            removedIndexEntryCount: 1,
+            removedOrphanFileCount: 2,
+            repairedMetadataCount: 3,
+            reclaimedByteCount: 4_096
+        )
+        XCTAssertEqual(health.repairedItemCount, 6)
+        XCTAssertTrue(health.didRepairStorage)
+        XCTAssertFalse(health.formattedReclaimedBytes.isEmpty)
+        XCTAssertEqual(
+            LocalStorageSnapshot(
+                pdfBytes: .max,
+                versionBytes: .max,
+                textIndexBytes: -64,
+                ocrBytes: 0,
+                deliveryCacheBytes: 0,
+                officeExportBytes: 0,
+                officeDeliveryBytes: 0,
+                changeReportBytes: 0,
+                metadataBytes: 0
+            ).totalBytes,
+            .max
+        )
+
+        let budgetPlan = PDFOfficeVisualBudgetPlan(profile: makeProfile(pageCount: 1))
+        let receiptA = PDFOfficeExportReceipt(
+            format: .wordDocument,
+            fileName: "A.docx",
+            fileSizeBytes: 1_024,
+            plan: nil,
+            budgetPlan: budgetPlan
+        )
+        let receiptB = PDFOfficeExportReceipt(
+            format: .plainText,
+            fileName: "B.txt",
+            fileSizeBytes: -8,
+            plan: nil,
+            budgetPlan: budgetPlan
+        )
+        let officeSummary = PDFOfficePinnedStorageSummary.measuring([
+            PDFPinnedOfficeOutput(
+                recordID: UUID(),
+                documentName: "A",
+                receipt: receiptA
+            ),
+            PDFPinnedOfficeOutput(
+                recordID: UUID(),
+                documentName: "B",
+                receipt: receiptB
+            )
+        ])
+        XCTAssertEqual(officeSummary.outputCount, 2)
+        XCTAssertEqual(officeSummary.byteCount, 1_024)
+        XCTAssertEqual(officeSummary.countContract, "2/24")
+        XCTAssertEqual(officeSummary.remainingOutputCount, 22)
+        XCTAssertTrue(officeSummary.canAdd(bytes: 1))
+        XCTAssertFalse(
+            officeSummary.canAdd(
+                bytes: PDFOfficePinnedStorageSummary.maximumByteCount
+            )
+        )
+        XCTAssertTrue(
+            PDFOfficePinnedStorageSummary(
+                outputCount: 20,
+                byteCount: 0
+            ).isNearCapacity
+        )
+        XCTAssertTrue(
+            PDFOfficePinnedStorageSummary(
+                outputCount: PDFOfficePinnedStorageSummary.maximumOutputCount,
+                byteCount: 0
+            ).isAtCapacity
+        )
+
+        XCTAssertEqual(PDFSourceLocationStatus.changed.title, "Source changed in Files")
+        XCTAssertEqual(PDFSourceLocationStatus.stale.symbol, "folder.badge.questionmark")
+        let permissions = PDFTechnicalPermissions(
+            allowsHighQualityPrinting: true,
+            allowsCopying: false,
+            allowsCommenting: true,
+            allowsFormFilling: true,
+            allowsDocumentAssembly: false,
+            allowsContentAccessibility: true
+        )
+        let source = PDFSourceLocationSnapshot(
+            status: .current,
+            name: "Source.pdf",
+            resolvedURL: URL(fileURLWithPath: "/tmp/Source.pdf"),
+            isUbiquitous: true,
+            modificationDate: Date(timeIntervalSince1970: 2)
+        )
+        let inspection = PDFTechnicalInspection(
+            byteCount: 2_048,
+            pageCount: 2,
+            sampledPageCount: 2,
+            textCoverage: 0.8,
+            imageDominantPageCount: 0,
+            formFieldCount: 1,
+            annotationCount: 1,
+            attachmentCount: 1,
+            outlineEntryCount: 2,
+            hasExplicitPageLabels: true,
+            isEncrypted: false,
+            isLocked: false,
+            permissions: permissions,
+            source: source
+        )
+        XCTAssertFalse(inspection.permissions?.allowsCopying ?? true)
+        XCTAssertEqual(inspection.source?.status, .current)
+
+        let blockID = try XCTUnwrap(
+            UUID(uuidString: "00000000-0000-0000-0000-000000000201")
+        )
+        let blockData = try JSONSerialization.data(
+            withJSONObject: [
+                "id": blockID.uuidString,
+                "text": "Legacy block",
+                "confidence": 0.91,
+                "normalizedX": 0.1,
+                "normalizedY": 0.2,
+                "normalizedWidth": 0.3,
+                "normalizedHeight": 0.4
+            ]
+        )
+        let legacyBlock = try JSONDecoder().decode(
+            OCRTextBlock.self,
+            from: blockData
+        )
+        XCTAssertFalse(legacyBlock.isUserCorrected)
+
+        let low = makeOCRBlock(text: "Low", confidence: 0.2)
+        let corrected = makeOCRBlock(
+            text: "Corrected",
+            confidence: 0.2,
+            isUserCorrected: true
+        )
+        let reviewPage = OCRPageResult(
+            pageIndex: 0,
+            text: "Invoice",
+            confidence: 0.85,
+            blocks: [low, corrected]
+        )
+        let cleanPage = OCRPageResult(
+            pageIndex: 1,
+            text: "Clean",
+            confidence: 0.99,
+            blocks: [corrected],
+            recognitionPass: .enhanced
+        )
+        XCTAssertEqual(reviewPage.lowConfidenceBlocks, [low])
+        XCTAssertTrue(reviewPage.needsReview)
+        XCTAssertFalse(cleanPage.needsReview)
+        let configuration = OCRRecognitionConfiguration(
+            languageMode: .selected,
+            languageIdentifiers: [
+                OCRRecognitionLanguage.english.rawValue,
+                OCRRecognitionLanguage.simplifiedChinese.rawValue
+            ],
+            customWords: ["Bates"]
+        )
+        XCTAssertEqual(
+            configuration.languageSummary,
+            [
+                OCRRecognitionLanguage.english.title.localizedUI,
+                OCRRecognitionLanguage.simplifiedChinese.title.localizedUI
+            ].joined(separator: ", ")
+        )
+        XCTAssertEqual(
+            OCRRecognitionConfiguration.automatic.languageSummary,
+            "Automatic language detection".localizedUI
+        )
+        let result = OCRResult(
+            pages: [cleanPage, reviewPage],
+            configuration: configuration
+        )
+        XCTAssertEqual(result.pages.map(\.pageIndex), [0, 1])
+        XCTAssertEqual(result.pagesNeedingReview.map(\.pageIndex), [0])
+        XCTAssertEqual(result.enhancedPageCount, 1)
+        XCTAssertEqual(result.text, "Page 1\nInvoice\n\nPage 2\nClean")
+
+        let legacyPageData = try JSONSerialization.data(
+            withJSONObject: [
+                "pageIndex": 4,
+                "text": "Legacy page",
+                "confidence": 0.93
+            ]
+        )
+        let legacyPage = try JSONDecoder().decode(
+            OCRPageResult.self,
+            from: legacyPageData
+        )
+        XCTAssertEqual(legacyPage.blocks, [])
+        XCTAssertEqual(legacyPage.recognitionPass, .standard)
+    }
+
+    func testPlannerMatrixPreflightAndErrorContracts_BitsUT()
+        throws {
+        XCTAssertEqual(
+            PDFQuickTaskPlanner.quickAccess(for: []),
+            [.scanToPDF, .imagesToPDF, .mergePDFs, .compressPDF]
+        )
+
+        var scanProfile = makeProfile(pageCount: 4)
+        scanProfile.kind = .scan
+        scanProfile.sampledPageCount = 4
+        scanProfile.imageDominantPageCount = 4
+        let scanRecord = DocumentRecord(
+            displayName: "Scanned exhibit",
+            fileName: "scan.pdf",
+            profile: scanProfile
+        )
+        XCTAssertEqual(
+            PDFQuickTaskPlanner.quickAccess(for: [scanRecord]),
+            [.recognizeText, .organizePages, .signPDF, .safeShare]
+        )
+        XCTAssertEqual(
+            PDFQuickTask.recognizeText.compatibilityNote(for: scanRecord),
+            "Image-based pages detected"
+        )
+        XCTAssertEqual(
+            PDFQuickTask.organizePages.compatibilityNote(for: scanRecord),
+            "4 pages ready to organize"
+        )
+
+        let contractBrief = DocumentBrief(
+            category: .contract,
+            summary: "Agreement",
+            entities: [],
+            suggestedSteps: [],
+            indexedAt: Date(timeIntervalSince1970: 95_000),
+            textSource: .searchableCopy,
+            indexedCharacterCount: 120,
+            confidence: .medium
+        )
+        let contractRecord = DocumentRecord(
+            displayName: "NDA",
+            fileName: "nda.pdf",
+            profile: makeProfile(pageCount: 1),
+            brief: contractBrief
+        )
+        let packageRecommendation = try XCTUnwrap(
+            PDFTaskPackagePlanner.recommendation(
+                for: contractRecord,
+                hasRecognizedText: true
+            )
+        )
+        XCTAssertEqual(packageRecommendation.package, .prepareToSend)
+        XCTAssertEqual(packageRecommendation.task, .signPDF)
+        XCTAssertEqual(packageRecommendation.reason, "Signature may be needed")
+        XCTAssertEqual(
+            PDFTaskPackagePlanner.task(
+                for: .prepareToSend,
+                record: contractRecord
+            ),
+            .signPDF
+        )
+
+        let amountBrief = DocumentBrief(
+            category: .invoice,
+            summary: "Invoice",
+            entities: [],
+            suggestedSteps: [
+                SuggestedStep(
+                    kind: .reviewAmount,
+                    title: "Check total",
+                    evidence: "Total $140",
+                    evidencePageIndex: 0
+                )
+            ],
+            indexedAt: Date(timeIntervalSince1970: 95_010),
+            textSource: .vision,
+            indexedCharacterCount: 80,
+            confidence: .medium
+        )
+        let amountRecord = DocumentRecord(
+            displayName: "Invoice",
+            fileName: "invoice.pdf",
+            profile: makeProfile(pageCount: 1),
+            brief: amountBrief
+        )
+        let actionRecommendation = DocumentActionPlanner.recommendation(
+            for: amountRecord,
+            hasRecognizedText: false
+        )
+        XCTAssertEqual(actionRecommendation.action, .brief)
+        XCTAssertEqual(actionRecommendation.reason, "Total $140")
+
+        XCTAssertEqual(PDFDeliveryPreflightStatus.ready.title, "Ready to verify")
+        XCTAssertEqual(PDFDeliveryPreflightStatus.blocked.symbol, "xmark.octagon")
+        let preflight = PDFDeliveryPreflightAssessment(
+            status: .review,
+            pageCount: 2,
+            byteCount: 2_048,
+            fixCount: 1,
+            reviewCount: 1,
+            items: [
+                PDFDeliveryPreflightItem(
+                    id: "metadata",
+                    title: "Metadata",
+                    detail: "Personal metadata will be removed",
+                    status: .willFix
+                )
+            ]
+        )
+        XCTAssertFalse(preflight.formattedSize.isEmpty)
+        XCTAssertEqual(preflight.items.map(\.id), ["metadata"])
+        XCTAssertEqual(PDFDeliveryOperation.bookletPrepared.symbol, "book.pages.fill")
+        XCTAssertEqual(
+            PaperPathError.invalidPassword.errorDescription,
+            "Use a PDF password between 8 and 128 characters."
+                .localizedUI
+        )
+        XCTAssertFalse(
+            PaperPathError.outputVerificationFailed("Blank page")
+                .errorDescription?.isEmpty ?? true
+        )
+    }
+
+    func testOCRNormalizationPreferenceAndCodingContracts_BitsUT()
+        throws {
+        let negativePage = OCRPageResult(
+            pageIndex: -1,
+            text: "Dropped",
+            confidence: 1
+        )
+        let uncorrected = OCRPageResult(
+            pageIndex: 1,
+            text: "Long uncorrected text",
+            confidence: 0.99,
+            blocks: []
+        )
+        let corrected = OCRPageResult(
+            pageIndex: 1,
+            text: "Fix",
+            confidence: 0.1,
+            blocks: [
+                makeOCRBlock(
+                    text: "Fix",
+                    confidence: 0.95,
+                    isUserCorrected: true
+                )
+            ]
+        )
+        let standardTie = OCRPageResult(
+            pageIndex: 2,
+            text: "Same",
+            confidence: 0.8,
+            blocks: []
+        )
+        let enhancedTie = OCRPageResult(
+            pageIndex: 2,
+            text: "Same",
+            confidence: 0.8,
+            blocks: [],
+            recognitionPass: .enhanced
+        )
+
+        let normalized = OCRResult(
+            pages: [standardTie, negativePage, uncorrected, corrected, enhancedTie]
+        )
+        XCTAssertEqual(normalized.pages.map(\.pageIndex), [1, 2])
+        XCTAssertEqual(normalized.pages[0].text, "Fix")
+        XCTAssertEqual(
+            normalized.pages[0].blocks.filter(\.isUserCorrected).count,
+            1
+        )
+        XCTAssertEqual(normalized.pages[1].recognitionPass, .enhanced)
+        XCTAssertEqual(normalized.enhancedPageCount, 1)
+        XCTAssertEqual(normalized.meanConfidence, 0.45, accuracy: 0.0001)
+        XCTAssertLessThan(
+            try JSONEncoder().encode(normalized).count,
+            OCRResult.maximumEncodedTextBytes
+        )
+
+        let legacyData = try JSONSerialization.data(
+            withJSONObject: [
+                "pages": [
+                    [
+                        "pageIndex": 0,
+                        "text": "Legacy",
+                        "confidence": 0.9
+                    ]
+                ]
+            ]
+        )
+        let legacyResult = try JSONDecoder().decode(
+            OCRResult.self,
+            from: legacyData
+        )
+        XCTAssertEqual(legacyResult.configuration, .automatic)
+        XCTAssertEqual(legacyResult.pages.first?.recognitionPass, .standard)
+    }
+
+    func testVersionArchiveCapacityAndUnsafeManifestContracts_BitsUT() {
+        let now = Date(timeIntervalSince1970: 96_000)
+        let hash = String(repeating: "d", count: 64)
+        let documentID = UUID()
+
+        func archiveEntry(
+            fileName: String = "Case.pdf",
+            snapshotID: UUID = UUID(),
+            title: String = "Case file",
+            createdAt: Date = now,
+            byteCount: Int64 = 4_096,
+            pageCount: Int = 2,
+            sha256: String = hash
+        ) -> PDFVersionArchiveManifest.Entry {
+            PDFVersionArchiveManifest.Entry(
+                fileName: fileName,
+                documentID: documentID,
+                snapshotID: snapshotID,
+                title: title,
+                createdAt: createdAt,
+                byteCount: byteCount,
+                pageCount: pageCount,
+                sha256: sha256,
+                linkedDeliveryReceiptID: nil
+            )
+        }
+
+        let snapshotA = PDFVersionSnapshot(
+            id: UUID(),
+            documentID: documentID,
+            createdAt: now,
+            label: "Import",
+            fileName: "a.pdf",
+            byteCount: .max,
+            pageCount: 1,
+            contentRevisionID: UUID(),
+            contentFingerprint: hash,
+            bookmarkedPages: [],
+            bookmarkNames: [:],
+            lastPageIndex: 0,
+            milestoneName: "A",
+            isPinned: true,
+            linkedDeliveryReceiptID: nil,
+            linkedDeliveryReceipt: nil
+        )
+        let snapshotB = PDFVersionSnapshot(
+            id: UUID(),
+            documentID: documentID,
+            createdAt: now,
+            label: "Edit",
+            fileName: "b.pdf",
+            byteCount: 1,
+            pageCount: 1,
+            contentRevisionID: UUID(),
+            contentFingerprint: hash,
+            bookmarkedPages: [],
+            bookmarkNames: [:],
+            lastPageIndex: 0,
+            milestoneName: "B",
+            isPinned: true,
+            linkedDeliveryReceiptID: nil,
+            linkedDeliveryReceipt: nil
+        )
+        let measured = PDFPinnedVersionStorageSummary.measuring([
+            snapshotA,
+            snapshotB
+        ])
+        XCTAssertEqual(measured.byteCount, .max)
+        XCTAssertTrue(measured.isAtCapacity)
+        XCTAssertFalse(measured.canAdd(bytes: 1))
+        XCTAssertTrue(measured.byteContract.contains("/"))
+        XCTAssertFalse(measured.formattedRemainingBytes.isEmpty)
+
+        let valid = PDFVersionArchiveManifest(
+            schema: PDFVersionArchiveManifest.currentSchema,
+            createdAt: now,
+            entries: [archiveEntry()]
+        )
+        XCTAssertTrue(valid.isStructurallyValid(at: now.addingTimeInterval(1)))
+
+        let duplicateID = UUID()
+        XCTAssertFalse(
+            PDFVersionArchiveManifest(
+                schema: PDFVersionArchiveManifest.currentSchema,
+                createdAt: now,
+                entries: [
+                    archiveEntry(fileName: "A.pdf", snapshotID: duplicateID),
+                    archiveEntry(fileName: "B.pdf", snapshotID: duplicateID)
+                ]
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+        XCTAssertFalse(
+            PDFVersionArchiveManifest(
+                schema: PDFVersionArchiveManifest.currentSchema,
+                createdAt: now,
+                entries: [archiveEntry(title: "Bad\nTitle")]
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+        XCTAssertFalse(
+            PDFVersionArchiveManifest(
+                schema: PDFVersionArchiveManifest.currentSchema,
+                createdAt: now,
+                entries: [
+                    archiveEntry(createdAt: now.addingTimeInterval(6 * 60))
+                ]
+            ).isStructurallyValid(at: now.addingTimeInterval(1))
+        )
+    }
+
+    func testModelCatalogDisplayAndSearchContractsCoverEveryCase_BitsUT() {
+        let allQuickTasks = PDFQuickTask.allCases
+        XCTAssertEqual(allQuickTasks.count, 14)
+        XCTAssertTrue(allQuickTasks.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(allQuickTasks.allSatisfy { !$0.detail.isEmpty })
+        XCTAssertTrue(allQuickTasks.allSatisfy { !$0.symbol.isEmpty })
+        XCTAssertTrue(allQuickTasks.allSatisfy { !$0.searchAliases.isEmpty })
+        XCTAssertEqual(PDFQuickTask.scanToPDF.group, .create)
+        XCTAssertEqual(PDFQuickTask.exportText.group, .convert)
+        XCTAssertFalse(PDFQuickTask.mergePDFs.requiresDocument)
+        XCTAssertTrue(PDFQuickTask.safeShare.requiresDocument)
+        XCTAssertTrue(PDFQuickTask.organizePages.isDefaultQuickAccess)
+        XCTAssertFalse(PDFQuickTask.exportImages.isDefaultQuickAccess)
+        XCTAssertEqual(PDFQuickTask.signPDF.matchScore("Sign PDF"), 100)
+        XCTAssertEqual(PDFQuickTask.signPDF.matchScore("sign"), 80)
+        XCTAssertEqual(PDFQuickTask.signPDF.matchScore("signature"), 50)
+        XCTAssertNil(PDFQuickTask.signPDF.matchScore("spreadsheet"))
+
+        var formProfile = makeProfile(pageCount: 1)
+        formProfile.kind = .form
+        formProfile.formFieldCount = 1
+        let formRecord = DocumentRecord(
+            displayName: "Form",
+            fileName: "form.pdf",
+            profile: formProfile
+        )
+        XCTAssertTrue(PDFQuickTask.fillForms.supports(formRecord))
+        XCTAssertTrue(
+            PDFQuickTask.fillForms.compatibilityNote(for: formRecord)
+                .contains("1 interactive field")
+        )
+
+        var scanProfile = makeProfile(pageCount: 1)
+        scanProfile.kind = .scan
+        let scanRecord = DocumentRecord(
+            displayName: "Scan",
+            fileName: "scan.pdf",
+            profile: scanProfile
+        )
+        XCTAssertTrue(PDFQuickTask.recognizeText.supports(scanRecord))
+        XCTAssertFalse(PDFQuickTask.redactPDF.supports(scanRecord))
+        XCTAssertEqual(
+            PDFQuickTask.exportImages.compatibilityNote(for: scanRecord),
+            "1 page to render"
+        )
+
+        var multiProfile = makeProfile(pageCount: 3)
+        multiProfile.kind = .mixed
+        let multiRecord = DocumentRecord(
+            displayName: "Mixed",
+            fileName: "mixed.pdf",
+            profile: multiProfile
+        )
+        XCTAssertTrue(PDFQuickTask.organizePages.supports(multiRecord))
+        XCTAssertEqual(
+            PDFQuickTask.organizePages.compatibilityNote(for: multiRecord),
+            "3 pages ready to organize"
+        )
+        XCTAssertEqual(
+            PDFQuickTask.splitPDF.compatibilityNote(for: multiRecord),
+            "3 pages ready to extract"
+        )
+        XCTAssertEqual(
+            PDFQuickTask.signPDF.compatibilityNote(for: multiRecord),
+            "Ready for signature"
+        )
+        XCTAssertEqual(
+            PDFQuickTask.safeShare.compatibilityNote(for: multiRecord),
+            "Ready for verified delivery"
+        )
+
+        let allPackages = PDFTaskPackage.allCases
+        XCTAssertEqual(allPackages.count, 6)
+        XCTAssertTrue(allPackages.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(allPackages.allSatisfy { !$0.detail.isEmpty })
+        XCTAssertTrue(allPackages.allSatisfy { !$0.symbol.isEmpty })
+        XCTAssertTrue(allPackages.allSatisfy { !$0.searchAliases.isEmpty })
+        XCTAssertTrue(PDFTaskPackage.makeSearchable.matches("ocr scan"))
+        XCTAssertFalse(PDFTaskPackage.compressForEmail.matches("signature"))
+        XCTAssertEqual(PDFTaskPackage.prepareToSend.defaultTask, .safeShare)
+        XCTAssertEqual(PDFTaskPackage.fixPages.defaultTask, .organizePages)
+        XCTAssertTrue(PDFTaskPackage.fixPages.supports(multiRecord))
+        XCTAssertFalse(PDFTaskPackage.redactAndProve.supports(scanRecord))
+
+        var lockedProfile = makeProfile(pageCount: 3)
+        lockedProfile.isLocked = true
+        let lockedRecord = DocumentRecord(
+            displayName: "Locked",
+            fileName: "locked.pdf",
+            profile: lockedProfile
+        )
+        XCTAssertTrue(
+            PDFQuickTask.scanToPDF.supports(lockedRecord)
+        )
+        XCTAssertFalse(
+            PDFQuickTask.safeShare.supports(lockedRecord)
+        )
+        XCTAssertFalse(
+            PDFTaskPackage.prepareToSend.supports(lockedRecord)
+        )
+    }
+
+    func testModelFormatActionAndToolContractsCoverEveryCase_BitsUT() {
+        let formats = PDFTextExportFormat.allCases
+        XCTAssertEqual(formats.count, 6)
+        XCTAssertTrue(formats.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.detail.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.symbol.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.fileExtension.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.editabilityIntent.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.appearanceIntent.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.sizeIntent.isEmpty })
+        XCTAssertTrue(formats.allSatisfy { !$0.bestFor.isEmpty })
+        XCTAssertEqual(
+            formats.filter { $0.isOfficeFormat },
+            [.wordDocument, .excelWorkbook, .powerPointPresentation]
+        )
+        XCTAssertEqual(PDFTextExportFormat.wordDocument.officePageLimit, 1_000)
+        XCTAssertEqual(PDFTextExportFormat.powerPointPresentation.officePageLimit, 500)
+        XCTAssertNil(PDFTextExportFormat.plainText.officePageLimit)
+
+        let actions = DocumentAction.allCases
+        XCTAssertEqual(actions.count, 9)
+        XCTAssertTrue(actions.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(actions.allSatisfy { !$0.explanation.isEmpty })
+        XCTAssertTrue(actions.allSatisfy { !$0.symbol.isEmpty })
+
+        let tools = DocumentTool.allCases
+        XCTAssertEqual(tools.count, 24)
+        XCTAssertTrue(tools.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(tools.allSatisfy { !$0.compactTitle.isEmpty })
+        XCTAssertTrue(tools.allSatisfy { !$0.symbol.isEmpty })
+        XCTAssertTrue(tools.allSatisfy { !$0.detail.isEmpty })
+        XCTAssertTrue(tools.allSatisfy { !$0.searchAliases.isEmpty })
+        XCTAssertEqual(DocumentTool.brief.group, .understand)
+        XCTAssertEqual(DocumentTool.highlight.group, .markUp)
+        XCTAssertEqual(DocumentTool.sign.group, .finish)
+        XCTAssertEqual(DocumentTool.organize.group, .pages)
+        XCTAssertEqual(DocumentTool.export.group, .export)
+        XCTAssertEqual(DocumentTool.find.matchScore("Find"), 1_210)
+        XCTAssertGreaterThan(
+            DocumentTool.bates.matchScore("legal exhibit") ?? 0,
+            DocumentTool.bates.matchScore("finish") ?? 0
+        )
+        XCTAssertNil(DocumentTool.protect.matchScore("ocr scan"))
+    }
+
+    func testModelVerificationProgressAndProvenanceContracts_BitsUT()
+        throws {
+        let now = Date(timeIntervalSince1970: 97_000)
+        let packageID = UUID()
+        let receiptID = UUID()
+        let entry = PDFOfficeDeliveryEntry(
+            sourceRecordID: UUID(),
+            sourceRevisionID: UUID(),
+            sourceName: "Matter",
+            receiptID: receiptID,
+            format: .wordDocument,
+            archiveName: "Matter.docx",
+            byteCount: 4_096,
+            sha256: String(repeating: "a", count: 64)
+        )
+        let verifiedArtifact = PDFOfficeVerifiedArtifact(
+            entry: entry,
+            url: temporaryDirectory.appendingPathComponent("Matter.docx"),
+            formatEvidence: .ooxml(
+                partCount: 7,
+                xmlPartCount: 4,
+                relationshipCount: 2,
+                mediaPartCount: 1
+            )
+        )
+        XCTAssertTrue(verifiedArtifact.formattedSize.contains("KB"))
+        XCTAssertEqual(verifiedArtifact.shortFingerprint, String(repeating: "a", count: 12))
+        XCTAssertEqual(
+            verifiedArtifact.formatEvidence.summary,
+            AppLocalization.format(
+                "%lld parts · %lld XML · %lld relationships · %lld media",
+                7,
+                4,
+                2,
+                1
+            )
+        )
+        XCTAssertEqual(
+            PDFOfficeArtifactFormatEvidence.richText.summary,
+            "RTF structure · UTF-8"
+        )
+        XCTAssertEqual(
+            PDFOfficeArtifactFormatEvidence.utf8Text.symbol,
+            "text.alignleft"
+        )
+
+        let report = PDFOfficeReportVerificationResult(
+            status: .verified,
+            packageID: packageID,
+            keyID: "signer-key",
+            sourceCount: 1,
+            outputCount: 1,
+            createdAt: now,
+            expiresAt: now.addingTimeInterval(60),
+            verifiedAt: now,
+            detail: "Verified",
+            publicKeyBase64: Data(repeating: 1, count: 32).base64EncodedString(),
+            trustStatus: .unknown,
+            trustedSignerName: nil
+        )
+        XCTAssertTrue(report.canTrustSigner(at: now))
+        XCTAssertFalse(report.isExpired(at: now))
+        XCTAssertTrue(report.isExpired(at: now.addingTimeInterval(61)))
+        XCTAssertEqual(
+            report.appendingDetail("ready").detail,
+            "Verified ready"
+        )
+        XCTAssertEqual(
+            report.attachingVerifiedArtifacts([verifiedArtifact])
+                .verifiedArtifacts,
+            [verifiedArtifact]
+        )
+        XCTAssertEqual(
+            report.updatingTrust(.trusted, signerName: "Legal Ops")
+                .trustedSignerName,
+            "Legal Ops"
+        )
+
+        let changeReport = PDFChangeReportVerificationResult(
+            status: .verified,
+            reportID: UUID(),
+            generatedAt: now,
+            sourceName: "A.pdf",
+            revisedName: "B.pdf",
+            changedPageCount: 2,
+            deliveryReceiptID: receiptID,
+            sourceRevisionID: nil,
+            revisedRevisionID: nil,
+            sourceFingerprint: nil,
+            revisedFingerprint: nil,
+            verifiedBody: nil,
+            verifiedBodyByteCount: nil,
+            verifiedBodySHA256: nil,
+            keyID: "change-key",
+            detail: "Signed",
+            publicKeyBase64: Data(repeating: 2, count: 32).base64EncodedString(),
+            trustStatus: .unknown,
+            trustedSignerName: nil
+        )
+        XCTAssertTrue(changeReport.canTrustSigner)
+        XCTAssertEqual(
+            changeReport.resolvingTrust(
+                .trusted,
+                trustedSignerName: "Reviewer"
+            ).trustedSignerName,
+            "Reviewer"
+        )
+
+        let progressWithoutBytes = PDFOperationProgress(
+            label: "Idle",
+            fractionCompleted: 0
+        )
+        XCTAssertNil(progressWithoutBytes.byteSummary)
+        XCTAssertNil(progressWithoutBytes.throughputSummary)
+        XCTAssertNil(progressWithoutBytes.remainingSummary)
+        XCTAssertFalse(progressWithoutBytes.isStalled(at: now))
+        let progressWithProcessedOnly = PDFOperationProgress(
+            label: "Copy",
+            fractionCompleted: 0.5,
+            processedBytes: 2_048
+        )
+        XCTAssertNotNil(progressWithProcessedOnly.byteSummary)
+        XCTAssertEqual(
+            PDFOperationProgress(
+                label: "Wait",
+                fractionCompleted: 0.1,
+                processedBytes: 1,
+                totalBytes: 10,
+                lastByteUpdateAt: now.addingTimeInterval(-1.5)
+            ).isStalled(at: now),
+            false
+        )
+        XCTAssertEqual(
+            PDFOperationProgress(
+                label: "Long",
+                fractionCompleted: 0.1,
+                estimatedRemainingSeconds: 125
+            ).remainingSummary,
+            "2m 5s"
+        )
+
+        let stages: [PDFBatchDeliveryStage] = [
+            .queued,
+            .checking,
+            .ready,
+            .creating,
+            .verified,
+            .reused,
+            .needsReview,
+            .blocked,
+            .failed,
+            .stopped
+        ]
+        XCTAssertTrue(stages.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(stages.allSatisfy { !$0.symbol.isEmpty })
+        XCTAssertEqual(stages.filter { $0.isFinal }.count, 6)
+        XCTAssertEqual(
+            stages.filter { $0.isShareable },
+            [.verified, .reused]
+        )
+
+        let batesRecord = makeRecord(name: "Bates", pageCount: 2)
+        let batesEntry = makeBatesEntry(
+            record: batesRecord,
+            outputRevisionID: UUID(),
+            start: 1,
+            end: 2,
+            sourceHash: String(repeating: "b", count: 64),
+            outputHash: String(repeating: "c", count: 64)
+        )
+        let statuses: [PDFBatesBatchEntryStatus] = [
+            .current,
+            .changed,
+            .removed,
+            .inTrash,
+            .missing,
+            .untrusted
+        ]
+        XCTAssertTrue(statuses.allSatisfy { !$0.title.isEmpty })
+        XCTAssertTrue(statuses.allSatisfy { !$0.symbol.isEmpty })
+        XCTAssertEqual(
+            statuses.map {
+                PDFBatesBatchReceiptVerificationItem(
+                    entry: batesEntry,
+                    status: $0,
+                    actualRevisionID: nil,
+                    actualSHA256: nil
+                ).detail
+            },
+            [
+                "Revision and SHA-256 match",
+                "The working copy changed after this receipt",
+                "The signed Bates removal matches this working copy",
+                "The verified revision is currently in Trash",
+                "The referenced private copy is unavailable",
+                "The signed receipt payload could not be trusted"
+            ]
+        )
+
+        let deliveryReport = PDFDeliveryPackageVerificationReport(
+            archiveName: "matter.zip",
+            archiveByteCount: 8_192,
+            packageID: packageID,
+            packageCreatedAt: now,
+            verifiedAt: now.addingTimeInterval(2),
+            artifactFileName: "Matter.pdf",
+            artifactByteCount: 4_096,
+            artifactPageCount: 1,
+            isEncrypted: false,
+            operation: .safeShare,
+            deliveryReceiptID: receiptID,
+            expectedSHA256: String(repeating: "d", count: 64),
+            actualSHA256: String(repeating: "d", count: 64),
+            checks: [
+                PDFDeliveryCheck(
+                    id: "hash",
+                    title: "SHA-256",
+                    detail: "Artifact bytes match.",
+                    status: .passed
+                )
+            ],
+            integrityFailures: [],
+            signatureStatus: .verified,
+            signatureDetail: "Valid",
+            signerKeyID: "delivery-key",
+            signerPublicKeyBase64:
+                Data(repeating: 3, count: 32).base64EncodedString(),
+            trustStatus: .trusted,
+            trustedSignerName: "Legal Ops",
+            verifiedArtifactURL:
+                temporaryDirectory.appendingPathComponent("Matter.pdf")
+        )
+        XCTAssertEqual(deliveryReport.status, .verified)
+        XCTAssertEqual(deliveryReport.warningCount, 0)
+        XCTAssertTrue(deliveryReport.hasValidSourceSignature)
+        XCTAssertTrue(deliveryReport.canOpenArtifact)
+        XCTAssertTrue(deliveryReport.canPreviewArtifact)
+        XCTAssertEqual(deliveryReport.provenanceTitle, "Legal Ops")
+        let invalidReport = deliveryReport.resolvingTrust(
+            .invalid,
+            trustedSignerName: nil
+        )
+        XCTAssertFalse(invalidReport.provenanceTitle.isEmpty)
+        XCTAssertNotEqual(invalidReport.provenanceTitle, "Legal Ops")
+        let provenance = PDFReceivedPackageProvenance(
+            report: deliveryReport,
+            importedAt: now.addingTimeInterval(3)
+        )
+        XCTAssertTrue(
+            provenance.matchesCurrentBytes(
+                fingerprint: String(repeating: "D", count: 64),
+                byteCount: 4_096
+            )
+        )
+        XCTAssertFalse(
+            provenance.matchesCurrentBytes(
+                fingerprint: String(repeating: "e", count: 64),
+                byteCount: 4_096
+            )
+        )
+        XCTAssertEqual(provenance.sourceTitle, "Legal Ops")
+        XCTAssertFalse(provenance.formattedArtifactSize.isEmpty)
+    }
+
+    func testModelPresentationMatricesExerciseEveryState_BitsUT() {
+        XCTAssertEqual(
+            Set(PDFQuickTaskGroup.allCases.map(\.id)).count,
+            PDFQuickTaskGroup.allCases.count
+        )
+        XCTAssertTrue(
+            PDFQuickTaskGroup.allCases.allSatisfy { !$0.title.isEmpty }
+        )
+        XCTAssertTrue(
+            PDFPageImageExportPreset.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+                    && !$0.detail.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            DocumentKind.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            DocumentToolGroup.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFReadingTheme.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFReadingLayout.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(PDFMarkupKind.allCases.allSatisfy { !$0.id.isEmpty })
+        XCTAssertTrue(
+            PDFMarkupColor.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFStampKind.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.stampName.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPageNumberFormat.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+                    && !$0.text(number: 2, total: 8).isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPageNumberPosition.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFGeneratedAnnotationKind.allCases.allSatisfy {
+                !$0.author.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFWatermarkPreset.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+                    && ($0 == .custom || !$0.defaultText.isEmpty)
+            }
+        )
+        XCTAssertTrue(
+            PDFWatermarkLayout.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFWatermarkTone.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFWatermarkIntensity.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+                    && $0.opacity > 0 && $0.scale > 0
+            }
+        )
+        XCTAssertTrue(
+            PDFTextReplacementFontStyle.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.pdfFontName.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFTextReplacementAlignment.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPrintPaperTarget.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPrintOrientationPolicy.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPrintScaleMode.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPrintProductionRisk.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFBookletBindingEdge.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFBookletSheetSide.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFSignaturePosition.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFSignatureSize.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+                    && $0.pageWidthFraction > 0
+            }
+        )
+        XCTAssertTrue(
+            PDFFormFieldKind.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFPageLabelStyle.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+                    && $0.formattedNumber(28).count >= 0
+            }
+        )
+        XCTAssertTrue(
+            DocumentWorkflowStatus.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            DocumentCategory.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            DetectedEntity.Kind.allCases.allSatisfy {
+                !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertEqual(
+            DetectedEntity.Kind.allCases.filter(\.isSensitive),
+            [.email, .phone, .identifier]
+        )
+        XCTAssertTrue(
+            PDFChangeSeverity.allCases.allSatisfy { !$0.title.isEmpty }
+        )
+        XCTAssertTrue(
+            OCRLanguageMode.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            OCRRecognitionLanguage.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty
+            }
+        )
+
+        let readiness: [PDFOfficeExportReadiness] = [
+            .strong, .review, .limited
+        ]
+        XCTAssertTrue(readiness.allSatisfy {
+            !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertTrue(PDFOfficeExportStage.allCases.allSatisfy {
+            !$0.id.isEmpty && !$0.title.isEmpty
+                && !$0.symbol.isEmpty && $0.threshold >= 0
+        })
+        XCTAssertEqual(PDFOfficeExportStage.current(fractionCompleted: -1), .analyze)
+        XCTAssertEqual(PDFOfficeExportStage.current(fractionCompleted: 0.7), .package)
+        XCTAssertEqual(PDFOfficeExportStage.current(fractionCompleted: 1), .verify)
+
+        let failureKinds: [PDFOfficeExportFailureKind] = [
+            .sourceLimit, .rights, .missingText, .busy, .storage,
+            .verification, .sourceChanged, .unavailableArtifact, .unknown
+        ]
+        XCTAssertTrue(failureKinds.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertEqual(
+            failureKinds.filter(\.allowsRetry).count,
+            6
+        )
+        XCTAssertEqual(
+            failureKinds.compactMap(\.recoveryTask),
+            [.splitPDF, .recognizeText]
+        )
+
+        let availability: [PDFOfficeArtifactAvailability] = [
+            .reusable, .sourceChanged, .expired, .unavailable
+        ]
+        XCTAssertTrue(availability.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let resources: [PDFOfficeResourceMode] = [
+            .ready, .conserving, .blocked
+        ]
+        XCTAssertTrue(resources.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let thermals: [PDFOfficeThermalLevel] = [
+            .nominal, .fair, .serious, .critical, .unknown
+        ]
+        XCTAssertTrue(thermals.allSatisfy { !$0.title.isEmpty })
+        let integrity: [PDFOfficeIntegrityStatus] = [
+            .verified, .missing, .mismatch, .sourceChanged
+        ]
+        XCTAssertTrue(integrity.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertEqual(integrity.filter(\.isVerified), [.verified])
+        let byteStages: [PDFByteProgressStage] = [
+            .reconstructing, .packaging, .checksumming, .archiving, .verifying
+        ]
+        XCTAssertTrue(byteStages.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let trustStatuses: [PDFOfficeSignerTrustStatus] = [
+            .thisDevice, .trusted, .unknown, .invalid, .unsupported
+        ]
+        XCTAssertTrue(trustStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let reportStatuses: [PDFOfficeReportVerificationStatus] = [
+            .verified, .expired, .invalid, .unsupported
+        ]
+        XCTAssertTrue(reportStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let matchStatuses: [PDFOfficeExternalMatchStatus] = [
+            .exact, .missing, .ambiguous, .inconsistent
+        ]
+        XCTAssertTrue(matchStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertTrue(PDFOfficeRouteConfidence.allCases.allSatisfy {
+            !$0.id.isEmpty && !$0.title.isEmpty
+                && !$0.symbol.isEmpty && !$0.detail.isEmpty
+        })
+        XCTAssertTrue(PDFOfficeProductionSLA.allCases.allSatisfy {
+            !$0.id.isEmpty && !$0.title.isEmpty && !$0.window.isEmpty
+                && !$0.symbol.isEmpty && !$0.detail.isEmpty
+        })
+        XCTAssertTrue(PDFOfficeVisualBudgetMode.allCases.allSatisfy {
+            !$0.id.isEmpty && !$0.storageValue.isEmpty
+                && !$0.title.isEmpty && !$0.symbol.isEmpty
+                && !$0.detail.isEmpty
+        })
+        XCTAssertTrue(PDFOfficeVisualBudgetPressure.allCases.allSatisfy {
+            !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertTrue(PDFOfficeVisualAnchorPolicy.allCases.allSatisfy {
+            !$0.id.isEmpty && !$0.title.isEmpty
+                && !$0.symbol.isEmpty && !$0.detail.isEmpty
+        })
+
+        let formCompatibility: [PDFFormCompatibility] = [
+            .ready, .limited, .unsupported
+        ]
+        XCTAssertTrue(formCompatibility.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let calculations: [PDFFormCalculationOperation] = [
+            .sum, .product, .average, .minimum, .maximum
+        ]
+        XCTAssertTrue(calculations.allSatisfy { !$0.title.isEmpty })
+        let formats: [PDFFormFormatKind] = [
+            .number, .percent, .date, .time
+        ]
+        XCTAssertTrue(formats.allSatisfy { !$0.title.isEmpty })
+        let origins: [PDFEmbeddedAttachmentOrigin] = [
+            .document, .pageAnnotation
+        ]
+        XCTAssertTrue(origins.allSatisfy { !$0.title.isEmpty })
+        let paperClasses: [PDFPagePaperClass] = [
+            .a4, .letter, .legal, .square, .custom
+        ]
+        XCTAssertTrue(paperClasses.allSatisfy { !$0.title.isEmpty })
+        let cropConfidence: [PDFPageCropConfidence] = [
+            .high, .medium, .low
+        ]
+        XCTAssertTrue(cropConfidence.allSatisfy { !$0.title.isEmpty })
+        let taskStages: [DocumentTaskStage] = [
+            .fillForm, .sign, .verify
+        ]
+        XCTAssertTrue(taskStages.allSatisfy {
+            !$0.title.isEmpty && !$0.detail.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertEqual(taskStages.map(\.action), [.reviewForm, .sign, .safeShare])
+        XCTAssertEqual(taskStages.map(\.quickTask), [.fillForms, .signPDF, .safeShare])
+        let textSources: [IndexedTextSource] = [
+            .native, .vision, .searchableCopy
+        ]
+        XCTAssertTrue(textSources.allSatisfy { !$0.title.isEmpty })
+        let confidence: [DocumentUnderstandingConfidence] = [
+            .high, .medium, .low
+        ]
+        XCTAssertTrue(confidence.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let suggestionKinds: [SuggestedStep.Kind] = [
+            .recognize, .reviewDate, .reviewAmount, .completeForm,
+            .reviewSignature, .organize, .share
+        ]
+        XCTAssertTrue(suggestionKinds.allSatisfy { !$0.symbol.isEmpty })
+        let operations: [PDFDeliveryOperation] = [
+            .compressed, .redacted, .protected, .unlocked, .flattened,
+            .safeShare, .edited, .textReplaced, .printPrepared,
+            .bookletPrepared
+        ]
+        XCTAssertTrue(operations.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let preflightStatuses: [PDFDeliveryPreflightStatus] = [
+            .ready, .review, .blocked
+        ]
+        XCTAssertTrue(preflightStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let failurePhases: [PDFBatchDeliveryFailurePhase] = [
+            .source, .preflight, .rendering, .verification, .saving,
+            .cancelled
+        ]
+        XCTAssertTrue(failurePhases.allSatisfy { !$0.title.isEmpty })
+        let changeSides: [PDFChangePageSide] = [.source, .revised]
+        XCTAssertTrue(changeSides.allSatisfy { !$0.title.isEmpty })
+        let matchKinds: [PDFPageMatchKind] = [
+            .unchanged, .modified, .inserted, .removed
+        ]
+        XCTAssertTrue(matchKinds.allSatisfy { !$0.title.isEmpty })
+        let differenceKinds: [PDFTextDifferenceKind] = [
+            .removed, .inserted
+        ]
+        XCTAssertTrue(differenceKinds.allSatisfy { !$0.title.isEmpty })
+        let granularities: [PDFTextDifferenceGranularity] = [
+            .word, .character
+        ]
+        XCTAssertTrue(granularities.allSatisfy { !$0.title.isEmpty })
+        let matchBases: [PDFPageMatchBasis] = [
+            .exactContent, .repeatedContent, .pageLabel, .textMarker,
+            .barcode, .context, .similarity
+        ]
+        XCTAssertTrue(matchBases.allSatisfy { !$0.title.isEmpty })
+        let versionStatuses: [PDFVersionArchiveVerificationStatus] = [
+            .verified, .failed
+        ]
+        XCTAssertTrue(versionStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let sourceStatuses: [PDFSourceLocationStatus] = [
+            .detached, .current, .changed, .unavailable, .stale
+        ]
+        XCTAssertTrue(sourceStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let recognitionPasses: [OCRRecognitionPass] = [
+            .standard, .enhanced
+        ]
+        XCTAssertTrue(recognitionPasses.allSatisfy { !$0.title.isEmpty })
+    }
+
+    func testOfficeBatchQueueAndBudgetStateMatrices_BitsUT() {
+        var profile = makeProfile(pageCount: 1_205)
+        profile.byteCount = 300 * 1_024 * 1_024
+        profile.sampledPageCount = 1_000
+        profile.imageDominantPageCount = 820
+
+        let budget = PDFOfficeVisualBudgetPlan(profile: profile)
+        XCTAssertFalse(budget.formattedTotalBudget.isEmpty)
+        XCTAssertFalse(budget.formattedPerPageBudget.isEmpty)
+        XCTAssertFalse(budget.formattedEstimatedVisualBytes.isEmpty)
+        XCTAssertFalse(budget.pressureContract.isEmpty)
+        XCTAssertFalse(budget.chunkSummary.isEmpty)
+        XCTAssertFalse(budget.compressionLadderSummary.isEmpty)
+        XCTAssertFalse(budget.anchorPolicySummary.isEmpty)
+        XCTAssertFalse(budget.reserveWindowSummary.isEmpty)
+        XCTAssertFalse(budget.memoryGuardSummary.isEmpty)
+        XCTAssertTrue((0...100).contains(budget.visualReferenceRatioPercent))
+        XCTAssertTrue((0...100).contains(budget.estimatedBudgetUsePercent))
+
+        for format in PDFTextExportFormat.allCases {
+            let plan = PDFOfficeExportFormatPlan.plan(
+                for: format,
+                profile: profile
+            )
+            XCTAssertEqual(plan.id, format.rawValue)
+            XCTAssertTrue((0...100).contains(plan.compositeScore))
+            XCTAssertFalse(plan.decisionRole.isEmpty)
+            XCTAssertFalse(plan.compactEvidence.isEmpty)
+            XCTAssertFalse(plan.actionTitle.isEmpty)
+            XCTAssertFalse(plan.primaryEvidence.isEmpty)
+            XCTAssertFalse(plan.riskEvidence.isEmpty)
+            XCTAssertFalse(plan.preferredUse.isEmpty)
+        }
+
+        let failures = [
+            PDFOfficeExportFailure.sourceLimit(
+                format: .powerPointPresentation,
+                pageCount: 501
+            ),
+            PDFOfficeExportFailure.unavailableArtifact(format: .wordDocument),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.lockedPDF
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.missingRecognizedText
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.insufficientStorage
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.fileTooLarge
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.outputVerificationFailed(
+                    "source changed during verification"
+                )
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.outputVerificationFailed("hash mismatch")
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.insufficientSelection(
+                    "already processing"
+                )
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.insufficientSelection("page limit")
+            ),
+            PDFOfficeExportFailure.classify(
+                format: .plainText,
+                error: PaperPathError.invalidPage
+            )
+        ]
+        XCTAssertEqual(Set(failures.map(\.kind)).count, 9)
+        XCTAssertTrue(failures.allSatisfy { !$0.detail.isEmpty })
+
+        let plan = PDFOfficeBatchPlan(
+            format: .wordDocument,
+            sourceRevisionID: UUID(),
+            profile: profile
+        )
+        XCTAssertGreaterThan(plan.segmentCount, 1)
+        XCTAssertTrue(plan.isBatchRequired)
+        XCTAssertFalse(plan.summary.isEmpty)
+        XCTAssertTrue(plan.segments.allSatisfy {
+            $0.id == $0.id && $0.pageCount > 0
+                && !$0.pageIndices.isEmpty && !$0.pageRangeLabel.isEmpty
+        })
+
+        var run = PDFOfficeBatchRun(plan: plan)
+        for index in run.segments.indices {
+            run.segments[index].status = [
+                PDFOfficeBatchSegmentStatus.completed,
+                .failed,
+                .cancelled
+            ][index % 3]
+            run.segments[index].fractionCompleted = Double(index + 1)
+                / Double(run.segments.count)
+        }
+        XCTAssertGreaterThan(run.completedCount, 0)
+        XCTAssertGreaterThan(run.failedCount, 0)
+        XCTAssertTrue((0...1).contains(run.fractionCompleted))
+        XCTAssertTrue((0...100).contains(run.percentCompleted))
+        XCTAssertFalse(run.retryableSegmentIDs.isEmpty)
+        let segmentStatuses: [PDFOfficeBatchSegmentStatus] = [
+            .queued, .extracting, .rebuilding, .retaining, .completed,
+            .failed, .cancelled
+        ]
+        XCTAssertTrue(segmentStatuses.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertEqual(segmentStatuses.filter(\.isTerminal).count, 3)
+        let batchStatuses: [PDFOfficeBatchStatus] = [
+            .preparing, .running, .paused, .completed, .partial, .failed,
+            .cancelled
+        ]
+        run.status = .completed
+        XCTAssertTrue(run.isFinished)
+        XCTAssertTrue(batchStatuses.allSatisfy { !$0.title.isEmpty })
+
+        var jobs = PDFOfficeQueuePriority.allCases.enumerated().map {
+            index,
+            priority in
+            var job = makeQueueJob(
+                recordID: UUID(),
+                revisionID: UUID(),
+                priority: priority,
+                createdAt: Date(timeIntervalSince1970: Double(index))
+            )
+            job.stage = [
+                PDFOfficeQueueJobStage.queued,
+                .analyzing,
+                .completed
+            ][index]
+            job.completedAt = Date(
+                timeIntervalSince1970: Double(index + 10)
+            )
+            return job
+        }
+        jobs.append(contentsOf: [
+            .init(
+                recordID: UUID(),
+                sourceRevisionID: UUID(),
+                sourceName: "Large",
+                sourcePageCount: 1_001,
+                format: .wordDocument,
+                priority: .background
+            ),
+            .init(
+                recordID: UUID(),
+                sourceRevisionID: UUID(),
+                sourceName: "Text",
+                sourcePageCount: 1,
+                format: .plainText,
+                priority: .normal
+            )
+        ])
+        XCTAssertTrue(PDFOfficeQueuePriority.allCases.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        let queueStages: [PDFOfficeQueueJobStage] = [
+            .queued, .analyzing, .rebuilding, .retaining, .paused,
+            .completed, .attention, .cancelled
+        ]
+        XCTAssertTrue(queueStages.allSatisfy {
+            !$0.title.isEmpty && !$0.symbol.isEmpty
+        })
+        XCTAssertEqual(queueStages.filter(\.isPending), [.queued, .paused])
+        XCTAssertEqual(queueStages.filter(\.isTerminal).count, 3)
+        XCTAssertFalse(jobs[0].isBatch)
+        XCTAssertTrue(jobs[3].isBatch)
+        XCTAssertTrue(jobs.allSatisfy { !$0.routeLabel.isEmpty })
+
+        var queue = PDFOfficeProductionQueue(jobs: jobs)
+        XCTAssertGreaterThan(queue.pendingCount, 0)
+        XCTAssertGreaterThan(queue.completedCount, 0)
+        XCTAssertEqual(queue.attentionCount, 0)
+        XCTAssertNotNil(queue.activeJob)
+        XCTAssertTrue(queue.hasRunnableJobs)
+        queue.restoreInterruptedWork()
+        XCTAssertTrue(queue.isSuspended)
+        queue.boundHistory()
+        XCTAssertEqual(queue.jobs.count, jobs.count)
+
+        let runtime = PDFOfficeRuntimeEvidence(
+            sourcePageCount: 2,
+            outputPageCount: 3,
+            primaryUnitLabel: "Paragraphs",
+            primaryUnitCount: 4,
+            characterCount: 20,
+            searchablePageCount: 2,
+            assetCount: 1,
+            assetByteCount: 1_024,
+            assetBudgetByteCount: 2_048,
+            assetCompressionFallbackCount: 1,
+            assetMinimumQualityPercent: 46
+        )
+        XCTAssertEqual(runtime.pageYieldPercent, 100)
+        XCTAssertEqual(runtime.searchableCoveragePercent, 67)
+        XCTAssertEqual(runtime.assetBudgetUsePercent, 50)
+        XCTAssertFalse(runtime.formattedAssetBytes.isEmpty)
+        XCTAssertFalse(runtime.formattedAssetBudget.isEmpty)
+    }
+
+    func testPrintBookletFormAndDifferenceDerivedContracts_BitsUT() {
+        let clearEvidence = PDFPrintProductionEvidence(
+            pageIndex: 0,
+            trimBoxInsetPoints: .none,
+            bleedInsetPoints: .none,
+            requiredBleedPoints: 9,
+            requiredSafeAreaPoints: 18,
+            nearestContentToTrimPoints: nil,
+            hasExplicitTrimBox: false,
+            hasBleedAllowance: true,
+            safeAreaRisk: .clear,
+            bleedRisk: .clear
+        )
+        let riskEvidence = PDFPrintProductionEvidence(
+            pageIndex: 1,
+            trimBoxInsetPoints: PDFPageCropInsets(
+                top: 1,
+                right: 2,
+                bottom: 3,
+                left: 4
+            ),
+            bleedInsetPoints: .none,
+            requiredBleedPoints: 9,
+            requiredSafeAreaPoints: 18,
+            nearestContentToTrimPoints: 7,
+            hasExplicitTrimBox: true,
+            hasBleedAllowance: false,
+            safeAreaRisk: .risk,
+            bleedRisk: .caution
+        )
+        XCTAssertEqual(clearEvidence.overallRisk, .clear)
+        XCTAssertEqual(clearEvidence.trimSummary, "Crop box")
+        XCTAssertEqual(clearEvidence.safeAreaSummary, "No text/fields")
+        XCTAssertEqual(riskEvidence.overallRisk, .risk)
+        XCTAssertFalse(riskEvidence.trimSummary.isEmpty)
+        XCTAssertEqual(riskEvidence.bleedSummary, "Missing")
+        XCTAssertFalse(riskEvidence.safeAreaSummary.isEmpty)
+
+        let pages = [
+            PDFPrintPreparationPage(
+                pageIndex: 0,
+                sourceWidth: 612,
+                sourceHeight: 792,
+                outputWidth: 612,
+                outputHeight: 792,
+                printableWidth: 564,
+                printableHeight: 744,
+                renderedWidth: 500,
+                renderedHeight: 700,
+                scale: 0.8,
+                visibleFraction: 1,
+                productionEvidence: clearEvidence
+            ),
+            PDFPrintPreparationPage(
+                pageIndex: 1,
+                sourceWidth: 792,
+                sourceHeight: 612,
+                outputWidth: 612,
+                outputHeight: 792,
+                printableWidth: 564,
+                printableHeight: 744,
+                renderedWidth: 600,
+                renderedHeight: 744,
+                scale: 1.2,
+                visibleFraction: 0.8,
+                productionEvidence: riskEvidence
+            )
+        ]
+        XCTAssertEqual(pages.map(\.id), [0, 1])
+        XCTAssertTrue(pages[0].hasPadding)
+        XCTAssertTrue(pages[1].hasClipping)
+        XCTAssertTrue(pages.allSatisfy { $0.isScaled })
+        XCTAssertTrue(pages.allSatisfy { !$0.sourceSizeLabel.isEmpty })
+        XCTAssertTrue(pages.allSatisfy { !$0.outputSizeLabel.isEmpty })
+        XCTAssertEqual(pages.map(\.scalePercent), [80, 120])
+        XCTAssertEqual(pages.map(\.visiblePercent), [100, 80])
+        XCTAssertEqual(pages[0].outcomeTitle, "Reduced")
+        XCTAssertEqual(pages[1].outcomeTitle, "Preflight risk")
+
+        let printAssessment = PDFPrintPreparationAssessment(
+            revisionID: UUID(),
+            options: .standard,
+            annotationCount: 0,
+            pages: pages
+        )
+        XCTAssertEqual(printAssessment.clippedPageCount, 1)
+        XCTAssertEqual(printAssessment.scaledPageCount, 2)
+        XCTAssertEqual(printAssessment.paddedPageCount, 1)
+        XCTAssertEqual(printAssessment.productionRiskPageCount, 1)
+        XCTAssertEqual(printAssessment.productionCautionPageCount, 0)
+        XCTAssertEqual(printAssessment.productionReviewPageCount, 1)
+        XCTAssertEqual(printAssessment.bleedRiskPageCount, 1)
+        XCTAssertEqual(printAssessment.safeAreaRiskPageCount, 1)
+        XCTAssertEqual(printAssessment.averageScalePercent, 100)
+
+        let left = PDFBookletSlot(
+            sourcePageIndex: 0,
+            scale: 0.9,
+            visibleFraction: 1,
+            creepOffsetPoints: -4
+        )
+        let blank = PDFBookletSlot(
+            sourcePageIndex: nil,
+            scale: 1,
+            visibleFraction: 1,
+            creepOffsetPoints: 6
+        )
+        let spread = PDFBookletSpread(
+            outputPageIndex: 0,
+            signatureNumber: 1,
+            signatureSheetCount: 2,
+            sheetNumber: 1,
+            side: .front,
+            left: left,
+            right: blank,
+            sheetWidth: 792,
+            sheetHeight: 612
+        )
+        XCTAssertEqual(left.pageNumber, 1)
+        XCTAssertEqual(left.scalePercent, 90)
+        XCTAssertTrue(blank.isBlank)
+        XCTAssertTrue(spread.hasBlankSlot)
+        XCTAssertEqual(spread.id, 0)
+        XCTAssertEqual(spread.pageOrderLabel, "1 · Blank")
+        let booklet = PDFBookletAssessment(
+            revisionID: UUID(),
+            options: PDFBookletOptions(
+                paperTarget: .letter,
+                bindingEdge: .left,
+                outerMarginPoints: 24,
+                gutterPoints: 12,
+                showsFoldMarks: true,
+                signatureSheetLimit: 2,
+                creepCompensationPoints: 6
+            ),
+            sourcePageCount: 1,
+            paddedPageCount: 4,
+            annotationCount: 0,
+            spreads: [spread]
+        )
+        XCTAssertEqual(booklet.signatureCount, 1)
+        XCTAssertEqual(booklet.insertedBlankCount, 3)
+        XCTAssertEqual(booklet.sheetCount, 1)
+        XCTAssertEqual(booklet.outputPageCount, 1)
+        XCTAssertEqual(booklet.maximumCreepOffsetPoints, 6)
+        XCTAssertEqual(booklet.largestSignatureSheetCount, 2)
+        XCTAssertEqual(booklet.averageScalePercent, 90)
+
+        let region = PDFDifferenceRegion(
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.1,
+            intensity: 0.8
+        )
+        let character = PDFTextDifferenceEvidence(
+            kind: .removed,
+            text: " \n\t",
+            region: region,
+            granularity: .character
+        )
+        let word = PDFTextDifferenceEvidence(
+            kind: .inserted,
+            text: "A replacement phrase that is deliberately longer than the preview",
+            region: region,
+            granularity: .word
+        )
+        let modified = PDFPageChange(
+            pageIndex: 1,
+            sourceExists: true,
+            revisedExists: true,
+            visibleDifference: 0,
+            changedPixelRatio: 0,
+            geometryChanged: false,
+            textChanged: true,
+            sourceTextCharacterCount: 3,
+            revisedTextCharacterCount: 64,
+            differenceRegions: [region],
+            sourceTextDifferences: [character],
+            revisedTextDifferences: [word],
+            matchBasis: .textMarker
+        )
+        XCTAssertFalse(modified.id.isEmpty)
+        XCTAssertEqual(modified.resolvedSourcePageIndex, 1)
+        XCTAssertEqual(modified.resolvedRevisedPageIndex, 1)
+        XCTAssertEqual(modified.resolvedMatchKind, .modified)
+        XCTAssertTrue(modified.isTextOnlyChange)
+        XCTAssertEqual(modified.textDifferenceCount, 2)
+        XCTAssertEqual(modified.characterDifferenceCount, 1)
+        XCTAssertEqual(modified.wordDifferenceCount, 1)
+        XCTAssertEqual(modified.resolvedTextDifferenceGranularity, .character)
+        XCTAssertFalse(modified.localizedTextEvidenceCountLabel.isEmpty)
+        XCTAssertFalse(modified.textDifferencePreview?.isEmpty ?? true)
+        XCTAssertEqual(modified.preferredOpenSide, .revised)
+        XCTAssertEqual(modified.preferredOpenPageIndex, 1)
+        XCTAssertEqual(modified.severity, .major)
+
+        let inserted = PDFPageChange(
+            pageIndex: 2,
+            sourceExists: false,
+            revisedExists: true,
+            visibleDifference: 1,
+            changedPixelRatio: 1,
+            geometryChanged: true,
+            textChanged: false,
+            sourceTextCharacterCount: 0,
+            revisedTextCharacterCount: 5
+        )
+        let removed = PDFPageChange(
+            pageIndex: 3,
+            sourceExists: true,
+            revisedExists: false,
+            visibleDifference: 1,
+            changedPixelRatio: 1,
+            geometryChanged: false,
+            textChanged: false,
+            sourceTextCharacterCount: 5,
+            revisedTextCharacterCount: 0
+        )
+        XCTAssertEqual(inserted.resolvedMatchKind, .inserted)
+        XCTAssertEqual(removed.resolvedMatchKind, .removed)
+        XCTAssertEqual(removed.preferredOpenSide, .source)
+        XCTAssertEqual(removed.preferredOpenPageIndex, 3)
+
+        let review = PDFChangeReview(
+            sourcePageCount: 3,
+            revisedPageCount: 4,
+            comparedPageCount: 2,
+            changes: [modified, inserted, removed]
+        )
+        XCTAssertEqual(review.visibleChangedPageCount, 2)
+        XCTAssertEqual(review.textChangedPageCount, 1)
+        XCTAssertEqual(review.geometryChangedPageCount, 1)
+        XCTAssertEqual(review.totalChangedPageCount, 3)
+        XCTAssertEqual(review.addedPageCount, 1)
+        XCTAssertEqual(review.removedPageCount, 0)
+        XCTAssertEqual(review.visiblyUnchangedPageCount, 2)
+        XCTAssertFalse(review.isIdentical)
+        XCTAssertGreaterThan(review.estimatedCacheByteCount, 0)
+        XCTAssertEqual(review.resolvedPageMatches.count, 4)
+        XCTAssertEqual(review.revisedPage(matchingSourcePage: 1), 1)
+        XCTAssertEqual(review.sourcePage(matchingRevisedPage: 1), 1)
+    }
+
+    func testOfficeArtifactFormatAndShareVerificationRoundTrip_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("format-verification-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 2
+        )
+        let index = DocumentTextIndex(
+            source: .vision,
+            pages: [
+                IndexedPageText(
+                    pageIndex: 0,
+                    text: "Invoice 1042\nDescription Quantity Total\nPaper 2 18.00"
+                ),
+                IndexedPageText(
+                    pageIndex: 1,
+                    text: "Approval notes\nReviewed locally"
+                )
+            ],
+            indexedAt: Date()
+        )
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.verifiedOfficeDeliveryPrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try LocalFileSecurity.prepareProtectedDirectory(at: directory)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        var entries: [PDFOfficeDeliveryEntry] = []
+        var urls: [String: URL] = [:]
+        for format in PDFTextExportFormat.allCases {
+            let name = "verified-\(format.rawValue).\(format.fileExtension)"
+            let url = directory.appendingPathComponent(name)
+            _ = try PDFOutputService().exportText(
+                sourceURL: source,
+                destination: url,
+                textIndex: index,
+                title: "Verified Office Export",
+                format: format,
+                profile: makeProfile(pageCount: 2)
+            )
+            let data = try Data(contentsOf: url)
+            let entry = PDFOfficeDeliveryEntry(
+                sourceRecordID: UUID(),
+                sourceRevisionID: UUID(),
+                sourceName: "Format source",
+                receiptID: UUID(),
+                format: format,
+                archiveName: name,
+                byteCount: Int64(data.count),
+                sha256: sha256(data)
+            )
+            entries.append(entry)
+            urls[name] = url
+        }
+
+        let evidence = try PDFOfficeArtifactFormatVerificationService()
+            .verify(entries, extractedFileURLs: urls)
+        XCTAssertEqual(evidence.count, entries.count)
+        XCTAssertTrue(entries.allSatisfy { evidence[$0.receiptID] != nil })
+
+        let artifacts = try entries.map { entry in
+            PDFOfficeVerifiedArtifact(
+                entry: entry,
+                url: try XCTUnwrap(urls[entry.archiveName]),
+                formatEvidence: try XCTUnwrap(evidence[entry.receiptID])
+            )
+        }
+        let verifiedURLs = try PDFOfficeArtifactShareVerificationService()
+            .verify(artifacts)
+        XCTAssertEqual(
+            Set(verifiedURLs.map(\.standardizedFileURL)),
+            Set(urls.values.map(\.standardizedFileURL))
+        )
+
+        let signingStore = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("OfficeArchiveSigningStore"),
+            signingPrivateKeyProvider: {
+                Curve25519.Signing.PrivateKey()
+            }
+        )
+        let createdAt = PDFOfficeTimeAnchor.process.trustedDate()
+        let signedReport = try await signingStore
+            .signOfficeDeliveryPayload(
+                PDFOfficeVerificationPayload(
+                    schema: "PaperPath Office Delivery V34",
+                    packageID: UUID(),
+                    createdAt: createdAt,
+                    expiresAt: createdAt.addingTimeInterval(3_600),
+                    verifiedOutputs: entries.count,
+                    files: entries
+                )
+            )
+        let manifestURL = temporaryDirectory
+            .appendingPathComponent("PaperPath-delivery-manifest.json")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(signedReport).write(
+            to: manifestURL,
+            options: .atomic
+        )
+        let archiveURL = temporaryDirectory
+            .appendingPathComponent("verified-office-delivery.zip")
+        let archiveSources = entries.map { entry in
+            OfficeBatchArchiveSource(
+                sourceURL: urls[entry.archiveName]!,
+                archiveName: entry.archiveName
+            )
+        } + [
+            OfficeBatchArchiveSource(
+                sourceURL: manifestURL,
+                archiveName: manifestURL.lastPathComponent
+            )
+        ]
+        try OfficeBatchArchiveService().createArchive(
+            sources: archiveSources,
+            destination: archiveURL
+        )
+        let extractionDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "\(PaperPathTemporaryArtifact.verifiedOfficeDeliveryPrefix)\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try LocalFileSecurity.prepareProtectedDirectory(
+            at: extractionDirectory
+        )
+        defer {
+            try? FileManager.default.removeItem(at: extractionDirectory)
+        }
+        let archiveInspection = try PDFVersionArchiveVerificationService()
+            .verifyOfficeDeliveryArchive(
+                archiveURL: archiveURL,
+                extractionDirectory: extractionDirectory
+            )
+        XCTAssertEqual(archiveInspection.verifiedFileCount, entries.count)
+        XCTAssertEqual(
+            Set(archiveInspection.extractedFileURLs.keys),
+            Set(entries.map(\.archiveName))
+        )
+
+        let invalidText = directory.appendingPathComponent("invalid.txt")
+        try Data([0xf0, 0x28, 0x8c, 0x28]).write(to: invalidText)
+        let invalidEntry = PDFOfficeDeliveryEntry(
+            sourceRecordID: UUID(),
+            sourceRevisionID: UUID(),
+            sourceName: "Invalid UTF-8",
+            receiptID: UUID(),
+            format: .plainText,
+            archiveName: invalidText.lastPathComponent,
+            byteCount: 4,
+            sha256: sha256(try Data(contentsOf: invalidText))
+        )
+        XCTAssertThrowsError(
+            try PDFOfficeArtifactFormatVerificationService().verify(
+                [invalidEntry],
+                extractedFileURLs: [
+                    invalidEntry.archiveName: invalidText
+                ]
+            )
+        )
+    }
+
+    func testOutputAddedContentAndEmbeddedBookmarksRoundTrip_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("content-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 2
+        )
+        let edited = temporaryDirectory
+            .appendingPathComponent("content-edited.pdf")
+        let imageData = try XCTUnwrap(
+            makeTestImage(size: CGSize(width: 80, height: 60))
+                .pngData()
+        )
+        let bounds = PDFNormalizedRect(
+            x: 0.1,
+            y: 0.1,
+            width: 0.3,
+            height: 0.15
+        )
+        let linkURL = try XCTUnwrap(URL(string: "https://example.com/review"))
+        let progress = TestProgressRecorder()
+        try PDFOutputService().addContent(
+            sourceURL: source,
+            destination: edited,
+            overlays: [
+                .text(
+                    pageIndex: 0,
+                    bounds: bounds,
+                    text: "Approved",
+                    fontSize: 14,
+                    color: PDFInkColor(
+                        red: 0.1,
+                        green: 0.2,
+                        blue: 0.3,
+                        alpha: 1
+                    )
+                ),
+                .link(
+                    pageIndex: 0,
+                    bounds: PDFNormalizedRect(
+                        x: 0.1,
+                        y: 0.35,
+                        width: 0.5,
+                        height: 0.1
+                    ),
+                    title: "Review source",
+                    url: linkURL
+                ),
+                .image(
+                    pageIndex: 1,
+                    bounds: bounds,
+                    data: imageData
+                )
+            ],
+            progress: { progress.append($0) }
+        )
+        let editedDocument = try XCTUnwrap(PDFDocument(url: edited))
+        XCTAssertEqual(editedDocument.pageCount, 2)
+        XCTAssertEqual(editedDocument.page(at: 0)?.annotations.count, 3)
+        XCTAssertEqual(progress.values.last, 1)
+
+        let bookmarked = temporaryDirectory
+            .appendingPathComponent("content-bookmarked.pdf")
+        try PDFOutputService().embedBookmarks(
+            sourceURL: edited,
+            destination: bookmarked,
+            pageIndices: [1, 0, 1, -1, 99]
+        )
+        let bookmarkedDocument = try XCTUnwrap(
+            PDFDocument(url: bookmarked)
+        )
+        XCTAssertEqual(bookmarkedDocument.pageCount, 2)
+        XCTAssertEqual(
+            bookmarkedDocument.outlineRoot?.child(at: 0)?
+                .numberOfChildren,
+            2
+        )
+
+        XCTAssertThrowsError(
+            try PDFOutputService().addContent(
+                sourceURL: source,
+                destination: temporaryDirectory
+                    .appendingPathComponent("empty-content.pdf"),
+                overlays: []
+            )
+        )
+        XCTAssertThrowsError(
+            try PDFOutputService().addContent(
+                sourceURL: source,
+                destination: temporaryDirectory
+                    .appendingPathComponent("invalid-content.pdf"),
+                overlays: [
+                    .text(
+                        pageIndex: 99,
+                        bounds: bounds,
+                        text: "Invalid",
+                        fontSize: 12,
+                        color: PDFInkColor(
+                            red: 0,
+                            green: 0,
+                            blue: 0,
+                            alpha: 1
+                        )
+                    )
+                ]
+            )
+        )
+    }
+
+    func testPaperTemplateRendererCoversEveryTemplate_BitsUT() throws {
+        for kind in PaperTemplateKind.allCases {
+            XCTAssertFalse(kind.id.isEmpty)
+            XCTAssertFalse(kind.title.isEmpty)
+            XCTAssertFalse(kind.symbol.isEmpty)
+            for size in PaperTemplateSize.allCases {
+                XCTAssertFalse(size.id.isEmpty)
+                XCTAssertFalse(size.title.isEmpty)
+                XCTAssertGreaterThan(size.dimensions.width, 0)
+                let destination = temporaryDirectory.appendingPathComponent(
+                    "\(kind.rawValue)-\(size.rawValue).pdf"
+                )
+                try PaperTemplateRenderer().render(
+                    kind: kind,
+                    size: size,
+                    pageCount: 2,
+                    title: "\(kind.title) notes",
+                    to: destination
+                )
+                XCTAssertEqual(
+                    PDFDocument(url: destination)?.pageCount,
+                    2
+                )
+            }
+        }
+        XCTAssertThrowsError(
+            try PaperTemplateRenderer().render(
+                kind: .blank,
+                size: .letter,
+                pageCount: 0,
+                title: "Invalid",
+                to: temporaryDirectory
+                    .appendingPathComponent("invalid-template.pdf")
+            )
+        )
+    }
+
+    func testExternalInboxClaimRestoreAndCompleteLifecycle_BitsUT()
+        throws {
+        let sharedContainer = temporaryDirectory
+            .appendingPathComponent("ClaimRestoreInbox")
+        let source = temporaryDirectory
+            .appendingPathComponent("claim-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1
+        )
+        let staged = try ExternalPDFInbox.stagePDF(
+            from: source,
+            suggestedName: "Claim me.pdf",
+            sharedContainerURL: sharedContainer,
+            protectionHandler: { _ in }
+        )
+        let claimed = try ExternalPDFInbox.claim(
+            staged,
+            sharedContainerURL: sharedContainer
+        )
+        XCTAssertNotEqual(claimed.containerURL, staged.containerURL)
+        XCTAssertEqual(claimed.containerURL.pathExtension, "inbox")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: staged.containerURL.path)
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: claimed.containerURL.path)
+        )
+
+        try ExternalPDFInbox.restore(
+            claimed,
+            sharedContainerURL: sharedContainer
+        )
+        let restored = try XCTUnwrap(
+            ExternalPDFInbox.pendingItems(
+                sharedContainerURL: sharedContainer
+            ).first
+        )
+        XCTAssertEqual(restored.id, staged.id)
+        let claimedAgain = try ExternalPDFInbox.claim(
+            restored,
+            sharedContainerURL: sharedContainer
+        )
+        try ExternalPDFInbox.complete(
+            claimedAgain,
+            sharedContainerURL: sharedContainer
+        )
+        XCTAssertTrue(
+            try ExternalPDFInbox.pendingItems(
+                sharedContainerURL: sharedContainer
+            ).isEmpty
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: claimedAgain.containerURL.path
+            )
+        )
+        XCTAssertTrue(
+            [
+                ExternalPDFInboxError.sharedContainerUnavailable,
+                .invalidPDF,
+                .fileTooLarge,
+                .inboxFull,
+                .insufficientStorage,
+                .incompleteCopy
+            ].allSatisfy {
+                !($0.errorDescription ?? "").isEmpty
+            }
+        )
+    }
+
+    func testSignedChangeReportCreationVerificationAndTrust_BitsUT()
+        async throws {
+        let now = Date()
+        let region = PDFDifferenceRegion(
+            x: 0.1,
+            y: 0.2,
+            width: 0.3,
+            height: 0.08,
+            intensity: 0.75
+        )
+        let changes = [
+            PDFPageChange(
+                pageIndex: 0,
+                sourcePageIndex: 0,
+                revisedPageIndex: 0,
+                matchKind: .modified,
+                sourceExists: true,
+                revisedExists: true,
+                visibleDifference: 0.02,
+                changedPixelRatio: 0.2,
+                geometryChanged: true,
+                textChanged: true,
+                sourceTextCharacterCount: 40,
+                revisedTextCharacterCount: 52,
+                differenceRegions: [region],
+                sourceTextDifferences: (0..<5).map {
+                    PDFTextDifferenceEvidence(
+                        kind: .removed,
+                        text: "Old *value* \($0)",
+                        region: region,
+                        granularity: $0 == 0 ? .character : .word
+                    )
+                },
+                revisedTextDifferences: (0..<5).map {
+                    PDFTextDifferenceEvidence(
+                        kind: .inserted,
+                        text: "New [value] \($0)",
+                        region: region
+                    )
+                },
+                matchBasis: .exactContent
+            ),
+            PDFPageChange(
+                pageIndex: 1,
+                sourcePageIndex: nil,
+                revisedPageIndex: 1,
+                matchKind: .inserted,
+                sourceExists: false,
+                revisedExists: true,
+                visibleDifference: 1,
+                changedPixelRatio: 1,
+                geometryChanged: false,
+                textChanged: false,
+                sourceTextCharacterCount: 0,
+                revisedTextCharacterCount: 20,
+                matchBasis: .context
+            ),
+            PDFPageChange(
+                pageIndex: 2,
+                sourcePageIndex: 2,
+                revisedPageIndex: nil,
+                matchKind: .removed,
+                sourceExists: true,
+                revisedExists: false,
+                visibleDifference: 1,
+                changedPixelRatio: 1,
+                geometryChanged: false,
+                textChanged: false,
+                sourceTextCharacterCount: 20,
+                revisedTextCharacterCount: 0,
+                matchBasis: .pageLabel
+            )
+        ]
+        let review = PDFChangeReview(
+            sourcePageCount: 3,
+            revisedPageCount: 3,
+            comparedPageCount: 1,
+            changes: changes,
+            pageMatches: [
+                PDFPageMatch(
+                    id: 0,
+                    sourcePageIndex: 0,
+                    revisedPageIndex: 0,
+                    kind: .modified,
+                    basis: .exactContent
+                )
+            ]
+        )
+        let descriptor = PDFChangeReportDescriptor(
+            reportID: UUID(),
+            scope: "Full review",
+            sourceName: "Base *matter*.pdf",
+            revisedName: "Revised [matter].pdf",
+            sourceRevisionID: UUID(),
+            revisedRevisionID: UUID(),
+            sourceFingerprint: String(repeating: "a", count: 64),
+            revisedFingerprint: String(repeating: "b", count: 64),
+            deliveryReceiptID: UUID(),
+            generatedAt: now
+        )
+        let service = PDFChangeReportService()
+        let signingKey = Curve25519.Signing.PrivateKey()
+        let signingStore = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ChangeReportSigningStore"),
+            signingPrivateKeyProvider: { signingKey }
+        )
+        let body = try service.render(
+            review: review,
+            descriptor: descriptor,
+            signerKeyID: try await signingStore
+                .officeDeliverySigningKeyID()
+        )
+        XCTAssertTrue(
+            String(decoding: body, as: UTF8.self)
+                .contains("## Page Changes")
+        )
+        let payload = try service.signaturePayload(
+            body: body,
+            review: review,
+            descriptor: descriptor
+        )
+        let envelope = try await signingStore
+            .signChangeReportPayload(payload)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "PaperPath-ChangeReport-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        try LocalFileSecurity.prepareProtectedDirectory(at: directory)
+        defer {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        let url = try service.create(
+            body: body,
+            envelope: envelope,
+            directory: directory,
+            fileName: "matter-change-report.md",
+            referenceDate: now
+        )
+        let parsed = try service.parseSignedReport(
+            Data(contentsOf: url)
+        )
+        XCTAssertEqual(parsed.body, body)
+        XCTAssertEqual(
+            parsed.envelope.payload.reportID,
+            envelope.payload.reportID
+        )
+        XCTAssertEqual(
+            parsed.envelope.payload.bodySHA256,
+            envelope.payload.bodySHA256
+        )
+        XCTAssertEqual(parsed.envelope.signature, envelope.signature)
+        XCTAssertTrue(
+            service.bodyIdentityMatches(
+                parsed.body,
+                payload: parsed.envelope.payload,
+                signerKeyID: parsed.envelope.signature.keyID
+            )
+        )
+
+        let verifyingStore = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ChangeReportVerifyingStore"),
+            signingPrivateKeyProvider: {
+                Curve25519.Signing.PrivateKey()
+            }
+        )
+        let unknown = try await verifyingStore.verifyChangeReport(at: url)
+        XCTAssertEqual(unknown.status, .verified)
+        XCTAssertEqual(unknown.trustStatus, .unknown)
+        XCTAssertTrue(unknown.canTrustSigner)
+        let trusted = try await verifyingStore
+            .trustChangeReportSigner(unknown)
+        XCTAssertEqual(trusted.trustStatus, .trusted)
+        let verifiedAgain = try await verifyingStore
+            .verifyChangeReport(at: url)
+        XCTAssertEqual(verifiedAgain.trustStatus, .trusted)
+
+        let card = PDFOfficeSignerIdentityCard(
+            schema: "PaperPath Signing Identity V1",
+            keyID: envelope.signature.keyID,
+            publicKeyBase64: envelope.signature.publicKeyBase64,
+            generatedAt: now
+        )
+        let parsedCard = try await verifyingStore
+            .parseOfficeSignerIdentityPayload(card.qrPayload)
+        XCTAssertEqual(parsedCard.schema, card.schema)
+        XCTAssertEqual(parsedCard.keyID, card.keyID)
+        XCTAssertEqual(parsedCard.publicKeyBase64, card.publicKeyBase64)
+        var signers = try await verifyingStore.updateOfficeTrustedSigner(
+            keyID: card.keyID,
+            displayName: "  External reviewer  ",
+            note: "  Trusted for this matter  "
+        )
+        XCTAssertEqual(signers.first?.displayName, "External reviewer")
+        signers = try await verifyingStore.removeOfficeTrustedSigner(card.keyID)
+        XCTAssertTrue(signers.isEmpty)
+    }
+
+    func testDocumentStoreMetadataStorageAndSigningLifecycle_BitsUT()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("store-lifecycle.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 2
+        )
+        let sourceData = try Data(contentsOf: source)
+        let fingerprint = sha256(sourceData)
+        let revisionID = UUID()
+        let receipt = makeDeliveryReceipt(
+            fingerprint: fingerprint,
+            revisionID: revisionID,
+            pageCount: 2,
+            byteCount: Int64(sourceData.count)
+        )
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("MetadataLifecycleStore"),
+            availableCapacity: { _ in 2 * 1_024 * 1_024 * 1_024 },
+            signingPrivateKeyProvider: {
+                Curve25519.Signing.PrivateKey()
+            }
+        )
+        var record = try await store.importPDF(
+            from: source,
+            preferredName: "Matter",
+            deliveryReceipt: receipt,
+            contentRevisionID: revisionID,
+            preserveSourceLocation: false
+        )
+        let containsImportedDocument = try await store.containsDocuments()
+        XCTAssertTrue(containsImportedDocument)
+
+        let signedManifest = try await store
+            .signedDeliveryPackageManifest(
+                for: record,
+                artifactFileName: "Matter-final.pdf"
+            )
+        XCTAssertEqual(
+            signedManifest.manifest.artifact.sha256,
+            fingerprint
+        )
+        XCTAssertEqual(
+            signedManifest.manifest.deliveryReceiptID,
+            receipt.id
+        )
+
+        let firstDuplicate = try await store.duplicate(record)
+        let secondDuplicate = try await store.duplicate(record)
+        XCTAssertNotEqual(firstDuplicate.displayName, secondDuplicate.displayName)
+        let duplicatedIDs = Set([
+            record.id,
+            firstDuplicate.id,
+            secondDuplicate.id
+        ])
+        var updatedRecords = try await store.updateWorkflow(
+            recordIDs: duplicatedIDs,
+            status: .reviewing
+        )
+        XCTAssertEqual(updatedRecords.count, 3)
+        XCTAssertTrue(
+            updatedRecords.allSatisfy {
+                $0.workflowStatus == .reviewing
+            }
+        )
+        updatedRecords = try await store.setPinned(
+            recordIDs: duplicatedIDs,
+            isPinned: true
+        )
+        XCTAssertTrue(updatedRecords.allSatisfy(\.isPinned))
+        updatedRecords = try await store.updateTags([
+            record.id: ["  Legal  ", "legal", String(repeating: "x", count: 40)],
+            firstDuplicate.id: ["Review"],
+            secondDuplicate.id: ["Archive"]
+        ])
+        XCTAssertEqual(updatedRecords.count, 3)
+
+        record = try XCTUnwrap(
+            updatedRecords.first { $0.id == record.id }
+        )
+        record = try await store.setPinned(record, isPinned: false)
+        record = try await store.updateDueDate(
+            record,
+            dueAt: Date(timeIntervalSince1970: 200_000),
+            expectedDueAt: record.dueAt
+        )
+        record = try await store.updatePrivateNote(
+            record,
+            note: "  Preserve the signed source.  ",
+            expectedNote: record.privateNote
+        )
+        record = try await store.updateBookmarks(
+            record,
+            pages: [1, 0, 1, -1, 99]
+        )
+        record = try await store.updateBookmarkName(
+            record,
+            pageIndex: 1,
+            name: "  Approval page  "
+        )
+        XCTAssertEqual(record.bookmarkedPages, [0, 1])
+        XCTAssertEqual(record.bookmarkNames[1], "Approval page")
+        XCTAssertEqual(record.tags.first, "Legal")
+        XCTAssertEqual(record.tags.last?.count, 24)
+        XCTAssertEqual(record.privateNote, "Preserve the signed source.")
+
+        let viewedAt = Date().addingTimeInterval(30)
+        record = try await store.updateReadingPosition(
+            recordID: record.id,
+            pageIndex: 99,
+            expectedRevisionID: record.contentRevisionID,
+            viewedAt: viewedAt
+        )
+        XCTAssertEqual(record.lastPageIndex, 1)
+        let staleReadingPosition = try await store.updateReadingPosition(
+            recordID: record.id,
+            pageIndex: 0,
+            expectedRevisionID: record.contentRevisionID,
+            viewedAt: viewedAt.addingTimeInterval(-10)
+        )
+        XCTAssertEqual(staleReadingPosition.lastPageIndex, 1)
+        let storedRecords = try await store.load()
+        let syncBaseline = try XCTUnwrap(
+            storedRecords.first(where: { $0.id == record.id })
+        )
+
+        let syncDate = Date().addingTimeInterval(3_600)
+        let synchronized = try await store.applyMetadataSync(
+            PDFMetadataSyncUpdate(
+                recordID: record.id,
+                fingerprint: fingerprint.uppercased(),
+                expectedLocalState:
+                    PDFMetadataSyncLocalState(syncBaseline),
+                lastPageIndex: -10,
+                lastViewedAt: syncDate,
+                bookmarkedPages: [1, 1, 20],
+                workflowStatus: .ready,
+                isPinned: true,
+                tags: [" Synced ", "synced", "Evidence"],
+                completedActions: [.inspect, .safeShare],
+                deliveryReceipt: receipt,
+                updatedAt: syncDate
+            ),
+            to: syncBaseline
+        )
+        XCTAssertEqual(synchronized.lastPageIndex, 0)
+        XCTAssertEqual(synchronized.bookmarkedPages, [1])
+        XCTAssertEqual(synchronized.workflowStatus, .ready)
+        XCTAssertEqual(synchronized.tags, ["Synced", "Evidence"])
+        XCTAssertTrue(synchronized.hasCurrentDeliveryReceipt)
+
+        let emptyAnalysis = try await store.loadAnalysis(for: [])
+        XCTAssertTrue(emptyAnalysis.textIndices.isEmpty)
+        XCTAssertTrue(emptyAnalysis.ocrResults.isEmpty)
+        let missingAnalysis = try await store.loadAnalysis(
+            for: [record.id]
+        )
+        XCTAssertTrue(missingAnalysis.textIndices.isEmpty)
+        XCTAssertTrue(missingAnalysis.ocrResults.isEmpty)
+
+        let preflight = PDFDeliveryPreflightCacheEntry(
+            recordID: record.id,
+            revisionID: record.contentRevisionID,
+            checkedAt: Date(),
+            assessment: PDFDeliveryPreflightAssessment(
+                status: .ready,
+                pageCount: record.profile.pageCount,
+                byteCount: record.profile.byteCount,
+                fixCount: 0,
+                reviewCount: 0,
+                items: [
+                    PDFDeliveryPreflightItem(
+                        id: "reopen",
+                        title: "Reopen",
+                        detail: "The working copy is readable.",
+                        status: .passed
+                    )
+                ]
+            )
+        )
+        try await store.saveDeliveryPreflight(preflight)
+        let loadedPreflight = try await store.loadDeliveryPreflightCache(
+            for: [record]
+        )
+        let restoredPreflight = try XCTUnwrap(loadedPreflight[record.id])
+        XCTAssertEqual(restoredPreflight.recordID, preflight.recordID)
+        XCTAssertEqual(restoredPreflight.revisionID, preflight.revisionID)
+        XCTAssertEqual(restoredPreflight.assessment, preflight.assessment)
+        XCTAssertEqual(
+            restoredPreflight.checkedAt.timeIntervalSince1970,
+            preflight.checkedAt.timeIntervalSince1970,
+            accuracy: 1
+        )
+        await store.removeDeliveryPreflight(recordID: record.id)
+
+        let batchDate = Date()
+        let batchRun = PDFBatchDeliveryRun(
+            id: UUID(),
+            startedAt: batchDate,
+            updatedAt: batchDate,
+            sourceRecordIDs: [record.id],
+            sourceRevisionIDs: [
+                record.id: record.contentRevisionID
+            ],
+            items: [
+                PDFBatchDeliveryItem(
+                    sourceRecordID: record.id,
+                    stage: .queued,
+                    detail: "Waiting"
+                )
+            ]
+        )
+        try await store.saveBatchDeliveryRun(batchRun)
+        let persistedBatchRun = try await store.loadBatchDeliveryRun()
+        let loadedBatchRun = try XCTUnwrap(persistedBatchRun)
+        XCTAssertEqual(loadedBatchRun.id, batchRun.id)
+        XCTAssertEqual(loadedBatchRun.sourceRecordIDs, batchRun.sourceRecordIDs)
+        XCTAssertEqual(
+            loadedBatchRun.sourceRevisionIDs,
+            batchRun.sourceRevisionIDs
+        )
+        XCTAssertEqual(loadedBatchRun.items, batchRun.items)
+        XCTAssertEqual(
+            loadedBatchRun.startedAt.timeIntervalSince1970,
+            batchRun.startedAt.timeIntervalSince1970,
+            accuracy: 1
+        )
+        XCTAssertEqual(
+            loadedBatchRun.updatedAt.timeIntervalSince1970,
+            batchRun.updatedAt.timeIntervalSince1970,
+            accuracy: 1
+        )
+        await store.clearBatchDeliveryRun()
+        let clearedBatchRun = try await store.loadBatchDeliveryRun()
+        XCTAssertNil(clearedBatchRun)
+
+        let officeQueueDate = Date(timeIntervalSince1970: 100)
+        let officeQueue = PDFOfficeProductionQueue(
+            jobs: [
+                PDFOfficeQueueJob(
+                    recordID: record.id,
+                    sourceRevisionID: record.contentRevisionID,
+                    sourceName: record.displayName,
+                    sourcePageCount: record.profile.pageCount,
+                    format: .wordDocument,
+                    priority: .urgent,
+                    createdAt: officeQueueDate
+                )
+            ],
+            updatedAt: officeQueueDate
+        )
+        try await store.saveOfficeProductionQueue(officeQueue)
+        let loadedOfficeQueue = try await store
+            .loadOfficeProductionQueue()
+        XCTAssertEqual(loadedOfficeQueue.jobs, officeQueue.jobs)
+        await store.clearOfficeProductionQueue()
+        let clearedOfficeQueue = try await store
+            .loadOfficeProductionQueue()
+        XCTAssertTrue(clearedOfficeQueue.jobs.isEmpty)
+
+        let officePlan = PDFOfficeExportFormatPlan.plan(
+            for: .wordDocument,
+            profile: record.profile
+        )
+        let officeReceipt = PDFOfficeExportReceipt(
+            format: .wordDocument,
+            fileName: "Matter.docx",
+            fileSizeBytes: 4_096,
+            plan: officePlan,
+            budgetPlan: PDFOfficeVisualBudgetPlan(
+                profile: record.profile
+            )
+        )
+        record = try await store.recordOfficeExportReceipt(
+            officeReceipt,
+            for: record
+        )
+        XCTAssertEqual(record.officeReceipts.first?.id, officeReceipt.id)
+        let officeBatchPlan = PDFOfficeBatchPlan(
+            format: .wordDocument,
+            sourceRevisionID: record.contentRevisionID,
+            profile: record.profile
+        )
+        let officeBatchRun = PDFOfficeBatchRun(plan: officeBatchPlan)
+        record = try await store.updateOfficeBatchRun(
+            officeBatchRun,
+            for: record
+        )
+        XCTAssertEqual(record.officeBatchRun?.id, officeBatchRun.id)
+
+        let storage = try await store.storageSnapshot()
+        XCTAssertGreaterThan(storage.pdfBytes, 0)
+        XCTAssertGreaterThan(storage.metadataBytes, 0)
+        let available = try await store
+            .availableCapacityForOfficeProduction()
+        XCTAssertEqual(available, 2 * 1_024 * 1_024 * 1_024)
+        try await store.ensureTemporaryWorkingCapacity(
+            for: [source, source],
+            copyMultiplier: 2,
+            reserveBytes: 0
+        )
+
+        _ = try await store.moveToTrash(firstDuplicate)
+        do {
+            _ = try await store.permanentlyDelete(
+                recordIDs: [firstDuplicate.id, secondDuplicate.id]
+            )
+            XCTFail("Mixed Trash state must reject the whole deletion")
+        } catch {
+            XCTAssertTrue(
+                String(describing: error).contains("no longer in Trash")
+            )
+        }
+        let deletedAfterRejectedBatch = try await store.loadDeleted()
+        let expectedDeletedIDs = [firstDuplicate.id]
+        XCTAssertEqual(
+            deletedAfterRejectedBatch.map(\.id),
+            expectedDeletedIDs
+        )
+        guard deletedAfterRejectedBatch.map(\.id)
+                == expectedDeletedIDs
+        else { return }
+        let activeAfterRejectedBatch = try await store.load()
+        XCTAssertTrue(
+            activeAfterRejectedBatch.contains {
+                $0.id == secondDuplicate.id
+            }
+        )
+
+        _ = try await store.moveToTrash(secondDuplicate)
+        let deletedDuplicateIDs = try await store.permanentlyDelete(
+            recordIDs: [firstDuplicate.id, secondDuplicate.id]
+        )
+        XCTAssertEqual(Set(deletedDuplicateIDs), Set([
+            firstDuplicate.id,
+            secondDuplicate.id
+        ]))
+        let trashedRecord = try await store.moveToTrash(record)
+        try await store.delete(trashedRecord)
+        let containsAfterDeletion = try await store.containsDocuments()
+        XCTAssertFalse(containsAfterDeletion)
+        try await store.eraseAllData()
+        let recordsAfterErase = try await store.load()
+        XCTAssertTrue(recordsAfterErase.isEmpty)
+    }
+
+    func testResidualServiceEntryPointsAndSearchContracts_BitsUT()
+        throws {
+        let mixed = temporaryDirectory
+            .appendingPathComponent("residual-mixed.pdf")
+        try PDFTestFixtureFactory.makeMixedGeometryPDF(at: mixed)
+        let profile = try PDFInspectionService().inspect(url: mixed)
+        let technical = try PDFDocumentStructureService()
+            .technicalInspection(
+                in: mixed,
+                profile: profile,
+                source: nil
+            )
+        XCTAssertEqual(technical.pageCount, 4)
+        XCTAssertEqual(technical.sampledPageCount, profile.sampledPageCount)
+        XCTAssertNotNil(technical.permissions)
+
+        let preparationProgress = TestProgressRecorder()
+        let assessment = try PDFMutationService()
+            .pagePreparationAssessment(
+                in: mixed,
+                revisionID: UUID(),
+                progress: { preparationProgress.append($0) }
+            )
+        XCTAssertEqual(assessment.pages.count, 4)
+        XCTAssertEqual(preparationProgress.values.last, 1)
+        XCTAssertTrue(
+            assessment.pages.allSatisfy {
+                $0.widthPoints > 0
+                    && $0.heightPoints > 0
+                    && $0.inkCoverage.isFinite
+            }
+        )
+
+        let flattened = temporaryDirectory
+            .appendingPathComponent("residual-flattened.pdf")
+        try PDFOutputService().flatten(
+            sourceURL: mixed,
+            destination: flattened
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(PDFDocument(url: flattened)).pageCount,
+            4
+        )
+        let compressionEstimates = [
+            PDFCompressionEstimate(
+                sourceByteCount: 10_000,
+                estimatedByteCount: 4_000,
+                sampledPageCount: 1
+            ),
+            PDFCompressionEstimate(
+                sourceByteCount: 10_000,
+                estimatedByteCount: 12_000,
+                sampledPageCount: 2
+            )
+        ]
+        XCTAssertEqual(compressionEstimates.first?.savingsPercent, 60)
+        XCTAssertNil(compressionEstimates.last?.savingsPercent)
+        XCTAssertTrue(
+            compressionEstimates.allSatisfy {
+                !$0.formattedSize.isEmpty && !$0.summary.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PDFCompressionQuality.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.detail.isEmpty
+            }
+        )
+
+        let invoice = temporaryDirectory
+            .appendingPathComponent("demo-invoice.pdf")
+        let report = temporaryDirectory
+            .appendingPathComponent("demo-report.pdf")
+        try DemoPDFBuilder.createInvoice(at: invoice)
+        try DemoPDFBuilder.createReport(at: report)
+        XCTAssertEqual(try XCTUnwrap(PDFDocument(url: invoice)).pageCount, 1)
+        XCTAssertEqual(try XCTUnwrap(PDFDocument(url: report)).pageCount, 1)
+
+        let combined = temporaryDirectory
+            .appendingPathComponent("residual-combined.pdf")
+        let composition = PDFCompositionService()
+        try composition.combine(urls: [invoice, report], to: combined)
+        try composition.combine(urls: [report, invoice], to: combined)
+        XCTAssertEqual(try XCTUnwrap(PDFDocument(url: combined)).pageCount, 2)
+
+        let quad = ScanCropQuad(
+            topLeft: ScanCropPoint(x: 0.08, y: 0.06),
+            topRight: ScanCropPoint(x: 0.92, y: 0.08),
+            bottomRight: ScanCropPoint(x: 0.9, y: 0.94),
+            bottomLeft: ScanCropPoint(x: 0.1, y: 0.91)
+        )
+        XCTAssertTrue(quad.isValid)
+        XCTAssertFalse(quad.isEffectivelyFullFrame)
+        XCTAssertFalse(quad.cacheKey.isEmpty)
+        XCTAssertEqual(
+            ScanCropCorner.allCases.map { quad.point(for: $0) }.count,
+            4
+        )
+        XCTAssertTrue(
+            ScanEnhancement.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PaperTemplateKind.allCases.allSatisfy {
+                !$0.id.isEmpty && !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            PaperTemplateSize.allCases.allSatisfy {
+                !$0.id.isEmpty
+                    && !$0.title.isEmpty
+                    && $0.dimensions.width > 0
+            }
+        )
+        let scanRenderer = ScanPDFRenderer()
+        let image = makeTestImage(size: CGSize(width: 96, height: 72))
+        XCTAssertNotNil(
+            scanRenderer.preview(
+                image: image,
+                enhancement: .grayscale
+            ).cgImage
+        )
+        let scanURL = temporaryDirectory
+            .appendingPathComponent("residual-scan.pdf")
+        try scanRenderer.render(
+            pages: [ScanPageImage(image: image)],
+            to: scanURL,
+            enhancement: .blackAndWhite
+        )
+        scanRenderer.releaseCachedResources()
+        VisionOCRService().releaseCachedResources()
+        XCTAssertEqual(try XCTUnwrap(PDFDocument(url: scanURL)).pageCount, 1)
+
+        let index = DocumentTextIndex(
+            source: .native,
+            pages: (0..<20).map {
+                IndexedPageText(
+                    pageIndex: $0,
+                    text: $0.isMultiple(of: 2)
+                        ? "Invoice approval evidence \($0)"
+                        : "Unrelated page \($0)"
+                )
+            },
+            indexedAt: Date()
+        )
+        XCTAssertTrue(
+            try index.containsEveryTerm(["invoice", "approval"])
+        )
+        XCTAssertFalse(
+            try index.containsEveryTerm(["invoice", "missing"])
+        )
+        XCTAssertEqual(
+            try index.cancellableMatches(
+                for: "invoice approval",
+                excerptLimit: 48,
+                limit: 3
+            ).count,
+            3
+        )
+        let indexedOCR = PDFTextIndexService().index(
+            from: OCRResult(
+                pages: [
+                    OCRPageResult(
+                        pageIndex: 0,
+                        text: "Recognized invoice",
+                        confidence: 0.9,
+                        blocks: [
+                            makeOCRBlock(
+                                text: "Recognized invoice",
+                                confidence: 0.9
+                            )
+                        ]
+                    )
+                ]
+            )
+        )
+        XCTAssertEqual(indexedOCR.source, .vision)
+        XCTAssertEqual(indexedOCR.pages.first?.text, "Recognized invoice")
+    }
+
+    func testRemainingModelDerivedContracts_BitsUT() throws {
+        let now = PDFOfficeTimeAnchor.process.trustedDate()
+        let profile = makeProfile(pageCount: 1_205)
+        let plan = PDFOfficeBatchPlan(
+            format: .wordDocument,
+            sourceRevisionID: UUID(),
+            profile: profile
+        )
+        let segment = try XCTUnwrap(plan.segments.first)
+        var receipt = PDFOfficeExportReceipt(
+            format: .wordDocument,
+            fileName: "Matter.docx",
+            fileSizeBytes: 8_192,
+            plan: PDFOfficeExportFormatPlan.plan(
+                for: .wordDocument,
+                profile: profile
+            ),
+            budgetPlan: PDFOfficeVisualBudgetPlan(profile: profile),
+            portfolio: PDFOfficeExportPortfolio(profile: profile),
+            batchPlan: plan,
+            batchSegment: segment
+        )
+        receipt.sourceRevisionID = plan.sourceRevisionID
+        receipt.retainedFileName = "retained.docx"
+        receipt.reusableUntil = now.addingTimeInterval(3_600)
+        receipt.artifactSHA256 = String(repeating: "a", count: 64)
+        XCTAssertFalse(receipt.formattedSize.isEmpty)
+        XCTAssertFalse(receipt.shortTime.isEmpty)
+        XCTAssertFalse(receipt.receiptSummary.isEmpty)
+        XCTAssertFalse(receipt.auditEvidenceSummary.isEmpty)
+        XCTAssertTrue(receipt.isBatchSegment)
+        XCTAssertNotNil(receipt.batchSummary)
+        XCTAssertFalse(receipt.retentionSummary.isEmpty)
+        XCTAssertFalse(receipt.integritySummary.isEmpty)
+
+        let pinnedOutput = PDFPinnedOfficeOutput(
+            recordID: UUID(),
+            documentName: "Matter",
+            receipt: receipt
+        )
+        let officeStorage = PDFOfficePinnedStorageSummary.measuring(
+            [pinnedOutput]
+        )
+        XCTAssertFalse(officeStorage.formattedBytes.isEmpty)
+        XCTAssertFalse(officeStorage.countContract.isEmpty)
+        XCTAssertFalse(officeStorage.byteContract.isEmpty)
+        XCTAssertGreaterThan(officeStorage.byteUsageFraction, 0)
+        XCTAssertGreaterThan(officeStorage.countUsageFraction, 0)
+        XCTAssertGreaterThan(officeStorage.pressureFraction, 0)
+        XCTAssertFalse(officeStorage.formattedRemainingBytes.isEmpty)
+
+        let versionStorage = PDFPinnedVersionStorageSummary(
+            milestoneCount: 8,
+            byteCount: 256 * 1_024 * 1_024
+        )
+        XCTAssertFalse(versionStorage.formattedBytes.isEmpty)
+        XCTAssertFalse(versionStorage.countContract.isEmpty)
+        XCTAssertFalse(versionStorage.byteContract.isEmpty)
+        XCTAssertGreaterThan(versionStorage.countUsageFraction, 0)
+        XCTAssertGreaterThan(versionStorage.pressureFraction, 0)
+        XCTAssertFalse(versionStorage.formattedRemainingBytes.isEmpty)
+
+        let entry = PDFOfficeDeliveryEntry(
+            sourceRecordID: UUID(),
+            sourceRevisionID: UUID(),
+            sourceName: "Matter",
+            receiptID: receipt.id,
+            format: .wordDocument,
+            archiveName: receipt.fileName,
+            byteCount: receipt.fileSizeBytes,
+            sha256: try XCTUnwrap(receipt.artifactSHA256)
+        )
+        let candidate = PDFOfficeExternalCandidate(
+            id: UUID(),
+            fileName: entry.archiveName,
+            fileExtension: entry.format.fileExtension,
+            byteCount: entry.byteCount,
+            sha256: entry.sha256
+        )
+        XCTAssertFalse(candidate.formattedSize.isEmpty)
+        XCTAssertEqual(candidate.shortFingerprint.count, 12)
+        let officeMatch = PDFOfficeExternalMatchReport(
+            id: UUID(),
+            packageID: UUID(),
+            checkedAt: now,
+            matches: [
+                PDFOfficeExternalEntryMatch(
+                    entry: entry,
+                    status: .exact,
+                    candidates: [candidate]
+                ),
+                PDFOfficeExternalEntryMatch(
+                    entry: entry,
+                    status: .missing,
+                    candidates: []
+                ),
+                PDFOfficeExternalEntryMatch(
+                    entry: entry,
+                    status: .ambiguous,
+                    candidates: [candidate]
+                ),
+                PDFOfficeExternalEntryMatch(
+                    entry: entry,
+                    status: .inconsistent,
+                    candidates: [candidate]
+                )
+            ],
+            extraCandidates: [candidate],
+            totalCandidateCount: 1,
+            totalCandidateBytes: candidate.byteCount
+        )
+        XCTAssertEqual(officeMatch.missingCount, 1)
+        XCTAssertEqual(officeMatch.ambiguousCount, 1)
+        XCTAssertEqual(officeMatch.inconsistentCount, 1)
+        XCTAssertEqual(officeMatch.reviewCount, 4)
+        XCTAssertEqual(
+            PDFOfficeExternalMatchProgress(
+                packageID: officeMatch.packageID,
+                completedFileCount: 1,
+                totalFileCount: 4,
+                processedBytes: 0,
+                totalBytes: 0,
+                currentFileName: candidate.fileName
+            ).fractionCompleted,
+            0.25
+        )
+
+        var package = PDFOfficeDeliveryPackage(
+            id: officeMatch.packageID,
+            createdAt: now,
+            entries: [entry]
+        )
+        package.byteCount = 10_000
+        package.expiresAt = now.addingTimeInterval(60)
+        XCTAssertFalse(package.formattedSize.isEmpty)
+        XCTAssertFalse(package.isExpired)
+        XCTAssertFalse(package.retentionSummary.isEmpty)
+        package.pinnedAt = now
+        XCTAssertFalse(
+            package.retentionSummary(
+                at: now.addingTimeInterval(120)
+            ).isEmpty
+        )
+
+        XCTAssertTrue(
+            [
+                PDFBatesExternalEntryMatchStatus.outputMatch,
+                .removedMatch,
+                .sourceMatch,
+                .missing,
+                .ambiguous
+            ].allSatisfy {
+                !$0.title.isEmpty && !$0.symbol.isEmpty
+            }
+        )
+        XCTAssertTrue(
+            [
+                PDFImageObjectSnapshot.Storage.jpeg,
+                .flate,
+                .flateWithSoftMask
+            ].allSatisfy { !$0.detail.isEmpty }
+        )
+        let issues = [
+            PDFBatchDeliveryIssue.sourceUnavailable(),
+            .preflightFailed("Preflight failed"),
+            .blocked("Blocked"),
+            .review("Review"),
+            .renderingFailed("Render failed"),
+            .verificationFailed("Verification failed"),
+            .savingFailed("Save failed"),
+            .cancelled
+        ]
+        XCTAssertTrue(issues.allSatisfy {
+            !$0.code.isEmpty
+                && !$0.recovery.isEmpty
+                && !($0.errorDescription ?? "").isEmpty
+        })
+
+        let record = makeRecord(name: "Derived", pageCount: 2)
+        XCTAssertFalse(record.subtitle.isEmpty)
+        XCTAssertFalse(
+            makeDeliveryReceipt(
+                fingerprint: String(repeating: "b", count: 64),
+                revisionID: UUID(),
+                pageCount: 2,
+                byteCount: 2_048
+            ).formattedOutputSize.isEmpty
+        )
+        let evidence = PDFEvidenceOverlay(
+            pageIndex: 0,
+            regions: [
+                PDFDifferenceRegion(
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.2,
+                    intensity: 0.5
+                )
+            ],
+            tone: .revised,
+            generation: 1
+        )
+        XCTAssertEqual(evidence.pageIndex, 0)
+    }
+
+    func testTextReplacementAndContentValidationSafetyMatrix_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("text-safety-matrix.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 3
+        )
+        let service = PDFOutputService()
+        let color = PDFInkColor(
+            red: 0,
+            green: 0,
+            blue: 0,
+            alpha: 1
+        )
+
+        func region(
+            pageIndex: Int,
+            width: Double = 0.5,
+            lineCount: Int = 1,
+            text: String = "Original"
+        ) -> PDFTextFlowRegion {
+            PDFTextFlowRegion(
+                pageIndex: pageIndex,
+                normalizedX: 0.1,
+                normalizedY: 0.1,
+                normalizedWidth: width,
+                normalizedHeight: 0.1,
+                lineCount: lineCount,
+                originalText: text
+            )
+        }
+
+        func selection(
+            originalText: String = "Original",
+            lineCount: Int = 1,
+            hasMixedFonts: Bool = false,
+            pageRotation: Int = 0,
+            regions: [PDFTextFlowRegion] = []
+        ) -> PDFTextSelectionSnapshot {
+            PDFTextSelectionSnapshot(
+                pageIndex: regions.first?.pageIndex ?? 0,
+                originalText: originalText,
+                normalizedX: 0.1,
+                normalizedY: 0.1,
+                normalizedWidth: 0.5,
+                normalizedHeight: 0.1,
+                fontName: "Helvetica",
+                fontSize: 12,
+                color: color,
+                lineCount: lineCount,
+                hasMixedFonts: hasMixedFonts,
+                pageRotation: pageRotation,
+                flowRegions: regions
+            )
+        }
+
+        let blockedSelections: [
+            (
+                selection: PDFTextSelectionSnapshot,
+                replacement: String
+            )
+        ] = [
+            (
+                selection(
+                    regions: [
+                        region(pageIndex: 0),
+                        region(pageIndex: 2)
+                    ]
+                ),
+                "Replacement"
+            ),
+            (selection(), "   "),
+            (selection(), "Original"),
+            (selection(pageRotation: 90), "Replacement"),
+            (selection(hasMixedFonts: true), "Replacement"),
+            (
+                selection(
+                    lineCount: 97,
+                    regions: [
+                        region(pageIndex: 0, lineCount: 97)
+                    ]
+                ),
+                "Replacement"
+            ),
+            (
+                selection(
+                    regions: [
+                        region(pageIndex: 0, width: 0.001)
+                    ]
+                ),
+                "Replacement"
+            ),
+            (
+                selection(originalText: "Definitely absent"),
+                "Replacement"
+            )
+        ]
+        var firstBlockedAssessment: PDFTextReplacementAssessment?
+        for item in blockedSelections {
+            let assessment = try service.assessTextReplacement(
+                sourceURL: source,
+                selection: item.selection,
+                replacement: item.replacement,
+                fontStyle: .serif,
+                alignment: .center
+            )
+            XCTAssertEqual(assessment.status, .blocked)
+            XCTAssertFalse(assessment.isReady)
+            XCTAssertFalse(assessment.title.isEmpty)
+            XCTAssertFalse(assessment.detail.isEmpty)
+            firstBlockedAssessment = firstBlockedAssessment ?? assessment
+        }
+        let blocked = try XCTUnwrap(firstBlockedAssessment)
+        XCTAssertThrowsError(
+            try service.replaceText(
+                sourceURL: source,
+                destination: temporaryDirectory
+                    .appendingPathComponent("blocked-replacement.pdf"),
+                selection: blockedSelections[0].selection,
+                replacement: blockedSelections[0].replacement,
+                assessment: blocked
+            )
+        )
+
+        let invalidOverlays: [PDFContentOverlay] = [
+            .text(
+                pageIndex: -1,
+                bounds: PDFNormalizedRect(
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.1
+                ),
+                text: "Invalid page",
+                fontSize: 12,
+                color: color
+            ),
+            .text(
+                pageIndex: 0,
+                bounds: PDFNormalizedRect(
+                    x: .nan,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.1
+                ),
+                text: "Invalid bounds",
+                fontSize: 12,
+                color: color
+            ),
+            .text(
+                pageIndex: 0,
+                bounds: PDFNormalizedRect(
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.1
+                ),
+                text: " ",
+                fontSize: 12,
+                color: color
+            ),
+            .link(
+                pageIndex: 0,
+                bounds: PDFNormalizedRect(
+                    x: 0.1,
+                    y: 0.1,
+                    width: 0.2,
+                    height: 0.1
+                ),
+                title: "Unsupported",
+                url: try XCTUnwrap(URL(string: "file:///tmp/unsafe"))
+            )
+        ]
+        for (index, overlay) in invalidOverlays.enumerated() {
+            XCTAssertThrowsError(
+                try service.addContent(
+                    sourceURL: source,
+                    destination: temporaryDirectory
+                        .appendingPathComponent(
+                            "invalid-overlay-\(index).pdf"
+                        ),
+                    overlays: [overlay]
+                )
+            )
+        }
+    }
+
     private func makeOCRBlock(
         text: String,
-        confidence: Double
+        confidence: Double,
+        isUserCorrected: Bool = false
     ) -> OCRTextBlock {
         OCRTextBlock(
             text: text,
@@ -4534,7 +11559,8 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             normalizedX: 0.1,
             normalizedY: 0.1,
             normalizedWidth: 0.8,
-            normalizedHeight: 0.08
+            normalizedHeight: 0.08,
+            isUserCorrected: isUserCorrected
         )
     }
 
@@ -4576,9 +11602,127 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             personalMetadataEntryCount: 0,
             isEncrypted: false,
             sha256: fingerprint,
-            checks: [],
+            checks: [
+                PDFDeliveryCheck(
+                    id: "reopened",
+                    title: "Output reopened",
+                    detail: "Output passed local verification.",
+                    status: .passed
+                )
+            ],
             outputRevisionID: revisionID
         )
+    }
+
+    private func makeSignedDeliveryPackage(
+        name: String,
+        tampersSignature: Bool
+    ) async throws -> (
+        archiveURL: URL,
+        artifactName: String,
+        artifactData: Data
+    ) {
+        let artifactName = "\(name).pdf"
+        let artifactURL = temporaryDirectory
+            .appendingPathComponent(artifactName)
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: artifactURL,
+            pageCount: 2
+        )
+        let artifactData = try Data(contentsOf: artifactURL)
+        let fingerprint = SHA256.hash(data: artifactData)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        var record = makeRecord(name: name, pageCount: 2)
+        record.contentFingerprint = fingerprint
+        record.deliveryReceipt = PDFDeliveryReceipt(
+            id: UUID(),
+            operation: .safeShare,
+            createdAt: Date(timeIntervalSince1970: 100),
+            sourcePageCount: 2,
+            outputPageCount: 2,
+            renderedPageCount: 2,
+            sourceByteCount: Int64(artifactData.count),
+            outputByteCount: Int64(artifactData.count),
+            unexpectedBlankPageIndices: [],
+            annotationCount: 0,
+            textCharacterCount: 120,
+            personalMetadataEntryCount: 0,
+            isEncrypted: false,
+            sha256: fingerprint,
+            checks: [
+                PDFDeliveryCheck(
+                    id: "reopened",
+                    title: "Final copy reopened",
+                    detail: "Both pages rendered after creation.",
+                    status: .passed
+                )
+            ],
+            outputRevisionID: record.contentRevisionID
+        )
+        let store = DocumentStore(
+            rootURL: temporaryDirectory.appendingPathComponent(
+                "DeliverySigning-\(UUID().uuidString)",
+                isDirectory: true
+            ),
+            signingPrivateKeyProvider: {
+                Curve25519.Signing.PrivateKey()
+            }
+        )
+        let manifest = PDFDeliveryPackageManifest(
+            artifactFileName: artifactName,
+            record: record,
+            receipt: try XCTUnwrap(record.deliveryReceipt)
+        )
+        let signed = try await store.signDeliveryPackageManifest(
+            manifest
+        )
+        let packaged: PDFSignedDeliveryPackageManifest
+        if tampersSignature {
+            packaged = PDFSignedDeliveryPackageManifest(
+                manifest: signed.manifest,
+                signature: PDFOfficeVerificationSignature(
+                    algorithm: signed.signature.algorithm,
+                    keyID: signed.signature.keyID,
+                    publicKeyBase64:
+                        signed.signature.publicKeyBase64,
+                    signatureBase64: Data(
+                        repeating: 0,
+                        count: 64
+                    ).base64EncodedString()
+                )
+            )
+        } else {
+            packaged = signed
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let manifestURL = temporaryDirectory
+            .appendingPathComponent(
+                "\(name)-PaperPath-delivery-receipt.json"
+            )
+        try encoder.encode(packaged).write(
+            to: manifestURL,
+            options: .atomic
+        )
+        let archiveURL = temporaryDirectory
+            .appendingPathComponent("\(name).zip")
+        try OfficeBatchArchiveService().createArchive(
+            sources: [
+                OfficeBatchArchiveSource(
+                    sourceURL: artifactURL,
+                    archiveName: artifactName
+                ),
+                OfficeBatchArchiveSource(
+                    sourceURL: manifestURL,
+                    archiveName: "PaperPath-delivery-receipt.json"
+                )
+            ],
+            destination: archiveURL
+        )
+        return (archiveURL, artifactName, artifactData)
     }
 
     private func makeRecord(

@@ -2,6 +2,7 @@ import SwiftUI
 
 struct StampPickerView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let pageIndex: Int
     let onSelect: (PDFStampKind) -> Void
@@ -39,20 +40,11 @@ struct StampPickerView: View {
                     )
 
                     LazyVGrid(
-                        columns: [
-                            GridItem(
-                                .adaptive(
-                                    minimum: 210,
-                                    maximum: 320
-                                ),
-                                spacing: PPSpacing.small
-                            )
-                        ],
+                        columns: stampColumns,
                         spacing: PPSpacing.small
                     ) {
                         ForEach(PDFStampKind.allCases) { kind in
                             Button {
-                                dismiss()
                                 onSelect(kind)
                             } label: {
                                 HStack(spacing: PPSpacing.medium) {
@@ -75,7 +67,11 @@ struct StampPickerView: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityHint(
-                                "Adds \(kind.title.lowercased()) to page \(pageIndex + 1)"
+                                AppLocalization.format(
+                                    "Adds %@ to page %lld",
+                                    kind.title.localizedUI.lowercased(),
+                                    pageIndex + 1
+                                )
                             )
 
                         }
@@ -91,9 +87,28 @@ struct StampPickerView: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
             }
         }
+        .accessibilityAction(.escape) {
+            dismiss()
+        }
+    }
+
+    private var stampColumns: [GridItem] {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            return [GridItem(.flexible())]
+        }
+        return [
+            GridItem(
+                .adaptive(
+                    minimum: 210,
+                    maximum: 320
+                ),
+                spacing: PPSpacing.small
+            )
+        ]
     }
 
     private func stampPreview(_ kind: PDFStampKind) -> some View {
@@ -101,6 +116,13 @@ struct StampPickerView: View {
             .font(.caption2.smallCaps().weight(.bold))
             .fontDesign(.monospaced)
             .foregroundStyle(tint(for: kind))
+            .lineLimit(
+                dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+            )
+            .minimumScaleFactor(
+                dynamicTypeSize.ppPrefersExpandedLayout ? 1 : 0.72
+            )
+            .multilineTextAlignment(.center)
             .frame(maxWidth: .infinity, minHeight: 30)
             .overlay {
                 RoundedRectangle(cornerRadius: 4)
@@ -197,8 +219,11 @@ private enum PDFPageBatchScope:
 }
 
 struct PageNumberingSheet: View {
+    @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
     let pageCount: Int
     let onApply: (PDFPageNumberingPayload) async -> Bool
@@ -214,6 +239,9 @@ struct PageNumberingSheet: View {
     @State private var isConfirmingRemoval = false
     @State private var successFeedback = 0
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var didCommitUpdate = false
 
     init(
         pageCount: Int,
@@ -265,7 +293,9 @@ struct PageNumberingSheet: View {
 
                     numberPreview
                     scopeControls
+                        .disabled(isApplying || didCommitUpdate)
                     numberingControls
+                        .disabled(isApplying || didCommitUpdate)
                 }
                 .frame(maxWidth: 760)
                 .padding(PPSpacing.regular)
@@ -277,14 +307,24 @@ struct PageNumberingSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
-                        (isApplying ? "Stop" : "Cancel").localizedUI
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isApplying
+                                    ? "Stop"
+                                    : didCommitUpdate
+                                        ? "Done"
+                                        : "Cancel"
+                        ).localizedUI
                     ) {
                         if isApplying {
-                            operationTask?.cancel()
+                            interruptOperation()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
                 ToolbarItem(placement: .secondaryAction) {
                     Menu {
@@ -299,7 +339,7 @@ struct PageNumberingSheet: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
-                    .disabled(isApplying)
+                    .disabled(isApplying || didCommitUpdate)
                     .accessibilityLabel("Page number options")
                 }
             }
@@ -308,6 +348,13 @@ struct PageNumberingSheet: View {
             }
         }
         .interactiveDismissDisabled(isApplying)
+        .accessibilityAction(.escape) {
+            if isApplying {
+                interruptOperation()
+            } else {
+                dismiss()
+            }
+        }
         .confirmationDialog(
             "Remove all PaperPath page numbers?",
             isPresented: $isConfirmingRemoval,
@@ -330,9 +377,20 @@ struct PageNumberingSheet: View {
                 maximumStartNumber
             )
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptOperation(invalidateResult: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptOperation(invalidateResult: true)
+        }
         .onDisappear {
-            operationTask?.cancel()
-            operationTask = nil
+            interruptOperation(invalidateResult: true)
         }
     }
 
@@ -382,7 +440,7 @@ struct PageNumberingSheet: View {
             scopePicker
 
             if scope == .range {
-                let layout = dynamicTypeSize.isAccessibilitySize
+                let layout = dynamicTypeSize.ppPrefersExpandedLayout
                     ? AnyLayout(VStackLayout(spacing: PPSpacing.small))
                     : AnyLayout(HStackLayout(spacing: PPSpacing.small))
                 layout {
@@ -429,10 +487,22 @@ struct PageNumberingSheet: View {
 
             formatPicker
 
-            HStack(spacing: PPSpacing.medium) {
+            let layout = dynamicTypeSize.ppPrefersExpandedLayout
+                ? AnyLayout(
+                    VStackLayout(
+                        alignment: .leading,
+                        spacing: PPSpacing.xSmall
+                    )
+                )
+                : AnyLayout(
+                    HStackLayout(spacing: PPSpacing.medium)
+                )
+            layout {
                 Label("Position", systemImage: position.symbol)
                     .font(.subheadline.weight(.semibold))
-                Spacer()
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
                 Picker("Position", selection: $position) {
                     ForEach(PDFPageNumberPosition.allCases) { option in
                         Label(
@@ -443,6 +513,12 @@ struct PageNumberingSheet: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    alignment: .leading
+                )
             }
 
             Stepper(
@@ -465,7 +541,7 @@ struct PageNumberingSheet: View {
                     .tag(option)
             }
         }
-        if dynamicTypeSize.isAccessibilitySize {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
             picker.pickerStyle(.menu)
         } else {
             picker.pickerStyle(.segmented)
@@ -480,7 +556,7 @@ struct PageNumberingSheet: View {
                     .tag(option)
             }
         }
-        if dynamicTypeSize.isAccessibilitySize {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
             picker.pickerStyle(.menu)
         } else {
             picker.pickerStyle(.segmented)
@@ -506,6 +582,9 @@ struct PageNumberingSheet: View {
                             selectedPageCount
                         )
                 )
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 if !isApplying {
                     Image(systemName: "arrow.right")
@@ -513,8 +592,10 @@ struct PageNumberingSheet: View {
             }
         }
         .buttonStyle(PPPrimaryButtonStyle())
+        .keyboardShortcut(.defaultAction)
         .disabled(
             isApplying
+                || didCommitUpdate
                 || selectedPageCount == 0
                 || selectedPageCount > 10_000
         )
@@ -526,7 +607,10 @@ struct PageNumberingSheet: View {
                 .frame(height: 0.6)
         }
         .accessibilityHint(
-            "Adds editable page numbers to the selected pages."
+            (
+                pageNumberingDisabledReason
+                    ?? "Adds editable page numbers to the selected pages."
+            ).localizedUI
         )
     }
 
@@ -550,6 +634,19 @@ struct PageNumberingSheet: View {
         max(1, 999_999 - max(0, selectedPageCount - 1))
     }
 
+    private var pageNumberingDisabledReason: String? {
+        if isApplying {
+            return "Wait for the current operation to finish."
+        }
+        if selectedPageCount == 0 {
+            return "Choose at least one page."
+        }
+        if selectedPageCount > 10_000 {
+            return "Choose no more than 10,000 pages."
+        }
+        return nil
+    }
+
     private var previewText: String {
         format.text(
             number: startNumber,
@@ -570,6 +667,10 @@ struct PageNumberingSheet: View {
     }
 
     private func apply() {
+        guard operationTask == nil, !didCommitUpdate,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         let payload = PDFPageNumberingPayload(
             pageIndices: selectedPageIndices,
             startNumber: startNumber,
@@ -577,18 +678,24 @@ struct PageNumberingSheet: View {
             position: position
         )
         isApplying = true
+        operationStopRequested = false
+        didCommitUpdate = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
             let succeeded = await onApply(payload)
-            if Task.isCancelled {
-                if succeeded {
-                    dismiss()
-                }
-                isApplying = false
-                operationTask = nil
-                return
-            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            didCommitUpdate = succeeded
             isApplying = false
             operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                didCommitUpdate = succeeded
+                reportStoppedDocumentUpdate(succeeded: succeeded)
+                return
+            }
             guard succeeded else { return }
             successFeedback += 1
             dismiss()
@@ -596,29 +703,75 @@ struct PageNumberingSheet: View {
     }
 
     private func removeAll() {
+        guard operationTask == nil, !didCommitUpdate,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         isApplying = true
+        operationStopRequested = false
+        didCommitUpdate = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
             let succeeded = await onRemoveAll()
-            if Task.isCancelled {
-                if succeeded {
-                    dismiss()
-                }
-                isApplying = false
-                operationTask = nil
-                return
-            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            didCommitUpdate = succeeded
             isApplying = false
             operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                didCommitUpdate = succeeded
+                reportStoppedDocumentUpdate(succeeded: succeeded)
+                return
+            }
             guard succeeded else { return }
             successFeedback += 1
             dismiss()
         }
     }
+
+    private func interruptOperation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isApplying = false
+        }
+    }
+
+    private func reportStoppedDocumentUpdate(succeeded: Bool) {
+        model[noticeFor: paperPathSceneID] = (
+            succeeded
+                ? "Document update finished before stopping · changes kept"
+                : "Document update stopped · working copy unchanged"
+        ).localizedUI
+    }
 }
 
 struct BatesNumberingSheet: View {
+    private enum FocusedField: Hashable {
+        case leadingAffix
+        case trailingAffix
+        case startNumber
+    }
+
+    @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
     let pageCount: Int
     let onApply: (PDFBatesNumberingPayload) async -> Bool
@@ -636,6 +789,10 @@ struct BatesNumberingSheet: View {
     @State private var isConfirmingRemoval = false
     @State private var successFeedback = 0
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var didCommitUpdate = false
+    @FocusState private var focusedField: FocusedField?
 
     init(
         pageCount: Int,
@@ -688,7 +845,9 @@ struct BatesNumberingSheet: View {
 
                     batesPreview
                     scopeControls
+                        .disabled(isApplying || didCommitUpdate)
                     sequenceControls
+                        .disabled(isApplying || didCommitUpdate)
                 }
                 .frame(maxWidth: 760)
                 .padding(PPSpacing.regular)
@@ -700,14 +859,24 @@ struct BatesNumberingSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
-                        (isApplying ? "Stop" : "Cancel").localizedUI
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isApplying
+                                    ? "Stop"
+                                    : didCommitUpdate
+                                        ? "Done"
+                                        : "Cancel"
+                        ).localizedUI
                     ) {
                         if isApplying {
-                            operationTask?.cancel()
+                            interruptOperation()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
                 ToolbarItem(placement: .secondaryAction) {
                     Menu {
@@ -722,8 +891,14 @@ struct BatesNumberingSheet: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
-                    .disabled(isApplying)
+                    .disabled(isApplying || didCommitUpdate)
                     .accessibilityLabel("Bates number options")
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        focusedField = nil
+                    }
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -731,6 +906,13 @@ struct BatesNumberingSheet: View {
             }
         }
         .interactiveDismissDisabled(isApplying)
+        .accessibilityAction(.escape) {
+            if isApplying {
+                interruptOperation()
+            } else {
+                dismiss()
+            }
+        }
         .confirmationDialog(
             "Remove all PaperPath Bates numbers?",
             isPresented: $isConfirmingRemoval,
@@ -750,13 +932,13 @@ struct BatesNumberingSheet: View {
         }
         .sensoryFeedback(.success, trigger: successFeedback)
         .onChange(of: prefix) { _, value in
-            if value.count > 64 {
-                prefix = String(value.prefix(64))
+            if value.count > 24 {
+                prefix = String(value.prefix(24))
             }
         }
         .onChange(of: suffix) { _, value in
-            if value.count > 64 {
-                suffix = String(value.prefix(64))
+            if value.count > 24 {
+                suffix = String(value.prefix(24))
             }
         }
         .onChange(of: startNumberText) { _, value in
@@ -768,9 +950,23 @@ struct BatesNumberingSheet: View {
                 startNumberText = bounded
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            focusedField = nil
+            interruptOperation(invalidateResult: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            focusedField = nil
+            interruptOperation(invalidateResult: true)
+        }
         .onDisappear {
-            operationTask?.cancel()
-            operationTask = nil
+            focusedField = nil
+            interruptOperation(invalidateResult: true)
         }
     }
 
@@ -825,7 +1021,7 @@ struct BatesNumberingSheet: View {
             scopePicker
 
             if scope == .range {
-                let layout = dynamicTypeSize.isAccessibilitySize
+                let layout = dynamicTypeSize.ppPrefersExpandedLayout
                     ? AnyLayout(
                         VStackLayout(spacing: PPSpacing.small)
                     )
@@ -879,24 +1075,28 @@ struct BatesNumberingSheet: View {
                     affixField(
                         title: "Prefix",
                         placeholder: "CASE-",
-                        text: $prefix
+                        text: $prefix,
+                        field: .leadingAffix
                     )
                     affixField(
                         title: "Suffix",
                         placeholder: "-A",
-                        text: $suffix
+                        text: $suffix,
+                        field: .trailingAffix
                     )
                 }
                 VStack(spacing: PPSpacing.small) {
                     affixField(
                         title: "Prefix",
                         placeholder: "CASE-",
-                        text: $prefix
+                        text: $prefix,
+                        field: .leadingAffix
                     )
                     affixField(
                         title: "Suffix",
                         placeholder: "-A",
-                        text: $suffix
+                        text: $suffix,
+                        field: .trailingAffix
                     )
                 }
             }
@@ -906,6 +1106,7 @@ struct BatesNumberingSheet: View {
                 text: $startNumberText
             )
             .keyboardType(.numberPad)
+            .focused($focusedField, equals: .startNumber)
             .textFieldStyle(.roundedBorder)
             .monospacedDigit()
 
@@ -919,10 +1120,22 @@ struct BatesNumberingSheet: View {
             )
             .font(.subheadline.monospacedDigit())
 
-            HStack(spacing: PPSpacing.medium) {
+            let positionLayout = dynamicTypeSize.ppPrefersExpandedLayout
+                ? AnyLayout(
+                    VStackLayout(
+                        alignment: .leading,
+                        spacing: PPSpacing.xSmall
+                    )
+                )
+                : AnyLayout(
+                    HStackLayout(spacing: PPSpacing.medium)
+                )
+            positionLayout {
                 Label("Position", systemImage: position.symbol)
                     .font(.subheadline.weight(.semibold))
-                Spacer()
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
                 Picker("Position", selection: $position) {
                     ForEach(PDFPageNumberPosition.allCases) { option in
                         Label(
@@ -933,6 +1146,12 @@ struct BatesNumberingSheet: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    alignment: .leading
+                )
             }
 
             if let validationMessage {
@@ -949,7 +1168,8 @@ struct BatesNumberingSheet: View {
     private func affixField(
         title: String,
         placeholder: String,
-        text: Binding<String>
+        text: Binding<String>,
+        field: FocusedField
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             Text(title.localizedUI)
@@ -959,6 +1179,13 @@ struct BatesNumberingSheet: View {
                 .textFieldStyle(.roundedBorder)
                 .textInputAutocapitalization(.characters)
                 .autocorrectionDisabled()
+                .focused($focusedField, equals: field)
+                .accessibilityValue(
+                    AppLocalization.format(
+                        "%lld of 24 characters",
+                        text.wrappedValue.count
+                    )
+                )
         }
     }
 
@@ -970,7 +1197,7 @@ struct BatesNumberingSheet: View {
                     .tag(option)
             }
         }
-        if dynamicTypeSize.isAccessibilitySize {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
             picker.pickerStyle(.menu)
         } else {
             picker.pickerStyle(.segmented)
@@ -996,6 +1223,9 @@ struct BatesNumberingSheet: View {
                             selectedPageCount
                         )
                 )
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 if !isApplying {
                     Image(systemName: "arrow.right")
@@ -1003,8 +1233,10 @@ struct BatesNumberingSheet: View {
             }
         }
         .buttonStyle(PPPrimaryButtonStyle())
+        .keyboardShortcut(.defaultAction)
         .disabled(
             isApplying
+                || didCommitUpdate
                 || validationMessage != nil
                 || selectedPageCount == 0
                 || selectedPageCount > 10_000
@@ -1017,7 +1249,10 @@ struct BatesNumberingSheet: View {
                 .frame(height: 0.6)
         }
         .accessibilityHint(
-            "Adds one editable Bates identifier to every selected page."
+            (
+                applyDisabledReason
+                    ?? "Adds one editable Bates identifier to every selected page."
+            ).localizedUI
         )
     }
 
@@ -1091,6 +1326,22 @@ struct BatesNumberingSheet: View {
         return nil
     }
 
+    private var applyDisabledReason: String? {
+        if isApplying {
+            return "Wait for the current operation to finish."
+        }
+        if let validationMessage {
+            return validationMessage
+        }
+        if selectedPageCount == 0 {
+            return "Choose at least one page."
+        }
+        if selectedPageCount > 10_000 {
+            return "Choose no more than 10,000 pages."
+        }
+        return nil
+    }
+
     private var firstPreview: String {
         PDFBatesNumberingPayload.text(
             number: startNumber ?? 1,
@@ -1128,7 +1379,10 @@ struct BatesNumberingSheet: View {
 
     private func apply() {
         guard let startNumber,
-              validationMessage == nil
+              validationMessage == nil,
+              operationTask == nil, !didCommitUpdate,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
         else { return }
         let payload = PDFBatesNumberingPayload(
             pageIndices: selectedPageIndices,
@@ -1139,18 +1393,24 @@ struct BatesNumberingSheet: View {
             position: position
         )
         isApplying = true
+        operationStopRequested = false
+        didCommitUpdate = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
             let succeeded = await onApply(payload)
-            if Task.isCancelled {
-                if succeeded {
-                    dismiss()
-                }
-                isApplying = false
-                operationTask = nil
-                return
-            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            didCommitUpdate = succeeded
             isApplying = false
             operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                didCommitUpdate = succeeded
+                reportStoppedDocumentUpdate(succeeded: succeeded)
+                return
+            }
             guard succeeded else { return }
             successFeedback += 1
             dismiss()
@@ -1158,29 +1418,69 @@ struct BatesNumberingSheet: View {
     }
 
     private func removeAll() {
+        guard operationTask == nil, !didCommitUpdate,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         isApplying = true
+        operationStopRequested = false
+        didCommitUpdate = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
             let succeeded = await onRemoveAll()
-            if Task.isCancelled {
-                if succeeded {
-                    dismiss()
-                }
-                isApplying = false
-                operationTask = nil
-                return
-            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            didCommitUpdate = succeeded
             isApplying = false
             operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                didCommitUpdate = succeeded
+                reportStoppedDocumentUpdate(succeeded: succeeded)
+                return
+            }
             guard succeeded else { return }
             successFeedback += 1
             dismiss()
         }
     }
+
+    private func interruptOperation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isApplying = false
+        }
+    }
+
+    private func reportStoppedDocumentUpdate(succeeded: Bool) {
+        model[noticeFor: paperPathSceneID] = (
+            succeeded
+                ? "Document update finished before stopping · changes kept"
+                : "Document update stopped · working copy unchanged"
+        ).localizedUI
+    }
 }
 
 struct WatermarkSheet: View {
+    @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
     let pageCount: Int
     let onApply: (PDFWatermarkPayload) async -> Bool
@@ -1198,6 +1498,9 @@ struct WatermarkSheet: View {
     @State private var isConfirmingRemoval = false
     @State private var successFeedback = 0
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var didCommitUpdate = false
 
     init(
         pageCount: Int,
@@ -1248,8 +1551,11 @@ struct WatermarkSheet: View {
 
                     watermarkPreview
                     textControls
+                        .disabled(isApplying || didCommitUpdate)
                     scopeControls
+                        .disabled(isApplying || didCommitUpdate)
                     appearanceControls
+                        .disabled(isApplying || didCommitUpdate)
                 }
                 .frame(maxWidth: 760)
                 .padding(PPSpacing.regular)
@@ -1261,14 +1567,24 @@ struct WatermarkSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
-                        (isApplying ? "Stop" : "Cancel").localizedUI
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isApplying
+                                    ? "Stop"
+                                    : didCommitUpdate
+                                        ? "Done"
+                                        : "Cancel"
+                        ).localizedUI
                     ) {
                         if isApplying {
-                            operationTask?.cancel()
+                            interruptOperation()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
                 ToolbarItem(placement: .secondaryAction) {
                     Menu {
@@ -1283,7 +1599,7 @@ struct WatermarkSheet: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
-                    .disabled(isApplying)
+                    .disabled(isApplying || didCommitUpdate)
                     .accessibilityLabel("Watermark options")
                 }
             }
@@ -1292,6 +1608,13 @@ struct WatermarkSheet: View {
             }
         }
         .interactiveDismissDisabled(isApplying)
+        .accessibilityAction(.escape) {
+            if isApplying {
+                interruptOperation()
+            } else {
+                dismiss()
+            }
+        }
         .confirmationDialog(
             "Remove all PaperPath watermarks?",
             isPresented: $isConfirmingRemoval,
@@ -1313,9 +1636,20 @@ struct WatermarkSheet: View {
                 customText = String(value.prefix(64))
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptOperation(invalidateResult: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptOperation(invalidateResult: true)
+        }
         .onDisappear {
-            operationTask?.cancel()
-            operationTask = nil
+            interruptOperation(invalidateResult: true)
         }
     }
 
@@ -1380,10 +1714,22 @@ struct WatermarkSheet: View {
     private var textControls: some View {
         VStack(alignment: .leading, spacing: PPSpacing.medium) {
             SectionEyebrow(text: "TEXT")
-            HStack(spacing: PPSpacing.medium) {
+            let presetLayout = dynamicTypeSize.ppPrefersExpandedLayout
+                ? AnyLayout(
+                    VStackLayout(
+                        alignment: .leading,
+                        spacing: PPSpacing.xSmall
+                    )
+                )
+                : AnyLayout(
+                    HStackLayout(spacing: PPSpacing.medium)
+                )
+            presetLayout {
                 Label("Preset", systemImage: "textformat")
                     .font(.subheadline.weight(.semibold))
-                Spacer()
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
                 Picker("Preset", selection: $preset) {
                     ForEach(PDFWatermarkPreset.allCases) { option in
                         Text(option.title.localizedUI)
@@ -1391,6 +1737,12 @@ struct WatermarkSheet: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    alignment: .leading
+                )
             }
 
             if preset == .custom {
@@ -1407,6 +1759,16 @@ struct WatermarkSheet: View {
                     )
                 )
             }
+
+            if let textValidationMessage {
+                Label(
+                    textValidationMessage.localizedUI,
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.amber)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.bottom, PPSpacing.medium)
         .overlay(alignment: .bottom) {
@@ -1422,7 +1784,7 @@ struct WatermarkSheet: View {
             scopePicker
 
             if scope == .range {
-                let layout = dynamicTypeSize.isAccessibilitySize
+                let layout = dynamicTypeSize.ppPrefersExpandedLayout
                     ? AnyLayout(
                         VStackLayout(spacing: PPSpacing.small)
                     )
@@ -1471,10 +1833,23 @@ struct WatermarkSheet: View {
         VStack(alignment: .leading, spacing: PPSpacing.medium) {
             SectionEyebrow(text: "APPEARANCE")
 
-            HStack(spacing: PPSpacing.medium) {
+            let layoutPickerLayout =
+                dynamicTypeSize.ppPrefersExpandedLayout
+                    ? AnyLayout(
+                        VStackLayout(
+                            alignment: .leading,
+                            spacing: PPSpacing.xSmall
+                        )
+                    )
+                    : AnyLayout(
+                        HStackLayout(spacing: PPSpacing.medium)
+                    )
+            layoutPickerLayout {
                 Label("Layout", systemImage: layout.symbol)
                     .font(.subheadline.weight(.semibold))
-                Spacer()
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
                 Picker("Layout", selection: $layout) {
                     ForEach(PDFWatermarkLayout.allCases) { option in
                         Label(
@@ -1485,46 +1860,69 @@ struct WatermarkSheet: View {
                     }
                 }
                 .pickerStyle(.menu)
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    alignment: .leading
+                )
             }
 
-            HStack(spacing: PPSpacing.small) {
+            let colorLayout = dynamicTypeSize.ppPrefersExpandedLayout
+                ? AnyLayout(
+                    VStackLayout(
+                        alignment: .leading,
+                        spacing: PPSpacing.xSmall
+                    )
+                )
+                : AnyLayout(
+                    HStackLayout(spacing: PPSpacing.small)
+                )
+            colorLayout {
                 Text("Color")
                     .font(.subheadline.weight(.semibold))
-                Spacer()
-                ForEach(PDFWatermarkTone.allCases) { option in
-                    Button {
-                        tone = option
-                    } label: {
-                        Circle()
-                            .fill(tint(for: option))
-                            .frame(width: 28, height: 28)
-                            .overlay {
-                                if tone == option {
-                                    Image(systemName: "checkmark")
-                                        .font(.caption2.weight(.bold))
-                                        .foregroundStyle(.white)
-                                }
-                            }
-                            .overlay {
-                                Circle()
-                                    .stroke(
-                                        PPColor.border,
-                                        lineWidth: 0.7
-                                    )
-                            }
-                            .frame(width: 44, height: 44)
-                            .contentShape(Circle())
+                HStack(spacing: PPSpacing.small) {
+                    if !dynamicTypeSize.ppPrefersExpandedLayout {
+                        Spacer(minLength: 0)
                     }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(
-                        AppLocalization.format(
-                            "%@ watermark color",
-                            option.title.localizedUI
+                    ForEach(PDFWatermarkTone.allCases) { option in
+                        Button {
+                            tone = option
+                        } label: {
+                            Circle()
+                                .fill(tint(for: option))
+                                .frame(width: 28, height: 28)
+                                .overlay {
+                                    if tone == option {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption2.weight(.bold))
+                                            .foregroundStyle(.white)
+                                    }
+                                }
+                                .overlay {
+                                    Circle()
+                                        .stroke(
+                                            PPColor.border,
+                                            lineWidth: 0.7
+                                        )
+                                }
+                                .frame(width: 44, height: 44)
+                                .contentShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            AppLocalization.format(
+                                "%@ watermark color",
+                                option.title.localizedUI
+                            )
                         )
-                    )
-                    .accessibilityValue(
-                        tone == option ? "Selected" : ""
-                    )
+                        .accessibilityValue(
+                            tone == option ? "Selected" : ""
+                        )
+                        .accessibilityAddTraits(
+                            tone == option ? .isSelected : []
+                        )
+                    }
                 }
             }
 
@@ -1540,7 +1938,7 @@ struct WatermarkSheet: View {
                     .tag(option)
             }
         }
-        if dynamicTypeSize.isAccessibilitySize {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
             picker.pickerStyle(.menu)
         } else {
             picker.pickerStyle(.segmented)
@@ -1558,7 +1956,7 @@ struct WatermarkSheet: View {
                     .tag(option)
             }
         }
-        if dynamicTypeSize.isAccessibilitySize {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
             picker.pickerStyle(.menu)
         } else {
             picker.pickerStyle(.segmented)
@@ -1584,6 +1982,9 @@ struct WatermarkSheet: View {
                             selectedPageCount
                         )
                 )
+                .lineLimit(2)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
                 Spacer()
                 if !isApplying {
                     Image(systemName: "arrow.right")
@@ -1591,9 +1992,11 @@ struct WatermarkSheet: View {
             }
         }
         .buttonStyle(PPPrimaryButtonStyle())
+        .keyboardShortcut(.defaultAction)
         .disabled(
             isApplying
-                || !isTextValid
+                || didCommitUpdate
+                || textValidationMessage != nil
                 || selectedPageCount == 0
                 || selectedPageCount > 10_000
         )
@@ -1605,7 +2008,10 @@ struct WatermarkSheet: View {
                 .frame(height: 0.6)
         }
         .accessibilityHint(
-            "Adds one editable watermark to every selected page."
+            (
+                watermarkApplyDisabledReason
+                    ?? "Adds one editable watermark to every selected page."
+            ).localizedUI
         )
     }
 
@@ -1635,11 +2041,40 @@ struct WatermarkSheet: View {
     }
 
     private var isTextValid: Bool {
-        !watermarkText.isEmpty
-            && watermarkText.count <= 64
-            && watermarkText.rangeOfCharacter(
-                from: .controlCharacters
-            ) == nil
+        textValidationMessage == nil
+    }
+
+    private var textValidationMessage: String? {
+        guard !watermarkText.isEmpty else {
+            return "Enter watermark text."
+        }
+        guard watermarkText.count <= 64 else {
+            return "Use 64 characters or fewer for watermark text."
+        }
+        guard preset != .custom
+                || customText.rangeOfCharacter(
+                    from: .controlCharacters
+                ) == nil
+        else {
+            return "Watermark text cannot contain line breaks."
+        }
+        return nil
+    }
+
+    private var watermarkApplyDisabledReason: String? {
+        if isApplying {
+            return "Wait for the current operation to finish."
+        }
+        if let textValidationMessage {
+            return textValidationMessage
+        }
+        if selectedPageCount == 0 {
+            return "Choose at least one page."
+        }
+        if selectedPageCount > 10_000 {
+            return "Choose no more than 10,000 pages."
+        }
+        return nil
     }
 
     private var previewAlignment: Alignment {
@@ -1663,8 +2098,14 @@ struct WatermarkSheet: View {
     }
 
     private func apply() {
-        guard isTextValid else { return }
+        guard isTextValid,
+              operationTask == nil, !didCommitUpdate,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         isApplying = true
+        operationStopRequested = false
+        didCommitUpdate = false
         let payload = PDFWatermarkPayload(
             pageIndices: selectedPageIndices,
             text: watermarkText,
@@ -1672,18 +2113,22 @@ struct WatermarkSheet: View {
             tone: tone,
             intensity: intensity
         )
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
             let succeeded = await onApply(payload)
-            if Task.isCancelled {
-                if succeeded {
-                    dismiss()
-                }
-                isApplying = false
-                operationTask = nil
-                return
-            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            didCommitUpdate = succeeded
             isApplying = false
             operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                didCommitUpdate = succeeded
+                reportStoppedDocumentUpdate(succeeded: succeeded)
+                return
+            }
             guard succeeded else { return }
             successFeedback += 1
             dismiss()
@@ -1691,33 +2136,73 @@ struct WatermarkSheet: View {
     }
 
     private func removeAll() {
+        guard operationTask == nil, !didCommitUpdate,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         isApplying = true
+        operationStopRequested = false
+        didCommitUpdate = false
+        let generation = UUID()
+        operationGeneration = generation
         operationTask = Task {
             let succeeded = await onRemoveAll()
-            if Task.isCancelled {
-                if succeeded {
-                    dismiss()
-                }
-                isApplying = false
-                operationTask = nil
-                return
-            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            didCommitUpdate = succeeded
             isApplying = false
             operationTask = nil
+            operationStopRequested = false
+            if wasStopped {
+                didCommitUpdate = succeeded
+                reportStoppedDocumentUpdate(succeeded: succeeded)
+                return
+            }
             guard succeeded else { return }
             successFeedback += 1
             dismiss()
         }
     }
+
+    private func interruptOperation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isApplying = false
+        }
+    }
+
+    private func reportStoppedDocumentUpdate(succeeded: Bool) {
+        model[noticeFor: paperPathSceneID] = (
+            succeeded
+                ? "Document update finished before stopping · changes kept"
+                : "Document update stopped · working copy unchanged"
+        ).localizedUI
+    }
 }
 
 struct NoteComposerSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
 
     let pageIndex: Int
     let onAdd: (String) -> Void
 
     @State private var note = ""
+    @State private var isConfirmingDiscard = false
+    @FocusState private var isNoteFocused: Bool
 
     var body: some View {
         NavigationStack {
@@ -1752,19 +2237,32 @@ struct NoteComposerSheet: View {
                     ]
                 )
 
-                TextField(
-                    "Note",
-                    text: $note,
-                    axis: .vertical
-                )
-                .lineLimit(5...12)
-                .textFieldStyle(.plain)
-                .padding(PPSpacing.medium)
-                .background(PPColor.surface)
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(PPColor.amber.opacity(0.55))
-                        .frame(height: 1)
+                VStack(alignment: .trailing, spacing: PPSpacing.small) {
+                    TextField(
+                        "Note",
+                        text: $note,
+                        axis: .vertical
+                    )
+                    .focused($isNoteFocused)
+                    .lineLimit(5...12)
+                    .textFieldStyle(.plain)
+                    .submitLabel(.done)
+                    .onSubmit(submitNote)
+                    .padding(PPSpacing.medium)
+                    .background(PPColor.surface)
+                    .overlay(alignment: .bottom) {
+                        Rectangle()
+                            .fill(PPColor.amber.opacity(0.55))
+                            .frame(height: 1)
+                    }
+
+                    PasteButton(payloadType: String.self) { values in
+                        paste(values.first)
+                    }
+                    .frame(minWidth: 44, minHeight: 44)
+                    .accessibilityHint(
+                        "Pastes text into the note"
+                    )
                 }
                 Spacer(minLength: 0)
             }
@@ -1774,21 +2272,15 @@ struct NoteComposerSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") { dismiss() }
+                    Button("Cancel") {
+                        requestDismissal()
+                    }
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Add") {
-                        let value = note.trimmingCharacters(
-                            in: .whitespacesAndNewlines
-                        )
-                        dismiss()
-                        onAdd(value)
-                    }
-                    .disabled(
-                        note.trimmingCharacters(
-                            in: .whitespacesAndNewlines
-                        ).isEmpty
-                    )
+                    Button("Add", action: submitNote)
+                        .disabled(trimmedNote.isEmpty)
+                        .keyboardShortcut(.defaultAction)
                 }
             }
             .onChange(of: note) { _, value in
@@ -1796,6 +2288,79 @@ struct NoteComposerSheet: View {
                     note = String(value.prefix(1_000))
                 }
             }
+            .confirmationDialog(
+                "Discard note draft?".localizedUI,
+                isPresented: $isConfirmingDiscard,
+                titleVisibility: .visible
+            ) {
+                Button(
+                    "Discard Draft".localizedUI,
+                    role: .destructive
+                ) {
+                    dismiss()
+                }
+                Button("Keep Editing".localizedUI, role: .cancel) {}
+            } message: {
+                Text(
+                    "The note has not been added to the PDF."
+                        .localizedUI
+                )
+            }
+            .interactiveDismissDisabled(!trimmedNote.isEmpty)
+            .accessibilityAction(.escape) {
+                requestDismissal()
+            }
+            .onChange(of: scenePhase) { _, phase in
+                guard phase == .background else { return }
+                discardProtectedDraft()
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                discardProtectedDraft()
+            }
+            .onDisappear {
+                note = ""
+                isNoteFocused = false
+            }
+            .task {
+                await Task.yield()
+                isNoteFocused = true
+            }
         }
+    }
+
+    private var trimmedNote: String {
+        note.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func submitNote() {
+        guard !trimmedNote.isEmpty else { return }
+        isNoteFocused = false
+        onAdd(trimmedNote)
+    }
+
+    private func paste(_ value: String?) {
+        guard let value else { return }
+        let separator = note.isEmpty ? "" : "\n"
+        note = String((note + separator + value).prefix(1_000))
+        isNoteFocused = true
+    }
+
+    private func requestDismissal() {
+        if trimmedNote.isEmpty {
+            dismiss()
+        } else {
+            isConfirmingDiscard = true
+        }
+    }
+
+    private func discardProtectedDraft() {
+        note = ""
+        isNoteFocused = false
+        dismiss()
     }
 }

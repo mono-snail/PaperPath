@@ -1,9 +1,59 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+private struct BatesProgressHeader: View {
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+
+    let title: String
+    let completedCount: Int?
+    let totalCount: Int?
+
+    var body: some View {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                )
+            )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.small)
+            )
+        layout {
+            Text(title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 2
+                        : 1
+                )
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let completedCount,
+               let totalCount,
+               totalCount > 0 {
+                Text("\(completedCount)/\(totalCount)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+        }
+    }
+}
+
 struct BatchBatesNumberingView: View {
+    private enum FocusedField: Hashable {
+        case prefix
+        case suffix
+        case startingNumber
+    }
+
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dismissSearch) private var dismissSearch
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     @State private var orderedRecordIDs: [UUID]
     @State private var searchText = ""
@@ -13,11 +63,14 @@ struct BatchBatesNumberingView: View {
     @State private var digitCount = 6
     @State private var startNumberText = "1"
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var isStopRequested = false
     @State private var successFeedback = 0
     @State private var errorFeedback = 0
     @State private var isPresentingReceiptHistory = false
     @State private var issuedReceipt:
         PDFSignedBatesBatchReceipt?
+    @FocusState private var focusedField: FocusedField?
 
     init(initialRecordIDs: [UUID] = []) {
         _orderedRecordIDs = State(initialValue: initialRecordIDs)
@@ -34,16 +87,24 @@ struct BatchBatesNumberingView: View {
                         spacing: PPSpacing.large
                     ) {
                         batchHeader
+                        OfficeClockContinuitySection()
                         sequenceSection
-                            .disabled(operationTask != nil)
+                            .disabled(
+                                operationTask != nil
+                                    || isAnotherBatesBatchActive
+                            )
                         documentSection
-                            .disabled(operationTask != nil)
+                            .disabled(
+                                operationTask != nil
+                                    || isAnotherBatesBatchActive
+                            )
                     }
                     .frame(maxWidth: 860)
                     .padding(PPSpacing.regular)
                     .padding(.bottom, 108)
                     .frame(maxWidth: .infinity)
                 }
+                .scrollDismissesKeyboard(.interactively)
             }
             .navigationTitle("Bates Several PDFs")
             .navigationBarTitleDisplayMode(.inline)
@@ -54,21 +115,34 @@ struct BatchBatesNumberingView: View {
                 ),
                 prompt: "Filter PDFs"
             )
+            .submitLabel(.search)
+            .onSubmit(of: .search) {
+                dismissSearch()
+            }
+            .onChange(of: searchText) { _, value in
+                if value.count > 200 {
+                    searchText = String(value.prefix(200))
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
                             operationTask == nil
                                 ? "Cancel"
-                                : "Stop"
+                                : isStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                         ).localizedUI
                     ) {
-                        if let operationTask {
-                            operationTask.cancel()
+                        if operationTask != nil {
+                            interruptBatchNumbering()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationTask != nil && isStopRequested)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -110,8 +184,17 @@ struct BatchBatesNumberingView: View {
                     } label: {
                         Image(systemName: "ellipsis.circle")
                     }
-                    .disabled(operationTask != nil)
+                    .disabled(
+                        operationTask != nil
+                            || isAnotherBatesBatchActive
+                    )
                     .accessibilityLabel("Batch selection options")
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") {
+                        focusedField = nil
+                    }
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -119,6 +202,18 @@ struct BatchBatesNumberingView: View {
             }
         }
         .interactiveDismissDisabled(operationTask != nil)
+        .accessibilityAction(.escape) {
+            if operationTask != nil {
+                interruptBatchNumbering()
+            } else if focusedField != nil {
+                focusedField = nil
+            } else if !searchText.isEmpty {
+                searchText = ""
+                dismissSearch()
+            } else {
+                dismiss()
+            }
+        }
         .sheet(isPresented: $isPresentingReceiptHistory) {
             BatesBatchReceiptHistoryView()
         }
@@ -134,13 +229,13 @@ struct BatchBatesNumberingView: View {
             trigger: orderedRecordIDs
         )
         .onChange(of: prefix) { _, value in
-            if value.count > 64 {
-                prefix = String(value.prefix(64))
+            if value.count > 24 {
+                prefix = String(value.prefix(24))
             }
         }
         .onChange(of: suffix) { _, value in
-            if value.count > 64 {
-                suffix = String(value.prefix(64))
+            if value.count > 24 {
+                suffix = String(value.prefix(24))
             }
         }
         .onChange(of: startNumberText) { _, value in
@@ -161,21 +256,43 @@ struct BatchBatesNumberingView: View {
                 !eligibleSet.contains($0)
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptBatchNumbering(invalidateResult: true)
+            searchText = ""
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptBatchNumbering(invalidateResult: true)
+            searchText = ""
+        }
         .onDisappear {
-            operationTask?.cancel()
-            operationTask = nil
+            interruptBatchNumbering(invalidateResult: true)
+            searchText = ""
         }
     }
 
     private var batchHeader: some View {
         WorkflowCommandHeader(
             eyebrow: "CONTINUOUS BATES",
-            title: operationTask == nil
-                ? "One sequence across PDFs"
-                : model.batesBatchProgress?.stage.title
-                    ?? "Preparing numbered copies",
+            title: isAnotherBatesBatchActive
+                ? "Bates task running in another window"
+                : operationTask == nil
+                    ? "One sequence across PDFs"
+                    : model.batesBatchProgress?.stage.title
+                        ?? "Preparing numbered copies",
             detail: operationTask == nil
-                ? "Order private copies, preview every range, then commit them together."
+                ? (
+                    isAnotherBatesBatchActive
+                        ? model.batesBatchProgress?
+                            .currentDocumentName
+                            ?? "Finish or stop that batch before starting another."
+                        : "Order private copies, preview every range, then commit them together."
+                )
                 : model.batesBatchProgress?.currentDocumentName
                     ?? "Checking selected PDFs",
             symbol: "square.stack.3d.up.fill",
@@ -214,11 +331,13 @@ struct BatchBatesNumberingView: View {
                     affixField(
                         title: "Prefix",
                         placeholder: "CASE-",
+                        field: .prefix,
                         text: $prefix
                     )
                     affixField(
                         title: "Suffix",
                         placeholder: "-A",
+                        field: .suffix,
                         text: $suffix
                     )
                 }
@@ -226,11 +345,13 @@ struct BatchBatesNumberingView: View {
                     affixField(
                         title: "Prefix",
                         placeholder: "CASE-",
+                        field: .prefix,
                         text: $prefix
                     )
                     affixField(
                         title: "Suffix",
                         placeholder: "-A",
+                        field: .suffix,
                         text: $suffix
                     )
                 }
@@ -311,6 +432,7 @@ struct BatchBatesNumberingView: View {
                 .keyboardType(.numberPad)
                 .textFieldStyle(.roundedBorder)
                 .monospacedDigit()
+                .focused($focusedField, equals: .startingNumber)
         }
         .frame(maxWidth: 320)
     }
@@ -336,19 +458,73 @@ struct BatchBatesNumberingView: View {
                     .font(.caption2.monospacedDigit().weight(.bold))
                     .foregroundStyle(PPColor.amber)
                 Spacer()
-                Text("Top to bottom".localizedUI)
+                Text(
+                    (
+                        normalizedSearchText.isEmpty
+                            ? "Top to bottom"
+                            : "Filtered view"
+                    ).localizedUI
+                )
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
             }
 
+            if !hiddenSelectedRecordIDs.isEmpty {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.small) {
+                        hiddenSelectionMessage
+                        Spacer(minLength: PPSpacing.small)
+                        deselectHiddenButton
+                    }
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    ) {
+                        hiddenSelectionMessage
+                        deselectHiddenButton
+                    }
+                }
+                .padding(.vertical, PPSpacing.xSmall)
+            }
+
             if displayedRecords.isEmpty {
-                ContentUnavailableView(
-                    "No eligible PDFs",
-                    systemImage: "doc.questionmark",
-                    description: Text(
-                        "Unlocked working copies appear here."
+                VStack(spacing: PPSpacing.medium) {
+                    ContentUnavailableView(
+                        (
+                            normalizedSearchText.isEmpty
+                                ? "No eligible PDFs"
+                                : "No matching PDFs"
+                        ).localizedUI,
+                        systemImage: normalizedSearchText.isEmpty
+                            ? "doc.questionmark"
+                            : "magnifyingglass",
+                        description: Text(
+                            (
+                                normalizedSearchText.isEmpty
+                                    ? "Unlocked working copies appear here."
+                                    : "Try another file name."
+                            ).localizedUI
+                        )
                     )
-                )
+                    if !normalizedSearchText.isEmpty {
+                        Button {
+                            searchText = ""
+                            dismissSearch()
+                        } label: {
+                            Label(
+                                "Clear Search",
+                                systemImage: "xmark.circle"
+                            )
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(
+                            PPQuietButtonStyle(tint: PPColor.amber)
+                        )
+                        .accessibilityIdentifier(
+                            "batchBatesClearSearch"
+                        )
+                    }
+                }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, PPSpacing.large)
             } else {
@@ -374,71 +550,99 @@ struct BatchBatesNumberingView: View {
         let planItem = plan?.items.first {
             $0.recordID == record.id
         }
-
-        return HStack(spacing: PPSpacing.small) {
-            Button {
-                toggle(record.id)
-            } label: {
-                Image(
-                    systemName: selectedIndex == nil
-                        ? "circle"
-                        : "checkmark.circle.fill"
-                )
-                .font(.title3)
-                .foregroundStyle(
-                    selectedIndex == nil
-                        ? PPColor.textSecondary
-                        : PPColor.amber
-                )
-                .frame(width: 40, height: 44)
-            }
-            .buttonStyle(.plain)
-            .disabled(operationTask != nil)
-            .accessibilityLabel(
-                AppLocalization.format(
-                    selectedIndex == nil
-                        ? "Select %@"
-                        : "Deselect %@",
-                    record.displayName
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
                 )
             )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.small)
+            )
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    if let selectedIndex {
-                        Text("\(selectedIndex + 1)")
-                            .font(
-                                .caption2.monospacedDigit().weight(.black)
-                            )
-                            .foregroundStyle(PPColor.surface)
-                            .frame(width: 22, height: 22)
-                            .background(PPColor.amber, in: Circle())
-                    }
-                    Text(record.displayName)
-                        .font(.subheadline.weight(.semibold))
-                        .fontDesign(.serif)
-                        .foregroundStyle(PPColor.textPrimary)
-                        .lineLimit(1)
+        return layout {
+            HStack(spacing: PPSpacing.small) {
+                Button {
+                    toggle(record.id)
+                } label: {
+                    Image(
+                        systemName: selectedIndex == nil
+                            ? "circle"
+                            : "checkmark.circle.fill"
+                    )
+                    .font(.title3)
+                    .foregroundStyle(
+                        selectedIndex == nil
+                            ? PPColor.textSecondary
+                            : PPColor.amber
+                    )
+                    .frame(width: 44, height: 44)
                 }
-
-                Text(
-                    planItem.map {
-                        AppLocalization.format(
-                            "%lld pages | %@ to %@",
-                            $0.pageCount,
-                            plan?.identifier(for: $0.startNumber) ?? "",
-                            plan?.identifier(for: $0.endNumber) ?? ""
-                        )
-                    } ?? record.subtitle
+                .buttonStyle(.plain)
+                .disabled(operationTask != nil)
+                .accessibilityLabel(
+                    AppLocalization.format(
+                        selectedIndex == nil
+                            ? "Select %@"
+                            : "Deselect %@",
+                        record.displayName
+                    )
                 )
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(2)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 6) {
+                        if let selectedIndex {
+                            Text("\(selectedIndex + 1)")
+                                .font(
+                                    .caption2.monospacedDigit()
+                                        .weight(.black)
+                                )
+                                .foregroundStyle(PPColor.surface)
+                                .frame(width: 22, height: 22)
+                                .background(PPColor.amber, in: Circle())
+                        }
+                        Text(record.displayName)
+                            .font(.subheadline.weight(.semibold))
+                            .fontDesign(.serif)
+                            .foregroundStyle(PPColor.textPrimary)
+                            .lineLimit(
+                                dynamicTypeSize.ppPrefersExpandedLayout
+                                    ? 3
+                                    : 2
+                            )
+                            .fixedSize(
+                                horizontal: false,
+                                vertical: true
+                            )
+                    }
+
+                    Text(
+                        planItem.map {
+                            AppLocalization.format(
+                                "%lld pages | %@ to %@",
+                                $0.pageCount,
+                                plan?.identifier(
+                                    for: $0.startNumber
+                                ) ?? "",
+                                plan?.identifier(
+                                    for: $0.endNumber
+                                ) ?? ""
+                            )
+                        } ?? record.subtitle
+                    )
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(2)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Spacer(minLength: PPSpacing.small)
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                Spacer(minLength: PPSpacing.small)
+            }
 
-            if let selectedIndex {
+            if let selectedIndex, normalizedSearchText.isEmpty {
                 HStack(spacing: 0) {
                     orderButton(
                         symbol: "arrow.up",
@@ -457,6 +661,19 @@ struct BatchBatesNumberingView: View {
                         move(record.id, offset: 1)
                     }
                 }
+                .frame(
+                    maxWidth:
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? .infinity
+                            : nil,
+                    alignment: .leading
+                )
+                .padding(
+                    .leading,
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 44 + PPSpacing.small
+                        : 0
+                )
             }
         }
         .frame(minHeight: 58)
@@ -472,7 +689,7 @@ struct BatchBatesNumberingView: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .frame(width: 38, height: 44)
+                .frame(width: 44, height: 44)
         }
         .buttonStyle(.plain)
         .foregroundStyle(
@@ -486,21 +703,24 @@ struct BatchBatesNumberingView: View {
     private var actionFooter: some View {
         VStack(spacing: PPSpacing.small) {
             if let progress = model.batesBatchProgress,
-               operationTask != nil {
+               operationTask != nil || isAnotherBatesBatchActive {
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text(progress.stage.title.localizedUI)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(PPColor.textPrimary)
-                        Spacer()
-                        Text(
-                            "\(progress.completedDocumentCount)/\(progress.totalDocumentCount)"
-                        )
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(PPColor.textSecondary)
-                    }
+                    BatesProgressHeader(
+                        title: progress.stage.title.localizedUI,
+                        completedCount:
+                            progress.completedDocumentCount,
+                        totalCount: progress.totalDocumentCount
+                    )
                     ProgressView(value: progress.fractionCompleted)
                         .tint(PPColor.cyan)
+                        .accessibilityLabel("Bates numbering progress")
+                        .accessibilityValue(
+                            AppLocalization.format(
+                                "%lld of %lld PDFs processed",
+                                progress.completedDocumentCount,
+                                progress.totalDocumentCount
+                            )
+                        )
                 }
             }
 
@@ -518,41 +738,76 @@ struct BatchBatesNumberingView: View {
 
     @ViewBuilder
     private var actionButton: some View {
-        if let operationTask {
+        if operationTask != nil {
             Button {
-                operationTask.cancel()
+                interruptBatchNumbering()
             } label: {
                 HStack(spacing: PPSpacing.small) {
-                    Image(systemName: "stop.fill")
-                    Text("Stop before commit".localizedUI)
+                    Image(
+                        systemName: isStopRequested
+                            ? "hourglass"
+                            : "stop.fill"
+                    )
+                    Text(
+                        (
+                            isStopRequested
+                                ? "Stopping"
+                                : "Stop safely"
+                        ).localizedUI
+                    )
                     Spacer()
                 }
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+            .disabled(isStopRequested)
         } else {
             Button {
                 apply()
             } label: {
                 HStack(spacing: PPSpacing.small) {
-                    Image(systemName: "number.square.fill")
+                    Image(
+                        systemName: isAnotherBatesBatchActive
+                            ? "hourglass"
+                            : "number.square.fill"
+                    )
                     Text(
-                        AppLocalization.format(
-                            "Bates number %lld PDFs",
-                            orderedRecordIDs.count
-                        )
+                        isAnotherBatesBatchActive
+                            ? "Bates task running".localizedUI
+                            : AppLocalization.format(
+                                "Bates number %lld PDFs",
+                                orderedRecordIDs.count
+                            )
                     )
                     Spacer()
-                    Image(systemName: "arrow.right")
+                    if !isAnotherBatesBatchActive {
+                        Image(systemName: "arrow.right")
+                    }
                 }
             }
             .buttonStyle(PPPrimaryButtonStyle())
-            .disabled(plan == nil)
+            .disabled(
+                plan == nil || isAnotherBatesBatchActive
+            )
+            .accessibilityHint(
+                (
+                    isAnotherBatesBatchActive
+                        ? "Finish or stop the Bates task in the other window."
+                        : validationMessage
+                            ?? "Creates verified numbered copies in the shown order."
+                ).localizedUI
+            )
         }
+    }
+
+    private var isAnotherBatesBatchActive: Bool {
+        operationTask == nil
+            && model.isBatesBatchMutationActive
     }
 
     private func affixField(
         title: String,
         placeholder: String,
+        field: FocusedField,
         text: Binding<String>
     ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -563,7 +818,44 @@ struct BatchBatesNumberingView: View {
                 .textFieldStyle(.roundedBorder)
                 .textInputAutocapitalization(.characters)
                 .autocorrectionDisabled()
+                .focused($focusedField, equals: field)
+                .submitLabel(.done)
+                .onSubmit {
+                    focusedField = nil
+                }
         }
+    }
+
+    private var hiddenSelectionMessage: some View {
+        Label(
+            AppLocalization.format(
+                "%lld selected outside this search",
+                hiddenSelectedRecordIDs.count
+            ),
+            systemImage: "eye.slash"
+        )
+        .font(.caption.weight(.semibold))
+        .foregroundStyle(PPColor.amber)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var deselectHiddenButton: some View {
+        Button {
+            let hiddenIDs = Set(hiddenSelectedRecordIDs)
+            orderedRecordIDs.removeAll {
+                hiddenIDs.contains($0)
+            }
+        } label: {
+            Label(
+                "Deselect Hidden",
+                systemImage: "minus.circle"
+            )
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.amber))
+        .accessibilityHint(
+            "Removes only selected PDFs hidden by the current search."
+                .localizedUI
+        )
     }
 
     private var eligibleRecords: [DocumentRecord] {
@@ -581,12 +873,27 @@ struct BatchBatesNumberingView: View {
     }
 
     private var filteredEligibleRecords: [DocumentRecord] {
-        let query = searchText.trimmingCharacters(
+        guard !normalizedSearchText.isEmpty else {
+            return eligibleRecords
+        }
+        return eligibleRecords.filter {
+            $0.displayName.localizedCaseInsensitiveContains(
+                normalizedSearchText
+            )
+        }
+    }
+
+    private var normalizedSearchText: String {
+        searchText.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard !query.isEmpty else { return eligibleRecords }
-        return eligibleRecords.filter {
-            $0.displayName.localizedCaseInsensitiveContains(query)
+    }
+
+    private var hiddenSelectedRecordIDs: [UUID] {
+        guard !normalizedSearchText.isEmpty else { return [] }
+        let visibleIDs = Set(filteredEligibleRecords.map(\.id))
+        return orderedRecordIDs.filter {
+            !visibleIDs.contains($0)
         }
     }
 
@@ -711,18 +1018,39 @@ struct BatchBatesNumberingView: View {
     }
 
     private func apply() {
+        guard !model.isBatesBatchMutationActive,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         guard let plan else {
             errorFeedback += 1
             return
         }
         let previousReceiptID = model.batesBatchReceipts.first?.id
-        operationTask = Task {
-            let succeeded = await model.applyBatesNumbersBatch(plan)
+        let generation = UUID()
+        operationGeneration = generation
+        isStopRequested = false
+        operationTask = Task { @MainActor in
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.applyBatesNumbersBatch(plan)
+            }
+            guard operationGeneration == generation else { return }
+            let wasStopped =
+                isStopRequested || Task.isCancelled
             operationTask = nil
+            isStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    succeeded
+                        ? "Bates numbering finished before stopping · receipt kept in History"
+                        : "Bates numbering stopped"
+                ).localizedUI
+                return
+            }
             guard succeeded else {
-                if !Task.isCancelled {
-                    errorFeedback += 1
-                }
+                errorFeedback += 1
                 return
             }
             successFeedback += 1
@@ -734,15 +1062,37 @@ struct BatchBatesNumberingView: View {
             }
         }
     }
+
+    private func interruptBatchNumbering(
+        invalidateResult: Bool = false
+    ) {
+        guard operationTask != nil else { return }
+        if invalidateResult {
+            operationGeneration = UUID()
+        } else {
+            guard !isStopRequested else { return }
+            isStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isStopRequested = false
+        }
+    }
 }
 
 struct BatesBatchReceiptHistoryView: View {
     @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dismissSearch) private var dismissSearch
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     @State private var searchText = ""
     @State private var selectedReceipt:
         PDFSignedBatesBatchReceipt?
+    @State private var pendingDocumentID: UUID?
     @State private var receiptPendingDeletion:
         PDFSignedBatesBatchReceipt?
     @State private var isImportingReceipt = false
@@ -755,6 +1105,10 @@ struct BatesBatchReceiptHistoryView: View {
     @State private var matchInspectionTask: Task<Void, Never>?
     @State private var importedMatchInspection:
         PDFBatesMatchReportInspection?
+    @State private var inspectionGeneration = UUID()
+    @State private var matchInspectionGeneration = UUID()
+    @State private var documentOpenTask: Task<Void, Never>?
+    @State private var documentOpenGeneration = UUID()
 
     var onOpenDocument: ((UUID) -> Void)?
 
@@ -764,19 +1118,43 @@ struct BatesBatchReceiptHistoryView: View {
                 PPCanvas()
 
                 if filteredReceipts.isEmpty {
-                    ContentUnavailableView(
-                        searchText.isEmpty
-                            ? "No Bates receipts"
-                            : "No matching receipts",
-                        systemImage: searchText.isEmpty
-                            ? "checkmark.seal"
-                            : "magnifyingglass",
-                        description: Text(
+                    VStack(spacing: PPSpacing.medium) {
+                        ContentUnavailableView(
                             searchText.isEmpty
-                                ? "A signed receipt is saved after a multi-PDF Bates batch."
-                                : "Try a file name, sequence, or signer Key ID."
+                                ? "No Bates receipts"
+                                : "No matching receipts",
+                            systemImage: searchText.isEmpty
+                                ? "checkmark.seal"
+                                : "magnifyingglass",
+                            description: Text(
+                                searchText.isEmpty
+                                    ? "A signed receipt is saved after a multi-PDF Bates batch."
+                                    : "Try a file name, sequence, or signer Key ID."
+                            )
                         )
-                    )
+                        if !searchText.isEmpty {
+                            Button {
+                                searchText = ""
+                                dismissSearch()
+                            } label: {
+                                Label(
+                                    "Clear Search",
+                                    systemImage: "xmark.circle"
+                                )
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(
+                                PPQuietButtonStyle(
+                                    tint: PPColor.amber
+                                )
+                            )
+                            .accessibilityIdentifier(
+                                "batesReceiptClearSearch"
+                            )
+                        }
+                    }
+                    .frame(maxWidth: 520)
+                    .padding(PPSpacing.regular)
                 } else {
                     ScrollView {
                         LazyVStack(spacing: 0) {
@@ -801,11 +1179,31 @@ struct BatesBatchReceiptHistoryView: View {
                 text: $searchText,
                 prompt: "Search receipts"
             )
+            .submitLabel(.search)
+            .onSubmit(of: .search) {
+                dismissSearch()
+            }
+            .onChange(of: searchText) { _, value in
+                if value.count > 200 {
+                    searchText = String(value.prefix(200))
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") {
-                        dismiss()
+                    Button(
+                        (
+                            hasActiveInspection
+                                ? "Stop"
+                                : "Close"
+                        ).localizedUI
+                    ) {
+                        if hasActiveInspection {
+                            stopExternalInspections()
+                        } else {
+                            dismiss()
+                        }
                     }
+                    .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -817,6 +1215,10 @@ struct BatesBatchReceiptHistoryView: View {
                                 systemImage: "checkmark.seal"
                             )
                         }
+                        .disabled(
+                            model.isBatesReceiptVerificationActive
+                                || model.isBatesBatchMutationActive
+                        )
                         Button {
                             isImportingMatchReport = true
                         } label: {
@@ -827,15 +1229,19 @@ struct BatesBatchReceiptHistoryView: View {
                             )
                         }
                     } label: {
-                        if isInspectingReceipt
-                            || isInspectingMatchReport {
-                            ProgressView()
-                        } else {
-                            Image(
-                                systemName:
-                                    "doc.badge.magnifyingglass"
-                            )
+                        ZStack {
+                            if isInspectingReceipt
+                                || isInspectingMatchReport {
+                                ProgressView()
+                                    .controlSize(.small)
+                            } else {
+                                Image(
+                                    systemName:
+                                        "doc.badge.magnifyingglass"
+                                )
+                            }
                         }
+                        .frame(width: 44, height: 44)
                     }
                     .disabled(
                         isInspectingReceipt
@@ -858,7 +1264,7 @@ struct BatesBatchReceiptHistoryView: View {
                   let url = urls.first
             else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
                 return
             }
@@ -873,16 +1279,19 @@ struct BatesBatchReceiptHistoryView: View {
                   let url = urls.first
             else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
                 return
             }
             inspectExternalMatchReport(url)
         }
-        .sheet(item: $selectedReceipt) { receipt in
+        .sheet(
+            item: $selectedReceipt,
+            onDismiss: completeDocumentOpen
+        ) { receipt in
             BatesBatchReceiptView(
                 receiptID: receipt.id,
-                onOpenDocument: onOpenDocument
+                onOpenDocument: nestedDocumentOpenAction
             )
         }
         .sheet(item: $importedInspection) { inspection in
@@ -894,8 +1303,21 @@ struct BatesBatchReceiptHistoryView: View {
             )
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {
-            if isInspectingReceipt || isInspectingMatchReport {
+            if isInspectingReceipt
+                || isInspectingMatchReport
+                || isAnotherReceiptVerificationActive {
                 externalVerificationProgress
+            }
+        }
+        .interactiveDismissDisabled(hasActiveInspection)
+        .accessibilityAction(.escape) {
+            if hasActiveInspection {
+                stopExternalInspections()
+            } else if !searchText.isEmpty {
+                searchText = ""
+                dismissSearch()
+            } else {
+                dismiss()
             }
         }
         .confirmationDialog(
@@ -916,9 +1338,11 @@ struct BatesBatchReceiptHistoryView: View {
                 }
                 receiptPendingDeletion = nil
                 Task {
-                    _ = await model.deleteBatesBatchReceipt(
-                        receiptID: receipt.id
-                    )
+                    _ = await model.withFeedbackTarget(paperPathSceneID) {
+                        await model.deleteBatesBatchReceipt(
+                            receiptID: receipt.id
+                        )
+                    }
                 }
             }
             Button("Cancel", role: .cancel) {
@@ -929,11 +1353,59 @@ struct BatesBatchReceiptHistoryView: View {
                 "The PDFs and their Bates numbers are not changed."
             )
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptProtectedReceiptHistory()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtectedReceiptHistory()
+        }
         .onDisappear {
-            inspectionTask?.cancel()
-            inspectionTask = nil
-            matchInspectionTask?.cancel()
-            matchInspectionTask = nil
+            interruptProtectedReceiptHistory()
+        }
+    }
+
+    private var nestedDocumentOpenAction: ((UUID) -> Void)? {
+        guard onOpenDocument != nil else { return nil }
+        return { recordID in
+            pendingDocumentID = recordID
+            selectedReceipt = nil
+        }
+    }
+
+    private var hasActiveInspection: Bool {
+        isInspectingReceipt || isInspectingMatchReport
+    }
+
+    private var isAnotherReceiptVerificationActive: Bool {
+        !isInspectingReceipt
+            && model.isBatesReceiptVerificationActive
+    }
+
+    private func completeDocumentOpen() {
+        guard let recordID = pendingDocumentID else { return }
+        pendingDocumentID = nil
+        let generation = UUID()
+        documentOpenGeneration = generation
+        documentOpenTask?.cancel()
+        documentOpenTask = Task { @MainActor in
+            defer {
+                if documentOpenGeneration == generation {
+                    documentOpenTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  documentOpenGeneration == generation,
+                  scenePhase == .active,
+                  model.record(id: recordID) != nil
+            else { return }
+            onOpenDocument?(recordID)
         }
     }
 
@@ -964,10 +1436,21 @@ struct BatesBatchReceiptHistoryView: View {
     private func receiptRow(
         _ receipt: PDFSignedBatesBatchReceipt
     ) -> some View {
-        Button {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                )
+            )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.small)
+            )
+        return Button {
             selectedReceipt = receipt
         } label: {
-            HStack(spacing: PPSpacing.small) {
+            layout {
+                HStack(spacing: PPSpacing.small) {
                 Image(
                     systemName: receipt.removal == nil
                         ? "checkmark.seal.fill"
@@ -988,7 +1471,11 @@ struct BatesBatchReceiptHistoryView: View {
                     )
                     .font(.subheadline.monospaced().weight(.semibold))
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? 2
+                            : 1
+                    )
 
                     Text(
                         AppLocalization.format(
@@ -1000,7 +1487,11 @@ struct BatesBatchReceiptHistoryView: View {
                     )
                     .font(.caption2.monospacedDigit())
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? 2
+                            : 1
+                    )
 
                     Text(
                         receipt.removal.map {
@@ -1019,11 +1510,15 @@ struct BatesBatchReceiptHistoryView: View {
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                }
 
-                Spacer(minLength: PPSpacing.small)
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.bold))
-                    .foregroundStyle(PPColor.mint)
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: PPSpacing.small)
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(PPColor.mint)
+                }
             }
             .frame(minHeight: 66)
             .contentShape(Rectangle())
@@ -1058,29 +1553,25 @@ struct BatesBatchReceiptHistoryView: View {
 
     private var externalVerificationProgress: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(
+            BatesProgressHeader(
+                title:
                     isInspectingMatchReport
                         ? "Reading signed match report".localizedUI
+                        : isAnotherReceiptVerificationActive
+                            ? "Receipt check running in another window"
+                                .localizedUI
                         : (
                             model.batesReceiptVerificationProgress?
                                 .currentDocumentName
                                 ?? "Reading signed receipt".localizedUI
-                        )
-                )
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(PPColor.textPrimary)
-                .lineLimit(1)
-                Spacer()
-                if let progress =
-                    model.batesReceiptVerificationProgress {
-                    Text(
-                        "\(progress.completedDocumentCount)/\(progress.totalDocumentCount)"
-                    )
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(PPColor.textSecondary)
-                }
-            }
+                        ),
+                completedCount:
+                    model.batesReceiptVerificationProgress?
+                        .completedDocumentCount,
+                totalCount:
+                    model.batesReceiptVerificationProgress?
+                        .totalDocumentCount
+            )
             ProgressView(
                 value: isInspectingMatchReport
                     ? nil
@@ -1102,15 +1593,26 @@ struct BatesBatchReceiptHistoryView: View {
     }
 
     private func inspectExternalReceipt(_ url: URL) {
-        guard !isInspectingMatchReport else { return }
+        guard !isInspectingMatchReport,
+              !model.isBatesReceiptVerificationActive,
+              !model.isBatesBatchMutationActive
+        else { return }
         inspectionTask?.cancel()
+        let generation = UUID()
+        inspectionGeneration = generation
         isInspectingReceipt = true
-        inspectionTask = Task {
-            let inspection = await model
-                .inspectExternalBatesBatchReceipt(at: url)
-            guard !Task.isCancelled else { return }
+        inspectionTask = Task { @MainActor in
+            let inspection = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.inspectExternalBatesBatchReceipt(
+                    at: url
+                )
+            }
+            guard inspectionGeneration == generation else { return }
             isInspectingReceipt = false
             inspectionTask = nil
+            guard !Task.isCancelled else { return }
             importedInspection = inspection
         }
     }
@@ -1118,21 +1620,57 @@ struct BatesBatchReceiptHistoryView: View {
     private func inspectExternalMatchReport(_ url: URL) {
         guard !isInspectingReceipt else { return }
         matchInspectionTask?.cancel()
+        let generation = UUID()
+        matchInspectionGeneration = generation
         isInspectingMatchReport = true
-        matchInspectionTask = Task {
-            let inspection = await model
-                .inspectExternalBatesMatchReport(at: url)
-            guard !Task.isCancelled else { return }
+        matchInspectionTask = Task { @MainActor in
+            let inspection = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.inspectExternalBatesMatchReport(
+                    at: url
+                )
+            }
+            guard matchInspectionGeneration == generation else { return }
             isInspectingMatchReport = false
             matchInspectionTask = nil
+            guard !Task.isCancelled else { return }
             importedMatchInspection = inspection
         }
+    }
+
+    private func stopExternalInspections() {
+        inspectionGeneration = UUID()
+        matchInspectionGeneration = UUID()
+        inspectionTask?.cancel()
+        inspectionTask = nil
+        matchInspectionTask?.cancel()
+        matchInspectionTask = nil
+        isInspectingReceipt = false
+        isInspectingMatchReport = false
+    }
+
+    private func interruptProtectedReceiptHistory() {
+        documentOpenGeneration = UUID()
+        documentOpenTask?.cancel()
+        documentOpenTask = nil
+        stopExternalInspections()
+        searchText = ""
+        selectedReceipt = nil
+        receiptPendingDeletion = nil
+        importedInspection = nil
+        importedMatchInspection = nil
+        isImportingReceipt = false
+        isImportingMatchReport = false
     }
 }
 
 struct ExternalBatesReceiptView: View {
     @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
     let inspection: PDFBatesBatchReceiptInspection
 
@@ -1142,6 +1680,11 @@ struct ExternalBatesReceiptView: View {
     @State private var matchTask: Task<Void, Never>?
     @State private var saveTask: Task<Void, Never>?
     @State private var matchReport: PDFBatesExternalMatchReport?
+    @State private var shouldChooseAgainAfterMatch = false
+    @State private var matchGeneration = UUID()
+    @State private var saveGeneration = UUID()
+    @State private var sourceSelectionTask: Task<Void, Never>?
+    @State private var sourceSelectionGeneration = UUID()
 
     var body: some View {
         NavigationStack {
@@ -1172,14 +1715,13 @@ struct ExternalBatesReceiptView: View {
                             ? "Close"
                             : "Stop"
                     ) {
-                        if let matchTask {
-                            matchTask.cancel()
-                        } else if let saveTask {
-                            saveTask.cancel()
+                        if matchTask != nil || saveTask != nil {
+                            cancelProtectedReceiptWork()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -1189,6 +1731,13 @@ struct ExternalBatesReceiptView: View {
         .interactiveDismissDisabled(
             isSaving || matchTask != nil
         )
+        .accessibilityAction(.escape) {
+            if matchTask != nil || saveTask != nil {
+                cancelProtectedReceiptWork()
+            } else {
+                dismiss()
+            }
+        }
         .sensoryFeedback(.success, trigger: saveFeedback)
         .fileImporter(
             isPresented: $isSelectingPDFs,
@@ -1199,30 +1748,38 @@ struct ExternalBatesReceiptView: View {
                   !urls.isEmpty
             else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
                 return
             }
             match(urls)
         }
-        .sheet(item: $matchReport) { report in
+        .sheet(
+            item: $matchReport,
+            onDismiss: completeMatchResultDismissal
+        ) { report in
             ExternalBatesFileMatchView(
                 receipt: inspection.receipt,
                 report: report
             ) {
-                Task { @MainActor in
-                    try? await Task.sleep(
-                        for: .milliseconds(180)
-                    )
-                    isSelectingPDFs = true
-                }
+                shouldChooseAgainAfterMatch = true
+                matchReport = nil
             }
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            cancelProtectedReceiptWork()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            cancelProtectedReceiptWork()
+        }
         .onDisappear {
-            matchTask?.cancel()
-            matchTask = nil
-            saveTask?.cancel()
-            saveTask = nil
+            cancelProtectedReceiptWork()
         }
     }
 
@@ -1329,13 +1886,13 @@ struct ExternalBatesReceiptView: View {
                             .font(.subheadline.weight(.semibold))
                             .fontDesign(.serif)
                             .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(1)
+                            .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                         Text(
                             "\(item.entry.startIdentifier) - \(item.entry.endIdentifier)"
                         )
                         .font(.caption.monospaced().weight(.semibold))
                         .foregroundStyle(PPColor.amber)
-                        .lineLimit(1)
+                        .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                         Text(item.detail.localizedUI)
                             .font(.caption2)
                             .foregroundStyle(PPColor.textSecondary)
@@ -1365,74 +1922,33 @@ struct ExternalBatesReceiptView: View {
                progress.receiptID == inspection.receipt.id,
                matchTask != nil {
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text(progress.currentFileName)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(
-                            "\(progress.completedFileCount)/\(progress.totalFileCount)"
-                        )
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(PPColor.textSecondary)
-                    }
+                    BatesProgressHeader(
+                        title: progress.currentFileName,
+                        completedCount: progress.completedFileCount,
+                        totalCount: progress.totalFileCount
+                    )
                     ProgressView(value: progress.fractionCompleted)
                         .tint(PPColor.cyan)
+                        .accessibilityLabel("Bates file match progress")
+                        .accessibilityValue(
+                            AppLocalization.format(
+                                "%lld of %lld PDFs checked",
+                                progress.completedFileCount,
+                                progress.totalFileCount
+                            )
+                        )
                 }
             }
 
-            HStack(spacing: PPSpacing.small) {
-                Button {
-                    if let matchTask {
-                        matchTask.cancel()
-                    } else {
-                        isSelectingPDFs = true
-                    }
-                } label: {
-                    Label(
-                        matchTask == nil
-                            ? "Match PDF Files"
-                            : "Stop Matching",
-                        systemImage:
-                            matchTask == nil
-                                ? "doc.text.magnifyingglass"
-                                : "stop.fill"
-                    )
-                    .frame(maxWidth: .infinity)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.small) {
+                    matchPDFButton
+                    keepReceiptButton
                 }
-                .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(
-                    inspection.report.signatureStatus != .verified
-                )
-
-                Button {
-                    keepReceipt()
-                } label: {
-                    Label(
-                        isAlreadySaved
-                            ? "Saved"
-                            : (
-                                isSaving
-                                    ? "Saving"
-                                    : "Keep"
-                            ),
-                        systemImage: isAlreadySaved
-                            ? "checkmark.circle.fill"
-                            : "tray.and.arrow.down"
-                    )
-                    .frame(maxWidth: .infinity)
+                VStack(spacing: PPSpacing.small) {
+                    matchPDFButton
+                    keepReceiptButton
                 }
-                .buttonStyle(
-                    PPQuietButtonStyle(tint: PPColor.cyan)
-                )
-                .disabled(
-                    isAlreadySaved
-                        || isSaving
-                        || matchTask != nil
-                        || inspection.report.signatureStatus
-                            != .verified
-                )
             }
         }
         .padding(.horizontal, PPSpacing.regular)
@@ -1443,6 +1959,61 @@ struct ExternalBatesReceiptView: View {
                 .fill(PPColor.border.opacity(0.66))
                 .frame(height: 0.6)
         }
+    }
+
+    private var matchPDFButton: some View {
+        Button {
+            if matchTask != nil {
+                cancelProtectedReceiptWork()
+            } else {
+                isSelectingPDFs = true
+            }
+        } label: {
+            Label(
+                matchTask == nil
+                    ? "Match PDF Files"
+                    : "Stop Matching",
+                systemImage:
+                    matchTask == nil
+                        ? "doc.text.magnifyingglass"
+                        : "stop.fill"
+            )
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(PPPrimaryButtonStyle())
+        .disabled(
+            inspection.report.signatureStatus != .verified
+        )
+    }
+
+    private var keepReceiptButton: some View {
+        Button {
+            keepReceipt()
+        } label: {
+            Label(
+                isAlreadySaved
+                    ? "Saved"
+                    : (
+                        isSaving
+                            ? "Saving"
+                            : "Keep"
+                    ),
+                systemImage: isAlreadySaved
+                    ? "checkmark.circle.fill"
+                    : "tray.and.arrow.down"
+            )
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(
+            PPQuietButtonStyle(tint: PPColor.cyan)
+        )
+        .disabled(
+            isAlreadySaved
+                || isSaving
+                || matchTask != nil
+                || inspection.report.signatureStatus
+                    != .verified
+        )
     }
 
     private var isAlreadySaved: Bool {
@@ -1498,20 +2069,47 @@ struct ExternalBatesReceiptView: View {
         value: String,
         symbol: String
     ) -> some View {
-        HStack(spacing: PPSpacing.small) {
-            Image(systemName: symbol)
-                .foregroundStyle(PPColor.cyan)
-                .frame(width: 24)
-            Text(title.localizedUI)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(PPColor.textSecondary)
-            Spacer(minLength: PPSpacing.small)
-            Text(value)
-                .font(.caption.monospaced())
-                .foregroundStyle(PPColor.textPrimary)
-                .multilineTextAlignment(.trailing)
-                .lineLimit(2)
-                .minimumScaleFactor(0.72)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        Image(systemName: symbol)
+                            .foregroundStyle(PPColor.cyan)
+                            .frame(width: 24)
+                        Text(title.localizedUI)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(
+                                PPColor.textSecondary
+                            )
+                    }
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(PPColor.textPrimary)
+                        .fixedSize(
+                            horizontal: false,
+                            vertical: true
+                        )
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    Image(systemName: symbol)
+                        .foregroundStyle(PPColor.cyan)
+                        .frame(width: 24)
+                    Text(title.localizedUI)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
+                    Spacer(minLength: PPSpacing.small)
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(PPColor.textPrimary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.72)
+                }
+            }
         }
         .frame(minHeight: 34)
     }
@@ -1529,13 +2127,19 @@ struct ExternalBatesReceiptView: View {
 
     private func keepReceipt() {
         guard !isAlreadySaved,
+              saveTask == nil, matchTask == nil,
               inspection.report.signatureStatus == .verified
         else { return }
         isSaving = true
-        saveTask = Task {
-            let saved = await model.retainExternalBatesBatchReceipt(
-                inspection.receipt
-            )
+        let generation = UUID()
+        saveGeneration = generation
+        saveTask = Task { @MainActor in
+            let saved = await model.withFeedbackTarget(paperPathSceneID) {
+                await model.retainExternalBatesBatchReceipt(
+                    inspection.receipt
+                )
+            }
+            guard saveGeneration == generation else { return }
             isSaving = false
             saveTask = nil
             guard saved else { return }
@@ -1546,22 +2150,66 @@ struct ExternalBatesReceiptView: View {
 
     private func match(_ urls: [URL]) {
         matchTask?.cancel()
-        matchTask = Task {
-            let report = await model.matchExternalBatesPDFs(
-                receipt: inspection.receipt,
-                candidateURLs: urls
-            )
-            let wasCancelled = Task.isCancelled
+        let generation = UUID()
+        matchGeneration = generation
+        matchTask = Task { @MainActor in
+            let report = await model.withFeedbackTarget(paperPathSceneID) {
+                await model.matchExternalBatesPDFs(
+                    receipt: inspection.receipt,
+                    candidateURLs: urls
+                )
+            }
+            guard matchGeneration == generation else { return }
             matchTask = nil
-            guard !wasCancelled else { return }
+            guard !Task.isCancelled else { return }
             matchReport = report
+        }
+    }
+
+    private func cancelProtectedReceiptWork() {
+        sourceSelectionGeneration = UUID()
+        sourceSelectionTask?.cancel()
+        sourceSelectionTask = nil
+        matchGeneration = UUID()
+        saveGeneration = UUID()
+        matchTask?.cancel()
+        matchTask = nil
+        saveTask?.cancel()
+        saveTask = nil
+        isSelectingPDFs = false
+        matchReport = nil
+        shouldChooseAgainAfterMatch = false
+        isSaving = false
+    }
+
+    private func completeMatchResultDismissal() {
+        guard shouldChooseAgainAfterMatch else { return }
+        shouldChooseAgainAfterMatch = false
+        let generation = UUID()
+        sourceSelectionGeneration = generation
+        sourceSelectionTask?.cancel()
+        sourceSelectionTask = Task { @MainActor in
+            defer {
+                if sourceSelectionGeneration == generation {
+                    sourceSelectionTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  sourceSelectionGeneration == generation,
+                  scenePhase == .active
+            else { return }
+            isSelectingPDFs = true
         }
     }
 }
 
 struct ExternalBatesFileMatchView: View {
     @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let receipt: PDFSignedBatesBatchReceipt
     let report: PDFBatesExternalMatchReport
@@ -1572,6 +2220,7 @@ struct ExternalBatesFileMatchView: View {
     @State private var isSharing = false
     @State private var isConfirmingExport = false
     @State private var exportFeedback = 0
+    @State private var exportGeneration = UUID()
 
     var body: some View {
         NavigationStack {
@@ -1600,10 +2249,16 @@ struct ExternalBatesFileMatchView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") {
-                        dismiss()
+                    Button(
+                        (exportTask == nil ? "Close" : "Stop").localizedUI
+                    ) {
+                        if exportTask != nil {
+                            interruptProtectedExport()
+                        } else {
+                            dismiss()
+                        }
                     }
-                    .disabled(exportTask != nil)
+                    .keyboardShortcut(.cancelAction)
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -1611,6 +2266,13 @@ struct ExternalBatesFileMatchView: View {
             }
         }
         .interactiveDismissDisabled(exportTask != nil)
+        .accessibilityAction(.escape) {
+            if exportTask != nil {
+                interruptProtectedExport()
+            } else {
+                dismiss()
+            }
+        }
         .sheet(isPresented: $isSharing, onDismiss: removeShareFile) {
             if let shareURL {
                 ShareSheet(items: [shareURL])
@@ -1631,10 +2293,20 @@ struct ExternalBatesFileMatchView: View {
                 "The JSON includes receipt document names, selected PDF file names, byte sizes, and SHA-256 fingerprints. PDF bytes are not included."
             )
         }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptProtectedExport()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtectedExport()
+        }
         .onDisappear {
-            exportTask?.cancel()
-            exportTask = nil
-            removeShareFile()
+            interruptProtectedExport()
         }
     }
 
@@ -1732,7 +2404,6 @@ struct ExternalBatesFileMatchView: View {
 
     private var chooseAgainButton: some View {
         Button {
-            dismiss()
             onChooseAgain()
         } label: {
             Label(
@@ -1795,13 +2466,21 @@ struct ExternalBatesFileMatchView: View {
                         Text(candidate.fileName)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(1)
+                            .lineLimit(
+                                dynamicTypeSize.ppPrefersExpandedLayout
+                                    ? 2
+                                    : 1
+                            )
                         Text(
                             "\(candidate.formattedSize) | SHA-256 \(candidate.shortFingerprint)"
                         )
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 2
+                                : 1
+                        )
                     }
                 }
                 .frame(minHeight: 54)
@@ -1830,13 +2509,17 @@ struct ExternalBatesFileMatchView: View {
                     .font(.subheadline.weight(.semibold))
                     .fontDesign(.serif)
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? 2
+                            : 1
+                    )
                 Text(
                     "\(match.entry.startIdentifier) - \(match.entry.endIdentifier)"
                 )
                 .font(.caption.monospaced().weight(.semibold))
                 .foregroundStyle(PPColor.amber)
-                .lineLimit(1)
+                .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                 Text(candidateSummary(match))
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
@@ -1902,16 +2585,25 @@ struct ExternalBatesFileMatchView: View {
     private func exportReport() {
         guard exportTask == nil, !isSharing else { return }
         removeShareFile()
-        exportTask = Task {
-            let url = await model.exportSignedBatesMatchReport(
-                receipt: receipt,
-                report: report
-            )
-            let wasCancelled = Task.isCancelled
-            exportTask = nil
-            guard !wasCancelled, let url else {
+        let generation = UUID()
+        exportGeneration = generation
+        exportTask = Task { @MainActor in
+            let url = await model.withFeedbackTarget(paperPathSceneID) {
+                await model.exportSignedBatesMatchReport(
+                    receipt: receipt,
+                    report: report
+                )
+            }
+            guard exportGeneration == generation else {
                 if let url {
-                    try? FileManager.default.removeItem(at: url)
+                    await model.discardTemporaryExportCopies(at: [url])
+                }
+                return
+            }
+            exportTask = nil
+            guard !Task.isCancelled, let url else {
+                if let url {
+                    await model.discardTemporaryExportCopies(at: [url])
                 }
                 return
             }
@@ -1923,13 +2615,24 @@ struct ExternalBatesFileMatchView: View {
 
     private func removeShareFile() {
         guard let shareURL else { return }
-        try? FileManager.default.removeItem(at: shareURL)
         self.shareURL = nil
+        Task {
+            await model.discardTemporaryExportCopies(at: [shareURL])
+        }
+    }
+
+    private func interruptProtectedExport() {
+        exportGeneration = UUID()
+        exportTask?.cancel()
+        exportTask = nil
+        isSharing = false
+        removeShareFile()
     }
 }
 
 struct BatesMatchReportInspectionView: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let inspection: PDFBatesMatchReportInspection
 
@@ -1966,8 +2669,12 @@ struct BatesMatchReportInspectionView: View {
                     Button("Done") {
                         dismiss()
                     }
+                    .keyboardShortcut(.cancelAction)
                 }
             }
+        }
+        .accessibilityAction(.escape) {
+            dismiss()
         }
     }
 
@@ -2101,13 +2808,13 @@ struct BatesMatchReportInspectionView: View {
                         Text(candidate.fileName)
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(1)
+                            .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                         Text(
                             "\(candidate.formattedSize) | SHA-256 \(candidate.shortFingerprint)"
                         )
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
+                        .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                     }
                 }
                 .frame(minHeight: 54)
@@ -2136,13 +2843,13 @@ struct BatesMatchReportInspectionView: View {
                     .font(.subheadline.weight(.semibold))
                     .fontDesign(.serif)
                     .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
+                    .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                 Text(
                     "\(match.entry.startIdentifier) - \(match.entry.endIdentifier)"
                 )
                 .font(.caption.monospaced().weight(.semibold))
                 .foregroundStyle(PPColor.amber)
-                .lineLimit(1)
+                .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1)
                 Text(candidateSummary(match))
                     .font(.caption2)
                     .foregroundStyle(PPColor.textSecondary)
@@ -2163,20 +2870,47 @@ struct BatesMatchReportInspectionView: View {
         value: String,
         symbol: String
     ) -> some View {
-        HStack(spacing: PPSpacing.small) {
-            Image(systemName: symbol)
-                .foregroundStyle(verificationColor)
-                .frame(width: 24)
-            Text(title.localizedUI)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(PPColor.textSecondary)
-            Spacer(minLength: PPSpacing.small)
-            Text(value)
-                .font(.caption.monospaced())
-                .foregroundStyle(PPColor.textPrimary)
-                .multilineTextAlignment(.trailing)
-                .lineLimit(2)
-                .minimumScaleFactor(0.72)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        Image(systemName: symbol)
+                            .foregroundStyle(verificationColor)
+                            .frame(width: 24)
+                        Text(title.localizedUI)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(
+                                PPColor.textSecondary
+                            )
+                    }
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(PPColor.textPrimary)
+                        .fixedSize(
+                            horizontal: false,
+                            vertical: true
+                        )
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    Image(systemName: symbol)
+                        .foregroundStyle(verificationColor)
+                        .frame(width: 24)
+                    Text(title.localizedUI)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
+                    Spacer(minLength: PPSpacing.small)
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(PPColor.textPrimary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.72)
+                }
+            }
         }
         .frame(minHeight: 34)
     }
@@ -2200,8 +2934,11 @@ struct BatesMatchReportInspectionView: View {
     }
 
     private var verificationSymbol: String {
-        inspection.isVerified
-            ? inspection.trustStatus.symbol
+        if inspection.isVerified {
+            return inspection.trustStatus.symbol
+        }
+        return inspection.signatureStatus == .verified
+            ? inspection.receiptSignatureStatus.symbol
             : inspection.signatureStatus.symbol
     }
 
@@ -2221,7 +2958,6 @@ struct BatesMatchReportInspectionView: View {
 
     private var evidenceVerified: Bool {
         inspection.isVerified
-            && inspection.receiptSignatureStatus == .verified
     }
 
     private func candidateSummary(
@@ -2261,6 +2997,9 @@ struct BatesMatchReportInspectionView: View {
 struct BatesBatchReceiptView: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let receiptID: UUID
     var onOpenDocument: ((UUID) -> Void)?
@@ -2277,6 +3016,11 @@ struct BatesBatchReceiptView: View {
     @State private var removalTask: Task<Void, Never>?
     @State private var verificationFeedback = 0
     @State private var removalFeedback = 0
+    @State private var errorFeedback = 0
+    @State private var verificationFailed = false
+    @State private var verificationGeneration = UUID()
+    @State private var shareGeneration = UUID()
+    @State private var removalGeneration = UUID()
 
     var body: some View {
         NavigationStack {
@@ -2309,10 +3053,16 @@ struct BatesBatchReceiptView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") {
-                        dismiss()
+                    Button(
+                        (hasActiveTask ? "Stop" : "Close").localizedUI
+                    ) {
+                        if hasActiveTask {
+                            stopActiveReceiptTask()
+                        } else {
+                            dismiss()
+                        }
                     }
-                    .disabled(removalTask != nil)
+                    .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
@@ -2379,18 +3129,44 @@ struct BatesBatchReceiptView: View {
         .task(id: receiptID) {
             recheck()
         }
-        .interactiveDismissDisabled(removalTask != nil)
+        .interactiveDismissDisabled(hasActiveTask)
+        .accessibilityAction(.escape) {
+            if hasActiveTask {
+                stopActiveReceiptTask()
+            } else {
+                dismiss()
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background {
+                interruptProtectedReceiptWork()
+            } else if phase == .active {
+                recheck()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtectedReceiptWork()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            guard scenePhase == .active else { return }
+            recheck()
+        }
         .onDisappear {
-            verificationTask?.cancel()
-            verificationTask = nil
-            shareTask?.cancel()
-            shareTask = nil
-            removalTask?.cancel()
-            removalTask = nil
-            removeShareFile()
+            interruptProtectedReceiptWork()
         }
         .sensoryFeedback(.success, trigger: verificationFeedback)
         .sensoryFeedback(.success, trigger: removalFeedback)
+        .sensoryFeedback(.error, trigger: errorFeedback)
         .sheet(isPresented: $isSharing, onDismiss: removeShareFile) {
             if let shareURL {
                 ShareSheet(items: [shareURL])
@@ -2403,9 +3179,12 @@ struct BatesBatchReceiptView: View {
         ) {
             Button("Delete Receipt", role: .destructive) {
                 Task {
-                    if await model.deleteBatesBatchReceipt(
-                        receiptID: receiptID
-                    ) {
+                    let deleted = await model.withFeedbackTarget(paperPathSceneID) {
+                        await model.deleteBatesBatchReceipt(
+                            receiptID: receiptID
+                        )
+                    }
+                    if deleted {
                         dismiss()
                     }
                 }
@@ -2452,7 +3231,11 @@ struct BatesBatchReceiptView: View {
                     $0.currentDocumentName
                 )
             } ?? report?.detail
-                ?? "Checking the signature and current private copies.",
+                ?? (
+                    verificationFailed
+                        ? "Receipt verification failed. Recheck when the private copies are available."
+                        : "Checking the signature and current private copies."
+                ),
             symbol: reportSymbol,
             tint: reportColor,
             metrics: [
@@ -2594,40 +3377,70 @@ struct BatesBatchReceiptView: View {
         let verification = report?.items.first {
             $0.entry.recordID == entry.recordID
         }
-        let content = HStack(spacing: PPSpacing.small) {
-            Text("\(number)")
-                .font(.caption2.monospacedDigit().weight(.black))
-                .foregroundStyle(PPColor.surface)
-                .frame(width: 24, height: 24)
-                .background(entryStatusColor(verification), in: Circle())
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(entry.displayName)
-                    .font(.subheadline.weight(.semibold))
-                    .fontDesign(.serif)
-                    .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
-                Text(
-                    "\(entry.startIdentifier) - \(entry.endIdentifier)"
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
                 )
-                .font(.caption.monospaced().weight(.semibold))
-                .foregroundStyle(PPColor.amber)
-                .lineLimit(1)
-                Text(
-                    AppLocalization.format(
-                        "%lld pages | SHA-256 %@",
-                        entry.pageCount,
-                        entry.shortOutputFingerprint
+            )
+            : AnyLayout(
+                HStackLayout(
+                    alignment: .center,
+                    spacing: PPSpacing.small
+                )
+            )
+        let content = layout {
+            HStack(alignment: .top, spacing: PPSpacing.small) {
+                Text("\(number)")
+                    .font(.caption2.monospacedDigit().weight(.black))
+                    .foregroundStyle(PPColor.surface)
+                    .frame(width: 24, height: 24)
+                    .background(
+                        entryStatusColor(verification),
+                        in: Circle()
                     )
-                )
-                .font(.caption2.monospacedDigit())
-                .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(1)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(entry.displayName)
+                        .font(.subheadline.weight(.semibold))
+                        .fontDesign(.serif)
+                        .foregroundStyle(PPColor.textPrimary)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout ? 3 : 1
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        "\(entry.startIdentifier) - \(entry.endIdentifier)"
+                    )
+                    .font(.caption.monospaced().weight(.semibold))
+                    .foregroundStyle(PPColor.amber)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        AppLocalization.format(
+                            "%lld pages | SHA-256 %@",
+                            entry.pageCount,
+                            entry.shortOutputFingerprint
+                        )
+                    )
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .layoutPriority(1)
+
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                Spacer(minLength: PPSpacing.small)
             }
 
-            Spacer(minLength: PPSpacing.small)
-
-            VStack(alignment: .trailing, spacing: 3) {
+            HStack(spacing: PPSpacing.xSmall) {
                 Image(
                     systemName:
                         verification?.status.symbol
@@ -2641,6 +3454,12 @@ struct BatesBatchReceiptView: View {
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
             }
+            .frame(
+                maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? .infinity
+                    : nil,
+                alignment: .leading
+            )
         }
         .frame(minHeight: 72)
         .contentShape(Rectangle())
@@ -2659,7 +3478,6 @@ struct BatesBatchReceiptView: View {
            model.record(id: entry.recordID) != nil,
            let onOpenDocument {
             Button {
-                dismiss()
                 onOpenDocument(entry.recordID)
             } label: {
                 content
@@ -2676,20 +3494,47 @@ struct BatesBatchReceiptView: View {
         value: String,
         symbol: String
     ) -> some View {
-        HStack(spacing: PPSpacing.small) {
-            Image(systemName: symbol)
-                .foregroundStyle(PPColor.cyan)
-                .frame(width: 24)
-            Text(title.localizedUI)
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(PPColor.textSecondary)
-            Spacer(minLength: PPSpacing.small)
-            Text(value)
-                .font(.caption.monospaced())
-                .foregroundStyle(PPColor.textPrimary)
-                .multilineTextAlignment(.trailing)
-                .lineLimit(2)
-                .minimumScaleFactor(0.72)
+        Group {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    HStack(spacing: PPSpacing.small) {
+                        Image(systemName: symbol)
+                            .foregroundStyle(PPColor.cyan)
+                            .frame(width: 24)
+                        Text(title.localizedUI)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(
+                                PPColor.textSecondary
+                            )
+                    }
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(PPColor.textPrimary)
+                        .fixedSize(
+                            horizontal: false,
+                            vertical: true
+                        )
+                }
+            } else {
+                HStack(spacing: PPSpacing.small) {
+                    Image(systemName: symbol)
+                        .foregroundStyle(PPColor.cyan)
+                        .frame(width: 24)
+                    Text(title.localizedUI)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
+                    Spacer(minLength: PPSpacing.small)
+                    Text(value)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(PPColor.textPrimary)
+                        .multilineTextAlignment(.trailing)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.72)
+                }
+            }
         }
         .frame(minHeight: 34)
     }
@@ -2698,40 +3543,57 @@ struct BatesBatchReceiptView: View {
         VStack(spacing: PPSpacing.small) {
             if let progress = verificationProgress {
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text(progress.currentDocumentName)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(1)
-                        Spacer()
-                        Text(
-                            "\(progress.completedDocumentCount)/\(progress.totalDocumentCount)"
-                        )
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(PPColor.textSecondary)
-                    }
+                    BatesProgressHeader(
+                        title: progress.currentDocumentName,
+                        completedCount:
+                            progress.completedDocumentCount,
+                        totalCount: progress.totalDocumentCount
+                    )
                     ProgressView(value: progress.fractionCompleted)
                         .tint(PPColor.cyan)
+                        .accessibilityLabel("Batch verification progress")
+                        .accessibilityValue(
+                            AppLocalization.format(
+                                "%lld of %lld PDFs checked",
+                                progress.completedDocumentCount,
+                                progress.totalDocumentCount
+                            )
+                        )
                 }
             }
 
             if removalTask != nil,
                let progress = model.batesBatchProgress {
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack {
-                        Text(progress.stage.title.localizedUI)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(PPColor.textPrimary)
-                        Spacer()
-                        Text(
-                            "\(progress.completedDocumentCount)/\(progress.totalDocumentCount)"
-                        )
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(PPColor.textSecondary)
-                    }
+                    BatesProgressHeader(
+                        title: progress.stage.title.localizedUI,
+                        completedCount:
+                            progress.completedDocumentCount,
+                        totalCount: progress.totalDocumentCount
+                    )
                     ProgressView(value: progress.fractionCompleted)
                         .tint(PPColor.rose)
+                        .accessibilityLabel("Bates removal progress")
+                        .accessibilityValue(
+                            AppLocalization.format(
+                                "%lld of %lld PDFs processed",
+                                progress.completedDocumentCount,
+                                progress.totalDocumentCount
+                            )
+                        )
                 }
+            }
+
+            if model.isBatesBatchMutationActive,
+               removalTask == nil {
+                Label(
+                    "Another Bates batch is updating PDFs.",
+                    systemImage: "hourglass"
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.amber)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityAddTraits(.updatesFrequently)
             }
 
             if receipt?.removal == nil {
@@ -2757,46 +3619,15 @@ struct BatesBatchReceiptView: View {
                 )
             }
 
-            HStack(spacing: PPSpacing.small) {
-                Button {
-                    recheck()
-                } label: {
-                    Label(
-                        verificationTask == nil
-                            ? "Recheck PDFs"
-                            : "Checking",
-                        systemImage:
-                            verificationTask == nil
-                                ? "arrow.triangle.2.circlepath"
-                                : "hourglass"
-                    )
-                    .frame(maxWidth: .infinity)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.small) {
+                    recheckButton
+                    shareButton
                 }
-                .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
-                .disabled(
-                    verificationTask != nil || removalTask != nil
-                )
-
-                Button {
-                    prepareShare()
-                } label: {
-                    Label(
-                        isPreparingShare
-                            ? "Preparing"
-                            : "Share",
-                        systemImage:
-                            isPreparingShare
-                                ? "hourglass"
-                                : "square.and.arrow.up"
-                    )
-                    .frame(maxWidth: .infinity)
+                VStack(spacing: PPSpacing.small) {
+                    shareButton
+                    recheckButton
                 }
-                .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(
-                    shareURL != nil
-                        || isPreparingShare
-                        || removalTask != nil
-                )
             }
         }
         .padding(.horizontal, PPSpacing.regular)
@@ -2809,8 +3640,59 @@ struct BatesBatchReceiptView: View {
         }
     }
 
+    private var recheckButton: some View {
+        Button {
+            recheck()
+        } label: {
+            Label(
+                verificationTask == nil
+                    ? "Recheck PDFs"
+                    : "Checking",
+                systemImage:
+                    verificationTask == nil
+                        ? "arrow.triangle.2.circlepath"
+                        : "hourglass"
+            )
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+        .disabled(
+            verificationTask != nil
+                || removalTask != nil
+                || model.isBatesBatchMutationActive
+                || model.isBatesReceiptVerificationActive
+        )
+    }
+
+    private var shareButton: some View {
+        Button {
+            prepareShare()
+        } label: {
+            Label(
+                isPreparingShare
+                    ? "Preparing"
+                    : "Share",
+                systemImage:
+                    isPreparingShare
+                        ? "hourglass"
+                        : "square.and.arrow.up"
+            )
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(PPPrimaryButtonStyle())
+        .disabled(
+            shareURL != nil
+                || isPreparingShare
+                || removalTask != nil
+        )
+    }
+
     private var reportTitle: String {
-        guard let report else { return "Checking receipt" }
+        guard let report else {
+            return verificationFailed
+                ? "Couldn’t verify receipt"
+                : "Checking receipt"
+        }
         if report.signatureStatus != .verified {
             return "Receipt cannot be trusted"
         }
@@ -2828,7 +3710,11 @@ struct BatesBatchReceiptView: View {
     }
 
     private var reportSymbol: String {
-        guard let report else { return "hourglass" }
+        guard let report else {
+            return verificationFailed
+                ? "exclamationmark.triangle.fill"
+                : "hourglass"
+        }
         if report.signatureStatus != .verified {
             return "xmark.seal.fill"
         }
@@ -2846,7 +3732,9 @@ struct BatesBatchReceiptView: View {
     }
 
     private var reportColor: Color {
-        guard let report else { return PPColor.cyan }
+        guard let report else {
+            return verificationFailed ? PPColor.rose : PPColor.cyan
+        }
         if report.signatureStatus != .verified {
             return PPColor.rose
         }
@@ -2891,20 +3779,41 @@ struct BatesBatchReceiptView: View {
                   $0.status == .current
               })
         else { return false }
-        return verificationTask == nil && removalTask == nil
+        return verificationTask == nil
+            && removalTask == nil
+            && !model.isBatesBatchMutationActive
+            && !model.isBatesReceiptVerificationActive
+    }
+
+    private var hasActiveTask: Bool {
+        verificationTask != nil
+            || shareTask != nil
+            || removalTask != nil
     }
 
     private func recheck() {
+        guard !model.isBatesBatchMutationActive,
+              !model.isBatesReceiptVerificationActive
+        else { return }
         verificationTask?.cancel()
-        verificationTask = Task {
-            let verified = await model.verifyBatesBatchReceipt(
-                receiptID: receiptID
-            )
+        let generation = UUID()
+        verificationGeneration = generation
+        verificationFailed = false
+        verificationTask = Task { @MainActor in
+            let verified = await model.withFeedbackTarget(paperPathSceneID) {
+                await model.verifyBatesBatchReceipt(
+                    receiptID: receiptID
+                )
+            }
+            guard verificationGeneration == generation else { return }
+            verificationTask = nil
             guard !Task.isCancelled else { return }
             report = verified
-            verificationTask = nil
             if verified != nil {
                 verificationFeedback += 1
+            } else {
+                verificationFailed = true
+                errorFeedback += 1
             }
         }
     }
@@ -2912,16 +3821,29 @@ struct BatesBatchReceiptView: View {
     private func prepareShare() {
         guard !isPreparingShare else { return }
         isPreparingShare = true
-        shareTask = Task {
-            guard let url = await model.exportBatesBatchReceipt(
-                receiptID: receiptID
-            ) else {
+        let generation = UUID()
+        shareGeneration = generation
+        shareTask = Task { @MainActor in
+            let exportedURL = await model.withFeedbackTarget(paperPathSceneID) {
+                await model.exportBatesBatchReceipt(
+                    receiptID: receiptID
+                )
+            }
+            guard let url = exportedURL else {
+                guard shareGeneration == generation else { return }
                 isPreparingShare = false
                 shareTask = nil
+                if !Task.isCancelled {
+                    errorFeedback += 1
+                }
+                return
+            }
+            guard shareGeneration == generation else {
+                await model.discardTemporaryExportCopies(at: [url])
                 return
             }
             guard !Task.isCancelled else {
-                try? FileManager.default.removeItem(at: url)
+                await model.discardTemporaryExportCopies(at: [url])
                 isPreparingShare = false
                 shareTask = nil
                 return
@@ -2937,13 +3859,24 @@ struct BatesBatchReceiptView: View {
         guard canRemoveBates else { return }
         verificationTask?.cancel()
         verificationTask = nil
-        removalTask = Task {
-            let succeeded = await model.removeBatesNumbersBatch(
-                receiptID: receiptID
-            )
-            let wasCancelled = Task.isCancelled
+        let generation = UUID()
+        removalGeneration = generation
+        removalTask = Task { @MainActor in
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.removeBatesNumbersBatch(
+                    receiptID: receiptID
+                )
+            }
+            guard removalGeneration == generation else { return }
             removalTask = nil
-            guard succeeded, !wasCancelled else { return }
+            guard succeeded else {
+                if !Task.isCancelled {
+                    errorFeedback += 1
+                }
+                return
+            }
             removalFeedback += 1
             recheck()
         }
@@ -2951,8 +3884,44 @@ struct BatesBatchReceiptView: View {
 
     private func removeShareFile() {
         guard let shareURL else { return }
-        try? FileManager.default.removeItem(at: shareURL)
         self.shareURL = nil
         isSharing = false
+        Task {
+            await model.discardTemporaryExportCopies(at: [shareURL])
+        }
+    }
+
+    private func stopActiveReceiptTask() {
+        if removalTask != nil {
+            // A committed atomic removal must still be acknowledged.
+            removalTask?.cancel()
+        } else if shareTask != nil {
+            stopSharePreparation()
+        } else {
+            stopVerification()
+        }
+    }
+
+    private func stopVerification() {
+        verificationGeneration = UUID()
+        verificationTask?.cancel()
+        verificationTask = nil
+    }
+
+    private func stopSharePreparation() {
+        shareGeneration = UUID()
+        shareTask?.cancel()
+        shareTask = nil
+        isPreparingShare = false
+        removeShareFile()
+    }
+
+    private func interruptProtectedReceiptWork() {
+        stopVerification()
+        stopSharePreparation()
+        isSharing = false
+        removalGeneration = UUID()
+        removalTask?.cancel()
+        removalTask = nil
     }
 }

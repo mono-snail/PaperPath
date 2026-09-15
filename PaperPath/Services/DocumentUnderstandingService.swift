@@ -1,6 +1,51 @@
 import Foundation
 import PDFKit
 
+enum DocumentSearchNormalization {
+    static let maximumQueryCharacters = 512
+    static let maximumTermCharacters = 64
+    static let maximumTermCount = 16
+
+    static func text(_ value: String) -> String {
+        value.folding(
+            options: [
+                .caseInsensitive,
+                .diacriticInsensitive,
+                .widthInsensitive
+            ],
+            locale: nil
+        )
+        .lowercased()
+    }
+
+    static func terms(in query: String) -> [String] {
+        normalizedTerms(
+            String(query.prefix(maximumQueryCharacters))
+            .split(whereSeparator: \.isWhitespace)
+            .map(String.init)
+        )
+    }
+
+    static func normalizedTerms(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+        result.reserveCapacity(min(values.count, maximumTermCount))
+        for value in values {
+            let normalized = text(
+                String(value.prefix(maximumTermCharacters))
+            )
+            guard !normalized.isEmpty,
+                  seen.insert(normalized).inserted
+            else { continue }
+            result.append(normalized)
+            if result.count == maximumTermCount {
+                break
+            }
+        }
+        return result
+    }
+}
+
 struct IndexedPageText: Codable, Hashable, Sendable {
     let pageIndex: Int
     let text: String
@@ -11,36 +56,104 @@ struct DocumentTextMatch: Hashable, Sendable {
     let excerpt: String
 }
 
+struct DocumentTextSearchEvaluation: Sendable {
+    let containsEveryTerm: Bool
+    let matches: [DocumentTextMatch]
+}
+
 struct DocumentTextIndex: Codable, Hashable, Sendable {
+    static let maximumCharacterCount = 500_000
+    static let maximumUTF8ByteCount = maximumCharacterCount * 4
+
     let source: IndexedTextSource
     let pages: [IndexedPageText]
     let indexedAt: Date
+    let isTruncated: Bool?
+    let contentRevisionID: UUID?
+
+    init(
+        source: IndexedTextSource,
+        pages: [IndexedPageText],
+        indexedAt: Date,
+        isTruncated: Bool? = nil,
+        contentRevisionID: UUID? = nil
+    ) {
+        self.source = source
+        self.pages = pages
+        self.indexedAt = indexedAt
+        self.isTruncated = isTruncated
+        self.contentRevisionID = contentRevisionID
+    }
+
+    func bound(to revisionID: UUID) -> DocumentTextIndex {
+        DocumentTextIndex(
+            source: source,
+            pages: pages,
+            indexedAt: indexedAt,
+            isTruncated: isTruncated,
+            contentRevisionID: revisionID
+        )
+    }
 
     var text: String {
         pages.map(\.text).joined(separator: "\n\n")
     }
 
     var characterCount: Int {
-        pages.reduce(0) { $0 + $1.text.count }
+        pages.reduce(0) { count, page in
+            let (next, overflow) = count.addingReportingOverflow(
+                page.text.count
+            )
+            return overflow ? .max : next
+        }
+    }
+
+    var hasTruncatedContent: Bool {
+        isTruncated
+            ?? (characterCount >= Self.maximumCharacterCount)
     }
 
     func segment(
         from startPageIndex: Int,
         through endPageIndex: Int
     ) -> DocumentTextIndex {
-        DocumentTextIndex(
+        guard startPageIndex <= endPageIndex else {
+            return DocumentTextIndex(
+                source: source,
+                pages: [],
+                indexedAt: indexedAt,
+                isTruncated: hasTruncatedContent
+            )
+        }
+        let startOffset = lowerBoundPageOffset(for: startPageIndex)
+        let endOffset = endPageIndex == Int.max
+            ? pages.endIndex
+            : lowerBoundPageOffset(for: endPageIndex + 1)
+        return DocumentTextIndex(
             source: source,
-            pages: pages.compactMap { page in
-                guard page.pageIndex >= startPageIndex,
-                      page.pageIndex <= endPageIndex
-                else { return nil }
+            pages: pages[startOffset..<endOffset].map { page in
                 return IndexedPageText(
                     pageIndex: page.pageIndex - startPageIndex,
                     text: page.text
                 )
             },
-            indexedAt: indexedAt
+            indexedAt: indexedAt,
+            isTruncated: hasTruncatedContent
         )
+    }
+
+    private func lowerBoundPageOffset(for pageIndex: Int) -> Int {
+        var lower = pages.startIndex
+        var upper = pages.endIndex
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if pages[middle].pageIndex < pageIndex {
+                lower = middle + 1
+            } else {
+                upper = middle
+            }
+        }
+        return lower
     }
 
     func firstMatchingPage(for query: String) -> Int? {
@@ -63,21 +176,100 @@ struct DocumentTextIndex: Codable, Hashable, Sendable {
         excerptLimit: Int = 180,
         limit: Int = 200
     ) -> [DocumentTextMatch] {
-        let terms = query
-            .split(whereSeparator: \.isWhitespace)
-            .map { String($0) }
-        guard !terms.isEmpty, limit > 0 else { return [] }
-        return pages.lazy.filter {
-            terms.allSatisfy($0.text.localizedCaseInsensitiveContains)
+        let terms = DocumentSearchNormalization.terms(in: query)
+        let resultLimit = min(max(0, limit), 500)
+        guard !terms.isEmpty, resultLimit > 0 else { return [] }
+        var results: [DocumentTextMatch] = []
+        results.reserveCapacity(min(resultLimit, pages.count))
+        for page in pages {
+            let searchableText =
+                DocumentSearchNormalization.text(page.text)
+            guard terms.allSatisfy(searchableText.contains),
+                  let result = match(
+                      page: page,
+                      terms: terms,
+                      excerptLimit: excerptLimit
+                  )
+            else {
+                continue
+            }
+            results.append(result)
+            if results.count == resultLimit {
+                break
+            }
         }
-        .prefix(limit)
-        .compactMap {
-            match(
-                page: $0,
-                terms: terms,
-                excerptLimit: excerptLimit
+        return results
+    }
+
+    func containsEveryTerm(
+        _ terms: [String]
+    ) throws -> Bool {
+        try evaluateSearch(
+            normalizedTerms: terms,
+            matchLimit: 0
+        ).containsEveryTerm
+    }
+
+    func cancellableMatches(
+        for query: String,
+        excerptLimit: Int = 180,
+        limit: Int = 200
+    ) throws -> [DocumentTextMatch] {
+        guard limit > 0 else { return [] }
+        let terms = DocumentSearchNormalization.terms(in: query)
+        return try evaluateSearch(
+            normalizedTerms: terms,
+            excerptLimit: excerptLimit,
+            matchLimit: limit
+        ).matches
+    }
+
+    func evaluateSearch(
+        normalizedTerms values: [String],
+        excerptLimit: Int = 180,
+        matchLimit: Int = 200
+    ) throws -> DocumentTextSearchEvaluation {
+        let terms = DocumentSearchNormalization.normalizedTerms(values)
+        let resultLimit = min(max(0, matchLimit), 500)
+        guard !terms.isEmpty else {
+            return DocumentTextSearchEvaluation(
+                containsEveryTerm: true,
+                matches: []
             )
         }
+
+        var remaining = Set(terms)
+        var results: [DocumentTextMatch] = []
+        results.reserveCapacity(min(resultLimit, pages.count))
+        for (offset, page) in pages.enumerated() {
+            if offset.isMultiple(of: 16) {
+                try Task.checkCancellation()
+            }
+            let searchableText =
+                DocumentSearchNormalization.text(page.text)
+            for term in terms
+            where remaining.contains(term)
+                && searchableText.contains(term) {
+                remaining.remove(term)
+            }
+            if results.count < resultLimit,
+               terms.allSatisfy(searchableText.contains),
+               let result = match(
+                   page: page,
+                   terms: terms,
+                   excerptLimit: excerptLimit
+               ) {
+                results.append(result)
+            }
+            if remaining.isEmpty,
+               resultLimit == 0 || results.count == resultLimit {
+                break
+            }
+        }
+        return DocumentTextSearchEvaluation(
+            containsEveryTerm: remaining.isEmpty,
+            matches: results
+        )
     }
 
     private func match(
@@ -93,8 +285,12 @@ struct DocumentTextIndex: Codable, Hashable, Sendable {
         let firstRange = terms.compactMap {
             text.range(
                 of: $0,
-                options: [.caseInsensitive, .diacriticInsensitive],
-                locale: .current
+                options: [
+                    .caseInsensitive,
+                    .diacriticInsensitive,
+                    .widthInsensitive
+                ],
+                locale: nil
             )
         }.min {
             $0.lowerBound < $1.lowerBound
@@ -102,7 +298,7 @@ struct DocumentTextIndex: Codable, Hashable, Sendable {
         let matchOffset = firstRange.map {
             text.distance(from: text.startIndex, to: $0.lowerBound)
         } ?? 0
-        let limit = max(48, excerptLimit)
+        let limit = min(max(48, excerptLimit), 1_000)
         let startOffset = max(0, matchOffset - limit / 3)
         let endOffset = min(text.count, startOffset + limit)
         let start = text.index(text.startIndex, offsetBy: startOffset)
@@ -118,7 +314,7 @@ struct DocumentTextIndex: Codable, Hashable, Sendable {
 }
 
 struct PDFTextIndexService: Sendable {
-    private let maximumCharacterCount = 500_000
+    private static let maximumPageCount = 100_000
 
     func extractNativeText(from url: URL) throws -> DocumentTextIndex {
         guard let document = PDFDocument(url: url) else {
@@ -127,16 +323,36 @@ struct PDFTextIndexService: Sendable {
         guard !document.isLocked else {
             throw PaperPathError.lockedPDF
         }
+        guard document.pageCount > 0 else {
+            throw PaperPathError.unreadablePDF
+        }
+        guard document.pageCount <= Self.maximumPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Index PDFs with up to 100,000 pages."
+            )
+        }
 
-        var remaining = maximumCharacterCount
+        var remaining = DocumentTextIndex.maximumCharacterCount
         var pages: [IndexedPageText] = []
-        for pageIndex in 0..<document.pageCount where remaining > 0 {
+        var isTruncated = false
+        for pageIndex in 0..<document.pageCount {
             try Task.checkCancellation()
-            guard let text = document.page(at: pageIndex)?.string else { continue }
-            let normalized = text
-                .replacingOccurrences(of: "\u{00a0}", with: " ")
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard remaining > 0 else {
+                isTruncated = true
+                break
+            }
+            let normalized: String? = autoreleasepool {
+                guard let text = document.page(at: pageIndex)?.string
+                else { return nil }
+                return text
+                    .replacingOccurrences(of: "\u{00a0}", with: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let normalized else { continue }
             guard !normalized.isEmpty else { continue }
+            if normalized.count > remaining {
+                isTruncated = true
+            }
             let pageText = String(normalized.prefix(remaining))
             pages.append(IndexedPageText(pageIndex: pageIndex, text: pageText))
             remaining -= pageText.count
@@ -145,26 +361,42 @@ struct PDFTextIndexService: Sendable {
         return DocumentTextIndex(
             source: .native,
             pages: pages,
-            indexedAt: Date()
+            indexedAt: Date(),
+            isTruncated: isTruncated
         )
     }
 
     func index(from result: OCRResult) -> DocumentTextIndex {
         var pages: [IndexedPageText] = []
         pages.reserveCapacity(result.pages.count)
+        var remaining = DocumentTextIndex.maximumCharacterCount
+        var isTruncated = false
         for page in result.pages {
-            guard !Task.isCancelled else { break }
+            guard !Task.isCancelled else {
+                isTruncated = true
+                break
+            }
+            guard remaining > 0 else {
+                isTruncated = true
+                break
+            }
+            if page.text.count > remaining {
+                isTruncated = true
+            }
+            let pageText = String(page.text.prefix(remaining))
             pages.append(
                 IndexedPageText(
                     pageIndex: page.pageIndex,
-                    text: page.text
+                    text: pageText
                 )
             )
+            remaining -= pageText.count
         }
         return DocumentTextIndex(
             source: .vision,
             pages: pages,
-            indexedAt: Date()
+            indexedAt: Date(),
+            isTruncated: isTruncated
         )
     }
 }
@@ -174,9 +406,12 @@ struct DocumentUnderstandingService: Sendable {
         index: DocumentTextIndex,
         profile: DocumentProfile
     ) -> DocumentBrief {
+        let indexedCharacterCount = index.characterCount
         let text = index.text
+        let normalizedText = text.lowercased()
         let classification = classification(
-            for: text,
+            normalizedText: normalizedText,
+            characterCount: indexedCharacterCount,
             profile: profile
         )
         let category = classification.category
@@ -185,7 +420,9 @@ struct DocumentUnderstandingService: Sendable {
             index: index,
             category: category,
             entities: entities,
-            profile: profile
+            profile: profile,
+            text: text,
+            normalizedText: normalizedText
         )
 
         return DocumentBrief(
@@ -201,39 +438,39 @@ struct DocumentUnderstandingService: Sendable {
             suggestedSteps: Array(steps.prefix(5)),
             indexedAt: index.indexedAt,
             textSource: index.source,
-            indexedCharacterCount: index.characterCount,
+            indexedCharacterCount: indexedCharacterCount,
             confidence: classification.confidence
         )
     }
 
     private func classification(
-        for text: String,
+        normalizedText: String,
+        characterCount: Int,
         profile: DocumentProfile
     ) -> Classification {
         if profile.formFieldCount > 0 {
             return Classification(category: .form, confidence: .high)
         }
 
-        let normalized = text.lowercased()
         let scores: [(DocumentCategory, Int)] = [
             (
                 .invoice,
                 keywordScore(
-                    in: normalized,
+                    in: normalizedText,
                     keywords: ["invoice", "amount due", "bill to", "payment terms"]
                 )
             ),
             (
                 .receipt,
                 keywordScore(
-                    in: normalized,
+                    in: normalizedText,
                     keywords: ["receipt", "subtotal", "cashier", "change due"]
                 )
             ),
             (
                 .contract,
                 keywordScore(
-                    in: normalized,
+                    in: normalizedText,
                     keywords: [
                         "agreement",
                         "hereinafter",
@@ -246,14 +483,14 @@ struct DocumentUnderstandingService: Sendable {
             (
                 .report,
                 keywordScore(
-                    in: normalized,
+                    in: normalizedText,
                     keywords: ["report", "executive summary", "findings", "methodology"]
                 )
             ),
             (
                 .letter,
                 keywordScore(
-                    in: normalized,
+                    in: normalizedText,
                     keywords: ["dear ", "sincerely", "to whom it may concern"]
                 )
             )
@@ -262,7 +499,7 @@ struct DocumentUnderstandingService: Sendable {
         guard let best = scores.max(by: { $0.1 < $1.1 }), best.1 > 0 else {
             return Classification(
                 category: .general,
-                confidence: text.count >= 500 ? .medium : .low
+                confidence: characterCount >= 500 ? .medium : .low
             )
         }
         let confidence: DocumentUnderstandingConfidence
@@ -288,15 +525,38 @@ struct DocumentUnderstandingService: Sendable {
     private func extractEntities(from index: DocumentTextIndex) -> [DetectedEntity] {
         var entities: [DetectedEntity] = []
         var seen: Set<String> = []
+        let detector = try? NSDataDetector(
+            types: NSTextCheckingResult.CheckingType.link.rawValue
+                | NSTextCheckingResult.CheckingType.phoneNumber.rawValue
+                | NSTextCheckingResult.CheckingType.date.rawValue
+        )
+        let expressionDefinitions: [(String, DetectedEntity.Kind)] = [
+            (
+                #"(?i)(?:USD|EUR|GBP|CNY|RMB|\$|€|£|¥)\s?\d[\d,.]*(?:\.\d{2})?"#,
+                .amount
+            ),
+            (
+                #"(?i)(?:invoice|order|reference|ref|account)\s*(?:no\.?|number|#|:)\s*[A-Z0-9][A-Z0-9._-]{2,}"#,
+                .reference
+            ),
+            (
+                #"(?i)(?:SSN|social security|tax id|passport|IBAN)\s*(?:no\.?|number|#|:)?\s*[A-Z0-9][A-Z0-9 -]{4,30}"#,
+                .identifier
+            )
+        ]
+        let expressions = expressionDefinitions.compactMap {
+            pattern,
+            kind -> (NSRegularExpression, DetectedEntity.Kind)? in
+            guard let expression = try? NSRegularExpression(
+                pattern: pattern
+            ) else { return nil }
+            return (expression, kind)
+        }
 
         for page in index.pages {
             guard !Task.isCancelled else { break }
             let range = NSRange(page.text.startIndex..., in: page.text)
-            if let detector = try? NSDataDetector(
-                types: NSTextCheckingResult.CheckingType.link.rawValue
-                    | NSTextCheckingResult.CheckingType.phoneNumber.rawValue
-                    | NSTextCheckingResult.CheckingType.date.rawValue
-            ) {
+            if let detector {
                 detector.enumerateMatches(
                     in: page.text,
                     options: [],
@@ -338,43 +598,27 @@ struct DocumentUnderstandingService: Sendable {
                 }
             }
 
-            appendRegexMatches(
-                pattern: #"(?i)(?:USD|EUR|GBP|CNY|RMB|\$|€|£|¥)\s?\d[\d,.]*(?:\.\d{2})?"#,
-                kind: .amount,
-                page: page,
-                seen: &seen,
-                entities: &entities
-            )
-            appendRegexMatches(
-                pattern: #"(?i)(?:invoice|order|reference|ref|account)\s*(?:no\.?|number|#|:)\s*[A-Z0-9][A-Z0-9._-]{2,}"#,
-                kind: .reference,
-                page: page,
-                seen: &seen,
-                entities: &entities
-            )
-            appendRegexMatches(
-                pattern: #"(?i)(?:SSN|social security|tax id|passport|IBAN)\s*(?:no\.?|number|#|:)?\s*[A-Z0-9][A-Z0-9 -]{4,30}"#,
-                kind: .identifier,
-                page: page,
-                seen: &seen,
-                entities: &entities
-            )
+            for (expression, kind) in expressions {
+                appendRegexMatches(
+                    expression: expression,
+                    kind: kind,
+                    page: page,
+                    seen: &seen,
+                    entities: &entities
+                )
+            }
         }
 
         return entities
     }
 
     private func appendRegexMatches(
-        pattern: String,
+        expression: NSRegularExpression,
         kind: DetectedEntity.Kind,
         page: IndexedPageText,
         seen: inout Set<String>,
         entities: inout [DetectedEntity]
     ) {
-        guard let expression = try? NSRegularExpression(
-            pattern: pattern,
-            options: []
-        ) else { return }
         let range = NSRange(page.text.startIndex..., in: page.text)
         for match in expression.matches(in: page.text, range: range) {
             guard !Task.isCancelled else { break }
@@ -413,11 +657,11 @@ struct DocumentUnderstandingService: Sendable {
         index: DocumentTextIndex,
         category: DocumentCategory,
         entities: [DetectedEntity],
-        profile: DocumentProfile
+        profile: DocumentProfile,
+        text: String,
+        normalizedText: String
     ) -> [SuggestedStep] {
         var steps: [SuggestedStep] = []
-        let text = index.text
-        let normalized = text.lowercased()
 
         if text.isEmpty && (profile.kind == .scan || profile.kind == .mixed) {
             steps.append(
@@ -438,9 +682,9 @@ struct DocumentUnderstandingService: Sendable {
                 )
             )
         }
-        if normalized.contains("signature")
-            || normalized.contains("sign here")
-            || normalized.contains("signed by") {
+        if normalizedText.contains("signature")
+            || normalizedText.contains("sign here")
+            || normalizedText.contains("signed by") {
             let evidence = firstEvidence(
                 in: index,
                 matching: ["signature", "sign here", "signed by"]

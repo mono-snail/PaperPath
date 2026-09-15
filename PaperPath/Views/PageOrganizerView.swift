@@ -5,22 +5,42 @@ import SwiftUI
 import UniformTypeIdentifiers
 import VisionKit
 
+private struct PendingPageCopy {
+    let destinationID: UUID
+    let pageIndices: Set<Int>
+    let sourceRevisionID: UUID
+    let destinationRevisionID: UUID
+}
+
+private struct PendingPageRange {
+    let indices: Set<Int>
+    let sourceRevisionID: UUID
+}
+
 struct PageOrganizerView: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let startInSelectionMode: Bool
+    let initialSelectedPageIndices: Set<Int>
     let onCreated: (DocumentRoute) -> Void
+    let onPrepare: () -> Void
 
     @State private var pendingDeleteIndex: Int?
+    @State private var pendingDeletionRevisionID: UUID?
+    @State private var pendingBulkDeleteIndices: Set<Int> = []
     @State private var selectedIndices: Set<Int> = []
     @State private var isSelecting: Bool
     @State private var isImportingPages = false
     @State private var isChoosingDestination = false
+    @State private var isPresentingPageSelection = false
+    @State private var isPresentingPageActions = false
     @State private var isSelectingRange = false
     @State private var isConfirmingBulkDelete = false
     @State private var cropPageIndex: Int?
@@ -31,16 +51,39 @@ struct PageOrganizerView: View {
     @State private var isPresentingBatesNumbers = false
     @State private var isPreparingPages = false
     @State private var preparationInitialSelection: Set<Int> = []
+    @State private var pendingPageRange: PendingPageRange?
+    @State private var pendingPageCopy: PendingPageCopy?
+    @State private var mutationTask: Task<Void, Never>?
+    @State private var mutationGeneration = UUID()
+    @State private var locallyCommittedRevisionID: UUID?
+    @State private var pageMutationStopRequested = false
+    @State private var pageMutationErrorMessage: String?
+    @State private var pageMutationErrorFeedback = 0
+    @State private var didRevealInitialSelection = false
+    @State private var isJumpingToPage = false
+    @State private var pageJumpText = ""
+    @State private var pageToReveal: Int?
 
     init(
         recordID: UUID,
         startInSelectionMode: Bool = false,
-        onCreated: @escaping (DocumentRoute) -> Void
+        initialSelectedPageIndices: Set<Int> = [],
+        onCreated: @escaping (DocumentRoute) -> Void,
+        onPrepare: @escaping () -> Void = {}
     ) {
         self.recordID = recordID
         self.startInSelectionMode = startInSelectionMode
+        self.initialSelectedPageIndices = initialSelectedPageIndices
         self.onCreated = onCreated
-        _isSelecting = State(initialValue: startInSelectionMode)
+        self.onPrepare = onPrepare
+        _selectedIndices = State(
+            initialValue: initialSelectedPageIndices
+        )
+        _isSelecting = State(
+            initialValue:
+                startInSelectionMode
+                    || !initialSelectedPageIndices.isEmpty
+        )
     }
 
     var body: some View {
@@ -68,82 +111,128 @@ struct PageOrganizerView: View {
             )
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        pageJumpText = ""
+                        isJumpingToPage = true
+                    } label: {
+                        Image(systemName: "number")
+                    }
+                    .disabled(isPageMutationBusy)
+                    .accessibilityLabel("Go to page".localizedUI)
+                    .help("Go to page".localizedUI)
+                    .accessibilityIdentifier("organizerGoToPage")
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            isSelecting
-                                ? "Cancel"
-                                : "Select"
+                            mutationTask == nil
+                                ? "Close"
+                                : pageMutationStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                         ).localizedUI
                     ) {
-                        withAnimation(
-                            reduceMotion ? nil : .easeOut(duration: 0.18)
-                        ) {
-                            isSelecting.toggle()
-                            selectedIndices.removeAll()
+                        if mutationTask != nil {
+                            interruptPageMutation()
+                        } else {
+                            dismiss()
                         }
                     }
-                    .disabled(model.isProcessing(recordID))
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(
+                        pageMutationStopRequested
+                            || (
+                                mutationTask == nil
+                                    && model.isProcessing(recordID)
+                            )
+                    )
                 }
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
-                        .disabled(model.isProcessing(recordID))
-                }
-                ToolbarItem(placement: .secondaryAction) {
-                    Menu {
-                        if model.canUndoPageChange(recordID: recordID) {
-                            Button {
-                                Task {
-                                    _ = await model.undoLastPageChange(
-                                        recordID: recordID
+                if !isSelecting {
+                    ToolbarItem(placement: .secondaryAction) {
+                        Menu {
+                            if model.canUndoPageChange(recordID: recordID) {
+                                Button {
+                                    startPageMutation {
+                                        _ = await model.undoLastPageChange(
+                                            recordID: recordID
+                                        )
+                                    }
+                                } label: {
+                                    Label(
+                                        "Undo Last Page Change",
+                                        systemImage: "arrow.uturn.backward"
                                     )
+                                }
+                                Divider()
+                            }
+                            Button {
+                                if let record = model.record(id: recordID) {
+                                    startPageMutation {
+                                        await model.insertBlankPage(
+                                            recordID: recordID,
+                                            after: record.profile.pageCount - 1
+                                        )
+                                    }
                                 }
                             } label: {
                                 Label(
-                                    "Undo Last Page Change",
-                                    systemImage: "arrow.uturn.backward"
+                                    "Add Blank Page",
+                                    systemImage: "doc.badge.plus"
                                 )
                             }
-                            Divider()
-                        }
-                        Button {
-                            if let record = model.record(id: recordID) {
-                                Task {
-                                    await model.insertBlankPage(
-                                        recordID: recordID,
-                                        after: record.profile.pageCount - 1
-                                    )
-                                }
+
+                            Button {
+                                isImportingPages = true
+                            } label: {
+                                Label(
+                                    "Add Pages from PDF",
+                                    systemImage: "doc.on.doc"
+                                )
                             }
                         } label: {
-                            Label("Add Blank Page", systemImage: "doc.badge.plus")
+                            Image(systemName: "plus")
                         }
-
-                        Button {
-                            isImportingPages = true
-                        } label: {
-                            Label("Add Pages from PDF", systemImage: "doc.on.doc")
-                        }
-                    } label: {
-                        Image(systemName: "plus")
+                        .disabled(isPageMutationBusy)
+                        .accessibilityLabel("Add pages")
                     }
-                    .disabled(model.isProcessing(recordID))
-                    .accessibilityLabel("Add pages")
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
-                if isSelecting {
-                    extractionBar
-                } else if model.isProcessing(recordID) {
+                if isPageMutationBusy {
                     HStack(spacing: PPSpacing.small) {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text("Updating working copy")
-                            .font(.caption.weight(.semibold))
-                        Spacer()
-                        OnDeviceBadge(compact: true)
+                        if let progress = model.operationProgress[recordID],
+                           !pageMutationStopRequested {
+                            LocalOperationProgressView(progress: progress)
+                        } else {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text(
+                                (
+                                    pageMutationStopRequested
+                                        ? "Stopping update"
+                                        : "Updating working copy"
+                                ).localizedUI
+                            )
+                                .font(.caption.weight(.semibold))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: PPSpacing.small)
+                        if mutationTask != nil {
+                            Button {
+                                interruptPageMutation()
+                            } label: {
+                                Image(systemName: "stop.fill")
+                                    .frame(width: 44, height: 44)
+                            }
+                            .buttonStyle(.plain)
+                            .disabled(pageMutationStopRequested)
+                            .accessibilityLabel("Stop".localizedUI)
+                            .help("Stop".localizedUI)
+                        }
                     }
                     .padding(.horizontal, PPSpacing.regular)
+                    .padding(.vertical, PPSpacing.small)
                     .frame(minHeight: 44)
                     .background(.bar)
                     .overlay(alignment: .top) {
@@ -151,8 +240,28 @@ struct PageOrganizerView: View {
                             .fill(PPColor.border.opacity(0.62))
                             .frame(height: 0.6)
                     }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityAddTraits(.updatesFrequently)
+                } else if isSelecting {
+                    extractionBar
+                } else if !startInSelectionMode {
+                    organizerCompletionBar
                 }
             }
+        }
+        .alert("Go to page".localizedUI, isPresented: $isJumpingToPage) {
+            TextField("Page number".localizedUI, text: $pageJumpText)
+                .keyboardType(.numberPad)
+            Button("Go".localizedUI) { pageToReveal = validJumpPage }
+                .disabled(validJumpPage == nil)
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(AppLocalization.format(
+                "Page 1-%lld", model.record(id: recordID)?.profile.pageCount ?? 0
+            ))
+        }
+        .onChange(of: pageJumpText) { _, value in
+            if value.count > 8 { pageJumpText = String(value.prefix(8)) }
         }
         .confirmationDialog(
             "Remove this page?",
@@ -163,9 +272,11 @@ struct PageOrganizerView: View {
             titleVisibility: .visible
         ) {
             Button("Remove Page", role: .destructive) {
-                guard let index = pendingDeleteIndex else { return }
+                guard let index = pendingDeleteIndex,
+                      deletionTargetsCurrentRevision()
+                else { return }
                 pendingDeleteIndex = nil
-                Task {
+                startPageMutation {
                     await model.deletePage(recordID: recordID, index: index)
                 }
             }
@@ -176,21 +287,34 @@ struct PageOrganizerView: View {
             Text("Only the private working copy changes.")
         }
         .confirmationDialog(
-            "Remove \(selectedIndices.count) selected pages?",
+            "Remove \(pendingBulkDeleteIndices.count) selected pages?",
             isPresented: $isConfirmingBulkDelete,
             titleVisibility: .visible
         ) {
             Button("Remove Pages", role: .destructive) {
-                let indices = selectedIndices
-                Task {
-                    if await model.deletePages(
+                guard deletionTargetsCurrentRevision() else { return }
+                let indices = pendingBulkDeleteIndices
+                startConfirmedPageMutation {
+                    await model.deletePages(
                         recordID: recordID,
                         indices: indices
-                    ) {
-                        selectedIndices.removeAll()
+                    )
+                } onCommitted: {
+                    selectedIndices.removeAll()
+                    if !initialSelectedPageIndices.isEmpty {
+                        isSelecting = false
                     }
                 }
             }
+            .accessibilityHint(
+                selectedIndices.count
+                    >= (model.record(id: recordID)?
+                        .profile.pageCount ?? 0)
+                    ? "A PDF must keep at least one page."
+                        .localizedUI
+                    : "Removes the selected pages from the private working copy."
+                        .localizedUI
+            )
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
@@ -203,40 +327,61 @@ struct PageOrganizerView: View {
         ) { result in
             guard case .success(let url) = result else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
                 return
             }
-            Task {
+            startPageMutation {
                 await model.appendPages(recordID: recordID, from: url)
             }
         }
-        .sheet(isPresented: $isChoosingDestination) {
+        .sheet(
+            isPresented: $isChoosingDestination,
+            onDismiss: completePageCopySelection
+        ) {
             PageCopyDestinationSheet(
                 sourceRecordID: recordID,
                 selectedCount: selectedIndices.count
             ) { destinationID in
-                let indices = selectedIndices
-                Task {
-                    if await model.copyPages(
-                        from: recordID,
-                        indices: indices,
-                        to: destinationID
-                    ) {
-                        selectedIndices.removeAll()
-                        isSelecting = false
-                    }
+                guard let sourceRevisionID =
+                        model.record(id: recordID)?
+                            .contentRevisionID,
+                      let destinationRevisionID =
+                        model.record(id: destinationID)?
+                            .contentRevisionID
+                else {
+                    presentPageMutationError(
+                        "The source or destination PDF is no longer available."
+                            .localizedUI
+                    )
+                    isChoosingDestination = false
+                    return
                 }
+                pendingPageCopy = PendingPageCopy(
+                    destinationID: destinationID,
+                    pageIndices: selectedIndices,
+                    sourceRevisionID: sourceRevisionID,
+                    destinationRevisionID:
+                        destinationRevisionID
+                )
+                isChoosingDestination = false
             }
         }
-        .sheet(isPresented: $isSelectingRange) {
+        .sheet(
+            isPresented: $isSelectingRange,
+            onDismiss: completePageRangeSelection
+        ) {
             if let record = model.record(id: recordID) {
                 PageRangeSelectionSheet(
                     pageCount: record.profile.pageCount
-                ) { range in
-                    selectedIndices = Set(range)
+                ) { indices in
+                    pendingPageRange = PendingPageRange(
+                        indices: indices,
+                        sourceRevisionID: record.contentRevisionID
+                    )
+                    isSelectingRange = false
                 }
-                .presentationDetents([.medium])
+                .presentationDetents([.medium, .large])
             }
         }
         .sheet(isPresented: $isPresentingRuleWorkbench) {
@@ -249,7 +394,7 @@ struct PageOrganizerView: View {
                 isPresentingRuleWorkbench = false
             } onReorder: { order, label in
                 isPresentingRuleWorkbench = false
-                Task {
+                startPageMutation {
                     _ = await model.reorderPages(
                         recordID: recordID,
                         order: order,
@@ -264,15 +409,23 @@ struct PageOrganizerView: View {
                 PageNumberingSheet(
                     pageCount: record.profile.pageCount,
                     onApply: { payload in
-                        await model.applyPageNumbers(
-                            recordID: recordID,
-                            payload: payload
-                        )
+                        await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.applyPageNumbers(
+                                recordID: recordID,
+                                payload: payload
+                            )
+                        }
                     },
                     onRemoveAll: {
-                        await model.removeGeneratedPageNumbers(
-                            recordID: recordID
-                        )
+                        await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.removeGeneratedPageNumbers(
+                                recordID: recordID
+                            )
+                        }
                     }
                 )
                 .presentationDetents([.large])
@@ -283,15 +436,23 @@ struct PageOrganizerView: View {
                 WatermarkSheet(
                     pageCount: record.profile.pageCount,
                     onApply: { payload in
-                        await model.applyWatermark(
-                            recordID: recordID,
-                            payload: payload
-                        )
+                        await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.applyWatermark(
+                                recordID: recordID,
+                                payload: payload
+                            )
+                        }
                     },
                     onRemoveAll: {
-                        await model.removeGeneratedWatermarks(
-                            recordID: recordID
-                        )
+                        await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.removeGeneratedWatermarks(
+                                recordID: recordID
+                            )
+                        }
                     }
                 )
                 .presentationDetents([.large])
@@ -302,15 +463,23 @@ struct PageOrganizerView: View {
                 BatesNumberingSheet(
                     pageCount: record.profile.pageCount,
                     onApply: { payload in
-                        await model.applyBatesNumbers(
-                            recordID: recordID,
-                            payload: payload
-                        )
+                        await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.applyBatesNumbers(
+                                recordID: recordID,
+                                payload: payload
+                            )
+                        }
                     },
                     onRemoveAll: {
-                        await model.removeGeneratedBatesNumbers(
-                            recordID: recordID
-                        )
+                        await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.removeGeneratedBatesNumbers(
+                                recordID: recordID
+                            )
+                        }
                     }
                 )
                 .presentationDetents([.large])
@@ -365,12 +534,48 @@ struct PageOrganizerView: View {
                 isSelecting = false
             }
         }
-        .interactiveDismissDisabled(model.isProcessing(recordID))
+        .interactiveDismissDisabled(isPageMutationBusy)
+        .accessibilityAction(.escape) {
+            if mutationTask != nil {
+                interruptPageMutation()
+            } else if model.isProcessing(recordID) {
+                return
+            } else if isSelecting && !startInSelectionMode {
+                endPageSelection()
+            } else {
+                dismiss()
+            }
+        }
         .sensoryFeedback(.selection, trigger: selectedIndices)
         .sensoryFeedback(
             .success,
             trigger: model.refreshToken(for: recordID)
         )
+        .sensoryFeedback(
+            .error,
+            trigger: pageMutationErrorFeedback
+        )
+        .onChange(
+            of: model.record(id: recordID)?.contentRevisionID
+        ) { oldRevision, newRevision in
+            guard oldRevision != newRevision else { return }
+            pendingDeleteIndex = nil
+            pendingDeletionRevisionID = nil
+            pendingBulkDeleteIndices = []
+            isConfirmingBulkDelete = false
+            guard mutationTask == nil,
+                  newRevision != locallyCommittedRevisionID
+            else { return }
+            let hadSelection = !selectedIndices.isEmpty
+            selectedIndices.removeAll()
+            discardPendingPageSelectionHandoffs()
+            if hadSelection {
+                presentPageMutationError(
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                )
+            }
+        }
         .onChange(
             of: model.record(id: recordID)?.profile.pageCount
         ) { _, pageCount in
@@ -378,6 +583,26 @@ struct PageOrganizerView: View {
             selectedIndices = selectedIndices.filter {
                 $0 >= 0 && $0 < pageCount
             }
+            pageMutationErrorMessage = nil
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            discardPendingPageSelectionHandoffs()
+            interruptPageMutation(invalidateResult: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            discardPendingPageSelectionHandoffs()
+            interruptPageMutation(invalidateResult: true)
+        }
+        .onDisappear {
+            discardPendingPageSelectionHandoffs()
+            interruptPageMutation(invalidateResult: true)
+            pageMutationErrorMessage = nil
         }
     }
 
@@ -385,121 +610,105 @@ struct PageOrganizerView: View {
         record: DocumentRecord,
         url: URL
     ) -> some View {
-        ScrollView {
-            LazyVStack(spacing: PPSpacing.medium) {
-                organizerHeader(record)
-                if !startInSelectionMode {
-                    organizerCommandDeck(record)
-                }
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(spacing: PPSpacing.medium) {
+                    if startInSelectionMode {
+                        organizerHeader(record)
+                    } else {
+                        organizerCommandDeck(record)
+                    }
+                    if let pageMutationErrorMessage {
+                        pageMutationErrorBanner(pageMutationErrorMessage)
+                    }
 
-                LazyVGrid(
-                    columns: pageColumns,
-                    alignment: .leading,
-                    spacing: PPSpacing.small
-                ) {
-                    ForEach(
-                        0..<record.profile.pageCount,
-                        id: \.self
-                    ) { index in
-                        pageRow(
-                            index: index,
-                            pageCount: record.profile.pageCount,
-                            url: url
-                        )
+                    LazyVGrid(
+                        columns: pageColumns,
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    ) {
+                        ForEach(
+                            0..<record.profile.pageCount,
+                            id: \.self
+                        ) { index in
+                            pageRow(
+                                index: index,
+                                pageCount: record.profile.pageCount,
+                                url: url
+                            )
+                            .id(index)
+                        }
                     }
                 }
+                .frame(maxWidth: 1_080)
+                .padding(PPSpacing.regular)
+                .frame(maxWidth: .infinity)
+                .id(model.refreshToken(for: recordID))
             }
-            .frame(maxWidth: 1_080)
-            .padding(PPSpacing.regular)
-            .frame(maxWidth: .infinity)
-            .id(model.refreshToken(for: recordID))
+            .onAppear {
+                revealInitialSelection(
+                    using: proxy,
+                    pageCount: record.profile.pageCount
+                )
+            }
+            .onChange(of: pageToReveal) { _, page in
+                guard let page, page >= 0, page < record.profile.pageCount else { return }
+                withAnimation(reduceMotion ? nil : PPMotion.selection) {
+                    proxy.scrollTo(page, anchor: .center)
+                }
+                pageToReveal = nil
+            }
+        }
+    }
+
+    private var validJumpPage: Int? {
+        guard let page = Int(pageJumpText.trimmingCharacters(in: .whitespacesAndNewlines)),
+              let count = model.record(id: recordID)?.profile.pageCount,
+              page > 0, page <= count else { return nil }
+        return page - 1
+    }
+
+    private func revealInitialSelection(
+        using proxy: ScrollViewProxy,
+        pageCount: Int
+    ) {
+        guard !didRevealInitialSelection,
+              let firstIndex = initialSelectedPageIndices
+                .sorted()
+                .first(where: { $0 >= 0 && $0 < pageCount })
+        else { return }
+        didRevealInitialSelection = true
+        Task { @MainActor in
+            await Task.yield()
+            guard !Task.isCancelled else { return }
+            withAnimation(
+                reduceMotion ? nil : .easeOut(duration: 0.22)
+            ) {
+                proxy.scrollTo(firstIndex, anchor: .center)
+            }
         }
     }
 
     private func organizerHeader(_ record: DocumentRecord) -> some View {
-        WorkflowCommandHeader(
-            eyebrow: startInSelectionMode
-                ? "SPLIT WORKFLOW"
-                : "PAGE WORKFLOW",
-            title: startInSelectionMode
-                ? "Choose pages"
-                : "Organize pages",
-            detail:
-                startInSelectionMode
-                    ? "Choose the pages to extract into a separate PDF."
-                    : "Move, rotate, trim, or remove pages in the private copy.",
-            symbol: "square.grid.2x2",
-            tint: PPColor.accent,
-            metrics: [
-                WorkflowMetric(
-                    value: "\(record.profile.pageCount)",
-                    label: "Pages",
-                    symbol: "doc.on.doc",
-                    tint: PPColor.accent
-                ),
-                WorkflowMetric(
-                    value: "\(selectedIndices.count)",
-                    label: "Selected",
-                    symbol: "checkmark.circle",
-                    tint: selectedIndices.isEmpty
-                        ? PPColor.textSecondary
-                        : PPColor.mint
-                ),
-                WorkflowMetric(
-                    value: model.canUndoPageChange(recordID: recordID)
-                        ? "Ready"
-                        : "Clean",
-                    label: "Undo",
-                    symbol: "arrow.uturn.backward",
-                    tint: model.canUndoPageChange(recordID: recordID)
-                        ? PPColor.amber
-                        : PPColor.textSecondary
-                )
-            ]
-        )
+        VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+            Text(record.displayName).font(PPType.document)
+            Text(AppLocalization.format("%lld pages · %lld selected", record.profile.pageCount, selectedIndices.count))
+                .font(PPType.measure)
+                .foregroundStyle(PPColor.textSecondary)
+        }
     }
 
     private func organizerCommandDeck(
         _ record: DocumentRecord
     ) -> some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            StudioSectionRule(
-                title: "PAGE BENCH",
-                detail: "Direct actions preserve one-step recovery",
-                symbol: "square.grid.3x3",
-                count: record.profile.pageCount,
-                tint: PPColor.cyan
-            )
+            organizerHeader(record)
 
             LazyVGrid(
                 columns: commandColumns,
                 alignment: .leading,
                 spacing: 0
             ) {
-                organizerCommand(
-                    "Prepare",
-                    detail: "Inspect margins",
-                    symbol: "rectangle.inset.filled",
-                    tint: PPColor.cyan
-                ) {
-                    preparationInitialSelection = []
-                    isPreparingPages = true
-                }
-
-                organizerCommand(
-                    "Blank page",
-                    detail: "Append at end",
-                    symbol: "doc.badge.plus",
-                    tint: PPColor.accent
-                ) {
-                    Task {
-                        await model.insertBlankPage(
-                            recordID: recordID,
-                            after: record.profile.pageCount - 1
-                        )
-                    }
-                }
-
                 organizerCommand(
                     "Import pages",
                     detail: "Append another PDF",
@@ -509,36 +718,11 @@ struct PageOrganizerView: View {
                     isImportingPages = true
                 }
 
-                organizerCommand(
-                    "Page numbers",
-                    detail: "Number a page range",
-                    symbol: "number.square",
-                    tint: PPColor.cyan
-                ) {
-                    isPresentingPageNumbers = true
-                }
+                pageMarksMenu
 
                 organizerCommand(
-                    "Bates",
-                    detail: "Assign page IDs",
-                    symbol: "number.square.fill",
-                    tint: PPColor.amber
-                ) {
-                    isPresentingBatesNumbers = true
-                }
-
-                organizerCommand(
-                    "Watermark",
-                    detail: "Mark a page range",
-                    symbol: "textformat.alt",
-                    tint: PPColor.rose
-                ) {
-                    isPresentingWatermark = true
-                }
-
-                organizerCommand(
-                    "Rules",
-                    detail: "Select or arrange",
+                    "Select by rule",
+                    detail: "Choose pages faster",
                     symbol: "line.3.horizontal.decrease",
                     tint: PPColor.mint
                 ) {
@@ -555,7 +739,7 @@ struct PageOrganizerView: View {
                     disabled:
                         !model.canUndoPageChange(recordID: recordID)
                 ) {
-                    Task {
+                    startPageMutation {
                         _ = await model.undoLastPageChange(
                             recordID: recordID
                         )
@@ -565,14 +749,58 @@ struct PageOrganizerView: View {
         }
     }
 
+    private var pageMarksMenu: some View {
+        Menu {
+            Button {
+                isPresentingPageNumbers = true
+            } label: {
+                Label("Page Numbers", systemImage: "number.square")
+            }
+            Button {
+                isPresentingWatermark = true
+            } label: {
+                Label("Watermark", systemImage: "textformat.alt")
+            }
+            Button {
+                isPresentingBatesNumbers = true
+            } label: {
+                Label("Bates Numbering", systemImage: "number.square.fill")
+            }
+        } label: {
+            HStack(spacing: PPSpacing.small) {
+                Image(systemName: "number.square")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(PPColor.accent)
+                    .frame(width: 20)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Page marks".localizedUI)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textPrimary)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+            .padding(.horizontal, PPSpacing.small)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minHeight: 46)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(isPageMutationBusy)
+    }
+
     private var pageColumns: [GridItem] {
         [
             GridItem(
                 .adaptive(
-                    minimum: dynamicTypeSize.isAccessibilitySize
+                    minimum: dynamicTypeSize.ppPrefersExpandedLayout
                         ? 260
                         : 168,
-                    maximum: 244
+                    maximum: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 360
+                        : 244
                 ),
                 spacing: PPSpacing.small,
                 alignment: .top
@@ -584,10 +812,12 @@ struct PageOrganizerView: View {
         [
             GridItem(
                 .adaptive(
-                    minimum: dynamicTypeSize.isAccessibilitySize
+                    minimum: dynamicTypeSize.ppPrefersExpandedLayout
                         ? 240
                         : 132,
-                    maximum: 220
+                    maximum: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 340
+                        : 220
                 ),
                 spacing: 0
             )
@@ -605,41 +835,70 @@ struct PageOrganizerView: View {
         Button(action: action) {
             HStack(spacing: PPSpacing.small) {
                 Image(systemName: symbol)
-                    .font(.caption.weight(.semibold))
+                    .font(.system(size: 18, weight: .semibold))
                     .foregroundStyle(
                         disabled
                             ? PPColor.textSecondary
-                            : tint
+                            : PPColor.accent
                     )
                     .frame(width: 20)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(title.localizedUI)
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
-                    Text(detail.localizedUI)
-                        .font(.caption2)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                        )
                 }
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, PPSpacing.small)
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(minHeight: 46)
-            .overlay(alignment: .leading) {
-                Rectangle()
-                    .fill(
-                        disabled
-                            ? PPColor.border
-                            : tint.opacity(0.72)
-                    )
-                    .frame(width: 2)
-                    .padding(.vertical, 6)
-            }
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(disabled || model.isProcessing(recordID))
+        .disabled(disabled || isPageMutationBusy)
+        .accessibilityHint(
+            disabled
+                ? detail.localizedUI
+                : isPageMutationBusy
+                    ? "Wait for the current page update to finish."
+                        .localizedUI
+                    : detail.localizedUI
+        )
+    }
+
+    private func pageMutationErrorBanner(
+        _ message: String
+    ) -> some View {
+        HStack(alignment: .top, spacing: PPSpacing.small) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(PPColor.rose)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(PPColor.textPrimary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: PPSpacing.small)
+            Button {
+                pageMutationErrorMessage = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("Dismiss page update error".localizedUI)
+        }
+        .padding(.horizontal, PPSpacing.small)
+        .padding(.vertical, PPSpacing.small)
+        .background(PPColor.rose.opacity(0.08))
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(PPColor.rose)
+                .frame(width: 2)
+        }
+        .accessibilityElement(children: .contain)
     }
 
     private func pageRow(
@@ -678,7 +937,7 @@ struct PageOrganizerView: View {
                     )
 
                     Text(String(format: "%03d", index + 1))
-                        .font(.caption2.monospacedDigit().weight(.bold))
+                        .font(.system(size: 12, weight: .bold, design: .monospaced))
                         .foregroundStyle(
                             selected ? Color.white : PPColor.textPrimary
                         )
@@ -706,7 +965,7 @@ struct PageOrganizerView: View {
                                 ? "checkmark.circle.fill"
                                 : "circle"
                         )
-                        .font(.title3)
+                        .font(.system(size: 20))
                         .foregroundStyle(
                             selected
                                 ? PPColor.accent
@@ -719,26 +978,27 @@ struct PageOrganizerView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.top, PPSpacing.medium)
                 .padding(.bottom, PPSpacing.small)
-                .overlay {
-                    StudioStageMarks(
-                        tint: selected
-                            ? PPColor.accent
-                            : PPColor.textSecondary,
-                        inset: 5,
-                        arm: 8
-                    )
-                }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("organizerPage-\(index)")
             .accessibilityLabel(
                 isSelecting
                     ? (
                         selected
-                            ? "Deselect page \(index + 1)"
-                            : "Select page \(index + 1)"
+                            ? AppLocalization.format(
+                                "Deselect page %lld",
+                                index + 1
+                            )
+                            : AppLocalization.format(
+                                "Select page %lld",
+                                index + 1
+                            )
                     )
-                    : "Select page \(index + 1)"
+                    : AppLocalization.format(
+                        "Select page %lld",
+                        index + 1
+                    )
             )
 
             if !isSelecting {
@@ -748,7 +1008,7 @@ struct PageOrganizerView: View {
                         symbol: "rotate.right",
                         tint: PPColor.accent
                     ) {
-                        Task {
+                        startPageMutation {
                             await model.rotatePage(
                                 recordID: recordID,
                                 index: index
@@ -785,7 +1045,7 @@ struct PageOrganizerView: View {
         }
         .contextMenu {
             Button {
-                Task {
+                startPageMutation {
                     await model.duplicatePage(
                         recordID: recordID,
                         index: index
@@ -799,7 +1059,7 @@ struct PageOrganizerView: View {
             }
 
             Button {
-                Task {
+                startPageMutation {
                     await model.rotatePage(
                         recordID: recordID,
                         index: index,
@@ -814,7 +1074,7 @@ struct PageOrganizerView: View {
             }
 
             Button {
-                Task {
+                startPageMutation {
                     await model.insertBlankPage(
                         recordID: recordID,
                         at: index
@@ -828,7 +1088,7 @@ struct PageOrganizerView: View {
             }
 
             Button {
-                Task {
+                startPageMutation {
                     await model.insertBlankPage(
                         recordID: recordID,
                         after: index
@@ -857,16 +1117,16 @@ struct PageOrganizerView: View {
                 }
             }
         }
-        .disabled(model.isProcessing(recordID))
+        .disabled(isPageMutationBusy)
         .draggable(pageDragIdentifier(index))
         .dropDestination(for: String.self) { items, _ in
             guard !isSelecting,
-                  !model.isProcessing(recordID),
+                  !isPageMutationBusy,
                   let item = items.first,
                   let sourceIndex = pageIndex(from: item),
                   sourceIndex != index
             else { return false }
-            Task {
+            startPageMutation {
                 await model.movePage(
                     recordID: recordID,
                     from: sourceIndex,
@@ -887,14 +1147,14 @@ struct PageOrganizerView: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.caption.weight(.semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(tint)
                 .frame(maxWidth: .infinity)
-                .frame(height: 38)
+                .frame(height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isProcessing(recordID))
+        .disabled(isPageMutationBusy)
         .accessibilityLabel(label.localizedUI)
     }
 
@@ -904,7 +1164,7 @@ struct PageOrganizerView: View {
     ) -> some View {
         Menu {
             Button {
-                Task {
+                startPageMutation {
                     await model.movePage(
                         recordID: recordID,
                         index: index,
@@ -917,7 +1177,7 @@ struct PageOrganizerView: View {
             .disabled(index == 0)
 
             Button {
-                Task {
+                startPageMutation {
                     await model.movePage(
                         recordID: recordID,
                         index: index,
@@ -930,7 +1190,7 @@ struct PageOrganizerView: View {
             .disabled(index == pageCount - 1)
 
             Button {
-                Task {
+                startPageMutation {
                     await model.movePage(
                         recordID: recordID,
                         from: index,
@@ -946,7 +1206,7 @@ struct PageOrganizerView: View {
             .disabled(index == 0)
 
             Button {
-                Task {
+                startPageMutation {
                     await model.movePage(
                         recordID: recordID,
                         from: index,
@@ -964,7 +1224,7 @@ struct PageOrganizerView: View {
             Divider()
 
             Button {
-                Task {
+                startPageMutation {
                     await model.rotatePage(
                         recordID: recordID,
                         index: index,
@@ -979,7 +1239,7 @@ struct PageOrganizerView: View {
             }
 
             Button {
-                Task {
+                startPageMutation {
                     await model.duplicatePage(
                         recordID: recordID,
                         index: index
@@ -995,7 +1255,7 @@ struct PageOrganizerView: View {
             Divider()
 
             Button {
-                Task {
+                startPageMutation {
                     await model.insertBlankPage(
                         recordID: recordID,
                         at: index
@@ -1009,7 +1269,7 @@ struct PageOrganizerView: View {
             }
 
             Button {
-                Task {
+                startPageMutation {
                     await model.insertBlankPage(
                         recordID: recordID,
                         after: index
@@ -1038,6 +1298,8 @@ struct PageOrganizerView: View {
             Divider()
 
             Button(role: .destructive) {
+                pendingDeletionRevisionID =
+                    model.record(id: recordID)?.contentRevisionID
                 pendingDeleteIndex = index
             } label: {
                 Label("Remove Page", systemImage: "trash")
@@ -1045,24 +1307,34 @@ struct PageOrganizerView: View {
             .disabled(pageCount == 1)
         } label: {
             Image(systemName: "ellipsis")
-                .font(.caption.weight(.bold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(PPColor.textSecondary)
                 .frame(maxWidth: .infinity)
-                .frame(height: 38)
+                .frame(height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isProcessing(recordID))
+        .disabled(isPageMutationBusy)
         .accessibilityLabel("More page actions")
     }
 
     private var extractionBar: some View {
-        let layout = dynamicTypeSize.isAccessibilitySize
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
             ? AnyLayout(VStackLayout(spacing: PPSpacing.medium))
             : AnyLayout(HStackLayout(spacing: PPSpacing.medium))
 
         return layout {
-            Menu {
+            Button {
+                isPresentingPageSelection = true
+            } label: {
+                Image(systemName: "checklist")
+                    .frame(width: 20, height: 20)
+            }
+            .confirmationDialog(
+                "Select pages",
+                isPresented: $isPresentingPageSelection,
+                titleVisibility: .visible
+            ) {
                 if let record = model.record(id: recordID) {
                     Button("All Pages") {
                         selectedIndices = Set(
@@ -1102,13 +1374,7 @@ struct PageOrganizerView: View {
                         }
                     }
                 }
-            } label: {
-                Label(
-                    selectedIndices.isEmpty
-                        ? "Select".localizedUI
-                        : pageSelectionTitle,
-                    systemImage: "checklist"
-                )
+                Button("Cancel", role: .cancel) {}
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.textPrimary))
             .accessibilityIdentifier("pageSelectionMenu")
@@ -1119,8 +1385,32 @@ struct PageOrganizerView: View {
                     selectedIndices.count
                 )
             )
+            .help("Page selection".localizedUI)
+            .disabled(isPageMutationBusy)
 
-            Menu {
+            Button {
+                isPresentingPageActions = true
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .frame(width: 20, height: 20)
+            }
+            .confirmationDialog(
+                "Page actions",
+                isPresented: $isPresentingPageActions,
+                titleVisibility: .visible
+            ) {
+                if !startInSelectionMode {
+                    Button {
+                        extractSelectedPages()
+                    } label: {
+                        Label(
+                            "Extract to New PDF",
+                            systemImage: "doc.on.doc"
+                        )
+                    }
+                    Divider()
+                }
+
                 if hasCopyDestination {
                     Button {
                         isChoosingDestination = true
@@ -1133,16 +1423,30 @@ struct PageOrganizerView: View {
                 }
 
                 Button {
+                    moveSelectedPages(toBeginning: true)
+                } label: {
+                    Label("Move selected pages to beginning".localizedUI, systemImage: "arrow.up.to.line")
+                }
+                .disabled(!canMoveSelectedPages(toBeginning: true))
+
+                Button {
+                    moveSelectedPages(toBeginning: false)
+                } label: {
+                    Label("Move selected pages to end".localizedUI, systemImage: "arrow.down.to.line")
+                }
+                .disabled(!canMoveSelectedPages(toBeginning: false))
+
+                Button {
                     let indices = selectedIndices
-                    Task {
-                        if await model.duplicatePages(
+                    startConfirmedPageMutation {
+                        await model.duplicatePages(
                             recordID: recordID,
                             indices: indices
-                        ) {
-                            selectedIndices = duplicatedPageIndices(
-                                for: indices
-                            )
-                        }
+                        )
+                    } onCommitted: {
+                        selectedIndices = duplicatedPageIndices(
+                            for: indices
+                        )
                     }
                 } label: {
                     Label(
@@ -1154,7 +1458,7 @@ struct PageOrganizerView: View {
 
                 Button {
                     let indices = selectedIndices
-                    Task {
+                    startPageMutation {
                         _ = await model.rotatePages(
                             recordID: recordID,
                             indices: indices
@@ -1169,7 +1473,7 @@ struct PageOrganizerView: View {
 
                 Button {
                     let indices = selectedIndices
-                    Task {
+                    startPageMutation {
                         _ = await model.rotatePages(
                             recordID: recordID,
                             indices: indices,
@@ -1193,7 +1497,7 @@ struct PageOrganizerView: View {
                     )
                 }
                 Button(role: .destructive) {
-                    isConfirmingBulkDelete = true
+                    requestBulkPageDeletion()
                 } label: {
                     Label("Remove Pages", systemImage: "trash")
                 }
@@ -1202,40 +1506,75 @@ struct PageOrganizerView: View {
                         >= (model.record(id: recordID)?
                             .profile.pageCount ?? 0)
                 )
-            } label: {
-                Label("Actions", systemImage: "ellipsis.circle")
+                Button("Cancel", role: .cancel) {}
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.textPrimary))
             .accessibilityIdentifier("pageSelectionActions")
+            .accessibilityLabel("Page actions")
+            .accessibilityValue(
+                AppLocalization.format(
+                    "%lld pages selected",
+                    selectedIndices.count
+                )
+            )
+            .help("Page actions".localizedUI)
             .disabled(
                 selectedIndices.isEmpty
-                    || model.isProcessing(recordID)
+                    || isPageMutationBusy
             )
+            .accessibilityHint(pageSelectionActionsHint)
+
+            if !startInSelectionMode,
+               !selectedIndices.isEmpty {
+                Button(role: .destructive) {
+                    requestBulkPageDeletion()
+                } label: {
+                    Image(systemName: "trash")
+                        .frame(width: 20, height: 20)
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.rose))
+                .disabled(
+                    isPageMutationBusy
+                        || selectedIndices.count
+                            >= (model.record(id: recordID)?
+                                .profile.pageCount ?? 0)
+                )
+                .accessibilityLabel("Remove selected pages")
+                .accessibilityHint(
+                    "Asks for confirmation before changing the private working copy."
+                        .localizedUI
+                )
+                .accessibilityIdentifier("removeSelectedOrganizerPages")
+            }
 
             Button {
-                Task {
-                    if let created = await model.extractPages(
-                        recordID: recordID,
-                        indices: selectedIndices
-                    ) {
-                        isSelecting = false
-                        selectedIndices.removeAll()
-                        dismiss()
-                        try? await Task.sleep(for: .milliseconds(220))
-                        onCreated(DocumentRoute(recordID: created.id))
-                    }
+                if startInSelectionMode {
+                    extractSelectedPages()
+                } else {
+                    endPageSelection()
                 }
             } label: {
                 Label(
-                    selectedIndices.isEmpty
-                        ? "Choose Pages"
-                        : "Extract \(selectedIndices.count)",
-                    systemImage: "doc.on.doc"
+                    pageSelectionPrimaryTitle,
+                    systemImage: startInSelectionMode
+                        ? "doc.on.doc"
+                        : "checkmark"
                 )
             }
             .buttonStyle(PPPrimaryButtonStyle())
-            .disabled(selectedIndices.isEmpty || model.isProcessing(recordID))
-            .accessibilityIdentifier("extractPagesButton")
+            .disabled(
+                isPageMutationBusy
+                    || (
+                        startInSelectionMode
+                            && selectedIndices.isEmpty
+                    )
+            )
+            .accessibilityIdentifier(
+                startInSelectionMode
+                    ? "extractPagesButton"
+                    : "finishPageSelection"
+            )
+            .accessibilityHint(pageSelectionPrimaryHint)
         }
         .padding(PPSpacing.regular)
         .background(PPColor.canvas.opacity(0.98))
@@ -1244,6 +1583,397 @@ struct PageOrganizerView: View {
                 .fill(PPColor.border.opacity(0.7))
                 .frame(height: 0.6)
         }
+        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+    }
+
+    private var organizerCompletionBar: some View {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.medium)
+            )
+        return layout {
+            Button {
+                beginPageSelection()
+            } label: {
+                Label("Select Pages", systemImage: "checklist")
+            }
+            .buttonStyle(PPQuietButtonStyle())
+            .accessibilityIdentifier("selectOrganizerPages")
+
+            Button {
+                onPrepare()
+            } label: {
+                Label("Review & Share", systemImage: "checkmark.shield")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(PPPrimaryButtonStyle())
+            .accessibilityHint(
+                "Continues to final checks before sharing"
+                    .localizedUI
+            )
+            .accessibilityIdentifier("finishOrganizingPages")
+        }
+        .padding(PPSpacing.regular)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(PPColor.border.opacity(0.7))
+                .frame(height: 0.6)
+        }
+        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
+    }
+
+    private var isPageMutationBusy: Bool {
+        mutationTask != nil || model.isProcessing(recordID)
+    }
+
+    private var pageSelectionPrimaryTitle: String {
+        if startInSelectionMode {
+            return selectedIndices.isEmpty
+                ? "Choose Pages".localizedUI
+                : AppLocalization.format(
+                    "Extract %lld",
+                    selectedIndices.count
+                )
+        }
+        guard !selectedIndices.isEmpty else {
+            return "Done Selecting".localizedUI
+        }
+        return AppLocalization.format(
+            "Done Selecting · %lld",
+            selectedIndices.count
+        )
+    }
+
+    private var pageSelectionActionsHint: String {
+        if isPageMutationBusy {
+            return "Wait for the current page update to finish."
+                .localizedUI
+        }
+        if selectedIndices.isEmpty {
+            return "Select at least one page first.".localizedUI
+        }
+        return "Opens actions for the selected pages.".localizedUI
+    }
+
+    private var pageSelectionPrimaryHint: String {
+        if isPageMutationBusy {
+            return "Wait for the current page update to finish."
+                .localizedUI
+        }
+        if startInSelectionMode, selectedIndices.isEmpty {
+            return "Select at least one page to create a separate PDF."
+                .localizedUI
+        }
+        if startInSelectionMode {
+            return "Creates a separate PDF from the selected pages."
+                .localizedUI
+        }
+        return "Keeps the current selection and returns to page actions."
+            .localizedUI
+    }
+
+    private func interruptPageMutation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            mutationGeneration = UUID()
+            pageMutationStopRequested = false
+        } else {
+            guard mutationTask != nil,
+                  !pageMutationStopRequested
+            else { return }
+            pageMutationStopRequested = true
+        }
+        mutationTask?.cancel()
+        if invalidateResult {
+            mutationTask = nil
+        }
+    }
+
+    private func requestBulkPageDeletion() {
+        pendingBulkDeleteIndices = selectedIndices
+        pendingDeletionRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        isConfirmingBulkDelete = true
+    }
+
+    private func deletionTargetsCurrentRevision() -> Bool {
+        guard let pendingDeletionRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == pendingDeletionRevisionID
+        else {
+            pendingDeleteIndex = nil
+            pendingBulkDeleteIndices = []
+            presentPageMutationError(
+                "The PDF changed before this action started. Review the updated PDF."
+                    .localizedUI
+            )
+            return false
+        }
+        return true
+    }
+
+    private func startPageMutation(
+        _ operation: @escaping @MainActor () async -> Void
+    ) {
+        guard mutationTask == nil,
+              !model.isProcessing(recordID),
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        pageMutationErrorMessage = nil
+        pageMutationStopRequested = false
+        let sourceRevisionID = model.record(id: recordID)?
+            .contentRevisionID
+        let generation = UUID()
+        mutationGeneration = generation
+        mutationTask = Task { @MainActor in
+            defer {
+                if mutationGeneration == generation {
+                    mutationTask = nil
+                    pageMutationStopRequested = false
+                }
+            }
+            guard mutationGeneration == generation,
+                  !Task.isCancelled,
+                  model.record(id: recordID)?.contentRevisionID == sourceRevisionID
+            else { return }
+            await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await operation()
+            }
+            guard mutationGeneration == generation else { return }
+            locallyCommittedRevisionID =
+                model.record(id: recordID)?.contentRevisionID
+            let wasStopped =
+                pageMutationStopRequested || Task.isCancelled
+            guard wasStopped else { return }
+            let committed =
+                sourceRevisionID != nil
+                    && model.record(id: recordID)?
+                        .contentRevisionID != sourceRevisionID
+            model[noticeFor: paperPathSceneID] = (
+                committed
+                    ? "Page update finished before stopping · changes kept"
+                    : "Page update stopped · working copy unchanged"
+            ).localizedUI
+        }
+    }
+
+    private func startConfirmedPageMutation(
+        _ operation: @escaping @MainActor () async -> Bool,
+        onCommitted: @escaping @MainActor () -> Void
+    ) {
+        guard mutationTask == nil,
+              !model.isProcessing(recordID),
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        pageMutationErrorMessage = nil
+        pageMutationStopRequested = false
+        let sourceRevisionID = model.record(id: recordID)?.contentRevisionID
+        let generation = UUID()
+        mutationGeneration = generation
+        mutationTask = Task { @MainActor in
+            defer {
+                if mutationGeneration == generation {
+                    mutationTask = nil
+                    pageMutationStopRequested = false
+                }
+            }
+            guard mutationGeneration == generation,
+                  !Task.isCancelled,
+                  model.record(id: recordID)?.contentRevisionID == sourceRevisionID
+            else { return }
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await operation()
+            }
+            guard mutationGeneration == generation else { return }
+            if succeeded {
+                locallyCommittedRevisionID =
+                    model.record(id: recordID)?.contentRevisionID
+            }
+            let wasStopped =
+                pageMutationStopRequested || Task.isCancelled
+            if succeeded {
+                onCommitted()
+            }
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    succeeded
+                        ? "Page update finished before stopping · changes kept"
+                        : "Page update stopped · working copy unchanged"
+                ).localizedUI
+                return
+            }
+            if !succeeded {
+                presentPageMutationError(
+                    "The page update could not be completed. Review the selection and try again."
+                        .localizedUI
+                )
+            }
+        }
+    }
+
+    private func selectedPageOrder(toBeginning: Bool) -> [Int] {
+        let count = model.record(id: recordID)?.profile.pageCount ?? 0
+        let pages = Array(0..<count)
+        let selected = pages.filter { selectedIndices.contains($0) }
+        let remaining = pages.filter { !selectedIndices.contains($0) }
+        return toBeginning ? selected + remaining : remaining + selected
+    }
+
+    private func canMoveSelectedPages(toBeginning: Bool) -> Bool {
+        let count = model.record(id: recordID)?.profile.pageCount ?? 0
+        return !selectedIndices.isEmpty && !isPageMutationBusy
+            && selectedPageOrder(toBeginning: toBeginning) != Array(0..<count)
+    }
+
+    private func moveSelectedPages(toBeginning: Bool) {
+        guard canMoveSelectedPages(toBeginning: toBeginning) else { return }
+        let order = selectedPageOrder(toBeginning: toBeginning)
+        let selection = selectedIndices
+        let updatedSelection = Set(order.indices.filter { selection.contains(order[$0]) })
+        startConfirmedPageMutation {
+            await model.reorderPages(
+                recordID: recordID,
+                order: order,
+                label: (toBeginning
+                    ? "Move selected pages to beginning"
+                    : "Move selected pages to end").localizedUI
+            )
+        } onCommitted: {
+            selectedIndices = updatedSelection
+        }
+    }
+
+    private func completePageRangeSelection() {
+        guard let request = pendingPageRange else { return }
+        pendingPageRange = nil
+        guard scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable,
+              let record = model.record(id: recordID),
+              record.contentRevisionID == request.sourceRevisionID,
+              record.profile.pageCount > 0
+        else {
+            presentPageMutationError(
+                "The PDF changed before this action started. Review the updated PDF."
+                    .localizedUI
+            )
+            return
+        }
+        guard !request.indices.isEmpty,
+              request.indices.allSatisfy({ (0..<record.profile.pageCount).contains($0) })
+        else { return }
+        selectedIndices = request.indices
+    }
+
+    private func completePageCopySelection() {
+        guard let pendingPageCopy else { return }
+        self.pendingPageCopy = nil
+        guard scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable,
+              !pendingPageCopy.pageIndices.isEmpty,
+              model.record(id: recordID)?.contentRevisionID
+                == pendingPageCopy.sourceRevisionID,
+              let destination = model.record(
+                id: pendingPageCopy.destinationID
+              ),
+              destination.isWorkingCopy,
+              !destination.profile.isLocked,
+              destination.contentRevisionID
+                == pendingPageCopy.destinationRevisionID
+        else {
+            presentPageMutationError(
+                "The source or destination PDF changed. Review the pages and choose again."
+                    .localizedUI
+            )
+            return
+        }
+        startConfirmedPageMutation {
+            await model.copyPages(
+                from: recordID,
+                indices: pendingPageCopy.pageIndices,
+                to: pendingPageCopy.destinationID
+            )
+        } onCommitted: {
+            selectedIndices.removeAll()
+            isSelecting = false
+        }
+    }
+
+    private func discardPendingPageSelectionHandoffs() {
+        pendingPageRange = nil
+        pendingPageCopy = nil
+        isSelectingRange = false
+        isChoosingDestination = false
+    }
+
+    private func extractSelectedPages() {
+        guard mutationTask == nil,
+              !model.isProcessing(recordID),
+              !selectedIndices.isEmpty,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        pageMutationErrorMessage = nil
+        pageMutationStopRequested = false
+        let indices = selectedIndices
+        let generation = UUID()
+        mutationGeneration = generation
+        mutationTask = Task { @MainActor in
+            defer {
+                if mutationGeneration == generation {
+                    mutationTask = nil
+                    pageMutationStopRequested = false
+                }
+            }
+            guard mutationGeneration == generation,
+                  !Task.isCancelled
+            else { return }
+            let created = await model.extractPages(
+                recordID: recordID,
+                indices: indices
+            )
+            guard mutationGeneration == generation else { return }
+            let wasStopped =
+                pageMutationStopRequested || Task.isCancelled
+            mutationTask = nil
+            pageMutationStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    created == nil
+                        ? "Page extraction stopped"
+                        : "Copy finished before stopping · copy kept in Library"
+                ).localizedUI
+                return
+            }
+            guard let created else {
+                presentPageMutationError(
+                    "The selected pages could not be extracted. Your selection is unchanged."
+                        .localizedUI
+                )
+                return
+            }
+            isSelecting = false
+            selectedIndices.removeAll()
+            onCreated(DocumentRoute(recordID: created.id))
+        }
+    }
+
+    private func presentPageMutationError(_ message: String) {
+        pageMutationErrorMessage = message
+        pageMutationErrorFeedback += 1
     }
 
     private func toggleSelection(_ index: Int) {
@@ -1254,21 +1984,30 @@ struct PageOrganizerView: View {
         }
     }
 
+    private func beginPageSelection() {
+        withAnimation(
+            reduceMotion ? nil : .easeOut(duration: 0.18)
+        ) {
+            isSelecting = true
+            selectedIndices.removeAll()
+        }
+    }
+
+    private func endPageSelection() {
+        withAnimation(
+            reduceMotion ? nil : .easeOut(duration: 0.18)
+        ) {
+            isSelecting = false
+            selectedIndices.removeAll()
+        }
+    }
+
     private var hasCopyDestination: Bool {
         model.documents.contains {
             $0.id != recordID
                 && $0.isWorkingCopy
                 && !$0.profile.isLocked
         }
-    }
-
-    private var pageSelectionTitle: String {
-        AppLocalization.format(
-            "%lld of %lld pages selected",
-            selectedIndices.count,
-            model.record(id: recordID)?.profile.pageCount
-                ?? selectedIndices.count
-        )
     }
 
     private func duplicatedPageIndices(
@@ -1296,8 +2035,44 @@ private struct ReplacementScanReviewSession:
     Identifiable,
     @unchecked Sendable {
     let id = UUID()
-    let images: [UIImage]
-    let initialOptions: ScanProcessingOptions
+    let pages: [ScanPageImage]
+    let fallbackOptions: ScanProcessingOptions
+    let displayName: String
+    let initialPageIndex: Int
+
+    init(
+        images: [UIImage],
+        initialOptions: ScanProcessingOptions,
+        displayName: String
+    ) {
+        pages = images.map {
+            ScanPageImage(
+                image: $0,
+                processingOptions: initialOptions
+            )
+        }
+        fallbackOptions = initialOptions
+        self.displayName = displayName
+        initialPageIndex = 0
+    }
+
+    init(
+        pages: [ScanPageImage],
+        fallbackOptions: ScanProcessingOptions,
+        displayName: String,
+        initialPageIndex: Int = 0
+    ) {
+        self.pages = pages
+        self.fallbackOptions = fallbackOptions
+        self.displayName = displayName
+        self.initialPageIndex = pages.isEmpty
+            ? 0
+            : min(max(0, initialPageIndex), pages.count - 1)
+    }
+}
+
+private struct PendingReviewedReplacementSource {
+    let pages: [ScanPageImage]
     let displayName: String
 }
 
@@ -1326,6 +2101,8 @@ private struct PageReplacementSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let destinationRecordID: UUID
     let destinationPageIndex: Int
@@ -1333,21 +2110,36 @@ private struct PageReplacementSheet: View {
 
     @State private var sourceRecordID: UUID?
     @State private var sourcePageIndex = 0
-    @State private var isReplacing = false
     @State private var sourceMode = SourceMode.library
     @State private var isImportingExternalSource = false
     @State private var isPreparingExternalSource = false
     @State private var externalSource: PDFExternalPageSource?
-    @State private var sourceAssessment:
-        PDFPagePreparationAssessment?
-    @State private var destinationAssessment:
-        PDFPagePreparationAssessment?
+    @State private var sourceGeometryItem:
+        PDFPagePreparationItem?
+    @State private var destinationGeometryItem:
+        PDFPagePreparationItem?
     @State private var externalPreparationTask:
         Task<Void, Never>?
+    @State private var externalPreparationGeneration = UUID()
+    @State private var replacementTask: Task<Void, Never>?
+    @State private var replacementGeneration = UUID()
+    @State private var replacementStopRequested = false
+    @State private var replacementCommittedAfterStop = false
+    @State private var replacementErrorMessage: String?
+    @State private var replacementErrorFeedback = 0
     @State private var photoItem: PhotosPickerItem?
     @State private var isPresentingScanner = false
+    @State private var pendingCameraScanReview:
+        ReplacementScanReviewSession?
     @State private var replacementScanReview:
         ReplacementScanReviewSession?
+    @State private var suspendedReplacementScanReview:
+        ReplacementScanReviewSession?
+    @State private var pendingReviewedReplacementSource:
+        PendingReviewedReplacementSource?
+    @State private var replacementReviewTransitionTask:
+        Task<Void, Never>?
+    @State private var replacementReviewTransitionGeneration = UUID()
 
     var body: some View {
         NavigationStack {
@@ -1365,12 +2157,18 @@ private struct PageReplacementSheet: View {
                         if let geometryNotice {
                             geometryNoticeView(geometryNotice)
                         }
+                        if let replacementErrorMessage {
+                            replacementErrorBanner(
+                                replacementErrorMessage
+                            )
+                        }
                         sourcePageGrid
                     }
                     .frame(maxWidth: 920)
                     .padding(PPSpacing.regular)
                     .frame(maxWidth: .infinity)
                 }
+                .disabled(replacementTask != nil)
 
                 replaceCommand
             }
@@ -1379,11 +2177,33 @@ private struct PageReplacementSheet: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel".localizedUI) {
-                        dismiss()
+                    Button(replacementToolbarTitle) {
+                        if replacementTask != nil {
+                            stopReplacementOperation()
+                        } else if externalPreparationTask != nil
+                                    || isPreparingExternalSource {
+                            stopExternalSourcePreparation()
+                        } else if replacementCommittedAfterStop {
+                            onComplete()
+                        } else {
+                            dismiss()
+                        }
                     }
-                    .disabled(isReplacing)
+                    .disabled(replacementStopRequested)
+                    .keyboardShortcut(.cancelAction)
                 }
+            }
+        }
+        .accessibilityAction(.escape) {
+            if replacementTask != nil {
+                stopReplacementOperation()
+            } else if externalPreparationTask != nil
+                        || isPreparingExternalSource {
+                stopExternalSourcePreparation()
+            } else if replacementCommittedAfterStop {
+                onComplete()
+            } else {
+                dismiss()
             }
         }
         .onAppear {
@@ -1394,20 +2214,50 @@ private struct PageReplacementSheet: View {
                 }
             }
         }
-        .task {
-            destinationAssessment =
-                await model.pagePreparationAssessment(
-                    recordID: destinationRecordID
-                )
-        }
-        .task(id: sourceRecordID) {
-            guard sourceMode == .library,
-                  let sourceRecordID
+        .task(id: destinationGeometryRequestID) {
+            destinationGeometryItem = nil
+            let revision = model.record(id: destinationRecordID)?
+                .contentRevisionID
+            let loaded = await model.pageGeometryItem(
+                recordID: destinationRecordID,
+                pageIndex: destinationPageIndex
+            )
+            guard !Task.isCancelled,
+                  model.record(id: destinationRecordID)?
+                    .contentRevisionID == revision
             else { return }
-            sourceAssessment =
-                await model.pagePreparationAssessment(
-                    recordID: sourceRecordID
+            destinationGeometryItem = loaded
+        }
+        .task(id: sourceGeometryRequestID) {
+            sourceGeometryItem = nil
+            switch sourceMode {
+            case .library:
+                guard let sourceRecordID else { return }
+                let revision = model.record(id: sourceRecordID)?
+                    .contentRevisionID
+                let loaded = await model.pageGeometryItem(
+                    recordID: sourceRecordID,
+                    pageIndex: sourcePageIndex
                 )
+                guard !Task.isCancelled,
+                      sourceMode == .library,
+                      self.sourceRecordID == sourceRecordID,
+                      model.record(id: sourceRecordID)?
+                        .contentRevisionID == revision
+                else { return }
+                sourceGeometryItem = loaded
+            case .files, .photos, .camera:
+                guard let externalSource else { return }
+                let loaded = await model.pageGeometryItem(
+                    source: externalSource,
+                    pageIndex: sourcePageIndex
+                )
+                guard !Task.isCancelled,
+                      sourceMode != .library,
+                      self.externalSource?.id == externalSource.id
+                else { return }
+                sourceGeometryItem = loaded
+            }
         }
         .fileImporter(
             isPresented: $isImportingExternalSource,
@@ -1415,7 +2265,7 @@ private struct PageReplacementSheet: View {
         ) { result in
             guard case .success(let url) = result else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
                 return
             }
@@ -1425,52 +2275,101 @@ private struct PageReplacementSheet: View {
             guard let item else { return }
             preparePhotoSource(item)
         }
-        .fullScreenCover(isPresented: $isPresentingScanner) {
+        .fullScreenCover(
+            isPresented: $isPresentingScanner,
+            onDismiss: presentPendingReplacementScanReview
+        ) {
             DocumentScannerView(
+                maximumPageCount: 24,
                 onComplete: { images in
+                    pendingCameraScanReview =
+                        ReplacementScanReviewSession(
+                            images: images,
+                            initialOptions: .document,
+                            displayName:
+                                "Reviewed Camera Scan".localizedUI
+                        )
                     isPresentingScanner = false
-                    DispatchQueue.main.async {
-                        replacementScanReview =
-                            ReplacementScanReviewSession(
-                                images: images,
-                                initialOptions: .document,
-                                displayName:
-                                    "Reviewed Camera Scan".localizedUI
-                            )
-                    }
                 },
                 onCancel: {
+                    pendingCameraScanReview = nil
                     isPresentingScanner = false
                 },
                 onError: { error in
+                    pendingCameraScanReview = nil
                     isPresentingScanner = false
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
             )
             .ignoresSafeArea()
         }
-        .sheet(item: $replacementScanReview) { session in
+        .sheet(
+            item: $replacementScanReview,
+            onDismiss: completeReviewedReplacementHandoff
+        ) { session in
             ScanReviewView(
-                images: session.images,
-                initialOptions: session.initialOptions,
-                purpose: .replacePage
+                pages: session.pages,
+                fallbackOptions: session.fallbackOptions,
+                purpose: .replacePage,
+                initialPageIndex: session.initialPageIndex,
+                onSuspend: { pages, pageIndex in
+                    suspendedReplacementScanReview =
+                        ReplacementScanReviewSession(
+                            pages: pages,
+                            fallbackOptions: session.fallbackOptions,
+                            displayName: session.displayName,
+                            initialPageIndex: pageIndex
+                        )
+                    replacementScanReview = nil
+                }
             ) { pages in
+                suspendedReplacementScanReview = nil
+                pendingReviewedReplacementSource =
+                    PendingReviewedReplacementSource(
+                        pages: pages,
+                        displayName: session.displayName
+                    )
                 replacementScanReview = nil
-                prepareImageSource(
-                    pages,
-                    displayName: session.displayName
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                presentPendingReplacementScanReview()
+                resumeSuspendedReplacementScanReview()
+                completeReviewedReplacementHandoff()
+            } else if phase == .background {
+                stopProtectedReplacementWork(
+                    preservesSuspendedReview: true
                 )
             }
         }
-        .onDisappear {
-            externalPreparationTask?.cancel()
-            externalPreparationTask = nil
-            replacementScanReview = nil
-            if let externalSource {
-                model.discardExternalPageSource(externalSource)
-            }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            stopProtectedReplacementWork()
         }
-        .interactiveDismissDisabled(isReplacing)
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            presentPendingReplacementScanReview()
+            resumeSuspendedReplacementScanReview()
+            completeReviewedReplacementHandoff()
+        }
+        .onDisappear {
+            stopProtectedReplacementWork()
+            pendingReviewedReplacementSource = nil
+        }
+        .interactiveDismissDisabled(hasActiveReplacementOperation)
+        .sensoryFeedback(
+            .error,
+            trigger: replacementErrorFeedback
+        )
     }
 
     private var candidates: [DocumentRecord] {
@@ -1490,6 +2389,20 @@ private struct PageReplacementSheet: View {
         return model.record(id: sourceRecordID)
     }
 
+    private var destinationGeometryRequestID: String {
+        "\(destinationRecordID.uuidString)-\(destinationPageIndex)-\(model.refreshToken(for: destinationRecordID))"
+    }
+
+    private var sourceGeometryRequestID: String {
+        let revision = sourceRecordID.map {
+            model.refreshToken(for: $0)
+        } ?? 0
+        let sourceID = sourceRecordID?.uuidString
+            ?? externalSource?.id.uuidString
+            ?? "none"
+        return "\(sourceMode.rawValue)-\(sourceID)-\(sourcePageIndex)-\(revision)"
+    }
+
     private var effectiveSourceURL: URL? {
         switch sourceMode {
         case .library:
@@ -1506,15 +2419,6 @@ private struct PageReplacementSheet: View {
             return sourceRecord?.profile.pageCount ?? 0
         case .files, .photos, .camera:
             return externalSource?.pageCount ?? 0
-        }
-    }
-
-    private var effectiveSourceAssessment:
-        PDFPagePreparationAssessment? {
-        switch sourceMode {
-        case .library: return sourceAssessment
-        case .files, .photos, .camera:
-            return externalSource?.assessment
         }
     }
 
@@ -1575,7 +2479,7 @@ private struct PageReplacementSheet: View {
             )
 
             Group {
-                if dynamicTypeSize.isAccessibilitySize {
+                if dynamicTypeSize.ppPrefersExpandedLayout {
                     VStack(
                         alignment: .leading,
                         spacing: PPSpacing.small
@@ -1595,20 +2499,67 @@ private struct PageReplacementSheet: View {
                 }
             }
             .onChange(of: sourceRecordID) { _, _ in
+                replacementErrorMessage = nil
                 sourcePageIndex = 0
-                sourceAssessment = nil
+                sourceGeometryItem = nil
             }
             .onChange(of: sourceMode) { _, _ in
+                replacementErrorMessage = nil
+                externalPreparationGeneration = UUID()
                 externalPreparationTask?.cancel()
                 externalPreparationTask = nil
                 discardPreparedSource()
                 isPreparingExternalSource = false
+                replacementScanReview = nil
+                suspendedReplacementScanReview = nil
+                pendingCameraScanReview = nil
+                pendingReviewedReplacementSource = nil
                 if sourceMode != .photos {
                     photoItem = nil
                 }
                 sourcePageIndex = 0
+                sourceGeometryItem = nil
+            }
+            if sourceMode == .library, candidates.isEmpty {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.small) {
+                        unavailableLibrarySourceMessage
+                        Spacer(minLength: PPSpacing.small)
+                        chooseReplacementFileButton
+                    }
+                    VStack(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    ) {
+                        unavailableLibrarySourceMessage
+                        chooseReplacementFileButton
+                    }
+                }
             }
         }
+    }
+
+    private var unavailableLibrarySourceMessage: some View {
+        Label(
+            "No other unlocked private copy is available.",
+            systemImage: "lock.doc"
+        )
+        .font(.caption)
+        .foregroundStyle(PPColor.textSecondary)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var chooseReplacementFileButton: some View {
+        Button {
+            sourceMode = .files
+        } label: {
+            Label("Choose from Files", systemImage: "folder")
+        }
+        .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
+        .accessibilityHint(
+            "Switches the replacement source to a temporary PDF from Files."
+                .localizedUI
+        )
     }
 
     private var sourceSelectionControl: some View {
@@ -1643,20 +2594,20 @@ private struct PageReplacementSheet: View {
                 .disabled(isPreparingExternalSource)
                 Spacer(minLength: 0)
                 if isPreparingExternalSource {
-                    ProgressView()
-                        .controlSize(.small)
+                    sourcePreparationIndicator
                 } else if let externalSource {
                     sourceSummary(externalSource)
                 }
             case .photos:
+                let photoButtonTitle = externalSource == nil
+                    ? "Choose Photo"
+                    : "Choose Another"
                 PhotosPicker(
                     selection: $photoItem,
                     matching: .images
                 ) {
                     Label(
-                        externalSource == nil
-                            ? "Choose Photo"
-                            : "Choose Another",
+                        photoButtonTitle,
                         systemImage: "photo"
                     )
                 }
@@ -1695,7 +2646,9 @@ private struct PageReplacementSheet: View {
             Text(source.displayName)
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textPrimary)
-                .lineLimit(1)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                )
             Text(
                 "\(source.pageCount) pages · \(source.formattedSize)"
             )
@@ -1706,7 +2659,7 @@ private struct PageReplacementSheet: View {
 
     private var sourceModeControl: some View {
         Group {
-            if dynamicTypeSize.isAccessibilitySize {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
                 Menu {
                     ForEach(SourceMode.allCases) { mode in
                         Button {
@@ -1745,7 +2698,7 @@ private struct PageReplacementSheet: View {
             }
         }
         .frame(
-            maxWidth: dynamicTypeSize.isAccessibilitySize
+            maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
                 ? .infinity
                 : 260
         )
@@ -1939,6 +2892,7 @@ private struct PageReplacementSheet: View {
                         id: \.self
                     ) { index in
                         Button {
+                            replacementErrorMessage = nil
                             sourcePageIndex = index
                         } label: {
                             VStack(spacing: 5) {
@@ -1995,9 +2949,37 @@ private struct PageReplacementSheet: View {
                                             : 0.6
                                     )
                             }
+                            .overlay(alignment: .topTrailing) {
+                                if index == sourcePageIndex {
+                                    Image(
+                                        systemName: "checkmark.circle.fill"
+                                    )
+                                    .font(.body.weight(.semibold))
+                                    .foregroundStyle(PPColor.mint)
+                                    .padding(PPSpacing.xSmall)
+                                    .accessibilityHidden(true)
+                                }
+                            }
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .accessibilityLabel(
+                            AppLocalization.format(
+                                "Replacement source page %lld",
+                                index + 1
+                            )
+                        )
+                        .accessibilityValue(
+                            (
+                                index == sourcePageIndex
+                                    ? "Selected"
+                                    : "Not selected"
+                            ).localizedUI
+                        )
+                        .accessibilityHint(
+                            "Uses this page in the replacement preview."
+                                .localizedUI
+                        )
                     }
                 }
             }
@@ -2024,16 +3006,8 @@ private struct PageReplacementSheet: View {
     }
 
     private var geometryNotice: GeometryNotice? {
-        guard let destination = destinationAssessment?.pages.first(
-            where: {
-                $0.pageIndex == destinationPageIndex
-            }
-        ),
-              let source = effectiveSourceAssessment?.pages.first(
-                where: {
-                    $0.pageIndex == sourcePageIndex
-                }
-              )
+        guard let destination = destinationGeometryItem,
+              let source = sourceGeometryItem
         else { return nil }
         let widthDelta = abs(
             destination.widthPoints - source.widthPoints
@@ -2096,60 +3070,70 @@ private struct PageReplacementSheet: View {
         }
     }
 
+    private func replacementErrorBanner(
+        _ message: String
+    ) -> some View {
+        HStack(alignment: .top, spacing: PPSpacing.small) {
+            Image(systemName: "exclamationmark.circle")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.rose)
+                .frame(width: 22)
+            Text(message.localizedUI)
+                .font(.caption)
+                .foregroundStyle(PPColor.rose)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            Button {
+                replacementErrorMessage = nil
+            } label: {
+                Image(systemName: "xmark")
+                    .frame(width: 44, height: 44)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(PPColor.textSecondary)
+            .accessibilityLabel(
+                "Dismiss replacement error".localizedUI
+            )
+        }
+        .frame(minHeight: 44)
+        .accessibilityIdentifier("pageReplacementError")
+    }
+
     private var replaceCommand: some View {
         Button {
-            isReplacing = true
-            Task {
-                let succeeded: Bool
-                switch sourceMode {
-                case .library:
-                    guard let sourceRecordID else {
-                        isReplacing = false
-                        return
-                    }
-                    succeeded = await model.replacePage(
-                        recordID: destinationRecordID,
-                        index: destinationPageIndex,
-                        from: sourceRecordID,
-                        sourceIndex: sourcePageIndex
-                    )
-                case .files, .photos, .camera:
-                    guard let externalSource else {
-                        isReplacing = false
-                        return
-                    }
-                    succeeded = await model.replacePage(
-                        recordID: destinationRecordID,
-                        index: destinationPageIndex,
-                        from: externalSource,
-                        sourceIndex: sourcePageIndex
-                    )
-                }
-                isReplacing = false
-                guard succeeded else { return }
-                dismiss()
+            if replacementTask != nil {
+                stopReplacementOperation()
+            } else if replacementCommittedAfterStop {
                 onComplete()
+            } else {
+                replacePage()
             }
         } label: {
             Label(
-                isReplacing
-                    ? "Replacing page"
-                    : AppLocalization.format(
-                        "Replace with page %lld",
-                        sourcePageIndex + 1
-                    ),
-                systemImage: isReplacing
-                    ? "hourglass"
-                    : "arrow.triangle.2.circlepath"
+                replacementCommandTitle,
+                systemImage: replacementCommittedAfterStop
+                    ? "checkmark"
+                    : replacementTask != nil
+                        ? "xmark.circle.fill"
+                        : "arrow.triangle.2.circlepath"
             )
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(PPPrimaryButtonStyle())
         .disabled(
-            effectiveSourceURL == nil
-                || isReplacing
-                || isPreparingExternalSource
+            replacementStopRequested
+                || (
+                    replacementTask == nil
+                        && (
+                            effectiveSourceURL == nil
+                                || isPreparingExternalSource
+                                || model.isProcessing(
+                                    destinationRecordID
+                                )
+                        )
+                )
         )
+        .accessibilityHint(replacementCommandHint)
         .padding(PPSpacing.regular)
         .background(.bar)
         .overlay(alignment: .top) {
@@ -2159,15 +3143,159 @@ private struct PageReplacementSheet: View {
         }
     }
 
-    private func prepareExternalSource(_ url: URL) {
+    private var replacementCommandTitle: String {
+        if replacementStopRequested {
+            return "Stopping replacement".localizedUI
+        }
+        if replacementCommittedAfterStop {
+            return "Done".localizedUI
+        }
+        if replacementTask != nil {
+            return "Stop replacing".localizedUI
+        }
+        return AppLocalization.format(
+                        "Replace with page %lld",
+                        sourcePageIndex + 1
+        )
+    }
+
+    private var replacementCommandHint: String {
+        if replacementStopRequested {
+            return "Waiting for the current replacement step to stop."
+                .localizedUI
+        }
+        if replacementCommittedAfterStop {
+            return "Returns to the updated working copy.".localizedUI
+        }
+        if replacementTask != nil {
+            return "Stops before the prepared page is committed"
+                .localizedUI
+        }
+        return "Replaces only this private working copy"
+            .localizedUI
+    }
+
+    private var replacementToolbarTitle: String {
+        if replacementStopRequested {
+            return "Stopping".localizedUI
+        }
+        if replacementCommittedAfterStop {
+            return "Done".localizedUI
+        }
+        if replacementTask != nil
+            || externalPreparationTask != nil
+            || isPreparingExternalSource {
+            return "Stop".localizedUI
+        }
+        return "Cancel".localizedUI
+    }
+
+    private var hasActiveReplacementOperation: Bool {
+        replacementTask != nil
+            || externalPreparationTask != nil
+            || isPreparingExternalSource
+    }
+
+    private func replacePage() {
+        guard replacementTask == nil,
+              !replacementCommittedAfterStop,
+              !model.isProcessing(destinationRecordID),
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        replacementErrorMessage = nil
+        replacementStopRequested = false
+        replacementCommittedAfterStop = false
+        let generation = UUID()
+        replacementGeneration = generation
+        replacementTask = Task { @MainActor in
+            defer {
+                if replacementGeneration == generation {
+                    replacementTask = nil
+                    replacementStopRequested = false
+                }
+            }
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                switch sourceMode {
+                case .library:
+                    guard let sourceRecordID else { return false }
+                    return await model.replacePage(
+                        recordID: destinationRecordID,
+                        index: destinationPageIndex,
+                        from: sourceRecordID,
+                        sourceIndex: sourcePageIndex
+                    )
+                case .files, .photos, .camera:
+                    guard let externalSource else { return false }
+                    return await model.replacePage(
+                        recordID: destinationRecordID,
+                        index: destinationPageIndex,
+                        from: externalSource,
+                        sourceIndex: sourcePageIndex
+                    )
+                }
+            }
+            guard replacementGeneration == generation else { return }
+            let wasStopped =
+                replacementStopRequested || Task.isCancelled
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    succeeded
+                        ? "Page replacement finished before stopping · change kept"
+                        : "Page replacement stopped · working copy unchanged"
+                ).localizedUI
+                replacementCommittedAfterStop = succeeded
+                return
+            }
+            guard succeeded else {
+                replacementErrorMessage =
+                    "The page was not replaced. Review the source and try again."
+                        .localizedUI
+                replacementErrorFeedback += 1
+                return
+            }
+            onComplete()
+        }
+    }
+
+    private func stopReplacementOperation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            replacementGeneration = UUID()
+        } else if replacementTask != nil {
+            replacementStopRequested = true
+        }
+        replacementTask?.cancel()
+        if invalidateResult {
+            replacementTask = nil
+            replacementStopRequested = false
+        }
+    }
+
+    private func stopExternalSourcePreparation() {
+        externalPreparationGeneration = UUID()
         externalPreparationTask?.cancel()
-        isPreparingExternalSource = true
-        discardPreparedSource()
-        externalPreparationTask = Task {
+        externalPreparationTask = nil
+        isPreparingExternalSource = false
+        photoItem = nil
+        replacementErrorMessage = nil
+        model[noticeFor: paperPathSceneID] = "Source preparation stopped".localizedUI
+        resumeSuspendedReplacementScanReview()
+    }
+
+    private func prepareExternalSource(_ url: URL) {
+        let generation = beginExternalPreparation()
+        externalPreparationTask = Task { @MainActor in
             let prepared = await model.prepareExternalPageSource(
                 from: url
             )
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled,
+                  externalPreparationGeneration == generation,
+                  sourceMode == .files
+            else {
                 if let prepared {
                     model.discardExternalPageSource(prepared)
                 }
@@ -2175,16 +3303,15 @@ private struct PageReplacementSheet: View {
             }
             externalSource = prepared
             sourcePageIndex = 0
-            isPreparingExternalSource = false
-            externalPreparationTask = nil
+            sourceGeometryItem = prepared?.assessment.pages.first
+            finishExternalPreparation(generation)
         }
     }
 
     @ViewBuilder
     private var sourcePreparationStatus: some View {
         if isPreparingExternalSource {
-            ProgressView()
-                .controlSize(.small)
+            sourcePreparationIndicator
         } else if let externalSource {
             VStack(alignment: .trailing, spacing: 1) {
                 Text(externalSource.displayName)
@@ -2200,37 +3327,72 @@ private struct PageReplacementSheet: View {
         }
     }
 
+    private var sourcePreparationIndicator: some View {
+        HStack(spacing: PPSpacing.xSmall) {
+            ProgressView()
+                .controlSize(.small)
+            Text("Preparing source".localizedUI)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(PPColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.updatesFrequently)
+    }
+
     private func preparePhotoSource(_ item: PhotosPickerItem) {
-        externalPreparationTask?.cancel()
-        isPreparingExternalSource = true
-        discardPreparedSource()
-        externalPreparationTask = Task {
-            guard let data = try? await item.loadTransferable(
-                type: Data.self
-            ),
-                  data.count <= 32 * 1_024 * 1_024,
-                  let image = await Self.downsampledImage(from: data)
+        let generation = beginExternalPreparation()
+        externalPreparationTask = Task { @MainActor in
+            guard let transfer = try? await item.loadTransferable(
+                type: ProtectedPhotoTransfer.self
+            )
             else {
-                guard !Task.isCancelled else { return }
-                isPreparingExternalSource = false
-                externalPreparationTask = nil
+                guard !Task.isCancelled,
+                      externalPreparationGeneration == generation,
+                      sourceMode == .photos
+                else { return }
                 photoItem = nil
-                model.present(PaperPathError.unreadableImage)
+                finishExternalPreparation(generation)
+                model.present(
+                    PaperPathError.unreadableImage,
+                    in: paperPathSceneID
+                )
                 return
             }
-            guard !Task.isCancelled else { return }
-            isPreparingExternalSource = false
-            photoItem = nil
-            try? await Task.sleep(for: .milliseconds(180))
+            defer { transfer.discard() }
+            guard transfer.byteCount <= 32 * 1_024 * 1_024,
+                  let image = await Self.downsampledImage(
+                    from: transfer.fileURL
+                  )
+            else {
+                guard !Task.isCancelled,
+                      externalPreparationGeneration == generation,
+                      sourceMode == .photos
+                else { return }
+                photoItem = nil
+                finishExternalPreparation(generation)
+                model.present(
+                    PaperPathError.unreadableImage,
+                    in: paperPathSceneID
+                )
+                return
+            }
             guard !Task.isCancelled,
+                  externalPreparationGeneration == generation,
                   sourceMode == .photos
             else { return }
-            externalPreparationTask = nil
+            isPreparingExternalSource = false
+            photoItem = nil
+            await Task.yield()
+            guard !Task.isCancelled,
+                  externalPreparationGeneration == generation,
+                  sourceMode == .photos
+            else { return }
             replacementScanReview = ReplacementScanReviewSession(
                 images: [image],
                 initialOptions: .original,
                 displayName: "Reviewed Photo Page".localizedUI
             )
+            finishExternalPreparation(generation)
         }
     }
 
@@ -2238,25 +3400,153 @@ private struct PageReplacementSheet: View {
         _ pages: [ScanPageImage],
         displayName: String
     ) {
-        externalPreparationTask?.cancel()
-        isPreparingExternalSource = true
-        discardPreparedSource()
-        externalPreparationTask = Task {
+        let expectedMode = sourceMode
+        guard expectedMode == .photos || expectedMode == .camera else {
+            return
+        }
+        let generation = beginExternalPreparation()
+        externalPreparationTask = Task { @MainActor in
             let prepared = await model.prepareImagePageSource(
                 pages: pages,
                 displayName: displayName
             )
-            guard !Task.isCancelled else {
+            guard !Task.isCancelled,
+                  externalPreparationGeneration == generation,
+                  sourceMode == expectedMode
+            else {
                 if let prepared {
                     model.discardExternalPageSource(prepared)
                 }
                 return
             }
+            guard let prepared else {
+                finishExternalPreparation(generation)
+                resumeSuspendedReplacementScanReview()
+                return
+            }
             externalSource = prepared
             sourcePageIndex = 0
-            isPreparingExternalSource = false
-            externalPreparationTask = nil
+            sourceGeometryItem = prepared.assessment.pages.first
+            suspendedReplacementScanReview = nil
+            finishExternalPreparation(generation)
         }
+    }
+
+    private func presentPendingReplacementScanReview() {
+        guard let session = pendingCameraScanReview,
+              replacementScanReview == nil,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable,
+              sourceMode == .camera
+        else { return }
+        let sessionID = session.id
+        replacementReviewTransitionTask?.cancel()
+        let generation = UUID()
+        replacementReviewTransitionGeneration = generation
+        replacementReviewTransitionTask = Task { @MainActor in
+            defer {
+                if replacementReviewTransitionGeneration == generation {
+                    replacementReviewTransitionTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  replacementReviewTransitionGeneration == generation,
+                  pendingCameraScanReview?.id == sessionID,
+                  replacementScanReview == nil,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  sourceMode == .camera
+            else { return }
+            pendingCameraScanReview = nil
+            replacementScanReview = session
+        }
+    }
+
+    private func resumeSuspendedReplacementScanReview() {
+        guard let session = suspendedReplacementScanReview,
+              replacementScanReview == nil,
+              pendingReviewedReplacementSource == nil,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable,
+              sourceMode == .photos || sourceMode == .camera
+        else { return }
+        let sessionID = session.id
+        replacementReviewTransitionTask?.cancel()
+        let generation = UUID()
+        replacementReviewTransitionGeneration = generation
+        replacementReviewTransitionTask = Task { @MainActor in
+            defer {
+                if replacementReviewTransitionGeneration == generation {
+                    replacementReviewTransitionTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  replacementReviewTransitionGeneration == generation,
+                  suspendedReplacementScanReview?.id == sessionID,
+                  replacementScanReview == nil,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  sourceMode == .photos || sourceMode == .camera
+            else { return }
+            suspendedReplacementScanReview = nil
+            replacementScanReview = session
+            model[noticeFor: paperPathSceneID] =
+                "Replacement review restored".localizedUI
+        }
+    }
+
+    private func completeReviewedReplacementHandoff() {
+        guard let source = pendingReviewedReplacementSource,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        replacementReviewTransitionTask?.cancel()
+        let generation = UUID()
+        replacementReviewTransitionGeneration = generation
+        replacementReviewTransitionTask = Task { @MainActor in
+            defer {
+                if replacementReviewTransitionGeneration == generation {
+                    replacementReviewTransitionTask = nil
+                }
+            }
+            await Task.yield()
+            guard !Task.isCancelled,
+                  replacementReviewTransitionGeneration == generation,
+                  pendingReviewedReplacementSource != nil,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            pendingReviewedReplacementSource = nil
+            suspendedReplacementScanReview =
+                ReplacementScanReviewSession(
+                    pages: source.pages,
+                    fallbackOptions: .document,
+                    displayName: source.displayName
+                )
+            prepareImageSource(
+                source.pages,
+                displayName: source.displayName
+            )
+        }
+    }
+
+    private func beginExternalPreparation() -> UUID {
+        externalPreparationTask?.cancel()
+        let generation = UUID()
+        externalPreparationGeneration = generation
+        isPreparingExternalSource = true
+        discardPreparedSource()
+        return generation
+    }
+
+    private func finishExternalPreparation(_ generation: UUID) {
+        guard externalPreparationGeneration == generation else {
+            return
+        }
+        isPreparingExternalSource = false
+        externalPreparationTask = nil
     }
 
     private func discardPreparedSource() {
@@ -2264,31 +3554,108 @@ private struct PageReplacementSheet: View {
             model.discardExternalPageSource(externalSource)
             self.externalSource = nil
         }
+        sourceGeometryItem = nil
+    }
+
+    private func stopProtectedReplacementWork(
+        preservesSuspendedReview: Bool = false
+    ) {
+        replacementReviewTransitionGeneration = UUID()
+        replacementReviewTransitionTask?.cancel()
+        replacementReviewTransitionTask = nil
+        externalPreparationGeneration = UUID()
+        stopReplacementOperation(invalidateResult: true)
+        externalPreparationTask?.cancel()
+        externalPreparationTask = nil
+        isPreparingExternalSource = false
+        replacementStopRequested = false
+        replacementCommittedAfterStop = false
+        replacementErrorMessage = nil
+        isImportingExternalSource = false
+        isPresentingScanner = false
+        if !preservesSuspendedReview {
+            pendingCameraScanReview = nil
+            suspendedReplacementScanReview = nil
+            pendingReviewedReplacementSource = nil
+            replacementScanReview = nil
+        }
+        photoItem = nil
+        discardPreparedSource()
     }
 
     private func beginReplacementScan() {
         guard VNDocumentCameraViewController.isSupported else {
-            model.present(PaperPathError.cameraUnavailable)
+            model.present(
+                PaperPathError.cameraUnavailable,
+                in: paperPathSceneID
+            )
             return
         }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .denied, .restricted:
-            model.presentCameraPermissionDenied()
+            model.presentCameraPermissionDenied(
+                in: paperPathSceneID
+            )
         case .authorized, .notDetermined:
             isPresentingScanner = true
         @unknown default:
-            model.present(PaperPathError.cameraUnavailable)
+            model.present(
+                PaperPathError.cameraUnavailable,
+                in: paperPathSceneID
+            )
         }
     }
 
     nonisolated private static func downsampledImage(
-        from data: Data
+        from fileURL: URL
     ) async -> UIImage? {
-        await Task.detached(priority: .userInitiated) {
-            guard let source = CGImageSourceCreateWithData(
-                data as CFData,
-                nil
-            ) else { return nil }
+        let worker = Task.detached(
+            priority: .userInitiated
+        ) { () throws -> UIImage? in
+            try Task.checkCancellation()
+            let values = try? fileURL.resourceValues(
+                forKeys: [
+                    .fileSizeKey,
+                    .isRegularFileKey,
+                    .isSymbolicLinkKey
+                ]
+            )
+            guard values?.isRegularFile == true,
+                  values?.isSymbolicLink != true,
+                  let fileSize = values?.fileSize,
+                  fileSize > 0,
+                  fileSize <= 32 * 1_024 * 1_024,
+                  let source = CGImageSourceCreateWithURL(
+                      fileURL as CFURL,
+                      [
+                          kCGImageSourceShouldCache: false
+                      ] as CFDictionary
+                  ),
+                  CGImageSourceGetCount(source) == 1,
+                  let properties =
+                    CGImageSourceCopyPropertiesAtIndex(
+                        source,
+                        0,
+                        nil
+                    ) as? [CFString: Any],
+                  let width = (
+                      properties[kCGImagePropertyPixelWidth]
+                        as? NSNumber
+                  )?.int64Value,
+                  let height = (
+                      properties[kCGImagePropertyPixelHeight]
+                        as? NSNumber
+                  )?.int64Value,
+                  width > 0,
+                  height > 0,
+                  width <= 100_000,
+                  height <= 100_000
+            else { return nil }
+            let pixels = width.multipliedReportingOverflow(by: height)
+            guard !pixels.overflow,
+                  pixels.partialValue <= 120_000_000
+            else { return nil }
+            try Task.checkCancellation()
             let options: [CFString: Any] = [
                 kCGImageSourceCreateThumbnailFromImageAlways: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
@@ -2300,34 +3667,61 @@ private struct PageReplacementSheet: View {
                 0,
                 options as CFDictionary
             ) else { return nil }
+            try Task.checkCancellation()
             return UIImage(cgImage: cgImage)
-        }.value
+        }
+        return try? await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
     }
 }
 
 private struct PageRuleWorkbench: View {
-    private enum NumberRule: String, CaseIterable, Identifiable {
+    private enum NumberRule:
+        String,
+        CaseIterable,
+        Identifiable,
+        Sendable {
         case all
         case odd
         case even
 
         var id: String { rawValue }
-        var title: String { rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .all: return "All"
+            case .odd: return "Odd"
+            case .even: return "Even"
+            }
+        }
     }
 
     private enum OrientationRule:
         String,
         CaseIterable,
-        Identifiable {
+        Identifiable,
+        Sendable {
         case any
         case portrait
         case landscape
 
         var id: String { rawValue }
-        var title: String { rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .any: return "Any"
+            case .portrait: return "Portrait"
+            case .landscape: return "Landscape"
+            }
+        }
     }
 
-    private enum PaperRule: String, CaseIterable, Identifiable {
+    private enum PaperRule:
+        String,
+        CaseIterable,
+        Identifiable,
+        Sendable {
         case any
         case a4
         case letter
@@ -2348,9 +3742,11 @@ private struct PageRuleWorkbench: View {
         }
     }
 
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
 
     let recordID: UUID
     let currentSelection: Set<Int>
@@ -2362,7 +3758,15 @@ private struct PageRuleWorkbench: View {
     @State private var orientationRule = OrientationRule.any
     @State private var paperRule = PaperRule.any
     @State private var isLoading = false
+    @State private var isCalculatingMatches = false
     @State private var analysisTask: Task<Void, Never>?
+    @State private var matchingIndices: Set<Int> = []
+    @State private var matchTask: Task<Void, Never>?
+    @State private var matchGeneration = UUID()
+    @State private var analysisGeneration = UUID()
+    @State private var ruleRevisionID: UUID?
+    @State private var assessmentErrorMessage: String?
+    @State private var assessmentErrorFeedback = 0
 
     var body: some View {
         NavigationStack {
@@ -2391,23 +3795,90 @@ private struct PageRuleWorkbench: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Select matches".localizedUI) {
-                        onSelect(matchingIndices)
+                        commitSelection()
                     }
-                    .disabled(matchingIndices.isEmpty)
+                    .disabled(
+                        matchingIndices.isEmpty
+                            || isCalculatingMatches
+                            || !rulesTargetCurrentRevision
+                    )
                 }
             }
         }
         .onAppear {
             startAssessment()
+            scheduleMatchCalculation()
+        }
+        .onChange(of: numberRule) { _, _ in
+            scheduleMatchCalculation()
+        }
+        .onChange(of: orientationRule) { _, _ in
+            scheduleMatchCalculation()
+        }
+        .onChange(of: paperRule) { _, _ in
+            scheduleMatchCalculation()
+        }
+        .onChange(of: pageCount) { _, _ in
+            scheduleMatchCalculation()
+        }
+        .onChange(of: contentRevisionID) { _, _ in
+            interruptRuleAssessment()
+            guard scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            startAssessment()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active {
+                if assessment == nil, analysisTask == nil {
+                    startAssessment()
+                } else if analysisTask == nil {
+                    scheduleMatchCalculation()
+                }
+            } else if phase == .background {
+                interruptRuleAssessment()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptRuleAssessment()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            if assessment == nil, analysisTask == nil {
+                startAssessment()
+            } else if analysisTask == nil {
+                scheduleMatchCalculation()
+            }
         }
         .onDisappear {
-            analysisTask?.cancel()
-            analysisTask = nil
+            interruptRuleAssessment()
         }
+        .sensoryFeedback(
+            .error,
+            trigger: assessmentErrorFeedback
+        )
     }
 
     private var pageCount: Int {
         model.record(id: recordID)?.profile.pageCount ?? 0
+    }
+
+    private var contentRevisionID: UUID? {
+        model.record(id: recordID)?.contentRevisionID
+    }
+
+    private var rulesTargetCurrentRevision: Bool {
+        guard let ruleRevisionID else { return false }
+        return contentRevisionID == ruleRevisionID
     }
 
     private var ruleHeader: some View {
@@ -2479,24 +3950,52 @@ private struct PageRuleWorkbench: View {
 
     private var numberRuleControl: some View {
         ruleControl("PAGE NUMBER") {
-            Picker("Page number", selection: $numberRule) {
+            let picker = Picker(
+                "Page number",
+                selection: $numberRule
+            ) {
                 ForEach(NumberRule.allCases) { rule in
                     Text(rule.title.localizedUI).tag(rule)
                 }
             }
-            .pickerStyle(.segmented)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker.pickerStyle(.segmented)
+            }
         }
     }
 
     private var orientationRuleControl: some View {
         ruleControl("ORIENTATION") {
-            Picker("Orientation", selection: $orientationRule) {
+            let picker = Picker(
+                "Orientation",
+                selection: $orientationRule
+            ) {
                 ForEach(OrientationRule.allCases) { rule in
                     Text(rule.title.localizedUI).tag(rule)
                 }
             }
-            .pickerStyle(.segmented)
-            .disabled(assessment == nil)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+                    .disabled(assessment == nil)
+            } else {
+                picker
+                    .pickerStyle(.segmented)
+                    .disabled(assessment == nil)
+            }
         }
     }
 
@@ -2522,7 +4021,7 @@ private struct PageRuleWorkbench: View {
             content()
         }
         .frame(
-            minWidth: dynamicTypeSize.isAccessibilitySize
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout
                 ? nil
                 : 190,
             maxWidth: .infinity,
@@ -2534,7 +4033,7 @@ private struct PageRuleWorkbench: View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "MATCH PREVIEW",
-                detail: isLoading
+                detail: isLoading || isCalculatingMatches
                     ? "Reading page geometry on device"
                     : "Page numbers before any action",
                 symbol: "number",
@@ -2542,7 +4041,7 @@ private struct PageRuleWorkbench: View {
                 tint: PPColor.cyan
             )
 
-            if isLoading {
+            if isLoading || isCalculatingMatches {
                 HStack(spacing: PPSpacing.small) {
                     ProgressView()
                         .controlSize(.small)
@@ -2551,6 +4050,34 @@ private struct PageRuleWorkbench: View {
                         .foregroundStyle(PPColor.textSecondary)
                 }
                 .frame(minHeight: 42)
+            } else if let assessmentErrorMessage {
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
+                    Label(
+                        assessmentErrorMessage.localizedUI,
+                        systemImage: "exclamationmark.circle"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(PPColor.rose)
+                    .fixedSize(horizontal: false, vertical: true)
+                    Button {
+                        startAssessment()
+                    } label: {
+                        Label(
+                            "Inspect Page Geometry Again",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(
+                        PPQuietButtonStyle(tint: PPColor.cyan)
+                    )
+                    .accessibilityIdentifier(
+                        "retryPageRuleAssessment"
+                    )
+                }
+                .padding(.vertical, PPSpacing.small)
             } else {
                 Text(matchSummary)
                     .font(.caption.monospacedDigit())
@@ -2595,7 +4122,7 @@ private struct PageRuleWorkbench: View {
                     detail: "Last page becomes first",
                     symbol: "arrow.up.arrow.down"
                 ) {
-                    onReorder(
+                    commitReorder(
                         Array((0..<pageCount).reversed()),
                         "Reverse page order".localizedUI
                     )
@@ -2605,8 +4132,8 @@ private struct PageRuleWorkbench: View {
                     detail: "1, 3, 5… then 2, 4, 6…",
                     symbol: "list.number"
                 ) {
-                    onReorder(
-                        oddIndices + evenIndices,
+                    commitReorder(
+                        groupedPageOrder(oddFirst: true),
                         "Group odd and even pages".localizedUI
                     )
                 }
@@ -2615,8 +4142,8 @@ private struct PageRuleWorkbench: View {
                     detail: "2, 4, 6… then 1, 3, 5…",
                     symbol: "list.number.rtl"
                 ) {
-                    onReorder(
-                        evenIndices + oddIndices,
+                    commitReorder(
+                        groupedPageOrder(oddFirst: false),
                         "Group even and odd pages".localizedUI
                     )
                 }
@@ -2625,7 +4152,7 @@ private struct PageRuleWorkbench: View {
                     detail: "Alternate first and second stacks",
                     symbol: "square.2.layers.3d"
                 ) {
-                    onReorder(
+                    commitReorder(
                         interleavedHalfOrder,
                         "Interleave page halves".localizedUI
                     )
@@ -2669,107 +4196,261 @@ private struct PageRuleWorkbench: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(pageCount < 2 || model.isProcessing(recordID))
+        .disabled(
+            pageCount < 2
+                || model.isProcessing(recordID)
+                || !rulesTargetCurrentRevision
+        )
     }
 
-    private var matchingIndices: Set<Int> {
-        Set((0..<pageCount).filter { index in
-            guard numberMatches(index) else { return false }
-            guard orientationRule != .any || paperRule != .any else {
-                return true
+    private func commitSelection() {
+        guard rulesTargetCurrentRevision else {
+            refreshRulesForUpdatedPDF()
+            return
+        }
+        onSelect(matchingIndices)
+    }
+
+    private func commitReorder(
+        _ order: [Int],
+        _ label: String
+    ) {
+        guard rulesTargetCurrentRevision else {
+            refreshRulesForUpdatedPDF()
+            return
+        }
+        onReorder(order, label)
+    }
+
+    private func refreshRulesForUpdatedPDF() {
+        model[noticeFor: paperPathSceneID] =
+            "The PDF changed before this action started. Review the updated PDF."
+                .localizedUI
+        startAssessment()
+    }
+
+    nonisolated private static func matchingIndices(
+        pageCount: Int,
+        pages: [PDFPagePreparationItem],
+        numberRule: NumberRule,
+        orientationRule: OrientationRule,
+        paperRule: PaperRule
+    ) -> Set<Int> {
+        let needsGeometry = orientationRule != .any
+            || paperRule != .any
+        var itemsByPage: [Int: PDFPagePreparationItem] = [:]
+        if needsGeometry {
+            itemsByPage.reserveCapacity(pages.count)
+            for (offset, item) in pages.enumerated() {
+                if offset.isMultiple(of: 256),
+                   Task.isCancelled {
+                    return []
+                }
+                itemsByPage[item.pageIndex] = item
             }
-            guard let item = assessment?.pages.first(where: {
-                $0.pageIndex == index
-            }) else { return false }
-            return orientationMatches(item) && paperMatches(item)
-        })
-    }
-
-    private func numberMatches(_ index: Int) -> Bool {
-        switch numberRule {
-        case .all: return true
-        case .odd: return index.isMultiple(of: 2)
-        case .even: return !index.isMultiple(of: 2)
         }
-    }
-
-    private func orientationMatches(
-        _ item: PDFPagePreparationItem
-    ) -> Bool {
-        switch orientationRule {
-        case .any: return true
-        case .portrait: return !item.isLandscape
-        case .landscape: return item.isLandscape
+        var matches = Set<Int>()
+        matches.reserveCapacity(
+            numberRule == .all
+                ? pageCount
+                : (pageCount + 1) / 2
+        )
+        for index in 0..<pageCount {
+            if index.isMultiple(of: 256),
+               Task.isCancelled {
+                return []
+            }
+            let numberMatches: Bool
+            switch numberRule {
+            case .all: numberMatches = true
+            case .odd: numberMatches = index.isMultiple(of: 2)
+            case .even: numberMatches = !index.isMultiple(of: 2)
+            }
+            guard numberMatches else { continue }
+            guard needsGeometry else {
+                matches.insert(index)
+                continue
+            }
+            guard let item = itemsByPage[index] else { continue }
+            let orientationMatches: Bool
+            switch orientationRule {
+            case .any: orientationMatches = true
+            case .portrait: orientationMatches = !item.isLandscape
+            case .landscape: orientationMatches = item.isLandscape
+            }
+            let paperMatches: Bool
+            switch paperRule {
+            case .any: paperMatches = true
+            case .a4: paperMatches = item.paperClass == .a4
+            case .letter: paperMatches = item.paperClass == .letter
+            case .legal: paperMatches = item.paperClass == .legal
+            case .square: paperMatches = item.paperClass == .square
+            case .custom: paperMatches = item.paperClass == .custom
+            }
+            if orientationMatches && paperMatches {
+                matches.insert(index)
+            }
         }
-    }
-
-    private func paperMatches(
-        _ item: PDFPagePreparationItem
-    ) -> Bool {
-        switch paperRule {
-        case .any: return true
-        case .a4: return item.paperClass == .a4
-        case .letter: return item.paperClass == .letter
-        case .legal: return item.paperClass == .legal
-        case .square: return item.paperClass == .square
-        case .custom: return item.paperClass == .custom
-        }
+        return matches
     }
 
     private var matchSummary: String {
-        let pages = matchingIndices.sorted()
-        guard !pages.isEmpty else {
+        guard !matchingIndices.isEmpty else {
             return "No pages match these rules.".localizedUI
         }
-        let visible = pages.prefix(48).map {
-            String($0 + 1)
-        }.joined(separator: " · ")
-        if pages.count > 48 {
+        var visiblePages: [String] = []
+        visiblePages.reserveCapacity(48)
+        for index in 0..<pageCount
+        where matchingIndices.contains(index) {
+            visiblePages.append(String(index + 1))
+            if visiblePages.count == 48 {
+                break
+            }
+        }
+        let visible = visiblePages.joined(separator: " · ")
+        if matchingIndices.count > visiblePages.count {
             return visible + AppLocalization.format(
                 " · +%lld more",
-                pages.count - 48
+                matchingIndices.count - visiblePages.count
             )
         }
         return visible
     }
 
-    private var oddIndices: [Int] {
-        (0..<pageCount).filter { $0.isMultiple(of: 2) }
-    }
-
-    private var evenIndices: [Int] {
-        (0..<pageCount).filter { !$0.isMultiple(of: 2) }
+    private func groupedPageOrder(oddFirst: Bool) -> [Int] {
+        var result: [Int] = []
+        result.reserveCapacity(pageCount)
+        let firstStart = oddFirst ? 0 : 1
+        let secondStart = oddFirst ? 1 : 0
+        result.append(
+            contentsOf: stride(
+                from: firstStart,
+                to: pageCount,
+                by: 2
+            )
+        )
+        result.append(
+            contentsOf: stride(
+                from: secondStart,
+                to: pageCount,
+                by: 2
+            )
+        )
+        return result
     }
 
     private var interleavedHalfOrder: [Int] {
         let split = (pageCount + 1) / 2
-        let first = Array(0..<split)
-        let second = Array(split..<pageCount)
         var result: [Int] = []
         result.reserveCapacity(pageCount)
-        for index in 0..<max(first.count, second.count) {
-            if first.indices.contains(index) {
-                result.append(first[index])
-            }
-            if second.indices.contains(index) {
-                result.append(second[index])
+        for index in 0..<split {
+            result.append(index)
+            let secondIndex = split + index
+            if secondIndex < pageCount {
+                result.append(secondIndex)
             }
         }
         return result
     }
 
     private func startAssessment() {
+        guard let requestedRevisionID = contentRevisionID else {
+            ruleRevisionID = nil
+            assessment = nil
+            isLoading = false
+            assessmentErrorMessage =
+                "The page geometry could not be inspected. Try again."
+                    .localizedUI
+            assessmentErrorFeedback += 1
+            return
+        }
+        let generation = UUID()
+        analysisGeneration = generation
         analysisTask?.cancel()
+        ruleRevisionID = requestedRevisionID
         isLoading = true
-        analysisTask = Task {
-            let loaded = await model.pagePreparationAssessment(
-                recordID: recordID
-            )
-            guard !Task.isCancelled else { return }
+        assessment = nil
+        assessmentErrorMessage = nil
+        analysisTask = Task { @MainActor in
+            let loaded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.pagePreparationAssessment(
+                    recordID: recordID
+                )
+            }
+            guard !Task.isCancelled,
+                  analysisGeneration == generation,
+                  contentRevisionID == requestedRevisionID
+            else { return }
             assessment = loaded
             isLoading = false
             analysisTask = nil
+            if loaded == nil {
+                assessmentErrorMessage =
+                    "Page geometry could not be inspected. Number rules still work; retry before using orientation or paper rules."
+                assessmentErrorFeedback += 1
+            }
+            scheduleMatchCalculation()
         }
+    }
+
+    private func scheduleMatchCalculation() {
+        matchGeneration = UUID()
+        matchTask?.cancel()
+        let generation = matchGeneration
+        let requestedPageCount = pageCount
+        let requestedPages = assessment?.pages ?? []
+        let requestedNumberRule = numberRule
+        let requestedOrientationRule = orientationRule
+        let requestedPaperRule = paperRule
+        let requestedRevisionID = ruleRevisionID
+        guard requestedRevisionID != nil,
+              contentRevisionID == requestedRevisionID
+        else {
+            matchingIndices.removeAll()
+            isCalculatingMatches = false
+            return
+        }
+        isCalculatingMatches = true
+        matchTask = Task { @MainActor in
+            let worker = Task.detached(priority: .userInitiated) {
+                Self.matchingIndices(
+                    pageCount: requestedPageCount,
+                    pages: requestedPages,
+                    numberRule: requestedNumberRule,
+                    orientationRule: requestedOrientationRule,
+                    paperRule: requestedPaperRule
+                )
+            }
+            let matches = await withTaskCancellationHandler {
+                await worker.value
+            } onCancel: {
+                worker.cancel()
+            }
+            guard !Task.isCancelled,
+                  matchGeneration == generation,
+                  contentRevisionID == requestedRevisionID
+            else { return }
+            matchingIndices = matches
+            isCalculatingMatches = false
+            matchTask = nil
+        }
+    }
+
+    private func interruptRuleAssessment() {
+        analysisGeneration = UUID()
+        matchGeneration = UUID()
+        matchTask?.cancel()
+        matchTask = nil
+        isCalculatingMatches = false
+        matchingIndices.removeAll()
+        analysisTask?.cancel()
+        analysisTask = nil
+        isLoading = false
+        assessment = nil
+        ruleRevisionID = nil
+        assessmentErrorMessage = nil
     }
 }
 
@@ -2779,7 +4460,12 @@ private struct PagePreparationView: View {
         case all
 
         var id: String { rawValue }
-        var title: String { rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .changes: return "Needs changes"
+            case .all: return "All pages"
+            }
+        }
     }
 
     @EnvironmentObject private var model: PaperPathModel
@@ -2787,6 +4473,8 @@ private struct PagePreparationView: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let initialSelection: Set<Int>
@@ -2799,7 +4487,11 @@ private struct PagePreparationView: View {
     @State private var analysisTask: Task<Void, Never>?
     @State private var applyTask: Task<Void, Never>?
     @State private var assessmentGeneration = 0
+    @State private var applyGeneration = UUID()
+    @State private var applyStopRequested = false
     @State private var selectionFeedback = 0
+    @State private var didApplyInitialSelection = false
+    @State private var initialSelectionRevisionID: UUID?
 
     var body: some View {
         NavigationStack {
@@ -2824,9 +4516,11 @@ private struct PagePreparationView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            isBusy
-                                ? "Stop"
-                                : "Cancel"
+                            applyStopRequested
+                                ? "Stopping"
+                                : isBusy
+                                    ? "Stop"
+                                    : "Cancel"
                         ).localizedUI
                     ) {
                         if isBusy {
@@ -2835,6 +4529,8 @@ private struct PagePreparationView: View {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(applyStopRequested)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Rescan".localizedUI) {
@@ -2847,11 +4543,49 @@ private struct PagePreparationView: View {
         .onAppear {
             startAssessment()
         }
+        .onChange(of: currentContentRevisionID) { oldValue, newValue in
+            guard oldValue != newValue,
+                  applyTask == nil
+            else { return }
+            interruptPreparationWork()
+            guard newValue != nil,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            startAssessment()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active,
+               assessment?.revisionID != currentContentRevisionID,
+               analysisTask == nil,
+               applyTask == nil {
+                startAssessment()
+            } else if phase == .background {
+                interruptPreparationWork()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptPreparationWork()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            guard scenePhase == .active,
+                  analysisTask == nil,
+                  applyTask == nil
+            else { return }
+            startAssessment()
+        }
         .onDisappear {
-            analysisTask?.cancel()
-            applyTask?.cancel()
-            analysisTask = nil
-            applyTask = nil
+            interruptPreparationWork()
         }
         .sensoryFeedback(
             .selection,
@@ -2914,34 +4648,16 @@ private struct PagePreparationView: View {
                 }
             }
 
-            HStack(spacing: PPSpacing.medium) {
-                Button {
-                    selectedPages = Set(
-                        suggestedPages.map(\.pageIndex)
-                    )
-                    selectionFeedback += 1
-                } label: {
-                    Label(
-                        "Select Suggested",
-                        systemImage: "checkmark.circle"
-                    )
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.medium) {
+                    preparationSelectionButtons
                 }
-                .buttonStyle(
-                    PPQuietButtonStyle(tint: PPColor.cyan)
-                )
-                .disabled(suggestedPages.isEmpty || isBusy)
-
-                Button {
-                    selectedPages.removeAll()
-                    selectionFeedback += 1
-                } label: {
-                    Label(
-                        "Keep All",
-                        systemImage: "rectangle"
-                    )
+                VStack(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                ) {
+                    preparationSelectionButtons
                 }
-                .buttonStyle(PPQuietButtonStyle())
-                .disabled(selectedPages.isEmpty || isBusy)
             }
         }
         .padding(.horizontal, PPSpacing.small)
@@ -2954,17 +4670,60 @@ private struct PagePreparationView: View {
         }
     }
 
+    @ViewBuilder
+    private var preparationSelectionButtons: some View {
+        Button {
+            selectedPages = Set(
+                suggestedPages.map(\.pageIndex)
+            )
+            selectionFeedback += 1
+        } label: {
+            Label(
+                "Select Suggested",
+                systemImage: "checkmark.circle"
+            )
+        }
+        .buttonStyle(
+            PPQuietButtonStyle(tint: PPColor.cyan)
+        )
+        .disabled(suggestedPages.isEmpty || isBusy)
+
+        Button {
+            selectedPages.removeAll()
+            selectionFeedback += 1
+        } label: {
+            Label(
+                "Keep All",
+                systemImage: "rectangle"
+            )
+        }
+        .buttonStyle(PPQuietButtonStyle())
+        .disabled(selectedPages.isEmpty || isBusy)
+    }
+
     private var reviewModePicker: some View {
         VStack(alignment: .leading, spacing: 3) {
             SectionEyebrow(text: "REVIEW")
-            Picker("Review", selection: $reviewMode) {
+            let picker = Picker("Review", selection: $reviewMode) {
                 ForEach(ReviewMode.allCases) { mode in
                     Text(mode.title.localizedUI).tag(mode)
                 }
             }
-            .pickerStyle(.segmented)
-            .frame(minWidth: 220)
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                picker
+                    .pickerStyle(.menu)
+                    .frame(
+                        maxWidth: .infinity,
+                        minHeight: 44,
+                        alignment: .leading
+                    )
+            } else {
+                picker
+                    .pickerStyle(.segmented)
+                    .frame(minWidth: 220)
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var safetyPaddingControl: some View {
@@ -2988,7 +4747,11 @@ private struct PagePreparationView: View {
             )
             .tint(PPColor.cyan)
         }
-        .frame(minWidth: 220)
+        .frame(
+            minWidth: dynamicTypeSize.ppPrefersExpandedLayout ? nil : 220,
+            maxWidth: .infinity,
+            alignment: .leading
+        )
     }
 
     @ViewBuilder
@@ -3038,7 +4801,7 @@ private struct PagePreparationView: View {
 
     private var pageColumns: [GridItem] {
         let count = horizontalSizeClass == .regular
-            && !dynamicTypeSize.isAccessibilitySize
+            && !dynamicTypeSize.ppPrefersExpandedLayout
             ? 2
             : 1
         return Array(
@@ -3219,7 +4982,11 @@ private struct PagePreparationView: View {
                 .frame(maxWidth: .infinity)
             }
             .buttonStyle(PPPrimaryButtonStyle())
-            .disabled(effectiveSelection.isEmpty || isBusy)
+            .disabled(
+                effectiveSelection.isEmpty
+                    || isBusy
+                    || model.isProcessing(recordID)
+            )
         }
         .padding(.horizontal, PPSpacing.regular)
         .padding(.vertical, PPSpacing.small)
@@ -3256,19 +5023,40 @@ private struct PagePreparationView: View {
         analysisTask != nil || applyTask != nil
     }
 
+    private var currentContentRevisionID: UUID? {
+        model.record(id: recordID)?.contentRevisionID
+    }
+
     private func startAssessment() {
+        guard let requestedRevisionID = currentContentRevisionID,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else {
+            assessment = nil
+            selectedPages.removeAll()
+            return
+        }
+        if initialSelectionRevisionID == nil {
+            initialSelectionRevisionID = requestedRevisionID
+        }
         analysisTask?.cancel()
         assessmentGeneration += 1
         let generation = assessmentGeneration
         assessment = nil
         selectedPages.removeAll()
         analysisTask = Task {
-            let loaded = await model.pagePreparationAssessment(
-                recordID: recordID
-            )
+            let loaded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.pagePreparationAssessment(
+                    recordID: recordID
+                )
+            }
             guard !Task.isCancelled,
                   generation == assessmentGeneration,
-                  let loaded
+                  let loaded,
+                  loaded.revisionID == requestedRevisionID,
+                  currentContentRevisionID == requestedRevisionID
             else {
                 if generation == assessmentGeneration {
                     analysisTask = nil
@@ -3283,9 +5071,16 @@ private struct PagePreparationView: View {
                     )
                 }.map(\.pageIndex)
             )
-            selectedPages = initialSelection.isEmpty
-                ? suggestions
-                : initialSelection.intersection(suggestions)
+            if didApplyInitialSelection
+                || requestedRevisionID
+                    != initialSelectionRevisionID {
+                selectedPages = suggestions
+            } else {
+                didApplyInitialSelection = true
+                selectedPages = initialSelection.isEmpty
+                    ? suggestions
+                    : initialSelection.intersection(suggestions)
+            }
             withAnimation(
                 reduceMotion ? nil : .easeOut(duration: 0.18)
             ) {
@@ -3295,7 +5090,11 @@ private struct PagePreparationView: View {
     }
 
     private func applyPreparation() {
-        guard let assessment else { return }
+        guard let assessment,
+              !model.isProcessing(recordID),
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         guard model.record(id: recordID)?.contentRevisionID
             == assessment.revisionID
         else {
@@ -3318,28 +5117,59 @@ private struct PagePreparationView: View {
             uniquingKeysWith: { _, newest in newest }
         )
         guard !requests.isEmpty else { return }
+        let generation = UUID()
+        applyGeneration = generation
+        applyStopRequested = false
         applyTask = Task {
-            let succeeded = await model.cropPages(
-                recordID: recordID,
-                insetsByPage: requests
-            )
-            guard !Task.isCancelled else {
-                applyTask = nil
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.cropPages(
+                    recordID: recordID,
+                    insetsByPage: requests
+                )
+            }
+            guard applyGeneration == generation else { return }
+            let wasStopped =
+                applyStopRequested || Task.isCancelled
+            applyTask = nil
+            applyStopRequested = false
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    succeeded
+                        ? "Page update finished before stopping · changes kept"
+                        : "Page update stopped · working copy unchanged"
+                ).localizedUI
+                if succeeded {
+                    startAssessment()
+                }
                 return
             }
-            applyTask = nil
             guard succeeded else { return }
-            dismiss()
             onComplete()
         }
     }
 
     private func stopWork() {
+        if applyTask != nil {
+            guard !applyStopRequested else { return }
+            applyStopRequested = true
+            applyTask?.cancel()
+        } else {
+            interruptPreparationWork()
+        }
+    }
+
+    private func interruptPreparationWork() {
         assessmentGeneration += 1
         analysisTask?.cancel()
-        applyTask?.cancel()
         analysisTask = nil
+        applyGeneration = UUID()
+        applyStopRequested = false
+        applyTask?.cancel()
         applyTask = nil
+        assessment = nil
+        selectedPages.removeAll()
     }
 }
 
@@ -3352,7 +5182,15 @@ private struct PageCropEditorView: View {
         case custom
 
         var id: String { rawValue }
-        var title: String { rawValue.capitalized }
+        var title: String {
+            switch self {
+            case .none: return "None"
+            case .light: return "Light"
+            case .standard: return "Standard"
+            case .tight: return "Tight"
+            case .custom: return "Custom"
+            }
+        }
 
         var insets: PDFPageCropInsets {
             let value: Double
@@ -3381,6 +5219,10 @@ private struct PageCropEditorView: View {
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let pageIndex: Int
@@ -3393,6 +5235,13 @@ private struct PageCropEditorView: View {
     @State private var pageAspectRatio: CGFloat = 612 / 792
     @State private var isApplying = false
     @State private var operationTask: Task<Void, Never>?
+    @State private var operationGeneration = UUID()
+    @State private var operationStopRequested = false
+    @State private var didCommitCrop = false
+    @State private var previewGeneration = 0
+    @State private var previewReloadToken = UUID()
+    @State private var isLoadingPreview = true
+    @State private var previewErrorMessage: String?
 
     var body: some View {
         NavigationStack {
@@ -3410,42 +5259,88 @@ private struct PageCropEditorView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button((isApplying ? "Stop" : "Cancel").localizedUI) {
+                    Button(
+                        (
+                            operationStopRequested
+                                ? "Stopping"
+                                : isApplying
+                                    ? "Stop"
+                                    : didCommitCrop
+                                        ? "Done"
+                                        : "Cancel"
+                        ).localizedUI
+                    ) {
                         if isApplying {
-                            operationTask?.cancel()
-                            operationTask = nil
-                            isApplying = false
+                            stopCropOperation()
+                        } else if didCommitCrop {
+                            onComplete()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(operationStopRequested)
                 }
             }
-            .task {
+            .task(id: cropPreviewRequestID) {
+                previewGeneration += 1
+                let generation = previewGeneration
+                isLoadingPreview = true
+                previewErrorMessage = nil
+                preview = nil
                 guard let url = model.url(for: recordID) else {
+                    isLoadingPreview = false
+                    previewErrorMessage =
+                        "The working copy is unavailable.".localizedUI
                     return
                 }
+                let revision = model.refreshToken(for: recordID)
                 let loaded =
                     await PDFEditorPreviewLoader.shared.preview(
                         url: url,
                         pageIndex: pageIndex,
-                        revision: model.refreshToken(for: recordID),
+                        revision: revision,
                         longEdge: 1_800
                     )
-                guard !Task.isCancelled, let loaded else {
+                guard !Task.isCancelled,
+                      generation == previewGeneration,
+                      model.refreshToken(for: recordID) == revision
+                else {
+                    return
+                }
+                guard let loaded else {
+                    isLoadingPreview = false
+                    previewErrorMessage =
+                        "The page preview could not be loaded. Try again."
+                            .localizedUI
                     return
                 }
                 preview = loaded.image
                 pageAspectRatio = CGFloat(loaded.aspectRatio)
+                isLoadingPreview = false
             }
             .onChange(of: preset) { _, value in
                 guard value != .custom else { return }
                 insets = value.insets
             }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active, preview == nil {
+                    previewReloadToken = UUID()
+                } else if phase == .background {
+                    interruptCropWork()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptCropWork()
+            }
             .interactiveDismissDisabled(isApplying)
             .onDisappear {
-                operationTask?.cancel()
-                operationTask = nil
+                interruptCropWork()
             }
         }
     }
@@ -3513,35 +5408,82 @@ private struct PageCropEditorView: View {
                     Image(uiImage: preview)
                         .resizable()
                         .scaledToFit()
-                } else {
-                    ProgressView()
-                }
+                    cropMask(pageSize: pageSize, cropRect: cropRect)
 
-                cropMask(pageSize: pageSize, cropRect: cropRect)
-
-                Rectangle()
-                    .stroke(
-                        insets.isValid
-                            ? PPColor.cyan
-                            : PPColor.amber,
-                        style: StrokeStyle(
-                            lineWidth: 2,
-                            dash: [7, 3]
+                    Rectangle()
+                        .stroke(
+                            insets.isValid
+                                ? PPColor.cyan
+                                : PPColor.amber,
+                            style: StrokeStyle(
+                                lineWidth: 2,
+                                dash: [7, 3]
+                            )
                         )
+                        .frame(
+                            width: cropRect.width,
+                            height: cropRect.height
+                        )
+                        .position(
+                            x: cropRect.midX,
+                            y: cropRect.midY
+                        )
+                } else if let previewErrorMessage {
+                    cropPreviewFailureState(previewErrorMessage)
+                } else if isLoadingPreview {
+                    VStack(spacing: PPSpacing.small) {
+                        ProgressView()
+                        Text("Loading page preview".localizedUI)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(PPColor.textSecondary)
+                    }
+                } else {
+                    cropPreviewFailureState(
+                        "The page preview stopped before it was ready. Try again."
+                            .localizedUI
                     )
-                    .frame(
-                        width: cropRect.width,
-                        height: cropRect.height
-                    )
-                    .position(
-                        x: cropRect.midX,
-                        y: cropRect.midY
-                    )
+                }
             }
             .frame(width: pageSize.width, height: pageSize.height)
             .clipped()
             .shadow(color: .black.opacity(0.12), radius: 12, y: 5)
         }
+    }
+
+    private func cropPreviewFailureState(
+        _ message: String
+    ) -> some View {
+        VStack(spacing: PPSpacing.small) {
+            Image(systemName: "doc.questionmark")
+                .font(.title2)
+                .foregroundStyle(PPColor.amber)
+            Text("Preview unavailable".localizedUI)
+                .font(.headline)
+                .foregroundStyle(PPColor.textPrimary)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(
+                    horizontal: false,
+                    vertical: true
+                )
+            Button {
+                retryCropPreview()
+            } label: {
+                Label(
+                    "Load Preview Again",
+                    systemImage: "arrow.clockwise"
+                )
+            }
+            .buttonStyle(
+                PPQuietButtonStyle(tint: PPColor.cyan)
+            )
+            .accessibilityIdentifier(
+                "retryPageCropPreview"
+            )
+        }
+        .padding(PPSpacing.medium)
     }
 
     private func cropMask(
@@ -3597,7 +5539,81 @@ private struct PageCropEditorView: View {
     }
 
     private var cropControls: some View {
-        VStack(spacing: PPSpacing.small) {
+        ScrollView {
+            VStack(spacing: PPSpacing.small) {
+                cropPresetControl
+                cropEdgeControls
+
+                Button {
+                    applyCrop()
+                } label: {
+                    Label(
+                        isApplying ? "Applying Crop" : "Apply Crop",
+                        systemImage: isApplying
+                            ? "hourglass"
+                            : "crop"
+                    )
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(PPPrimaryButtonStyle())
+                .disabled(
+                    isApplying
+                        || model.isProcessing(recordID)
+                        || preview == nil
+                        || !insets.isValid
+                        || insets == .none
+                )
+            }
+            .padding(.horizontal, PPSpacing.regular)
+            .padding(.vertical, PPSpacing.small)
+        }
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(maxHeight: cropControlsMaximumHeight)
+        .background(.bar)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(PPColor.border.opacity(0.62))
+                .frame(height: 0.6)
+        }
+    }
+
+    @ViewBuilder
+    private var cropPresetControl: some View {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            Menu {
+                ForEach(
+                    CropPreset.allCases.filter { $0 != .custom }
+                ) { option in
+                    Button {
+                        preset = option
+                    } label: {
+                        Label(
+                            option.title.localizedUI,
+                            systemImage: preset == option
+                                ? "checkmark"
+                                : "crop"
+                        )
+                    }
+                }
+            } label: {
+                HStack {
+                    Label(
+                        "Crop preset",
+                        systemImage: "slider.horizontal.3"
+                    )
+                    .font(.subheadline.weight(.semibold))
+                    Spacer(minLength: PPSpacing.small)
+                    Text(preset.title.localizedUI)
+                        .foregroundStyle(PPColor.textSecondary)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(PPColor.textSecondary)
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+        } else {
             Picker("Crop preset", selection: $preset) {
                 ForEach(
                     CropPreset.allCases.filter { $0 != .custom }
@@ -3606,7 +5622,19 @@ private struct PageCropEditorView: View {
                 }
             }
             .pickerStyle(.segmented)
+        }
+    }
 
+    @ViewBuilder
+    private var cropEdgeControls: some View {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            VStack(spacing: PPSpacing.small) {
+                edgeControl("Top", edge: .top)
+                edgeControl("Bottom", edge: .bottom)
+                edgeControl("Left", edge: .left)
+                edgeControl("Right", edge: .right)
+            }
+        } else {
             LazyVGrid(
                 columns: [
                     GridItem(.flexible(), spacing: PPSpacing.medium),
@@ -3619,31 +5647,14 @@ private struct PageCropEditorView: View {
                 edgeControl("Left", edge: .left)
                 edgeControl("Right", edge: .right)
             }
+        }
+    }
 
-            Button {
-                applyCrop()
-            } label: {
-                Label(
-                    isApplying ? "Applying Crop" : "Apply Crop",
-                    systemImage: isApplying ? "hourglass" : "crop"
-                )
-                .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(PPPrimaryButtonStyle())
-            .disabled(
-                isApplying
-                    || !insets.isValid
-                    || insets == .none
-            )
+    private var cropControlsMaximumHeight: CGFloat {
+        if verticalSizeClass == .compact {
+            return 230
         }
-        .padding(.horizontal, PPSpacing.regular)
-        .padding(.vertical, PPSpacing.small)
-        .background(.bar)
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.62))
-                .frame(height: 0.6)
-        }
+        return dynamicTypeSize.ppPrefersExpandedLayout ? 360 : 280
     }
 
     private func edgeControl(
@@ -3704,25 +5715,103 @@ private struct PageCropEditorView: View {
     }
 
     private func applyCrop() {
-        guard insets.isValid else { return }
+        guard operationTask == nil,
+              !didCommitCrop,
+              !model.isProcessing(recordID),
+              preview != nil,
+              insets.isValid,
+              insets != .none,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
         isApplying = true
+        operationStopRequested = false
+        didCommitCrop = false
         let requestedInsets = insets
-        operationTask = Task {
-            let succeeded = await model.cropPage(
-                recordID: recordID,
-                index: pageIndex,
-                insets: requestedInsets
-            )
-            guard !Task.isCancelled else {
-                isApplying = false
-                operationTask = nil
+        let generation = UUID()
+        operationGeneration = generation
+        operationTask = Task { @MainActor in
+            defer {
+                if operationGeneration == generation {
+                    isApplying = false
+                    operationTask = nil
+                    operationStopRequested = false
+                }
+            }
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.cropPage(
+                    recordID: recordID,
+                    index: pageIndex,
+                    insets: requestedInsets
+                )
+            }
+            guard operationGeneration == generation else {
                 return
             }
-            isApplying = false
-            operationTask = nil
+            let wasStopped =
+                operationStopRequested || Task.isCancelled
+            if wasStopped {
+                model[noticeFor: paperPathSceneID] = (
+                    succeeded
+                        ? "Page update finished before stopping · changes kept"
+                        : "Page update stopped · working copy unchanged"
+                ).localizedUI
+                if succeeded {
+                    didCommitCrop = true
+                    preset = .none
+                    insets = .none
+                    previewReloadToken = UUID()
+                }
+                return
+            }
             guard succeeded else { return }
-            dismiss()
             onComplete()
+        }
+    }
+
+    private func retryCropPreview() {
+        preview = nil
+        previewErrorMessage = nil
+        isLoadingPreview = true
+        previewReloadToken = UUID()
+    }
+
+    private var cropPreviewRequestID: String {
+        [
+            recordID.uuidString,
+            String(pageIndex),
+            String(model.refreshToken(for: recordID)),
+            previewReloadToken.uuidString
+        ].joined(separator: "-")
+    }
+
+    private func interruptCropWork() {
+        previewGeneration += 1
+        preview = nil
+        isLoadingPreview = false
+        previewErrorMessage = nil
+        didCommitCrop = false
+        stopCropOperation(invalidateResult: true)
+    }
+
+    private func stopCropOperation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+            operationStopRequested = false
+        } else {
+            guard operationTask != nil,
+                  !operationStopRequested
+            else { return }
+            operationStopRequested = true
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isApplying = false
         }
     }
 
@@ -3750,14 +5839,16 @@ private struct PageRangeSelectionSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     let pageCount: Int
-    let onSelect: (ClosedRange<Int>) -> Void
+    let onSelect: (Set<Int>) -> Void
 
+    @State private var usesPageNumbers = false
+    @State private var pageNumbers = ""
     @State private var startPage = 1
     @State private var endPage: Int
 
     init(
         pageCount: Int,
-        onSelect: @escaping (ClosedRange<Int>) -> Void
+        onSelect: @escaping (Set<Int>) -> Void
     ) {
         self.pageCount = max(1, pageCount)
         self.onSelect = onSelect
@@ -3768,20 +5859,37 @@ private struct PageRangeSelectionSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    Stepper(
-                        "First page: \(startPage)",
-                        value: $startPage,
-                        in: 1...max(1, endPage)
-                    )
-                    Stepper(
-                        "Last page: \(endPage)",
-                        value: $endPage,
-                        in: min(startPage, pageCount)...pageCount
-                    )
+                    Picker("Page selection".localizedUI, selection: $usesPageNumbers) {
+                        Text("Range".localizedUI).tag(false)
+                        Text("Page numbers".localizedUI).tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    if usesPageNumbers {
+                        TextField("1, 3-5, 9", text: $pageNumbers)
+                            .keyboardType(.numbersAndPunctuation)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .accessibilityLabel("Page numbers".localizedUI)
+                            .accessibilityIdentifier("organizerPageNumbers")
+                        if !pageNumbers.isEmpty, let selectionError {
+                            Label(selectionError, systemImage: "exclamationmark.circle")
+                                .font(.caption)
+                                .foregroundStyle(PPColor.rose)
+                        }
+                    } else {
+                        Stepper(
+                            "First page: \(startPage)",
+                            value: $startPage,
+                            in: 1...max(1, endPage)
+                        )
+                        Stepper(
+                            "Last page: \(endPage)",
+                            value: $endPage,
+                            in: min(startPage, pageCount)...pageCount
+                        )
+                    }
                 } footer: {
-                    Text(
-                        "\(max(0, endPage - startPage + 1)) pages will be selected."
-                    )
+                    Text(AppLocalization.format("%lld pages selected", selection.count))
                 }
             }
             .navigationTitle("Select Page Range")
@@ -3789,16 +5897,37 @@ private struct PageRangeSelectionSheet: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Select") {
-                        onSelect(
-                            (startPage - 1)...(endPage - 1)
-                        )
-                        dismiss()
+                        guard !selection.isEmpty else { return }
+                        onSelect(selection)
                     }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(selection.isEmpty)
                 }
             }
+            .onChange(of: pageNumbers) { _, value in
+                if value.count > 2_048 { pageNumbers = String(value.prefix(2_048)) }
+            }
+        }
+        .accessibilityAction(.escape) {
+            dismiss()
+        }
+    }
+
+    private var selection: Set<Int> {
+        if !usesPageNumbers { return Set((startPage - 1)..<endPage) }
+        return Set((try? PDFPageSelection.parse(pageNumbers, pageCount: pageCount)) ?? [])
+    }
+
+    private var selectionError: String? {
+        do {
+            _ = try PDFPageSelection.parse(pageNumbers, pageCount: pageCount)
+            return nil
+        } catch {
+            return error.localizedDescription
         }
     }
 }
@@ -3806,17 +5935,19 @@ private struct PageRangeSelectionSheet: View {
 private struct PageCopyDestinationSheet: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dismissSearch) private var dismissSearch
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let sourceRecordID: UUID
     let selectedCount: Int
     let onSelect: (UUID) -> Void
+    @State private var searchText = ""
 
     var body: some View {
         NavigationStack {
             List(destinations) { record in
                 Button {
                     onSelect(record.id)
-                    dismiss()
                 } label: {
                     HStack(spacing: PPSpacing.medium) {
                         Image(systemName: record.profile.kind.symbol)
@@ -3825,7 +5956,15 @@ private struct PageCopyDestinationSheet: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Text(record.displayName)
                                 .foregroundStyle(PPColor.textPrimary)
-                                .lineLimit(1)
+                                .lineLimit(
+                                    dynamicTypeSize.ppPrefersExpandedLayout
+                                        ? 3
+                                        : 1
+                                )
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
                             Text(
                                 "\(record.profile.pageCount) pages · append \(selectedCount)"
                             )
@@ -3834,26 +5973,67 @@ private struct PageCopyDestinationSheet: View {
                         }
                     }
                 }
+                .accessibilityHint(
+                    AppLocalization.format(
+                        "Copies %lld selected pages after this sheet closes",
+                        selectedCount
+                    )
+                )
             }
             .overlay {
                 if destinations.isEmpty {
                     ContentUnavailableView(
-                        "No destination PDF",
-                        systemImage: "doc.on.doc",
+                        normalizedSearchText.isEmpty
+                            ? "No destination PDF"
+                            : "No matching PDF",
+                        systemImage: normalizedSearchText.isEmpty
+                            ? "doc.on.doc"
+                            : "magnifyingglass",
                         description: Text(
-                            "Import or create another PDF first."
+                            normalizedSearchText.isEmpty
+                                ? "Import or create another PDF first."
+                                : "Try another document name or tag."
                         )
                     )
                 }
             }
+            .searchable(
+                text: $searchText,
+                prompt: "Search destination PDFs"
+            )
+            .submitLabel(.search)
+            .onSubmit(of: .search) {
+                dismissSearch()
+            }
+            .onChange(of: searchText) { _, value in
+                if value.count > 200 {
+                    searchText = String(value.prefix(200))
+                }
+            }
+            .scrollDismissesKeyboard(.interactively)
             .navigationTitle("Copy Pages To")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
                 }
             }
         }
+        .accessibilityAction(.escape) {
+            if !normalizedSearchText.isEmpty {
+                searchText = ""
+                dismissSearch()
+            } else {
+                dismiss()
+            }
+        }
+    }
+
+    private var normalizedSearchText: String {
+        searchText.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
     }
 
     private var destinations: [DocumentRecord] {
@@ -3861,6 +6041,17 @@ private struct PageCopyDestinationSheet: View {
             $0.id != sourceRecordID
                 && $0.isWorkingCopy
                 && !$0.profile.isLocked
+                && (
+                    normalizedSearchText.isEmpty
+                        || $0.displayName.localizedCaseInsensitiveContains(
+                            normalizedSearchText
+                        )
+                        || $0.tags.contains {
+                            $0.localizedCaseInsensitiveContains(
+                                normalizedSearchText
+                            )
+                        }
+                )
         }
     }
 }

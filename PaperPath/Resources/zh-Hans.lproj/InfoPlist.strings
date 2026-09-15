@@ -1,2 +1,3 @@
 "CFBundleDisplayName" = "PaperPath PDF";
-"NSCameraUsageDescription" = "用于将纸质文档扫描为仅在本机处理的私密 PDF 副本。";
+"NSCameraUsageDescription" = "用于扫描纸质文档或签名身份二维码；内容仅在本机处理。";
+"NSFaceIDUsageDescription" = "用于解锁 PaperPath 的私密文档工作区。";

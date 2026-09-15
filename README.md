@@ -38,6 +38,7 @@ shortest useful next actions.
 - Permanent redaction, compression, password protection, and flattened output
 - Local PDF export to DOCX, XLSX, searchable PPTX, images, RTF, Markdown, and text
 - Verified copies with page checks, metadata removal, SHA-256 receipts, and portable signed delivery-match reports
+- Signed delivery packages with on-device recipient verification, protected exact-PDF preview, and system sharing
 - Rename, tag, pin, share, and remove private copies
 - Unified document/tool search, customizable quick tools, and contextual next actions
 - Adaptive iPhone and iPad layouts
@@ -79,8 +80,7 @@ normal launch.
 - `docs/PRODUCT_ARCHITECTURE_V1.md`
 - `docs/FEATURE_PRIORITIES_V1.md`
 - `docs/TECHNICAL_NOTES_PDFKIT_VISIONKIT.md`
-- `docs/ITERATION_LOG.md`
-- `docs/PRODUCT_AUDIT_R107.md`
+- `docs/PaperPath项目全维度持续迭代提示词.md`
 
 ## Remaining Device Validation
 

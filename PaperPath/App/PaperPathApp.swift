@@ -2,18 +2,55 @@ import SwiftUI
 
 @main
 struct PaperPathApp: App {
-    @StateObject private var model = PaperPathModel()
+    @StateObject private var model = PaperPathApp.makeModel()
     @StateObject private var appLock = AppLockController()
     @StateObject private var purchase = PurchaseController()
     @AppStorage(AppLanguage.defaultsKey)
     private var languageCode = AppLanguage.system.rawValue
 
+    private static func makeModel() -> PaperPathModel {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("UITEST_POLISH_OCR"),
+           let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            return PaperPathModel(store: DocumentStore(
+                rootURL: documents.appendingPathComponent("PolishOCRFixture")
+            ))
+        }
+        if ProcessInfo.processInfo.arguments.contains("UITEST_OFFICE_CORPUS_RESULT"),
+           let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+           let data = try? Data(contentsOf: documents.appendingPathComponent("OfficeCorpus/report.json")),
+           let report = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let runID = report["runID"] as? String, UUID(uuidString: runID) != nil {
+            return PaperPathModel(store: DocumentStore(
+                rootURL: documents.appendingPathComponent("OfficeCorpus/store-\(runID)")
+            ))
+        }
+        if (ProcessInfo.processInfo.arguments.contains("UITEST_COMPETITIVE_GALLERY")
+            || ProcessInfo.processInfo.arguments.contains("UITEST_RECOVERY_GALLERY")),
+           let documents = FileManager.default.urls(
+            for: .documentDirectory, in: .userDomainMask
+           ).first {
+            return PaperPathModel(store: DocumentStore(
+                rootURL: documents.appendingPathComponent(
+                    ProcessInfo.processInfo.arguments.contains("UITEST_RECOVERY_GALLERY")
+                        ? "RecoveryFixture" : "CompetitiveFixture", isDirectory: true
+                )
+            ))
+        }
+#endif
+        return PaperPathModel()
+    }
+
     init() {
+#if DEBUG
+        // #region debug-point C:desk-launch-navigation
+        if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "desk-launch-navigation", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "C", "msg": "[DEBUG] App init", "location": "PaperPathApp.init"]); URLSession.shared.dataTask(with: request).resume() }
+        // #endregion
+#endif
         AppPreferences.registerDefaults()
 #if DEBUG
-        if ProcessInfo.processInfo.arguments.contains(
-            "UITEST_RESET_DEMO"
-        ) {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("UITEST_RESET_DEMO") {
             UserDefaults.standard.set(
                 "work",
                 forKey: "library.workspaceLane"
@@ -27,8 +64,8 @@ struct PaperPathApp: App {
     }
 
     var body: some Scene {
-        WindowGroup {
-            RootView()
+        WindowGroup(for: UUID.self) { $initialRecordID in
+            RootView(initialRecordID: initialRecordID)
                 .environmentObject(model)
                 .environmentObject(appLock)
                 .environmentObject(purchase)
@@ -38,16 +75,14 @@ struct PaperPathApp: App {
                         ?? .autoupdatingCurrent
                 )
                 .tint(PPColor.accent)
-                .task {
-                    async let bootstrap: Void = model.bootstrap()
-                    async let entitlement: Void =
-                        purchase.refreshForLaunch()
-                    _ = await (bootstrap, entitlement)
-                }
-                .onOpenURL { url in
-                    Task {
-                        await model.receiveExternalURL(url)
-                    }
+                .onChange(of: languageCode, initial: true) {
+                    _, newValue in
+                    UserDefaults(
+                        suiteName: ExternalPDFInbox.appGroupIdentifier
+                    )?.set(
+                        newValue,
+                        forKey: AppLanguage.defaultsKey
+                    )
                 }
         }
     }

@@ -14,9 +14,9 @@ enum AppLanguage: String, CaseIterable, Identifiable {
         case .system:
             return AppLocalization.string("System Language")
         case .english:
-            return "English"
+            return AppLocalization.string("English")
         case .simplifiedChinese:
-            return "简体中文"
+            return AppLocalization.string("Simplified Chinese")
         }
     }
 
@@ -84,6 +84,86 @@ enum AppLocalization {
             locale: selectedLanguage.locale,
             arguments: arguments
         )
+    }
+
+    static func datedDocumentName(
+        _ formatKey: String,
+        date: Date = Date()
+    ) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = selectedLanguage.locale
+        formatter.setLocalizedDateFormatFromTemplate("yMMMd")
+        return format(formatKey, formatter.string(from: date))
+    }
+
+    static func userFacingErrorDescription(
+        _ error: Error,
+        fallback: String = "PaperPath could not complete that action."
+    ) -> String {
+        let localizedFallback = string(fallback)
+        let nsError = error as NSError
+        guard !containsPrivateLocation(nsError) else {
+            return localizedFallback
+        }
+        let candidate = (error as? LocalizedError)?.errorDescription
+            ?? error.localizedDescription
+        let bounded = String(candidate.prefix(1_024))
+        guard !containsPrivateLocation(bounded) else {
+            return localizedFallback
+        }
+        let collapsed = bounded
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+        guard !collapsed.isEmpty,
+              collapsed.count <= 480
+        else {
+            return localizedFallback
+        }
+        return collapsed
+    }
+
+    private static func containsPrivateLocation(
+        _ error: NSError,
+        depth: Int = 0
+    ) -> Bool {
+        guard depth < 4 else { return false }
+        if error.userInfo[NSFilePathErrorKey] != nil {
+            return true
+        }
+        if let url = error.userInfo[NSURLErrorKey] as? URL,
+           url.isFileURL {
+            return true
+        }
+        if containsPrivateLocation(error.localizedDescription) {
+            return true
+        }
+        if let underlying = error.userInfo[
+            NSUnderlyingErrorKey
+        ] as? NSError {
+            return containsPrivateLocation(
+                underlying,
+                depth: depth + 1
+            )
+        }
+        return false
+    }
+
+    private static func containsPrivateLocation(
+        _ value: String
+    ) -> Bool {
+        let normalized = value.lowercased()
+        return [
+            "file://",
+            "/private/",
+            "/users/",
+            "/volumes/",
+            "/var/mobile/",
+            "/containers/data/",
+            "/mobile documents/"
+        ].contains {
+            normalized.contains($0)
+        }
     }
 
     private static func bundle(

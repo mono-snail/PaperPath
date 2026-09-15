@@ -83,6 +83,75 @@ enum DemoPDFBuilder {
         }
     }
 
+#if DEBUG
+    static func createOfficeSoak(at url: URL) throws {
+        let page = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let visual = UIGraphicsImageRenderer(
+            size: CGSize(width: 960, height: 540)
+        ).image { context in
+            UIColor(
+                red: 30 / 255,
+                green: 48 / 255,
+                blue: 70 / 255,
+                alpha: 1
+            ).setFill()
+            context.fill(
+                CGRect(x: 0, y: 0, width: 960, height: 540)
+            )
+            UIColor(
+                red: 44 / 255,
+                green: 193 / 255,
+                blue: 180 / 255,
+                alpha: 1
+            ).setFill()
+            context.fill(
+                CGRect(x: 80, y: 90, width: 800, height: 82)
+            )
+            UIColor.white.setFill()
+            context.fill(
+                CGRect(x: 80, y: 222, width: 560, height: 34)
+            )
+            context.fill(
+                CGRect(x: 80, y: 292, width: 710, height: 34)
+            )
+            context.fill(
+                CGRect(x: 80, y: 362, width: 430, height: 34)
+            )
+        }
+        let renderer = UIGraphicsPDFRenderer(bounds: page)
+        try renderer.writePDF(to: url) { context in
+            for pageIndex in 0..<192 {
+                autoreleasepool {
+                    context.beginPage()
+                    drawTitle(
+                        "Office stress \(pageIndex + 1)",
+                        in: page
+                    )
+                    drawParagraph(
+                        """
+                        Section \(pageIndex + 1)
+                        Owner: PaperPath stability automation
+                        Status: generated locally
+                        Amount: \(1_000 + pageIndex * 37)
+                        Notes: cancellation and memory recovery must remain bounded.
+                        """,
+                        y: 142,
+                        in: page
+                    )
+                    visual.draw(
+                        in: CGRect(
+                            x: 56,
+                            y: 350,
+                            width: 500,
+                            height: 281
+                        )
+                    )
+                }
+            }
+        }
+    }
+#endif
+
     private static func drawTitle(_ title: String, in page: CGRect) {
         let attributes: [NSAttributedString.Key: Any] = [
             .font: UIFont.systemFont(ofSize: 34, weight: .bold),

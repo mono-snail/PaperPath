@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import PDFKit
 import UIKit
@@ -8,6 +9,10 @@ private struct PDFInkRenderStyle: Hashable {
 }
 
 struct PDFMutationService: Sendable {
+    private static let maximumPageCount = 100_000
+    private static let maximumAnnotationsPerPage = 4_096
+    private static let maximumAnnotationsScanned = 100_000
+
     enum MoveDirection: Sendable {
         case earlier
         case later
@@ -34,18 +39,40 @@ struct PDFMutationService: Sendable {
         else {
             throw PaperPathError.unreadablePDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
         let resultLimit = limit.map { max(1, min($0, 10_001)) }
         var results: [PDFAnnotationSnapshot] = []
         if let resultLimit {
             results.reserveCapacity(min(resultLimit, 512))
         }
+        var scannedAnnotationCount = 0
         for pageIndex in 0..<document.pageCount {
             try Task.checkCancellation()
             guard let page = document.page(at: pageIndex) else {
-                continue
+                throw PaperPathError.invalidPage
             }
-            for (index, annotation) in page.annotations.enumerated() {
-                try Task.checkCancellation()
+            let annotations = page.annotations
+            guard annotations.count <= Self.maximumAnnotationsPerPage
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to inspect safely."
+                )
+            }
+            let nextScannedCount = scannedAnnotationCount
+                .addingReportingOverflow(annotations.count)
+            guard !nextScannedCount.overflow,
+                  nextScannedCount.partialValue
+                    <= Self.maximumAnnotationsScanned
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This PDF contains too many annotations to inspect safely."
+                )
+            }
+            scannedAnnotationCount = nextScannedCount.partialValue
+            for (index, annotation) in annotations.enumerated() {
+                if index.isMultiple(of: 64) {
+                    try Task.checkCancellation()
+                }
                 if let resultLimit,
                    results.count >= resultLimit {
                     return results
@@ -78,12 +105,59 @@ struct PDFMutationService: Sendable {
                             annotation.hasAppearanceStream,
                         canEditContents: capabilities.contents,
                         canEditStyle: capabilities.style,
-                        canRemove: true
+                        canRemove: true,
+                        mutationIdentity:
+                            annotationMutationIdentity(annotation)
                     )
                 )
             }
         }
         return results
+    }
+
+    func containsSignature(in url: URL) throws -> Bool {
+        guard let document = PDFDocument(url: url),
+              !document.isLocked
+        else {
+            throw PaperPathError.unreadablePDF
+        }
+        try Self.requireSupportedPageCount(document.pageCount)
+        var scannedAnnotationCount = 0
+        for pageIndex in 0..<document.pageCount {
+            try Task.checkCancellation()
+            guard let page = document.page(at: pageIndex) else {
+                throw PaperPathError.invalidPage
+            }
+            let annotations = page.annotations
+            guard annotations.count <= Self.maximumAnnotationsPerPage
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to inspect safely."
+                )
+            }
+            let nextScannedCount = scannedAnnotationCount
+                .addingReportingOverflow(annotations.count)
+            guard !nextScannedCount.overflow,
+                  nextScannedCount.partialValue
+                    <= Self.maximumAnnotationsScanned
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This PDF contains too many annotations to inspect safely."
+                )
+            }
+            scannedAnnotationCount = nextScannedCount.partialValue
+            for (index, annotation) in annotations.enumerated() {
+                if index.isMultiple(of: 64) {
+                    try Task.checkCancellation()
+                }
+                if normalizedAnnotationType(annotation)
+                    .caseInsensitiveCompare("ink") == .orderedSame,
+                   annotation.contents == "Signature" {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     func links(
@@ -95,6 +169,7 @@ struct PDFMutationService: Sendable {
         else {
             throw PaperPathError.unreadablePDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
         if let requestedPageIndex,
            requestedPageIndex < 0
             || requestedPageIndex >= document.pageCount {
@@ -102,20 +177,41 @@ struct PDFMutationService: Sendable {
         }
         let pageIndices = requestedPageIndex.map { [$0] }
             ?? Array(0..<document.pageCount)
-        return try pageIndices.flatMap {
-            pageIndex -> [PDFLinkAnnotationSnapshot] in
+        var results: [PDFLinkAnnotationSnapshot] = []
+        var scannedAnnotationCount = 0
+        for pageIndex in pageIndices {
             try Task.checkCancellation()
             guard let page = document.page(at: pageIndex) else {
-                return []
+                throw PaperPathError.invalidPage
             }
             let pageBounds = page.bounds(for: .cropBox)
             guard pageBounds.width > 0, pageBounds.height > 0 else {
-                return []
+                throw PaperPathError.invalidPage
             }
-            return page.annotations.enumerated().compactMap {
-                annotationIndex,
-                annotation in
-                guard isLink(annotation) else { return nil }
+            let annotations = page.annotations
+            guard annotations.count <= Self.maximumAnnotationsPerPage
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "A PDF page contains too many annotations to inspect safely."
+                )
+            }
+            let nextScannedCount = scannedAnnotationCount
+                .addingReportingOverflow(annotations.count)
+            guard !nextScannedCount.overflow,
+                  nextScannedCount.partialValue
+                    <= Self.maximumAnnotationsScanned
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This PDF contains too many annotations to inspect safely."
+                )
+            }
+            scannedAnnotationCount = nextScannedCount.partialValue
+            for (annotationIndex, annotation) in
+                annotations.enumerated() {
+                if annotationIndex.isMultiple(of: 64) {
+                    try Task.checkCancellation()
+                }
+                guard isLink(annotation) else { continue }
                 let target = linkTarget(
                     annotation,
                     document: document
@@ -124,7 +220,7 @@ struct PDFMutationService: Sendable {
                 guard !bounds.isNull,
                       bounds.width >= 4,
                       bounds.height >= 4
-                else { return nil }
+                else { continue }
                 let normalizedBounds = PDFNormalizedRect(
                     x: (bounds.minX - pageBounds.minX)
                         / pageBounds.width,
@@ -137,17 +233,20 @@ struct PDFMutationService: Sendable {
                     .trimmingCharacters(
                         in: .whitespacesAndNewlines
                     )
-                return PDFLinkAnnotationSnapshot(
-                    pageIndex: pageIndex,
-                    annotationIndex: annotationIndex,
-                    normalizedBounds: normalizedBounds,
-                    title: storedTitle?.isEmpty == false
-                        ? storedTitle!
-                        : target.title,
-                    target: target
+                results.append(
+                    PDFLinkAnnotationSnapshot(
+                        pageIndex: pageIndex,
+                        annotationIndex: annotationIndex,
+                        normalizedBounds: normalizedBounds,
+                        title: storedTitle.flatMap {
+                            $0.isEmpty ? nil : $0
+                        } ?? target.title,
+                        target: target
+                    )
                 )
             }
         }
+        return results
     }
 
     func applyLinkMutation(
@@ -184,12 +283,21 @@ struct PDFMutationService: Sendable {
                 let title = payload.title.trimmingCharacters(
                     in: .whitespacesAndNewlines
                 )
-                guard !title.isEmpty, title.count <= 240 else {
+                guard Self.isSafeSingleLineText(
+                    title,
+                    maximumCharacters: 240,
+                    maximumBytes: 1_024
+                ),
+                      Self.isValidNormalizedRect(payload.normalizedBounds)
+                else {
                     throw PaperPathError.insufficientSelection(
                         "Use a link label between 1 and 240 characters."
                     )
                 }
                 let pageBounds = page.bounds(for: .cropBox)
+                guard Self.hasValidPageBounds(pageBounds) else {
+                    throw PaperPathError.invalidPage
+                }
                 let normalized = payload.normalizedBounds
                 let bounds = CGRect(
                     x: pageBounds.minX
@@ -224,6 +332,9 @@ struct PDFMutationService: Sendable {
                         throw PaperPathError.invalidPage
                     }
                     let targetBounds = targetPage.bounds(for: .cropBox)
+                    guard Self.hasValidPageBounds(targetBounds) else {
+                        throw PaperPathError.invalidPage
+                    }
                     let destination = PDFDestination(
                         page: targetPage,
                         at: CGPoint(
@@ -265,6 +376,7 @@ struct PDFMutationService: Sendable {
         direction: RotationDirection = .clockwise,
         in url: URL
     ) throws {
+        try Self.requireBoundedSelection(indices)
         let unique = Array(Set(indices)).sorted()
         guard !unique.isEmpty else {
             throw PaperPathError.insufficientSelection(
@@ -297,6 +409,7 @@ struct PDFMutationService: Sendable {
         at indices: [Int],
         in url: URL
     ) throws {
+        try Self.requireBoundedSelection(indices)
         let unique = Array(Set(indices)).sorted(by: >)
         guard !unique.isEmpty else {
             throw PaperPathError.insufficientSelection(
@@ -304,6 +417,15 @@ struct PDFMutationService: Sendable {
             )
         }
         try mutate(url: url) { document in
+            let (resultPageCount, overflow) = document.pageCount
+                .addingReportingOverflow(unique.count)
+            guard !overflow,
+                  resultPageCount <= Self.maximumPageCount
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "The duplicated pages would exceed the 100,000-page limit."
+                )
+            }
             guard unique.allSatisfy({
                 $0 >= 0 && $0 < document.pageCount
             }) else {
@@ -337,6 +459,7 @@ struct PDFMutationService: Sendable {
         at indices: [Int],
         in url: URL
     ) throws {
+        try Self.requireBoundedSelection(indices)
         let unique = Array(Set(indices)).sorted(by: >)
         guard !unique.isEmpty else {
             throw PaperPathError.insufficientSelection(
@@ -450,17 +573,35 @@ struct PDFMutationService: Sendable {
             else {
                 throw PaperPathError.invalidPage
             }
+            try Self.requireSupportedPageCount(source.pageCount)
             destination.removePage(at: destinationIndex)
             destination.insert(replacement, at: destinationIndex)
         }
     }
 
     func addInk(_ payload: PDFInkPayload, in url: URL) throws {
-        try mutate(url: url) { document in
+        try Self.validateInkPayload(payload)
+        var expectedAnnotationCount: Int?
+        try mutate(
+            url: url,
+            verification: { reopened, _ in
+                guard let expectedAnnotationCount,
+                      let page = reopened.page(at: payload.pageIndex),
+                      page.annotations.count == expectedAnnotationCount
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the ink annotations could not be reopened"
+                    )
+                }
+            }
+        ) { document in
             guard let page = document.page(at: payload.pageIndex) else {
                 throw PaperPathError.invalidPage
             }
             let pageBounds = page.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(pageBounds) else {
+                throw PaperPathError.invalidPage
+            }
             let annotationBounds: CGRect
             switch payload.placement {
             case .page:
@@ -512,6 +653,14 @@ struct PDFMutationService: Sendable {
                     )
                 }
             }
+            guard Self.hasValidPageBounds(annotationBounds),
+                  annotationBounds.width >= 8,
+                  annotationBounds.height >= 8
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "Keep the drawing area fully inside the page."
+                )
+            }
 
             let groupedStrokes = Dictionary(
                 grouping: payload.strokes
@@ -535,6 +684,13 @@ struct PDFMutationService: Sendable {
                     halfPointWidth: Int((pointWidth * 2).rounded())
                 )
             }
+            guard !groupedStrokes.isEmpty else {
+                throw PaperPathError.insufficientSelection(
+                    "Draw at least one visible stroke."
+                )
+            }
+            expectedAnnotationCount = page.annotations.count
+                + groupedStrokes.count
 
             for (style, strokes) in groupedStrokes {
                 let annotation = PDFAnnotation(
@@ -586,21 +742,57 @@ struct PDFMutationService: Sendable {
         toPageAt pageIndex: Int,
         in url: URL
     ) throws {
-        try mutate(url: url) { document in
+        var expectedAnnotationCount: Int?
+        try mutate(
+            url: url,
+            verification: { document, _ in
+                guard let expectedAnnotationCount,
+                      let page = document.page(at: pageIndex),
+                      page.annotations.count == expectedAnnotationCount,
+                      page.annotations.contains(where: {
+                          $0.stampName?.trimmingCharacters(
+                              in: CharacterSet(charactersIn: "/")
+                          ) == kind.stampName.trimmingCharacters(
+                              in: CharacterSet(charactersIn: "/")
+                          )
+                              && $0.contents == kind.title
+                              && $0.shouldDisplay
+                              && $0.shouldPrint
+                              && Self.hasValidPageBounds($0.bounds)
+                      })
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the added stamp could not be reopened"
+                    )
+                }
+            }
+        ) { document in
             guard let page = document.page(at: pageIndex) else {
                 throw PaperPathError.invalidPage
             }
             let pageBounds = page.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(pageBounds),
+                  pageBounds.width >= 136,
+                  pageBounds.height >= 86
+            else {
+                throw PaperPathError.invalidPage
+            }
             let margin = min(36, max(12, pageBounds.width * 0.05))
             let width = min(180, max(112, pageBounds.width * 0.34))
             let height = min(54, max(38, width * 0.28))
+            let annotationBounds = CGRect(
+                x: pageBounds.maxX - margin - width,
+                y: pageBounds.maxY - margin - height,
+                width: width,
+                height: height
+            )
+            guard Self.hasValidPageBounds(annotationBounds),
+                  pageBounds.contains(annotationBounds)
+            else {
+                throw PaperPathError.invalidPage
+            }
             let annotation = PDFAnnotation(
-                bounds: CGRect(
-                    x: pageBounds.maxX - margin - width,
-                    y: pageBounds.maxY - margin - height,
-                    width: width,
-                    height: height
-                ),
+                bounds: annotationBounds,
                 forType: .stamp,
                 withProperties: nil
             )
@@ -610,6 +802,9 @@ struct PDFMutationService: Sendable {
             let border = PDFBorder()
             border.lineWidth = 1.4
             annotation.border = border
+            annotation.shouldDisplay = true
+            annotation.shouldPrint = true
+            expectedAnnotationCount = page.annotations.count + 1
             page.addAnnotation(annotation)
         }
     }
@@ -669,7 +864,13 @@ struct PDFMutationService: Sendable {
                         isGeneratedPageNumber($0)
                     }
                     guard generated.count == 1,
-                          generated[0].contents == expected
+                          generated[0].contents == expected,
+                          generated[0].shouldDisplay,
+                          generated[0].shouldPrint,
+                          Self.hasValidPageBounds(generated[0].bounds),
+                          page.bounds(for: .cropBox).contains(
+                              generated[0].bounds
+                          )
                     else {
                         throw PaperPathError.outputVerificationFailed(
                             "a visible page number did not persist"
@@ -695,8 +896,7 @@ struct PDFMutationService: Sendable {
                     page.removeAnnotation(annotation)
                 }
                 let pageBounds = page.bounds(for: .cropBox)
-                guard pageBounds.width.isFinite,
-                      pageBounds.height.isFinite,
+                guard Self.hasValidPageBounds(pageBounds),
                       pageBounds.width >= 48,
                       pageBounds.height >= 48
                 else {
@@ -747,7 +947,7 @@ struct PDFMutationService: Sendable {
                 for pageIndex in 0..<document.pageCount {
                     try Task.checkCancellation()
                     guard let page = document.page(at: pageIndex)
-                    else { continue }
+                    else { throw PaperPathError.invalidPage }
                     guard !page.annotations.contains(
                         where: isGeneratedPageNumber
                     ) else {
@@ -761,7 +961,7 @@ struct PDFMutationService: Sendable {
             for pageIndex in 0..<document.pageCount {
                 try Task.checkCancellation()
                 guard let page = document.page(at: pageIndex)
-                else { continue }
+                else { throw PaperPathError.invalidPage }
                 for annotation in page.annotations
                 where isGeneratedPageNumber(annotation) {
                     page.removeAnnotation(annotation)
@@ -851,7 +1051,11 @@ struct PDFMutationService: Sendable {
                     guard generated.count == 1,
                           generated[0].contents == expected,
                           generated[0].shouldDisplay,
-                          generated[0].shouldPrint
+                          generated[0].shouldPrint,
+                          Self.hasValidPageBounds(generated[0].bounds),
+                          page.bounds(for: .cropBox).contains(
+                              generated[0].bounds
+                          )
                     else {
                         throw PaperPathError.outputVerificationFailed(
                             "a Bates number did not persist"
@@ -869,7 +1073,7 @@ struct PDFMutationService: Sendable {
             where !selectedPageSet.contains(pageIndex) {
                 try Task.checkCancellation()
                 guard let page = document.page(at: pageIndex)
-                else { continue }
+                else { throw PaperPathError.invalidPage }
                 let hasCollision = page.annotations.contains {
                     isGeneratedBatesNumber($0)
                         && $0.contents.map(
@@ -894,8 +1098,7 @@ struct PDFMutationService: Sendable {
                     page.removeAnnotation(annotation)
                 }
                 let pageBounds = page.bounds(for: .cropBox)
-                guard pageBounds.width.isFinite,
-                      pageBounds.height.isFinite,
+                guard Self.hasValidPageBounds(pageBounds),
                       pageBounds.width >= 72,
                       pageBounds.height >= 72
                 else {
@@ -954,7 +1157,7 @@ struct PDFMutationService: Sendable {
                 for pageIndex in 0..<document.pageCount {
                     try Task.checkCancellation()
                     guard let page = document.page(at: pageIndex)
-                    else { continue }
+                    else { throw PaperPathError.invalidPage }
                     guard !page.annotations.contains(
                         where: isGeneratedBatesNumber
                     ),
@@ -972,7 +1175,7 @@ struct PDFMutationService: Sendable {
             for pageIndex in 0..<document.pageCount {
                 try Task.checkCancellation()
                 guard let page = document.page(at: pageIndex)
-                else { continue }
+                else { throw PaperPathError.invalidPage }
                 expectedSurvivors[pageIndex] = page.annotations
                     .filter { !isGeneratedBatesNumber($0) }
                     .map(annotationRemovalSignature)
@@ -1028,6 +1231,10 @@ struct PDFMutationService: Sendable {
                           generated[0].contents == text,
                           generated[0].shouldDisplay,
                           generated[0].shouldPrint,
+                          Self.hasValidPageBounds(generated[0].bounds),
+                          page.bounds(for: .cropBox).contains(
+                              generated[0].bounds
+                          ),
                           annotationRotation(generated[0])
                             == expectedRotation,
                           abs(
@@ -1058,8 +1265,7 @@ struct PDFMutationService: Sendable {
                     page.removeAnnotation(annotation)
                 }
                 let pageBounds = page.bounds(for: .cropBox)
-                guard pageBounds.width.isFinite,
-                      pageBounds.height.isFinite,
+                guard Self.hasValidPageBounds(pageBounds),
                       pageBounds.width >= 72,
                       pageBounds.height >= 72
                 else {
@@ -1138,7 +1344,7 @@ struct PDFMutationService: Sendable {
                 for pageIndex in 0..<document.pageCount {
                     try Task.checkCancellation()
                     guard let page = document.page(at: pageIndex)
-                    else { continue }
+                    else { throw PaperPathError.invalidPage }
                     guard !page.annotations.contains(
                         where: isGeneratedWatermark
                     ) else {
@@ -1152,7 +1358,7 @@ struct PDFMutationService: Sendable {
             for pageIndex in 0..<document.pageCount {
                 try Task.checkCancellation()
                 guard let page = document.page(at: pageIndex)
-                else { continue }
+                else { throw PaperPathError.invalidPage }
                 for annotation in page.annotations
                 where isGeneratedWatermark(annotation) {
                     page.removeAnnotation(annotation)
@@ -1180,39 +1386,102 @@ struct PDFMutationService: Sendable {
         let trimmedName = payload.name.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
-        guard !trimmedName.isEmpty, trimmedName.count <= 80 else {
+        guard Self.isSafeSingleLineText(
+            trimmedName,
+            maximumCharacters: 80,
+            maximumBytes: 512
+        ),
+              Self.isValidNormalizedRect(payload.normalizedBounds)
+        else {
             throw PaperPathError.insufficientSelection(
                 "Use a field name between 1 and 80 characters."
             )
+        }
+        if let maximumLength = payload.maximumLength {
+            guard payload.kind == .text,
+                  (1...4_000).contains(maximumLength)
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "Use a text field limit between 1 and 4,000 characters."
+                )
+            }
         }
         let options = payload.options.map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
         }.filter { !$0.isEmpty }
         if payload.kind == .radio || payload.kind == .choice {
             guard (2...12).contains(options.count),
-                  Set(options.map { $0.lowercased() }).count
+                  Set(options.map {
+                      $0.folding(
+                          options: [
+                              .caseInsensitive,
+                              .diacriticInsensitive,
+                              .widthInsensitive
+                          ],
+                          locale: .current
+                      )
+                  }).count
                     == options.count,
-                  options.allSatisfy({ $0.count <= 64 })
+                  options.allSatisfy({
+                      Self.isSafeSingleLineText(
+                          $0,
+                          maximumCharacters: 64,
+                          maximumBytes: 256
+                      )
+                  })
             else {
                 throw PaperPathError.insufficientSelection(
                     "Use 2 to 12 unique options, up to 64 characters each."
                 )
             }
         }
-        try mutate(url: url) { document in
+        var expectedAnnotationCount: Int?
+        let expectedWidgetCount = payload.kind == .radio
+            ? options.count
+            : 1
+        try mutate(
+            url: url,
+            verification: { reopened, _ in
+                guard let expectedAnnotationCount,
+                      let page = reopened.page(at: payload.pageIndex),
+                      page.annotations.count == expectedAnnotationCount
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the created form field could not be reopened"
+                    )
+                }
+                let matchingWidgets = page.annotations.filter {
+                    $0.fieldName?.caseInsensitiveCompare(
+                        trimmedName
+                    ) == .orderedSame
+                }
+                guard matchingWidgets.count == expectedWidgetCount else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the created form widgets did not match the request"
+                    )
+                }
+            }
+        ) { document in
             guard let page = document.page(at: payload.pageIndex) else {
                 throw PaperPathError.invalidPage
             }
-            let duplicate = (0..<document.pageCount).contains {
-                index in
-                document.page(at: index)?.annotations.contains {
+            var duplicate = false
+            for index in 0..<document.pageCount {
+                try Task.checkCancellation()
+                guard let candidatePage = document.page(at: index) else {
+                    throw PaperPathError.invalidPage
+                }
+                if candidatePage.annotations.contains(where: {
                     let name = $0.fieldName
                         ?? $0.value(
                             forAnnotationKey: .textLabel
                         ) as? String
                     return name?.caseInsensitiveCompare(trimmedName)
                         == .orderedSame
-                } == true
+                }) {
+                    duplicate = true
+                    break
+                }
             }
             guard !duplicate else {
                 throw PaperPathError.insufficientSelection(
@@ -1220,6 +1489,9 @@ struct PDFMutationService: Sendable {
                 )
             }
             let pageBounds = page.bounds(for: .cropBox)
+            guard Self.hasValidPageBounds(pageBounds) else {
+                throw PaperPathError.invalidPage
+            }
             let normalized = payload.normalizedBounds
             let fieldBounds = CGRect(
                 x: pageBounds.minX + normalized.x * pageBounds.width,
@@ -1238,6 +1510,11 @@ struct PDFMutationService: Sendable {
                     "Place the field fully inside the page."
                 )
             }
+            let addedAnnotationCount = payload.kind == .radio
+                ? options.count * 2
+                : 1
+            expectedAnnotationCount = page.annotations.count
+                + addedAnnotationCount
 
             func widget(bounds: CGRect) -> PDFAnnotation {
                 let annotation = PDFAnnotation(
@@ -1281,10 +1558,7 @@ struct PDFMutationService: Sendable {
                 annotation.widgetStringValue = ""
                 annotation.widgetDefaultStringValue = ""
                 annotation.isMultiline = payload.isMultiline
-                annotation.maximumLength = min(
-                    max(payload.maximumLength ?? 0, 0),
-                    4_000
-                )
+                annotation.maximumLength = payload.maximumLength ?? 0
                 annotation.font = UIFont(
                     name: "Helvetica",
                     size: 12
@@ -1398,6 +1672,7 @@ struct PDFMutationService: Sendable {
     ) throws {
         try mutate(url: url) { document in
             guard document.pageCount > 0,
+                  document.pageCount < Self.maximumPageCount,
                   insertionIndex >= 0,
                   insertionIndex <= document.pageCount,
                   let reference = document.page(
@@ -1441,10 +1716,20 @@ struct PDFMutationService: Sendable {
             else {
                 throw PaperPathError.unreadablePDF
             }
+            try Self.requireSupportedPageCount(source.pageCount)
+            let (resultPageCount, overflow) = document.pageCount
+                .addingReportingOverflow(source.pageCount)
+            guard !overflow,
+                  resultPageCount <= Self.maximumPageCount
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "The appended pages would exceed the 100,000-page limit."
+                )
+            }
             for index in 0..<source.pageCount {
                 try Task.checkCancellation()
                 guard let page = source.page(at: index)?.copy() as? PDFPage else {
-                    continue
+                    throw PaperPathError.invalidPage
                 }
                 document.insert(page, at: document.pageCount)
             }
@@ -1456,6 +1741,7 @@ struct PDFMutationService: Sendable {
         indices: [Int],
         in url: URL
     ) throws {
+        try Self.requireBoundedSelection(indices)
         let unique = Array(Set(indices)).sorted()
         guard !unique.isEmpty else {
             throw PaperPathError.insufficientSelection(
@@ -1470,6 +1756,16 @@ struct PDFMutationService: Sendable {
                   })
             else {
                 throw PaperPathError.unreadablePDF
+            }
+            try Self.requireSupportedPageCount(source.pageCount)
+            let (resultPageCount, overflow) = document.pageCount
+                .addingReportingOverflow(unique.count)
+            guard !overflow,
+                  resultPageCount <= Self.maximumPageCount
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "The copied pages would exceed the 100,000-page limit."
+                )
             }
             for index in unique {
                 try Task.checkCancellation()
@@ -1565,48 +1861,108 @@ struct PDFMutationService: Sendable {
         revisionID: UUID,
         progress: PDFProgressHandler = { _ in }
     ) throws -> PDFPagePreparationAssessment {
+        try pagePreparationAssessment(
+            in: url,
+            revisionID: revisionID,
+            pageIndices: nil,
+            detectsContentBounds: true,
+            progress: progress
+        )
+    }
+
+    func pageGeometryAssessment(
+        in url: URL,
+        revisionID: UUID,
+        pageIndices: [Int]
+    ) throws -> PDFPagePreparationAssessment {
+        try pagePreparationAssessment(
+            in: url,
+            revisionID: revisionID,
+            pageIndices: pageIndices,
+            detectsContentBounds: false
+        )
+    }
+
+    private func pagePreparationAssessment(
+        in url: URL,
+        revisionID: UUID,
+        pageIndices: [Int]?,
+        detectsContentBounds: Bool,
+        progress: PDFProgressHandler = { _ in }
+    ) throws -> PDFPagePreparationAssessment {
         guard let document = PDFDocument(url: url),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
 
-        var items: [PDFPagePreparationItem] = []
-        items.reserveCapacity(document.pageCount)
-        for pageIndex in 0..<document.pageCount {
-            try Task.checkCancellation()
-            guard let page = document.page(at: pageIndex) else {
+        let requestedIndices: [Int]
+        if let pageIndices {
+            let unique = Array(Set(pageIndices)).sorted()
+            guard !unique.isEmpty,
+                  unique.allSatisfy({
+                      $0 >= 0 && $0 < document.pageCount
+                  })
+            else {
                 throw PaperPathError.invalidPage
             }
-            let bounds = page.bounds(for: .cropBox)
-            guard bounds.width.isFinite,
-                  bounds.height.isFinite,
-                  bounds.width > 0,
-                  bounds.height > 0
-            else {
-                throw PaperPathError.outputVerificationFailed(
-                    "page \(pageIndex + 1) has invalid dimensions"
+            requestedIndices = unique
+        } else {
+            requestedIndices = Array(0..<document.pageCount)
+        }
+
+        var items: [PDFPagePreparationItem] = []
+        items.reserveCapacity(requestedIndices.count)
+        for (offset, pageIndex) in requestedIndices.enumerated() {
+            try Task.checkCancellation()
+            let item: PDFPagePreparationItem = try autoreleasepool {
+                guard let page = document.page(at: pageIndex) else {
+                    throw PaperPathError.invalidPage
+                }
+                let bounds = page.bounds(for: .cropBox)
+                guard bounds.width.isFinite,
+                      bounds.height.isFinite,
+                      bounds.width > 0,
+                      bounds.height > 0
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "page \(pageIndex + 1) has invalid dimensions"
+                    )
+                }
+                let rotation = ((page.rotation % 360) + 360) % 360
+                let swapsEdges = rotation == 90 || rotation == 270
+                let displaySize = swapsEdges
+                    ? CGSize(width: bounds.height, height: bounds.width)
+                    : bounds.size
+                let detection: (
+                    insets: PDFPageCropInsets,
+                    confidence: PDFPageCropConfidence,
+                    inkCoverage: Double
                 )
-            }
-            let rotation = ((page.rotation % 360) + 360) % 360
-            let swapsEdges = rotation == 90 || rotation == 270
-            let displaySize = swapsEdges
-                ? CGSize(width: bounds.height, height: bounds.width)
-                : bounds.size
-            let longestEdge: CGFloat = 420
-            let scale = longestEdge
-                / max(displaySize.width, displaySize.height)
-            let thumbnail = page.thumbnail(
-                of: CGSize(
-                    width: max(1, displaySize.width * scale),
-                    height: max(1, displaySize.height * scale)
-                ),
-                for: .cropBox
-            )
-            let detection = detectedContentBounds(in: thumbnail)
-            items.append(
-                PDFPagePreparationItem(
+                if detectsContentBounds {
+                    let longestEdge: CGFloat = 420
+                    let scale = longestEdge
+                        / max(displaySize.width, displaySize.height)
+                    let thumbnail = page.thumbnail(
+                        of: CGSize(
+                            width: max(
+                                1,
+                                displaySize.width * scale
+                            ),
+                            height: max(
+                                1,
+                                displaySize.height * scale
+                            )
+                        ),
+                        for: .cropBox
+                    )
+                    detection = detectedContentBounds(in: thumbnail)
+                } else {
+                    detection = (.none, .low, 0)
+                }
+                return PDFPagePreparationItem(
                     pageIndex: pageIndex,
                     widthPoints: Double(displaySize.width),
                     heightPoints: Double(displaySize.height),
@@ -1616,15 +1972,17 @@ struct PDFMutationService: Sendable {
                     confidence: detection.confidence,
                     inkCoverage: detection.inkCoverage
                 )
-            )
+            }
+            items.append(item)
             progress(
-                Double(pageIndex + 1)
-                    / Double(document.pageCount)
+                Double(offset + 1)
+                    / Double(requestedIndices.count)
             )
         }
         return PDFPagePreparationAssessment(
             revisionID: revisionID,
-            pages: items
+            pages: items,
+            pageCount: document.pageCount
         )
     }
 
@@ -1632,9 +1990,32 @@ struct PDFMutationService: Sendable {
         _ payload: PDFAnnotationEditPayload,
         in url: URL
     ) throws {
-        guard payload.contents.count <= 2_000 else {
+        let expectedType = payload.expectedType
+            .trimmingCharacters(
+                in: CharacterSet(charactersIn: "/")
+            )
+        guard payload.pageIndex >= 0,
+              payload.annotationIndex >= 0,
+              payload.contents.count <= 2_000,
+              payload.contents.utf8.count <= 8 * 1_024,
+              Self.isSafeEditableText(payload.contents),
+              Self.isSafeSingleLineText(
+                  expectedType,
+                  maximumCharacters: 64,
+                  maximumBytes: 128
+              ),
+              [
+                payload.color.red,
+                payload.color.green,
+                payload.color.blue,
+                payload.color.alpha
+              ].allSatisfy(\.isFinite),
+              payload.lineWidth.map({
+                  $0.isFinite && (0.5...12).contains($0)
+              }) ?? true
+        else {
             throw PaperPathError.insufficientSelection(
-                "Keep the annotation note under 2,000 characters."
+                "The annotation edit exceeds the safe local limit."
             )
         }
         let requestedColor = PDFInkColor(
@@ -1649,13 +2030,7 @@ struct PDFMutationService: Sendable {
             blue: requestedColor.blue,
             alpha: requestedColor.alpha
         )
-        let expectedType = payload.expectedType
-            .trimmingCharacters(
-                in: CharacterSet(charactersIn: "/")
-            )
-        let requestedLineWidth = payload.lineWidth.map {
-            min(max($0, 0.5), 12)
-        }
+        let requestedLineWidth = payload.lineWidth
 
         try mutate(
             url: url,
@@ -1728,8 +2103,15 @@ struct PDFMutationService: Sendable {
                 payload.annotationIndex
             ]
             let type = normalizedAnnotationType(annotation)
+            let identityMatches =
+                payload.expectedMutationIdentity.map {
+                    expectedIdentity in
+                    annotationMutationIdentity(annotation)
+                        == expectedIdentity
+                } ?? true
             guard type.caseInsensitiveCompare(expectedType)
-                    == .orderedSame
+                    == .orderedSame,
+                  identityMatches
             else {
                 throw PaperPathError.insufficientSelection(
                     "The selected annotation changed before saving."
@@ -1938,10 +2320,15 @@ struct PDFMutationService: Sendable {
         _ annotation: PDFAnnotation,
         matches target: PDFAnnotationRemovalTarget
     ) -> Bool {
-        normalizedAnnotationType(annotation)
-            .caseInsensitiveCompare(target.expectedType)
-            == .orderedSame
-            && annotation.contents == target.expectedContents
+        guard normalizedAnnotationType(annotation)
+                .caseInsensitiveCompare(target.expectedType)
+                == .orderedSame
+        else { return false }
+        if let expectedIdentity = target.expectedMutationIdentity {
+            return annotationMutationIdentity(annotation)
+                == expectedIdentity
+        }
+        return annotation.contents == target.expectedContents
             && PDFGeneratedAnnotationKind.resolve(
                 author: annotation.userName
             ) == target.expectedGeneratedKind
@@ -1950,21 +2337,45 @@ struct PDFMutationService: Sendable {
     private func annotationRemovalSignature(
         _ annotation: PDFAnnotation
     ) -> String {
+        annotationMutationIdentity(annotation)
+    }
+
+    private func annotationMutationIdentity(
+        _ annotation: PDFAnnotation
+    ) -> String {
         let bounds = annotation.bounds
-        func rounded(_ value: CGFloat) -> String {
-            String(format: "%.3f", Double(value))
+        let color = inkColor(
+            from: annotationStyleColor(
+                annotation,
+                type: normalizedAnnotationType(annotation)
+            )
+        )
+        func rounded(_ value: Double) -> String {
+            String(format: "%.3f", value)
         }
-        return [
+        let components = [
             normalizedAnnotationType(annotation).lowercased(),
             annotation.contents ?? "",
             annotation.userName ?? "",
             annotation.fieldName ?? "",
             annotation.stampName ?? "",
-            rounded(bounds.origin.x),
-            rounded(bounds.origin.y),
-            rounded(bounds.width),
-            rounded(bounds.height)
+            rounded(Double(bounds.origin.x)),
+            rounded(Double(bounds.origin.y)),
+            rounded(Double(bounds.width)),
+            rounded(Double(bounds.height)),
+            rounded(color.red),
+            rounded(color.green),
+            rounded(color.blue),
+            rounded(color.alpha),
+            rounded(effectiveLineWidth(annotation)),
+            annotation.url?.absoluteString
+                ?? (annotation.action as? PDFActionURL)?
+                    .url?.absoluteString
+                ?? ""
         ].joined(separator: "\u{1F}")
+        return SHA256.hash(data: Data(components.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
     }
 
     private func supportsLineWidth(_ type: String) -> Bool {
@@ -2052,18 +2463,19 @@ struct PDFMutationService: Sendable {
             )
         }
         let temporaryURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(UUID().uuidString).pdf")
+            .appendingPathComponent(
+                ".mutation-\(UUID().uuidString).pdf"
+            )
         defer { try? FileManager.default.removeItem(at: temporaryURL) }
         try PDFOutputService().applyFormFieldValues(
             sourceURL: url,
             destination: temporaryURL,
             values: updates
         )
-        _ = try FileManager.default.replaceItemAt(
-            url,
-            withItemAt: temporaryURL
+        try commitReplacement(
+            at: url,
+            with: temporaryURL
         )
-        LocalFileSecurity.applyCompleteProtection(to: url)
     }
 
     private func colorsMatch(
@@ -2077,13 +2489,16 @@ struct PDFMutationService: Sendable {
     }
 
     private func isLink(_ annotation: PDFAnnotation) -> Bool {
-        let isLinkSubtype = annotation.type?
+        let normalizedType = annotation.type?
             .trimmingCharacters(
                 in: CharacterSet(charactersIn: "/")
             )
-            .caseInsensitiveCompare(
-                PDFAnnotationSubtype.link.rawValue
-            ) == .orderedSame
+        let linkType = PDFAnnotationSubtype.link.rawValue
+            .trimmingCharacters(
+                in: CharacterSet(charactersIn: "/")
+            )
+        let isLinkSubtype = normalizedType?
+            .caseInsensitiveCompare(linkType) == .orderedSame
         return isLinkSubtype
             || annotation.url != nil
             || annotation.destination != nil
@@ -2120,9 +2535,17 @@ struct PDFMutationService: Sendable {
     private static func isSupportedWebURL(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased(),
               scheme == "http" || scheme == "https",
-              url.host?.isEmpty == false
+              let host = url.host,
+              !host.isEmpty,
+              host.utf8.count <= 253,
+              url.user == nil,
+              url.password == nil,
+              url.absoluteString.utf8.count <= 4_096
         else { return false }
-        return true
+        return url.absoluteString.unicodeScalars.allSatisfy {
+            !CharacterSet.controlCharacters.contains($0)
+                && !CharacterSet.illegalCharacters.contains($0)
+        }
     }
 
     private func normalizedFormFieldName(
@@ -2537,6 +2960,147 @@ struct PDFMutationService: Sendable {
         }
     }
 
+    private static func validateInkPayload(
+        _ payload: PDFInkPayload
+    ) throws {
+        guard payload.pageIndex >= 0,
+              !payload.strokes.isEmpty,
+              payload.strokes.count <= PDFInkPayload.maximumStrokeCount
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Draw between 1 and 400 strokes."
+            )
+        }
+        if payload.placement == .signature,
+           let bounds = payload.normalizedBounds,
+           !isValidNormalizedRect(bounds) {
+            throw PaperPathError.insufficientSelection(
+                "Keep the signature area fully inside the page."
+            )
+        }
+
+        var totalPointCount = 0
+        for (index, stroke) in payload.strokes.enumerated() {
+            if index.isMultiple(of: 16) {
+                try Task.checkCancellation()
+            }
+            let (nextPointCount, overflow) = totalPointCount
+                .addingReportingOverflow(stroke.points.count)
+            guard (2...PDFInkPayload.maximumPointsPerStroke)
+                    .contains(stroke.points.count),
+                  !overflow,
+                  nextPointCount <= PDFInkPayload.maximumTotalPointCount,
+                  stroke.points.allSatisfy({
+                      $0.x.isFinite
+                          && $0.y.isFinite
+                          && (0...1).contains($0.x)
+                          && (0...1).contains($0.y)
+                  }),
+                  stroke.normalizedLineWidth.map({
+                      $0.isFinite && (0.0005...0.08).contains($0)
+                  }) ?? true,
+                  stroke.color.map(isValidInkColor) ?? true
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "The drawing exceeds the safe stroke or point limit."
+                )
+            }
+            totalPointCount = nextPointCount
+        }
+    }
+
+    private static func isValidInkColor(_ color: PDFInkColor) -> Bool {
+        [
+            color.red,
+            color.green,
+            color.blue,
+            color.alpha
+        ].allSatisfy {
+            $0.isFinite && (0...1).contains($0)
+        }
+    }
+
+    private static func isSafeSingleLineText(
+        _ value: String,
+        maximumCharacters: Int,
+        maximumBytes: Int
+    ) -> Bool {
+        guard !value.isEmpty,
+              value.count <= maximumCharacters,
+              value.utf8.count <= maximumBytes
+        else { return false }
+        return value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+            return !CharacterSet.controlCharacters.contains(scalar)
+                && !CharacterSet.illegalCharacters.contains(scalar)
+                && !isBidirectionalControl
+        }
+    }
+
+    private static func isSafeEditableText(_ value: String) -> Bool {
+        value.unicodeScalars.allSatisfy { scalar in
+            let codePoint = scalar.value
+            let isBidirectionalControl =
+                (0x202A...0x202E).contains(codePoint)
+                    || (0x2066...0x2069).contains(codePoint)
+            let isAllowedWhitespace = scalar == "\n" || scalar == "\t"
+            return !CharacterSet.illegalCharacters.contains(scalar)
+                && (!CharacterSet.controlCharacters.contains(scalar)
+                    || isAllowedWhitespace)
+                && !isBidirectionalControl
+        }
+    }
+
+    private static func isValidNormalizedRect(
+        _ bounds: PDFNormalizedRect
+    ) -> Bool {
+        let values = [
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height
+        ]
+        return values.allSatisfy(\.isFinite)
+            && bounds.x >= 0
+            && bounds.y >= 0
+            && bounds.width >= 0.01
+            && bounds.height >= 0.01
+            && bounds.x + bounds.width <= 1.001
+            && bounds.y + bounds.height <= 1.001
+    }
+
+    private static func hasValidPageBounds(_ bounds: CGRect) -> Bool {
+        bounds.origin.x.isFinite
+            && bounds.origin.y.isFinite
+            && bounds.width.isFinite
+            && bounds.height.isFinite
+            && bounds.width > 0
+            && bounds.height > 0
+    }
+
+    private static func requireSupportedPageCount(
+        _ pageCount: Int
+    ) throws {
+        guard (1...Self.maximumPageCount).contains(pageCount) else {
+            throw PaperPathError.insufficientSelection(
+                "Process PDFs with up to 100,000 pages at a time."
+            )
+        }
+    }
+
+    private static func requireBoundedSelection(
+        _ indices: [Int]
+    ) throws {
+        guard indices.count <= Self.maximumPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Select up to 100,000 pages at a time."
+            )
+        }
+    }
+
     private func mutate(
         url: URL,
         verification: ((PDFDocument, URL) throws -> Void)? = nil,
@@ -2548,10 +3112,17 @@ struct PDFMutationService: Sendable {
         guard !document.isLocked else {
             throw PaperPathError.lockedPDF
         }
+        try Self.requireSupportedPageCount(document.pageCount)
+        try Task.checkCancellation()
 
         try operation(document)
+        try Self.requireSupportedPageCount(document.pageCount)
+        let expectedPageCount = document.pageCount
+        try Task.checkCancellation()
         let temporaryURL = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(UUID().uuidString).pdf")
+            .appendingPathComponent(
+                ".mutation-\(UUID().uuidString).pdf"
+            )
         defer { try? FileManager.default.removeItem(at: temporaryURL) }
         do {
             guard document.write(to: temporaryURL) else {
@@ -2559,27 +3130,116 @@ struct PDFMutationService: Sendable {
                     "The changed PDF could not be encoded."
                 )
             }
-            LocalFileSecurity.applyCompleteProtection(to: temporaryURL)
+            try LocalFileSecurity.requireCompleteProtection(
+                to: temporaryURL
+            )
+            guard let reopened = PDFDocument(url: temporaryURL),
+                  !reopened.isLocked,
+                  reopened.pageCount == expectedPageCount
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the changed PDF could not be reopened with every page"
+                )
+            }
             if let verification {
-                guard let reopened = PDFDocument(url: temporaryURL),
-                      !reopened.isLocked
-                else {
-                    throw PaperPathError.outputVerificationFailed(
-                        "the changed PDF could not be reopened"
-                    )
-                }
                 try verification(reopened, temporaryURL)
             }
-            _ = try FileManager.default.replaceItemAt(
-                url,
-                withItemAt: temporaryURL
+            try Task.checkCancellation()
+            try commitReplacement(
+                at: url,
+                with: temporaryURL
             )
-            LocalFileSecurity.applyCompleteProtection(to: url)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch let error as PaperPathError {
             throw error
         } catch {
             throw PaperPathError.storageFailure("The changed PDF could not be written.")
         }
+    }
+
+    private func commitReplacement(
+        at destinationURL: URL,
+        with stagingURL: URL
+    ) throws {
+        let fileManager = FileManager.default
+        let backupName = ".mutation-rollback-\(UUID().uuidString).pdf"
+        let backupURL = destinationURL.deletingLastPathComponent()
+            .appendingPathComponent(backupName)
+        defer {
+            try? fileManager.removeItem(at: backupURL)
+        }
+
+        var replacementStarted = false
+        do {
+            replacementStarted = true
+            _ = try fileManager.replaceItemAt(
+                destinationURL,
+                withItemAt: stagingURL,
+                backupItemName: backupName,
+                options: [.withoutDeletingBackupItem]
+            )
+            if fileManager.fileExists(atPath: backupURL.path) {
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: backupURL
+                )
+            }
+            try LocalFileSecurity.requireCompleteProtection(
+                to: destinationURL
+            )
+        } catch {
+            guard replacementStarted,
+                  fileManager.fileExists(atPath: backupURL.path)
+            else {
+                throw error
+            }
+            do {
+                let rollbackFingerprint = try fileFingerprint(
+                    at: backupURL
+                )
+                if fileManager.fileExists(atPath: destinationURL.path) {
+                    _ = try fileManager.replaceItemAt(
+                        destinationURL,
+                        withItemAt: backupURL
+                    )
+                } else {
+                    try fileManager.moveItem(
+                        at: backupURL,
+                        to: destinationURL
+                    )
+                }
+                try LocalFileSecurity.requireCompleteProtection(
+                    to: destinationURL
+                )
+                guard try fileFingerprint(at: destinationURL)
+                        == rollbackFingerprint
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the original PDF did not match its rollback copy"
+                    )
+                }
+            } catch {
+                throw PaperPathError.storageFailure(
+                    "The PDF changed, but its rollback copy could not be restored."
+                )
+            }
+            throw error
+        }
+    }
+
+    private func fileFingerprint(at url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var hasher = SHA256()
+        while true {
+            let data = try handle.read(upToCount: 1_048_576)
+                ?? Data()
+            if data.isEmpty { break }
+            hasher.update(data: data)
+        }
+        return hasher.finalize().map {
+            String(format: "%02x", $0)
+        }.joined()
     }
 
     private func stampColor(for kind: PDFStampKind) -> UIColor {

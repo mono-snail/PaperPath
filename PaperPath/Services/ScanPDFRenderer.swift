@@ -2,6 +2,7 @@ import CoreImage
 import CoreImage.CIFilterBuiltins
 import Foundation
 import ImageIO
+import PDFKit
 import UIKit
 @preconcurrency import Vision
 
@@ -183,6 +184,27 @@ struct ScanCropQuad: Hashable, Sendable {
     }
 }
 
+enum ScanAutomaticCropResolution: Hashable, Sendable {
+    case fullFrame
+    case crop(ScanCropQuad)
+
+    var cropQuad: ScanCropQuad? {
+        switch self {
+        case .fullFrame: return nil
+        case .crop(let quad): return quad
+        }
+    }
+
+    var rotatedClockwise: ScanAutomaticCropResolution {
+        switch self {
+        case .fullFrame:
+            return .fullFrame
+        case .crop(let quad):
+            return .crop(quad.rotatedClockwise)
+        }
+    }
+}
+
 struct ScanProcessingOptions: Hashable, Sendable {
     var enhancement: ScanEnhancement
     var autoCrop: Bool
@@ -205,8 +227,12 @@ struct ScanProcessingOptions: Hashable, Sendable {
         self.autoCrop = autoCrop
         self.removeShadows = removeShadows
         self.cleanEdges = cleanEdges
-        self.brightness = min(0.5, max(-0.5, brightness))
-        self.contrast = min(1.5, max(0.5, contrast))
+        self.brightness = brightness.isFinite
+            ? min(0.5, max(-0.5, brightness))
+            : 0
+        self.contrast = contrast.isFinite
+            ? min(1.5, max(0.5, contrast))
+            : 1
         self.manualCrop =
             manualCrop?.isValid == true
                 ? manualCrop
@@ -242,18 +268,22 @@ struct ScanPreviewResult: @unchecked Sendable {
 struct ScanPageImage: @unchecked Sendable {
     let image: UIImage
     let processingOptions: ScanProcessingOptions?
+    let automaticCropResolution: ScanAutomaticCropResolution?
 
     init(image: UIImage) {
         self.image = image
         processingOptions = nil
+        automaticCropResolution = nil
     }
 
     init(
         image: UIImage,
-        processingOptions: ScanProcessingOptions
+        processingOptions: ScanProcessingOptions,
+        automaticCropResolution: ScanAutomaticCropResolution? = nil
     ) {
         self.image = image
         self.processingOptions = processingOptions
+        self.automaticCropResolution = automaticCropResolution
     }
 }
 
@@ -313,6 +343,11 @@ struct PaperTemplateRenderer: @unchecked Sendable {
         title: String,
         to destination: URL
     ) throws {
+        guard (1...50).contains(pageCount) else {
+            throw PaperPathError.insufficientSelection(
+                "Create between 1 and 50 paper pages."
+            )
+        }
         let dimensions = size.dimensions
         let bounds = CGRect(origin: .zero, size: dimensions)
         let format = UIGraphicsPDFRendererFormat()
@@ -324,10 +359,24 @@ struct PaperTemplateRenderer: @unchecked Sendable {
             bounds: bounds,
             format: format
         )
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The paper template destination already exists."
+            )
+        }
+        let stagingURL = destination
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".paper-template-\(UUID().uuidString).pdf"
+            )
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        var publishedDestination = false
 
         do {
-            try renderer.writePDF(to: destination) { context in
-                for page in 0..<min(max(pageCount, 1), 50) {
+            try renderer.writePDF(to: stagingURL) { context in
+                for page in 0..<pageCount {
+                    if Task.isCancelled { return }
                     context.beginPage()
                     let cg = context.cgContext
                     UIColor.white.setFill()
@@ -340,9 +389,55 @@ struct PaperTemplateRenderer: @unchecked Sendable {
                     )
                 }
             }
-            LocalFileSecurity.applyCompleteProtection(to: destination)
+            try Task.checkCancellation()
+            try LocalFileSecurity.requireCompleteProtection(
+                to: stagingURL
+            )
+            guard let document = PDFDocument(url: stagingURL),
+                  !document.isLocked,
+                  document.pageCount == pageCount
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the paper template could not be reopened with every page"
+                )
+            }
+            for pageIndex in 0..<document.pageCount {
+                try Task.checkCancellation()
+                guard let page = document.page(at: pageIndex) else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "a paper template page could not be reopened"
+                    )
+                }
+                let pageBounds = page.bounds(for: .mediaBox)
+                guard pageBounds.width.isFinite,
+                      pageBounds.height.isFinite,
+                      pageBounds.width > 0,
+                      pageBounds.height > 0
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "a paper template page has invalid geometry"
+                    )
+                }
+            }
+            try Task.checkCancellation()
+            try fileManager.moveItem(at: stagingURL, to: destination)
+            publishedDestination = true
+            try LocalFileSecurity.requireCompleteProtection(to: destination)
+            LocalFileSecurity.excludeFromBackup(destination)
+        } catch is CancellationError {
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
+            throw CancellationError()
+        } catch let error as PaperPathError {
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
+            throw error
         } catch {
-            try? FileManager.default.removeItem(at: destination)
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
             throw PaperPathError.storageFailure(
                 "The paper template could not be created."
             )
@@ -446,13 +541,18 @@ struct PaperTemplateRenderer: @unchecked Sendable {
 
 struct ScanPDFRenderer: @unchecked Sendable {
     private let portraitPage = CGSize(width: 612, height: 792)
-    private let ciContext = CIContext(options: [
+    private static let maximumInputPageCount = 250
+    private static let maximumInputPixelsPerPage = 120_000_000.0
+    private static let maximumInputPixelsPerBatch = 1_200_000_000.0
+    private static let renderingLongestEdge: CGFloat = 3_200
+    private static let renderingPixelBudget = 8_000_000.0
+    private static let ciContext = CIContext(options: [
         .cacheIntermediates: false,
         .priorityRequestLow: true
     ])
 
     func releaseCachedResources() {
-        ciContext.clearCaches()
+        Self.ciContext.clearCaches()
     }
 
     func render(images: [UIImage], to destination: URL) throws {
@@ -489,6 +589,11 @@ struct ScanPDFRenderer: @unchecked Sendable {
         guard !pages.isEmpty else {
             throw PaperPathError.emptyScan
         }
+        try validateInputBudget(for: pages)
+        try ensureRenderingCapacity(
+            for: pages,
+            destination: destination
+        )
 
         let format = UIGraphicsPDFRendererFormat()
         format.documentInfo = [
@@ -501,23 +606,47 @@ struct ScanPDFRenderer: @unchecked Sendable {
             bounds: CGRect(origin: .zero, size: portraitPage),
             format: format
         )
+        let fileManager = FileManager.default
+        guard !fileManager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure(
+                "The scanned PDF destination already exists."
+            )
+        }
+        let stagingURL = destination
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".scan-render-\(UUID().uuidString).pdf"
+            )
+        defer { try? fileManager.removeItem(at: stagingURL) }
+        var publishedDestination = false
+        var lastReportedPercent = -1
         progress(0)
 
         do {
-            try renderer.writePDF(to: destination) { context in
+            try renderer.writePDF(to: stagingURL) { context in
                 for (index, page) in pages.enumerated() {
                     if Task.isCancelled { return }
                     autoreleasepool {
+                        var resolvedOptions =
+                            page.processingOptions ?? options
+                        if resolvedOptions.autoCrop,
+                           resolvedOptions.manualCrop == nil,
+                           let automaticCropResolution =
+                                page.automaticCropResolution {
+                            resolvedOptions.autoCrop = false
+                            resolvedOptions.manualCrop =
+                                automaticCropResolution.cropQuad
+                        }
                         let source = processingSized(
                             page.image,
-                            longestEdge: 3_200
+                            longestEdge: Self.renderingLongestEdge,
+                            maximumPixelCount: Self.renderingPixelBudget
                         )
                         let result = processed(
                             source,
-                            options:
-                                page.processingOptions
-                                    ?? options
+                            options: resolvedOptions
                         )
+                        guard !Task.isCancelled else { return }
                         context.beginPage()
                         UIColor.white.setFill()
                         context.cgContext.fill(
@@ -528,22 +657,159 @@ struct ScanPDFRenderer: @unchecked Sendable {
                         )
                     }
                     if Task.isCancelled { return }
-                    progress(
-                        Double(index + 1)
-                            / Double(max(1, pages.count))
+                    let fraction = Double(index + 1)
+                        / Double(pages.count)
+                    let percent = Int(
+                        (fraction * 100).rounded(.down)
                     )
+                    if percent > lastReportedPercent {
+                        lastReportedPercent = percent
+                        progress(fraction)
+                    }
                 }
             }
             try Task.checkCancellation()
-            LocalFileSecurity.applyCompleteProtection(to: destination)
+            try LocalFileSecurity.requireCompleteProtection(
+                to: stagingURL
+            )
+            try verifyRenderedPDF(
+                at: stagingURL,
+                expectedPageCount: pages.count
+            )
+            try Task.checkCancellation()
+            try fileManager.moveItem(at: stagingURL, to: destination)
+            publishedDestination = true
+            try LocalFileSecurity.requireCompleteProtection(to: destination)
+            LocalFileSecurity.excludeFromBackup(destination)
         } catch is CancellationError {
-            try? FileManager.default.removeItem(at: destination)
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
             throw CancellationError()
+        } catch let error as PaperPathError {
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
+            throw error
         } catch {
-            try? FileManager.default.removeItem(at: destination)
+            if publishedDestination {
+                try? fileManager.removeItem(at: destination)
+            }
             throw PaperPathError.storageFailure(
                 "The scanned pages could not be rendered."
             )
+        }
+    }
+
+    func validateInputBudget(
+        for pages: [ScanPageImage]
+    ) throws {
+        guard pages.count <= Self.maximumInputPageCount else {
+            throw PaperPathError.insufficientSelection(
+                "Create up to 250 scanned or image pages at once."
+            )
+        }
+        var totalPixelCount = 0.0
+        for page in pages {
+            try Task.checkCancellation()
+            let pixelSize = orientedPixelSize(of: page.image)
+            guard pixelSize.width.isFinite,
+                  pixelSize.height.isFinite,
+                  pixelSize.width > 0,
+                  pixelSize.height > 0
+            else {
+                throw PaperPathError.unreadableImage
+            }
+            let pixelCount = Double(pixelSize.width)
+                * Double(pixelSize.height)
+            guard pixelCount.isFinite,
+                  pixelCount <= Self.maximumInputPixelsPerPage
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "One selected image is too large to render safely."
+                )
+            }
+            totalPixelCount += pixelCount
+            guard totalPixelCount.isFinite,
+                  totalPixelCount <= Self.maximumInputPixelsPerBatch
+            else {
+                throw PaperPathError.insufficientSelection(
+                    "This scan batch is too large to render safely. Split it into smaller PDFs."
+                )
+            }
+        }
+    }
+
+    private func ensureRenderingCapacity(
+        for pages: [ScanPageImage],
+        destination: URL
+    ) throws {
+        let estimatedImageBytes = pages.reduce(Int64.zero) {
+            partial,
+            page in
+            let size = orientedPixelSize(of: page.image)
+            let renderedPixels = min(
+                Self.renderingPixelBudget,
+                Double(size.width) * Double(size.height)
+            )
+            let pageBytes = Int64(
+                min(
+                    Double(Int64.max),
+                    max(0, renderedPixels * 2)
+                )
+            )
+            let (sum, overflow) = partial.addingReportingOverflow(
+                pageBytes
+            )
+            return overflow ? Int64.max : sum
+        }
+        let (requiredBytes, overflow) = estimatedImageBytes
+            .addingReportingOverflow(64 * 1_024 * 1_024)
+        guard !overflow else {
+            throw PaperPathError.fileTooLarge
+        }
+        let parent = destination.deletingLastPathComponent()
+        let values = try parent.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        )
+        if let available =
+            values.volumeAvailableCapacityForImportantUsage,
+           available < requiredBytes {
+            throw PaperPathError.insufficientStorage
+        }
+    }
+
+    func verifyRenderedPDF(
+        at url: URL,
+        expectedPageCount: Int
+    ) throws {
+        guard let document = PDFDocument(url: url),
+              !document.isLocked,
+              document.pageCount == expectedPageCount
+        else {
+            throw PaperPathError.outputVerificationFailed(
+                "the scanned PDF could not be reopened with every page"
+            )
+        }
+        for pageIndex in 0..<document.pageCount {
+            try Task.checkCancellation()
+            guard let page = document.page(at: pageIndex) else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a scanned PDF page could not be reopened"
+                )
+            }
+            let bounds = page.bounds(for: .mediaBox)
+            guard bounds.origin.x.isFinite,
+                  bounds.origin.y.isFinite,
+                  bounds.width.isFinite,
+                  bounds.height.isFinite,
+                  bounds.width > 0,
+                  bounds.height > 0
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "a scanned PDF page has invalid geometry"
+                )
+            }
         }
     }
 
@@ -567,16 +833,32 @@ struct ScanPDFRenderer: @unchecked Sendable {
         options: ScanProcessingOptions
     ) -> ScanPreviewResult {
         processed(
-            processingSized(image, longestEdge: 1_600),
+            processingSized(
+                image,
+                longestEdge: 1_600,
+                maximumPixelCount: 2_000_000
+            ),
             options: options
         )
     }
 
-    private func processed(
+    func processed(
         _ image: UIImage,
         options: ScanProcessingOptions
     ) -> ScanPreviewResult {
         guard !Task.isCancelled else {
+            return ScanPreviewResult(
+                image: image,
+                detectedDocument: false,
+                cropQuad: nil
+            )
+        }
+        if options.enhancement == .original,
+           !options.autoCrop,
+           options.manualCrop == nil,
+           !options.removeShadows,
+           !options.cleanEdges,
+           !options.hasToneAdjustments {
             return ScanPreviewResult(
                 image: image,
                 detectedDocument: false,
@@ -678,7 +960,7 @@ struct ScanPDFRenderer: @unchecked Sendable {
             brightness: options.brightness,
             contrast: options.contrast
         ).cropped(to: input.extent)
-        guard let cgImage = ciContext.createCGImage(
+        guard let cgImage = Self.ciContext.createCGImage(
             output,
             from: output.extent
         ) else {
@@ -762,7 +1044,7 @@ struct ScanPDFRenderer: @unchecked Sendable {
         return controls.outputImage ?? input
     }
 
-    private func detectedRectangle(
+    func detectedRectangle(
         in image: UIImage
     ) -> VNRectangleObservation? {
         guard let cgImage = image.cgImage else { return nil }
@@ -866,18 +1148,76 @@ struct ScanPDFRenderer: @unchecked Sendable {
         )
     }
 
-    private func processingSized(
+    func processingSized(
         _ image: UIImage,
-        longestEdge: CGFloat
+        longestEdge: CGFloat,
+        maximumPixelCount: Double
     ) -> UIImage {
-        let edge = max(image.size.width, image.size.height)
-        guard edge > longestEdge else { return image }
-        let scale = longestEdge / edge
-        let size = CGSize(
-            width: max(1, image.size.width * scale),
-            height: max(1, image.size.height * scale)
+        let pixelSize = orientedPixelSize(of: image)
+        guard pixelSize.width.isFinite,
+              pixelSize.height.isFinite,
+              pixelSize.width > 0,
+              pixelSize.height > 0
+        else {
+            return image
+        }
+        let edgeScale = longestEdge
+            / max(pixelSize.width, pixelSize.height)
+        let sourcePixelCount =
+            Double(pixelSize.width) * Double(pixelSize.height)
+        let areaScale = CGFloat(
+            sqrt(maximumPixelCount / sourcePixelCount)
         )
-        return image.preparingThumbnail(of: size) ?? image
+        let scale = min(1, min(edgeScale, areaScale))
+        guard scale < 1 else { return image }
+
+        let targetSize = CGSize(
+            width: max(1, floor(pixelSize.width * scale)),
+            height: max(1, floor(pixelSize.height * scale))
+        )
+        if let thumbnail = image.preparingThumbnail(of: targetSize) {
+            return thumbnail
+        }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(
+            size: targetSize,
+            format: format
+        ).image { _ in
+            UIColor.white.setFill()
+            UIRectFill(CGRect(origin: .zero, size: targetSize))
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
+
+    func orientedPixelSize(of image: UIImage) -> CGSize {
+        let sourceSize: CGSize
+        if let cgImage = image.cgImage {
+            sourceSize = CGSize(
+                width: cgImage.width,
+                height: cgImage.height
+            )
+        } else if let extent = image.ciImage?.extent,
+                  extent.width.isFinite,
+                  extent.height.isFinite {
+            sourceSize = extent.size
+        } else {
+            sourceSize = CGSize(
+                width: image.size.width * image.scale,
+                height: image.size.height * image.scale
+            )
+        }
+
+        switch image.imageOrientation {
+        case .left, .leftMirrored, .right, .rightMirrored:
+            return CGSize(
+                width: sourceSize.height,
+                height: sourceSize.width
+            )
+        default:
+            return sourceSize
+        }
     }
 }
 

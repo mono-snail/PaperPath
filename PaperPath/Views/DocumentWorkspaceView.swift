@@ -1,7 +1,50 @@
+import PDFKit
 import SwiftUI
 import UIKit
 
+private enum ProtectedPDFPasswordValidationResult: Sendable {
+    case valid
+    case invalid
+    case unavailable
+}
+
 struct DocumentWorkspaceView: View {
+    private enum ToolMode: String, CaseIterable, Identifiable {
+        case read
+        case annotate
+        case pages
+        case deliver
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .read: return "Read"
+            case .annotate: return "Annotate"
+            case .pages: return "Pages"
+            case .deliver: return "Deliver"
+            }
+        }
+
+        var tint: Color {
+            switch self {
+            case .read: return PPColor.accent
+            case .annotate: return PPColor.cyan
+            case .pages: return PPColor.textPrimary
+            case .deliver: return PPColor.mint
+            }
+        }
+
+        var shortcut: KeyEquivalent {
+            switch self {
+            case .read: return "1"
+            case .annotate: return "2"
+            case .pages: return "3"
+            case .deliver: return "4"
+            }
+        }
+    }
+
     enum Sheet: String, Identifiable {
         case brief
         case insight
@@ -16,6 +59,9 @@ struct DocumentWorkspaceView: View {
         case protection
         case redaction
         case export
+        case officeExport
+        case imageExport
+        case verifiedExport
         case reading
         case bookmarks
         case formReview
@@ -25,6 +71,7 @@ struct DocumentWorkspaceView: View {
         case compare
         case deliveryReceipt
         case deliveryHistory
+        case receivedPackage
         case sourceLocation
         case technicalInspector
         case versionHistory
@@ -32,13 +79,90 @@ struct DocumentWorkspaceView: View {
         case privateNote
 
         var id: String { rawValue }
+
+        var exportFocus: PDFExportFocus? {
+            switch self {
+            case .officeExport: return .text
+            case .imageExport: return .images
+            case .verifiedExport: return .safeShare
+            default: return nil
+            }
+        }
+    }
+
+    private enum PendingWorkspaceHandoff {
+        case tool(DocumentTool)
+        case action(DocumentAction)
+        case stamp(
+            PDFStampKind,
+            pageIndex: Int,
+            contentRevisionID: UUID
+        )
+        case openDocument(DocumentRoute)
+        case safeShare
+        case unlockForVerifiedOutput
+        case recognitionSettings
+        case presentSheet(Sheet)
+        case navigate(
+            pageIndex: Int,
+            message: String,
+            recordsHistory: Bool,
+            thenPresent: Sheet?,
+            showsNotice: Bool,
+            contentRevisionID: UUID
+        )
+        case signature(
+            pageIndex: Int,
+            initialBounds: PDFNormalizedRect?,
+            fieldName: String?,
+            navigationMessage: String,
+            updatesCheckpoint: Bool,
+            contentRevisionID: UUID
+        )
+    }
+
+    private enum WorkspaceMetadataOperation {
+        case workflow
+        case pin
+        case rename
+        case bookmark
+        case trash
+
+        var title: String {
+            switch self {
+            case .workflow:
+                return "Updating workflow".localizedUI
+            case .pin:
+                return "Updating pin".localizedUI
+            case .rename:
+                return "Renaming working copy".localizedUI
+            case .bookmark:
+                return "Updating bookmark".localizedUI
+            case .trash:
+                return "Moving to Trash".localizedUI
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .workflow: return "folder"
+            case .pin: return "pin"
+            case .rename: return "pencil"
+            case .bookmark: return "bookmark"
+            case .trash: return "trash"
+            }
+        }
     }
 
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.openWindow) private var openWindow
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @AppStorage("reading.theme") private var savedReadingTheme = PDFReadingTheme.paper.rawValue
     @AppStorage("reading.layout") private var savedReadingLayout = PDFReadingLayout.continuous.rawValue
     @AppStorage("reading.horizontal") private var savedHorizontalNavigation = false
@@ -48,42 +172,95 @@ struct DocumentWorkspaceView: View {
     private var savedUnderlineColor = PDFMarkupColor.blue.rawValue
     @AppStorage("markup.strikeColor")
     private var savedStrikeColor = PDFMarkupColor.red.rawValue
+    @SceneStorage("workspace.toolMode")
+    private var savedToolMode = ToolMode.read.rawValue
+    @AppStorage("workspace.showToolNames")
+    private var showToolNames = true
 
     let recordID: UUID
     let initialPageIndex: Int?
     let initialQuickTask: PDFQuickTask?
+    let initialContentRevisionID: UUID?
+    let onReadingPositionChange: (Int, UUID) -> Void
     let onOpenDocument: (DocumentRoute) -> Void
 
     @State private var presentedSheet: Sheet?
+    @State private var pendingWorkspaceHandoff:
+        PendingWorkspaceHandoff?
     @State private var isRenaming = false
     @State private var proposedName = ""
+    @State private var originalName = ""
     @State private var isJumpingToPage = false
     @State private var pageJumpInput = ""
+    @FocusState private var renameFieldFocused: Bool
+    @FocusState private var pageJumpFieldFocused: Bool
     @State private var isConfirmingDelete = false
     @State private var requestedPageIndex: Int?
     @State private var pageNavigationToken = 0
     @State private var recognitionTask: Task<Void, Never>?
+    @State private var recognitionGeneration = UUID()
+    @State private var recognitionStopRequested = false
+    @State private var searchableCopyTask: Task<Void, Never>?
+    @State private var searchableCopyGeneration = UUID()
+    @State private var searchableCopyStopRequested = false
     @State private var readingPositionTask: Task<Void, Never>?
+    @State private var workspaceTransitionTask: Task<Void, Never>?
+    @State private var workspaceTransitionGeneration = UUID()
+    @State private var activeWorkspaceHandoff:
+        PendingWorkspaceHandoff?
+    @State private var workspaceHandoffFeedback = 0
+    @State private var shareTask: Task<Void, Never>?
+    @State private var shareGeneration = UUID()
+    @State private var temporaryShareURL: URL?
+    @State private var shareProgress: PDFOperationProgress?
+    @State private var shareRateWindow = ByteRateWindow()
+    @State private var workspaceMetadataTask: Task<Void, Never>?
+    @State private var workspaceMetadataGeneration = UUID()
+    @State private var workspaceMetadataStopRequested = false
+    @State private var activeMetadataOperation:
+        WorkspaceMetadataOperation?
+    @State private var metadataSuccessFeedback = 0
+    @State private var metadataErrorFeedback = 0
     @State private var readingPreferences = PDFReadingPreferences()
     @State private var pdfCommand: PDFViewCommand?
     @State private var currentPageIndex = 0
+    @State private var pageStateContentRevisionID: UUID?
     @State private var pageScrubberValue = 0.0
     @State private var isScrubbingPage = false
     @State private var pageBackHistory: [Int] = []
     @State private var pageForwardHistory: [Int] = []
+    @State private var pdfSearchHighlight: PDFTextSearchHighlight?
+    @State private var documentFindQuery = ""
+    @State private var documentFindHistory: [String] = []
     @State private var isImmersiveReading = false
     @State private var redactionMarks: [PDFRedactionMark] = []
     @State private var isAddingNote = false
+    @State private var pendingNote: String?
     @State private var isUnlocking = false
     @State private var unlockInput = ""
+    @State private var unlockErrorMessage: String?
+    @State private var unlockValidationTask: Task<Void, Never>?
+    @State private var unlockValidationGeneration = UUID()
+    @State private var unlockAttemptFeedback = 0
+    @FocusState private var unlockFieldFocused: Bool
     @State private var sessionPassword: String?
+    @State private var sessionUnlockGeneration = UUID()
+    @State private var confirmedSessionUnlockGeneration: UUID?
     @State private var isSessionUnlocked = false
+    @State private var isApplyingSessionUnlock = false
+    @State private var unlockCopyTask: Task<Void, Never>?
+    @State private var unlockCopyGeneration = UUID()
+    @State private var unlockCopyIssue: PDFBatchDeliveryIssue?
+    @State private var unlockCopyStopRequested = false
+    @State private var unlockSuccessFeedback = 0
+    @State private var unlockCopyErrorFeedback = 0
+    @State private var continuesVerifiedOutputAfterUnlock = false
     @State private var didRestoreReadingPreferences = false
     @State private var didHandleInitialQuickTask = false
     @State private var pageOrganizerStartsSelecting = false
-    @State private var exportFocus: PDFExportFocus?
+    @State private var pageOrganizerInitialSelection: Set<Int> = []
     @State private var isRedactionMode = false
-    @State private var recommendationTapCount = 0
+    @State private var pageNavigationFeedback = 0
     @State private var shareItems: [Any] = []
     @State private var isPresentingPencil = false
     @State private var isPresentingSignature = false
@@ -95,6 +272,8 @@ struct DocumentWorkspaceView: View {
     @State private var isConfiguringRecognition = false
     @State private var recognitionConfiguration =
         OCRRecognitionConfiguration.automatic
+    @State private var pendingRecognitionConfiguration:
+        OCRRecognitionConfiguration?
     @State private var textSelectionForReplacement:
         PDFTextSelectionSnapshot?
     @AppStorage("document.recentTools") private var savedRecentTools = ""
@@ -105,11 +284,18 @@ struct DocumentWorkspaceView: View {
         recordID: UUID,
         initialPageIndex: Int? = nil,
         initialQuickTask: PDFQuickTask? = nil,
+        initialContentRevisionID: UUID? = nil,
+        onReadingPositionChange: @escaping (Int, UUID) -> Void = {
+            _,
+            _ in
+        },
         onOpenDocument: @escaping (DocumentRoute) -> Void = { _ in }
     ) {
         self.recordID = recordID
         self.initialPageIndex = initialPageIndex
         self.initialQuickTask = initialQuickTask
+        self.initialContentRevisionID = initialContentRevisionID
+        self.onReadingPositionChange = onReadingPositionChange
         self.onOpenDocument = onOpenDocument
         _requestedPageIndex = State(initialValue: initialPageIndex)
     }
@@ -128,76 +314,166 @@ struct DocumentWorkspaceView: View {
             }
         }
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: initialPageIndex) {
-            guard let initialPageIndex else { return }
-            await Task.yield()
-            model.noticeMessage = "Opened at match · page \(initialPageIndex + 1)"
-        }
-        .task(id: initialQuickTask) {
-            guard !didHandleInitialQuickTask,
-                  let initialQuickTask
-            else { return }
-            didHandleInitialQuickTask = true
-            await Task.yield()
-            if let checkpoint = model.record(id: recordID)?
-                .taskCheckpoint,
-               checkpoint.stage.quickTask == initialQuickTask {
-                resume(checkpoint)
-            } else {
-                open(initialQuickTask)
-            }
-        }
         .task(id: recordID) {
+            await model.ensureAnalysisLoaded(for: recordID)
+            guard !Task.isCancelled else { return }
             await model.synchronizeCompletionState(recordID: recordID)
-            guard initialPageIndex == nil,
+            guard !Task.isCancelled,
                   let record = model.record(id: recordID)
             else { return }
+            pageStateContentRevisionID = record.contentRevisionID
+            if let initialContentRevisionID,
+               initialContentRevisionID
+                != record.contentRevisionID {
+                didHandleInitialQuickTask = true
+                model[noticeFor: paperPathSceneID] =
+                    "Continue point refreshed for the updated PDF"
+                        .localizedUI
+                if let checkpoint = record.taskCheckpoint,
+                   checkpoint.contentRevisionID
+                    == record.contentRevisionID {
+                    resume(checkpoint)
+                    return
+                }
+                currentPageIndex = record.lastPageIndex
+                pageScrubberValue = Double(record.lastPageIndex)
+                onReadingPositionChange(
+                    record.lastPageIndex,
+                    record.contentRevisionID
+                )
+                if record.lastPageIndex > 0 {
+                    await Task.yield()
+                    guard !Task.isCancelled else { return }
+                    showPage(
+                        record.lastPageIndex,
+                        message: "Resumed updated PDF",
+                        recordsHistory: false
+                    )
+                }
+                return
+            }
+            if let initialPageIndex {
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                _ = commitPageNavigation(
+                    initialPageIndex,
+                    message: "Opened at match",
+                    recordsHistory: false,
+                    showsNotice: initialQuickTask == nil
+                )
+            }
+            if !didHandleInitialQuickTask,
+               let initialQuickTask {
+                didHandleInitialQuickTask = true
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                if let currentRecord = model.record(id: recordID),
+                   let checkpoint = currentRecord.taskCheckpoint,
+                   checkpoint.contentRevisionID
+                    == currentRecord.contentRevisionID,
+                   checkpoint.stage.quickTask == initialQuickTask {
+                    resume(checkpoint)
+                } else {
+                    open(initialQuickTask)
+                }
+                return
+            }
+            guard initialPageIndex == nil else { return }
             currentPageIndex = record.lastPageIndex
             pageScrubberValue = Double(record.lastPageIndex)
             if record.lastPageIndex > 0 {
                 await Task.yield()
                 showPage(
                     record.lastPageIndex,
-                    message: "Resumed at page \(record.lastPageIndex + 1)",
+                    message: "Resumed reading",
                     recordsHistory: false
                 )
             } else {
+                onReadingPositionChange(
+                    0,
+                    record.contentRevisionID
+                )
                 await model.updateReadingPosition(
                     recordID: recordID,
-                    pageIndex: 0
+                    pageIndex: 0,
+                    expectedContentRevisionID:
+                        record.contentRevisionID
                 )
             }
         }
         .onDisappear {
-            recognitionTask?.cancel()
-            recognitionTask = nil
+            cancelWorkspaceTransition()
+            pendingWorkspaceHandoff = nil
+            pendingRecognitionConfiguration = nil
+            clearProtectedDocumentSession()
+            stopRecognition()
+            stopSearchableCopyCreation()
             readingPositionTask?.cancel()
             readingPositionTask = nil
+            stopSharePreparation()
+            cleanupShareCopy()
+            invalidateWorkspaceMetadataPresentation()
             let pageIndex = currentPageIndex
-            Task {
-                await model.updateReadingPosition(
-                    recordID: recordID,
-                    pageIndex: pageIndex
+            let viewedAt = Date()
+            let contentRevisionID = model.record(id: recordID)?
+                .contentRevisionID
+            if let contentRevisionID,
+               pageStateContentRevisionID == contentRevisionID {
+                onReadingPositionChange(
+                    pageIndex,
+                    contentRevisionID
                 )
             }
+            Task {
+                guard let contentRevisionID,
+                      pageStateContentRevisionID
+                        == contentRevisionID
+                else { return }
+                await model.updateReadingPosition(
+                    recordID: recordID,
+                    pageIndex: pageIndex,
+                    expectedContentRevisionID:
+                        contentRevisionID,
+                    viewedAt: viewedAt
+                )
+            }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptProtectedWorkspaceWork()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication.protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtectedWorkspaceWork()
         }
     }
 
     private func workspace(record: DocumentRecord, url: URL) -> some View {
-        ZStack {
-            PPCanvas()
+        let recentDocuments = model.recentDocuments(
+            excluding: record.id,
+            limit: 5
+        )
+        let activeSessionPassword = sessionPassword
+        let activeSessionGeneration = sessionUnlockGeneration
+        let workspaceChrome = AnyView(
+            ZStack {
+                PPCanvas()
 
-            VStack(spacing: 0) {
-                if !isImmersiveReading,
-                   horizontalSizeClass == .regular,
-                   !model.recentDocuments(
-                        excluding: record.id,
-                        limit: 1
-                   ).isEmpty {
-                    recentDocumentTabs(current: record)
-                }
+                VStack(spacing: 0) {
+                    if !isImmersiveReading,
+                       horizontalSizeClass == .regular,
+                       !dynamicTypeSize.isAccessibilitySize,
+                       !recentDocuments.isEmpty {
+                        recentDocumentTabs(
+                            current: record,
+                            recent: recentDocuments
+                        )
+                    }
 
-                if !isImmersiveReading {
+                if !isImmersiveReading, toolMode != .read {
                     workspaceContextStrip(record)
                         .frame(
                             maxWidth: horizontalSizeClass == .regular
@@ -210,6 +486,32 @@ struct DocumentWorkspaceView: View {
                         .padding(.bottom, PPSpacing.small)
                 }
 
+                if record.profile.isLocked,
+                   isSessionUnlocked,
+                   let unlockCopyIssue {
+                    unlockCopyRecoveryStrip(unlockCopyIssue)
+                        .frame(
+                            maxWidth: horizontalSizeClass == .regular
+                                ? 1_080
+                                : .infinity
+                        )
+                        .frame(maxWidth: .infinity)
+                        .padding(.horizontal, PPSpacing.regular)
+                        .padding(.bottom, PPSpacing.small)
+                }
+
+                if !isImmersiveReading,
+                   toolMode == .read || horizontalSizeClass == .compact,
+                   let prioritySignal =
+                        workspaceCommandSignals(record).first {
+                    compactWorkspaceSignal(
+                        prioritySignal,
+                        record: record
+                    )
+                    .padding(.horizontal, PPSpacing.regular)
+                    .padding(.bottom, PPSpacing.small)
+                }
+
                 PDFDocumentView(
                     url: url,
                     refreshToken: model.refreshToken(for: recordID),
@@ -217,6 +519,14 @@ struct DocumentWorkspaceView: View {
                     navigationToken: pageNavigationToken,
                     readingPreferences: readingPreferences,
                     command: pdfCommand,
+                    searchHighlight:
+                        pdfSearchHighlight?.contentRevisionID
+                            == record.contentRevisionID
+                            ? pdfSearchHighlight
+                            : nil,
+                    allowsMutation:
+                        !model.isProcessing(recordID)
+                            && workspaceMetadataTask == nil,
                     onMutation: {
                         Task {
                             await model.refreshAfterAnnotation(
@@ -226,7 +536,7 @@ struct DocumentWorkspaceView: View {
                     },
                     onRedactionMarks: { marks in
                         guard !marks.isEmpty else {
-                            model.noticeMessage = "Select text before marking a redaction"
+                            model[noticeFor: paperPathSceneID] = "Select text before marking a redaction"
                             return
                         }
                         redactionMarks = PDFRedactionMarkSanitizer.clean(
@@ -238,43 +548,47 @@ struct DocumentWorkspaceView: View {
                         textSelectionForReplacement = selection
                     },
                     onPageChange: { pageIndex in
+                        guard scenePhase == .active,
+                              UIApplication.shared
+                                .isProtectedDataAvailable,
+                              model.record(id: recordID)?
+                                .contentRevisionID
+                                == record.contentRevisionID,
+                              pageStateContentRevisionID
+                                == record.contentRevisionID
+                        else { return }
+                        if pdfSearchHighlight?.pageIndex != pageIndex {
+                            pdfSearchHighlight = nil
+                        }
                         currentPageIndex = pageIndex
                         if !isScrubbingPage {
                             pageScrubberValue = Double(pageIndex)
                         }
-                        scheduleReadingPositionSave(pageIndex)
+                        onReadingPositionChange(
+                            pageIndex,
+                            record.contentRevisionID
+                        )
+                        scheduleReadingPositionSave(
+                            pageIndex,
+                            expectedContentRevisionID:
+                                record.contentRevisionID
+                        )
                     },
                     onCommandMessage: { message in
-                        model.noticeMessage = message
+                        model[noticeFor: paperPathSceneID] = message
                     },
-                    unlockPassword: sessionPassword,
+                    unlockPassword: activeSessionPassword,
                     onUnlock: { success in
-                        isSessionUnlocked = success
-                        if success {
-                            unlockInput = ""
-                            model.noticeMessage = "Protected PDF unlocked for this session"
-                        } else {
-                            sessionPassword = nil
-                            model.noticeMessage = "The password didn’t match"
-                        }
-                    }
-                )
-                .background(PPColor.surfaceMuted)
-                .overlay {
-                    if !isImmersiveReading {
-                        StudioStageMarks(
-                            tint: record.profile.isLocked
-                                ? PPColor.amber
-                                : PPColor.accent,
-                            inset: horizontalSizeClass == .regular
-                                ? 14
-                                : 8,
-                            arm: horizontalSizeClass == .regular
-                                ? 18
-                                : 12
+                        handlePDFUnlockResult(
+                            success,
+                            expectedPassword:
+                                activeSessionPassword,
+                            generation:
+                                activeSessionGeneration
                         )
                     }
-                }
+                )
+                .background(PPColor.documentStage)
                 .padding(
                     .horizontal,
                     horizontalSizeClass == .regular
@@ -288,7 +602,10 @@ struct DocumentWorkspaceView: View {
                 )
                 .accessibilityIdentifier("pdfWorkspace")
                 .overlay(alignment: .topTrailing) {
-                    if model.isProcessing(recordID) {
+                    if model.isProcessing(recordID)
+                        || model.isAnalyzing(recordID)
+                        || unlockCopyTask != nil
+                        || workspaceMetadataTask != nil {
                         processingPill
                             .padding(PPSpacing.regular)
                     }
@@ -300,694 +617,1222 @@ struct DocumentWorkspaceView: View {
                 }
             }
 
-            if isImmersiveReading {
-                Button {
-                    withAnimation(
-                        reduceMotion
-                            ? nil
-                            : .snappy(duration: 0.24)
-                    ) {
-                        isImmersiveReading = false
-                    }
-                } label: {
-                    Image(
-                        systemName:
-                            "arrow.down.right.and.arrow.up.left"
-                    )
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(PPColor.textPrimary)
-                    .frame(width: 48, height: 48)
-                    .background(.ultraThinMaterial)
-                    .clipShape(Circle())
-                    .overlay {
-                        Circle()
-                            .stroke(
-                                PPColor.border.opacity(0.68),
-                                lineWidth: 0.7
-                            )
-                    }
-                    .shadow(
-                        color: .black.opacity(0.16),
-                        radius: 10,
-                        y: 4
-                    )
-                }
-                .buttonStyle(.plain)
-                .padding(PPSpacing.regular)
-                .frame(
-                    maxWidth: .infinity,
-                    maxHeight: .infinity,
-                    alignment: .bottomTrailing
-                )
-                .transition(.scale.combined(with: .opacity))
-                .accessibilityLabel("Exit immersive reading")
-                .accessibilityIdentifier("exitImmersiveReading")
-            }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            if !isImmersiveReading {
-                actionBar(record: record)
-            }
-        }
-        .toolbar(
-            isImmersiveReading ? .hidden : .visible,
-            for: .navigationBar
-        )
-        .statusBarHidden(isImmersiveReading)
-        .sensoryFeedback(.selection, trigger: isImmersiveReading)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
-                    Text(record.displayName)
-                        .font(.subheadline.weight(.semibold))
-                        .fontDesign(.serif)
+                if isImmersiveReading {
+                    Button {
+                        setImmersiveReading(false)
+                    } label: {
+                        Image(
+                            systemName:
+                                "arrow.down.right.and.arrow.up.left"
+                        )
+                        .font(.body.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
-                        .lineLimit(1)
-                        .accessibilityIdentifier(
-                            "workspaceDocumentTitle"
+                        .frame(width: 48, height: 48)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Circle())
+                        .overlay {
+                            Circle()
+                                .stroke(
+                                    PPColor.border.opacity(0.68),
+                                    lineWidth: 0.7
+                                )
+                        }
+                        .shadow(
+                            color: .black.opacity(0.16),
+                            radius: 10,
+                            y: 4
                         )
-                    Text(record.subtitle)
-                        .font(.caption2)
-                        .monospacedDigit()
-                        .foregroundStyle(PPColor.textSecondary)
+                    }
+                    .buttonStyle(.plain)
+                    .keyboardShortcut(.cancelAction)
+                    .padding(PPSpacing.regular)
+                    .frame(
+                        maxWidth: .infinity,
+                        maxHeight: .infinity,
+                        alignment: .bottomTrailing
+                    )
+                    .transition(.opacity)
+                    .accessibilityLabel("Exit immersive reading")
+                    .accessibilityHint(
+                        "Returns the document controls without changing your page."
+                    )
+                    .accessibilityIdentifier("exitImmersiveReading")
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button {
-                        presentedSheet = .find
-                    } label: {
-                        Label(
-                            "Find in Document",
-                            systemImage: "text.magnifyingglass"
-                        )
-                    }
-                    .keyboardShortcut("f", modifiers: .command)
-
-                    Button {
-                        presentedSheet = .reading
-                    } label: {
-                        Label("Reading Settings", systemImage: "textformat.size")
-                    }
-                    Button {
-                        withAnimation(
-                            reduceMotion
-                                ? nil
-                                : .snappy(duration: 0.24)
-                        ) {
-                            isImmersiveReading = true
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                if !isImmersiveReading {
+                    actionBar(record: record)
+                }
+            }
+            .toolbar(
+                isImmersiveReading ? .hidden : .visible,
+                for: .navigationBar
+            )
+            .statusBarHidden(isImmersiveReading)
+            .sensoryFeedback(.selection, trigger: isImmersiveReading)
+            .accessibilityAction(.escape) {
+                handleWorkspaceEscape()
+            }
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    VStack(spacing: 1) {
+                        Text(record.displayName)
+                            .font(PPType.document)
+                            .foregroundStyle(PPColor.textPrimary)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.82)
+                        if horizontalSizeClass == .regular,
+                           !dynamicTypeSize.ppPrefersExpandedLayout {
+                            Text(record.subtitle)
+                                .font(.caption2)
+                                .monospacedDigit()
+                                .foregroundStyle(PPColor.textSecondary)
+                                .lineLimit(1)
                         }
-                    } label: {
-                        Label(
-                            "Immersive Reading",
-                            systemImage:
-                                "arrow.up.left.and.arrow.down.right"
-                        )
                     }
-                    Button {
-                        presentedSheet = .reader
-                    } label: {
-                        Label(
-                            "Focus Reader",
-                            systemImage: "text.alignleft"
-                        )
-                    }
-                    Button {
-                        presentedSheet = .bookmarks
-                    } label: {
-                        Label(
-                            "Bookmarks & Outline",
-                            systemImage: "bookmark"
-                        )
-                    }
-                    Button {
-                        presentedSheet = .privateNote
-                    } label: {
-                        Label(
-                            record.privateNote == nil
-                                ? "Add Private Note"
-                                : "Edit Private Note",
-                            systemImage: "note.text"
-                        )
-                    }
-                    let recent = model.recentDocuments(
-                        excluding: recordID
-                    )
-                    if !recent.isEmpty {
-                        Divider()
-                        Menu("Recent Documents") {
-                            ForEach(recent) { recentRecord in
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(record.displayName)
+                    .accessibilityValue(record.subtitle.localizedUI)
+                    .accessibilityIdentifier("workspaceDocumentTitle")
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            presentedSheet = .find
+                        } label: {
+                            Label(
+                                "Find in Document",
+                                systemImage: "text.magnifyingglass"
+                            )
+                        }
+                        .keyboardShortcut("f", modifiers: .command)
+
+                        Button {
+                            presentedSheet = .tools
+                        } label: {
+                            Label("All tools", systemImage: "wrench.and.screwdriver")
+                        }
+                        .keyboardShortcut("t", modifiers: .command)
+
+                        Menu("Workspace tools".localizedUI) {
+                            ForEach(ToolMode.allCases) { mode in
                                 Button {
-                                    readingPositionTask?.cancel()
-                                    onOpenDocument(
-                                        DocumentRoute(
-                                            recordID: recentRecord.id,
-                                            pageIndex: recentRecord
-                                                .lastPageIndex
-                                        )
-                                    )
+                                    savedToolMode = mode.rawValue
+                                } label: {
+                                    Label(mode.title.localizedUI, systemImage: mode == toolMode ? "checkmark" : "circle")
+                                }
+                                .keyboardShortcut(mode.shortcut, modifiers: [.command, .control])
+                            }
+                        }
+                        .disabled(isRedactionMode)
+
+                        Menu {
+                            Button {
+                                presentedSheet = .reading
+                            } label: {
+                                Label(
+                                    "Reading Settings",
+                                    systemImage: "textformat.size"
+                                )
+                            }
+                            Button {
+                                toggleImmersiveReading()
+                            } label: {
+                                Label(
+                                    isImmersiveReading
+                                        ? "Exit immersive reading"
+                                        : "Immersive Reading",
+                                    systemImage:
+                                        "arrow.up.left.and.arrow.down.right"
+                                )
+                            }
+                            .keyboardShortcut(
+                                "i",
+                                modifiers: [.command, .shift]
+                            )
+                            Menu {
+                                Button {
+                                    runViewportCommand(.zoomIn)
                                 } label: {
                                     Label(
-                                        "\(recentRecord.displayName) · p\(recentRecord.lastPageIndex + 1)",
-                                        systemImage: recentRecord.profile
-                                            .kind.symbol
+                                        "Zoom In",
+                                        systemImage: "plus.magnifyingglass"
                                     )
+                                }
+                                .keyboardShortcut(
+                                    "+",
+                                    modifiers: .command
+                                )
+
+                                Button {
+                                    runViewportCommand(.zoomOut)
+                                } label: {
+                                    Label(
+                                        "Zoom Out",
+                                        systemImage: "minus.magnifyingglass"
+                                    )
+                                }
+                                .keyboardShortcut(
+                                    "-",
+                                    modifiers: .command
+                                )
+
+                                Button {
+                                    runViewportCommand(.fitToWindow)
+                                } label: {
+                                    Label(
+                                        "Fit to Window",
+                                        systemImage: "viewfinder"
+                                    )
+                                }
+                                .keyboardShortcut(
+                                    "0",
+                                    modifiers: .command
+                                )
+                            } label: {
+                                Label(
+                                    "Zoom",
+                                    systemImage: "plus.magnifyingglass"
+                                )
+                            }
+                            Button {
+                                presentedSheet = .reader
+                            } label: {
+                                Label(
+                                    "Focus Reader",
+                                    systemImage: "text.alignleft"
+                                )
+                            }
+                        } label: {
+                            Label("Reading", systemImage: "book")
+                        }
+                        Button {
+                            presentedSheet = .bookmarks
+                        } label: {
+                            Label(
+                                "Navigate",
+                                systemImage: "bookmark"
+                            )
+                            .accessibilityIdentifier(
+                                "workspaceNavigateAction"
+                            )
+                        }
+                        Button {
+                            presentedSheet = .privateNote
+                        } label: {
+                            Label(
+                                record.privateNote == nil
+                                    ? "Add Private Note"
+                                    : "Edit Private Note",
+                                systemImage: "note.text"
+                            )
+                        }
+                        if let previousDocument =
+                                recentDocuments.first {
+                            Divider()
+
+                            Button {
+                                openRecentDocument(previousDocument)
+                            } label: {
+                                Label(
+                                    "Previously Viewed Document",
+                                    systemImage: "arrow.left.arrow.right"
+                                )
+                            }
+                            .keyboardShortcut(
+                                .tab,
+                                modifiers: .control
+                            )
+                            .accessibilityHint(
+                                AppLocalization.format(
+                                    "Switches to %@",
+                                    previousDocument.displayName
+                                )
+                            )
+
+                            Menu("Recent Documents") {
+                                ForEach(recentDocuments) { recentRecord in
+                                    Button {
+                                        openRecentDocument(recentRecord)
+                                    } label: {
+                                        Label(
+                                            "\(recentRecord.displayName) · p\(recentRecord.lastPageIndex + 1)",
+                                            systemImage: recentRecord.profile
+                                                .kind.symbol
+                                        )
+                                    }
                                 }
                             }
                         }
-                    }
-                } label: {
-                    Image(systemName: "book.pages")
-                }
-                .accessibilityLabel("Reading and navigation")
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Menu("Move to") {
-                        ForEach(DocumentWorkflowStatus.allCases) { status in
+
+                        if UIDevice.current.userInterfaceIdiom == .pad {
+                            Divider()
+
                             Button {
-                                Task {
-                                    await model.updateWorkflow(
-                                        recordID: recordID,
-                                        status: status
-                                    )
+                                openCurrentDocumentInNewWindow(
+                                    record.id
+                                )
+                            } label: {
+                                Label(
+                                    "Open in New Window",
+                                    systemImage: "macwindow.badge.plus"
+                                )
+                            }
+                            .accessibilityHint(
+                                "Opens this PDF in a separate iPad window."
+                                    .localizedUI
+                            )
+                            .keyboardShortcut(
+                                "n",
+                                modifiers: [.command, .shift]
+                            )
+                            .help("Open in New Window".localizedUI)
+                        }
+                    } label: {
+                        Image(systemName: "book.pages")
+                    }
+                    .accessibilityLabel("Reading and navigation")
+                    .disabled(hasBlockingWorkspaceControlTask)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Menu {
+                            Menu("Move to") {
+                                ForEach(DocumentWorkflowStatus.allCases) { status in
+                                    Button {
+                                        updateWorkflow(status)
+                                    } label: {
+                                        Label(
+                                            status.title.localizedUI,
+                                            systemImage: status.symbol
+                                        )
+                                    }
+                                }
+                            }
+
+                            Button {
+                                togglePinned(
+                                    expectedIsPinned:
+                                        record.isPinned
+                                )
+                            } label: {
+                                Label(
+                                    record.isPinned ? "Unpin" : "Pin",
+                                    systemImage: record.isPinned
+                                        ? "pin.slash"
+                                        : "pin"
+                                )
+                            }
+
+                            Button {
+                                originalName = record.displayName
+                                proposedName = record.displayName
+                                isRenaming = true
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+                        } label: {
+                            Label("Organize", systemImage: "folder")
+                        }
+
+                        Button {
+                            presentedSheet = record.brief == nil ? .insight : .brief
+                        } label: {
+                            Label(
+                                "Document details",
+                                systemImage: "info.circle"
+                            )
+                        }
+
+                        Menu {
+                            Button {
+                                presentedSheet = .versionHistory
+                            } label: {
+                                Label(
+                                    "Version History",
+                                    systemImage: "clock.arrow.circlepath"
+                                )
+                            }
+
+                            Button {
+                                presentedSheet = .sourceLocation
+                            } label: {
+                                Label(
+                                    "File location & source",
+                                    systemImage: "folder.badge.gearshape"
+                                )
+                            }
+
+                            Button {
+                                presentedSheet = .technicalInspector
+                            } label: {
+                                Label(
+                                    "Technical details",
+                                    systemImage: "doc.text.magnifyingglass"
+                                )
+                            }
+                        } label: {
+                            Label(
+                                "History & source",
+                                systemImage: "clock.arrow.circlepath"
+                            )
+                        }
+
+                        let historyOutputs = model.deliveryHistoryOutputs(
+                            for: record.id
+                        )
+                        if record.deliveryReceipt != nil
+                            || record.receivedPackageProvenance != nil
+                            || !historyOutputs.isEmpty {
+                            Menu {
+                                if record.deliveryReceipt != nil {
+                                    Button {
+                                        presentedSheet = .deliveryReceipt
+                                    } label: {
+                                        Label(
+                                            "Delivery receipt",
+                                            systemImage: "checkmark.seal"
+                                        )
+                                    }
+                                }
+
+                                if record.receivedPackageProvenance != nil {
+                                    Button {
+                                        presentedSheet = .receivedPackage
+                                    } label: {
+                                        Label(
+                                            "Received Package",
+                                            systemImage: "shippingbox"
+                                        )
+                                    }
+                                }
+
+                                if !historyOutputs.isEmpty {
+                                    Button {
+                                        presentedSheet = .deliveryHistory
+                                    } label: {
+                                        Label(
+                                            AppLocalization.format(
+                                                "Delivery history (%lld)",
+                                                historyOutputs.count
+                                            ),
+                                            systemImage: "clock.badge.checkmark"
+                                        )
+                                    }
                                 }
                             } label: {
                                 Label(
-                                    status.title.localizedUI,
-                                    systemImage: status.symbol
+                                    "Results",
+                                    systemImage: "checkmark.seal"
                                 )
                             }
                         }
-                    }
 
-                    Button {
-                        Task {
-                            await model.togglePinned(recordID: recordID)
-                        }
-                    } label: {
-                        Label(
-                            record.isPinned ? "Unpin" : "Pin",
-                            systemImage: record.isPinned ? "pin.slash" : "pin"
-                        )
-                    }
-
-                    Button {
-                        proposedName = record.displayName
-                        isRenaming = true
-                    } label: {
-                        Label("Rename", systemImage: "pencil")
-                    }
-
-                    Button {
-                        presentedSheet = record.brief == nil ? .insight : .brief
-                    } label: {
-                        Label(
-                            "File & privacy details",
-                            systemImage: "info.circle"
-                        )
-                    }
-
-                    Button {
-                        presentedSheet = .technicalInspector
-                    } label: {
-                        Label(
-                            "Technical Inspector",
-                            systemImage: "doc.text.magnifyingglass"
-                        )
-                    }
-
-                    Button {
-                        presentedSheet = .versionHistory
-                    } label: {
-                        Label(
-                            "Version History",
-                            systemImage: "clock.arrow.circlepath"
-                        )
-                    }
-
-                    Button {
-                        presentedSheet = .sourceLocation
-                    } label: {
-                        Label(
-                            "Files & Source",
-                            systemImage: "folder.badge.gearshape"
-                        )
-                    }
-
-                    if record.deliveryReceipt != nil {
                         Button {
-                            presentedSheet = .deliveryReceipt
+                            printDocument(record: record, url: url)
                         } label: {
                             Label(
-                                "Delivery receipt",
-                                systemImage: "checkmark.seal"
+                                "Print Working Copy",
+                                systemImage: "printer"
                             )
                         }
-                    }
+                        .keyboardShortcut("p", modifiers: .command)
 
-                    let verifiedOutputs = model.verifiedOutputs(
-                        for: record.id
-                    )
-                    if !verifiedOutputs.isEmpty {
-                        Button {
-                            presentedSheet = .deliveryHistory
+                        Button(role: .destructive) {
+                            isConfirmingDelete = true
                         } label: {
-                            Label(
-                                "Verified outputs (\(verifiedOutputs.count))",
-                                systemImage: "clock.badge.checkmark"
-                            )
+                            Label("Move to Trash", systemImage: "trash")
                         }
-                    }
-
-                    Button {
-                        printDocument(record: record, url: url)
                     } label: {
-                        Label(
-                            "Print Working Copy",
-                            systemImage: "printer"
-                        )
+                        Image(systemName: "ellipsis.circle")
+                            .symbolRenderingMode(.hierarchical)
                     }
-                    .keyboardShortcut("p", modifiers: .command)
-
-                    Button(role: .destructive) {
-                        isConfirmingDelete = true
-                    } label: {
-                        Label("Move to Trash", systemImage: "trash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                        .symbolRenderingMode(.hierarchical)
+                    .accessibilityLabel("Document menu")
+                    .disabled(hasBlockingWorkspaceControlTask)
                 }
-                .accessibilityLabel("Document menu")
             }
-        }
-        .sheet(item: $presentedSheet) { sheet in
-            switch sheet {
-            case .brief:
-                DocumentBriefView(recordID: recordID) { step, pageIndex in
-                    handle(step, pageIndex: pageIndex)
+        )
+        .navigationTitle(record.displayName)
+
+        let workspaceSheets = AnyView(
+            workspaceChrome
+                .sheet(
+                    item: $presentedSheet,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) { sheet in
+                    AnyView(
+                        Group {
+                            switch sheet {
+                            case .brief:
+                                DocumentBriefView(
+                                    recordID: recordID,
+                                    onOpenPage: { pageIndex in
+                                        showPage(
+                                            pageIndex,
+                                            message: "Showing supporting evidence"
+                                        )
+                                    },
+                                    onStep: { step, pageIndex in
+                                        handle(step, pageIndex: pageIndex)
+                                    }
+                                )
+                                .presentationDetents([.medium, .large])
+                                .presentationDragIndicator(.visible)
+                            case .insight:
+                                DocumentInsightView(record: record) { action in
+                                    queueWorkspaceHandoff(.action(action))
+                                }
+                                    .presentationDetents([.medium, .large])
+                                    .presentationDragIndicator(.visible)
+                            case .pages:
+                                PageOrganizerView(
+                                    recordID: recordID,
+                                    startInSelectionMode: pageOrganizerStartsSelecting,
+                                    initialSelectedPageIndices:
+                                        pageOrganizerInitialSelection,
+                                    onCreated: openCreatedDocument,
+                                    onPrepare: {
+                                        openSafeShareAfterDismissal()
+                                        presentedSheet = nil
+                                    }
+                                )
+                                    .presentationDetents([.large])
+                                    .presentationDragIndicator(.visible)
+                            case .recognizedText:
+                                RecognizedTextView(
+                                    recordID: recordID,
+                                    onCreated: openCreatedDocument,
+                                    onOpenPage: { pageIndex in
+                                        showPage(
+                                            pageIndex,
+                                            message: "Reviewing recognized text"
+                                        )
+                                    },
+                                    onRecognizeAgain: {
+                                        openRecognitionSettings(
+                                            afterDismissal: true
+                                        )
+                                    }
+                                )
+                                    .presentationDetents([.large])
+                                    .presentationDragIndicator(.visible)
+                            case .share:
+                                ShareSheet(items: shareItems)
+                                    .presentationDetents([.medium, .large])
+                            case .tools:
+                                DocumentToolPalette(
+                                    recordTitle: record.displayName,
+                                    availableTools: availableTools(for: record),
+                                    unavailableReasons: unavailableToolReasons(
+                                        for: record
+                                    ),
+                                    recentTools: recentTools,
+                                    contextualTools: contextualTools(for: record),
+                                    contextualReasons: contextualToolReasons(
+                                        for: record
+                                    ),
+                                    onSelect: { tool in
+                                        queueWorkspaceHandoff(.tool(tool))
+                                    }
+                                )
+                                .onAppear {
+#if DEBUG
+                                    // #region debug-point B:tools-sheet-appeared
+                                    reportFrequentUIFreezeDebugEvent(
+                                        hypothesisID: "B",
+                                        location:
+                                            "DocumentWorkspaceView.toolsSheet.onAppear",
+                                        message: "Tools sheet appeared",
+                                        data: [
+                                            "recordID":
+                                                recordID.uuidString,
+                                            "presentedSheet":
+                                                presentedSheet?.rawValue
+                                                ?? "nil"
+                                        ]
+                                    )
+                                    // #endregion
+#endif
+                                }
+                                .presentationDetents([.large])
+                            case .stamp:
+                                StampPickerView(pageIndex: currentPageIndex) { kind in
+                                    queueWorkspaceHandoff(
+                                        .stamp(
+                                            kind,
+                                            pageIndex: currentPageIndex,
+                                            contentRevisionID:
+                                                record.contentRevisionID
+                                        )
+                                    )
+                                }
+                                .presentationDetents([.medium, .large])
+                            case .watermark:
+                                WatermarkSheet(
+                                    pageCount: record.profile.pageCount,
+                                    onApply: { payload in
+                                        await model.withFeedbackTarget(
+                                            paperPathSceneID
+                                        ) {
+                                            await model.applyWatermark(
+                                                recordID: recordID,
+                                                payload: payload
+                                            )
+                                        }
+                                    },
+                                    onRemoveAll: {
+                                        await model.withFeedbackTarget(
+                                            paperPathSceneID
+                                        ) {
+                                            await model
+                                                .removeGeneratedWatermarks(
+                                                    recordID: recordID
+                                                )
+                                        }
+                                    }
+                                )
+                                .presentationDetents([.large])
+                            case .bates:
+                                BatesNumberingSheet(
+                                    pageCount: record.profile.pageCount,
+                                    onApply: { payload in
+                                        await model.withFeedbackTarget(
+                                            paperPathSceneID
+                                        ) {
+                                            await model.applyBatesNumbers(
+                                                recordID: recordID,
+                                                payload: payload
+                                            )
+                                        }
+                                    },
+                                    onRemoveAll: {
+                                        await model.withFeedbackTarget(
+                                            paperPathSceneID
+                                        ) {
+                                            await model
+                                                .removeGeneratedBatesNumbers(
+                                                    recordID: recordID
+                                                )
+                                        }
+                                    }
+                                )
+                                .presentationDetents([.large])
+                            case .compression:
+                                CompressionSheet(
+                                    recordID: recordID,
+                                    onCreated: openCreatedDocument
+                                )
+                            case .protection:
+                                ProtectionSheet(
+                                    recordID: recordID,
+                                    onCreated: openCreatedDocument
+                                )
+                            case .redaction:
+                                RedactionReviewSheet(
+                                    recordID: recordID,
+                                    marks: $redactionMarks,
+                                    onReviewPage: { pageIndex in
+                                        showPage(
+                                            pageIndex,
+                                            message: "Reviewing redaction area"
+                                        )
+                                    },
+                                    onCreated: { route in
+                                        redactionMarks = []
+                                        openCreatedDocument(route)
+                                    }
+                                )
+                            case .export, .officeExport, .imageExport, .verifiedExport:
+                                DocumentExportSheet(
+                                    recordID: recordID,
+                                    focus: sheet.exportFocus,
+                                    onCreated: openCreatedDocument,
+                                    onReviewPage: {
+                                        pageIndex,
+                                        checkpointSaved in
+                                        showPage(
+                                            pageIndex,
+                                            message:
+                                                checkpointSaved
+                                                    ? "Reviewing preflight issue"
+                                                    : "Reviewing preflight issue · resume point not saved"
+                                        )
+                                    },
+                                    onRepairPreflightItem: {
+                                        action,
+                                        pageIndex,
+                                        checkpointSaved in
+                                        switch action {
+                                        case .organizePages:
+                                            guard let pageIndex else {
+                                                model[noticeFor: paperPathSceneID] =
+                                                    "The issue page could not be located"
+                                                        .localizedUI
+                                                return
+                                            }
+                                            pageOrganizerStartsSelecting = false
+                                            pageOrganizerInitialSelection = [pageIndex]
+                                            model[noticeFor: paperPathSceneID] =
+                                                (
+                                                    checkpointSaved
+                                                        ? "Blank page selected for review"
+                                                        : "Opening Pages · resume point not saved"
+                                                ).localizedUI
+                                            queueWorkspaceHandoff(
+                                                .presentSheet(.pages)
+                                            )
+                                        case .createEditableCopy:
+                                            queueWorkspaceHandoff(
+                                                .unlockForVerifiedOutput
+                                            )
+                                        }
+                                    }
+                                )
+                            case .reading:
+                                ReadingSettingsSheet(preferences: $readingPreferences)
+                                .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
+                            case .privateNote:
+                                DocumentPrivateNoteView(recordID: recordID)
+                                    .presentationDetents([.medium, .large])
+                            case .bookmarks:
+                                BookmarksSheet(
+                                    recordID: recordID,
+                                    currentPageIndex: currentPageIndex,
+                                    onSelect: { pageIndex in
+                                        showPage(
+                                            pageIndex,
+                                            message: "Opened bookmark"
+                                        )
+                                    },
+                                    onCreated: { route in
+                                        openCreatedDocument(route)
+                                    }
+                                )
+                            case .formReview:
+                                FormReviewView(
+                                    recordID: recordID,
+                                    initialPageIndex: currentPageIndex,
+                                    onSelectPage: {
+                                        pageIndex,
+                                        checkpointSaved in
+                                        showPage(
+                                            pageIndex,
+                                            message:
+                                                checkpointSaved
+                                                    ? "Opened form field"
+                                                    : "Opened form field · resume point not saved"
+                                        )
+                                    },
+                                    onSignField: {
+                                        field,
+                                        checkpointSaved in
+                                        showPageThenSignature(
+                                            field.pageIndex,
+                                            initialBounds: field.normalizedBounds,
+                                            fieldName: field.name,
+                                            navigationMessage:
+                                                checkpointSaved
+                                                    ? "Signature evidence"
+                                                    : "Opening signature · resume point not saved",
+                                            updatesCheckpoint: false
+                                        )
+                                    },
+                                    onPrepare: {
+                                        openSafeShareAfterDismissal()
+                                        presentedSheet = nil
+                                    }
+                                )
+                            case .find:
+                                DocumentFindView(
+                                    recordID: recordID,
+                                    initialQuery: documentFindQuery,
+                                    initialHistory: documentFindHistory,
+                                    initialSelectedPageIndex:
+                                        pdfSearchHighlight?.query
+                                            == documentFindQuery
+                                        ? pdfSearchHighlight?.pageIndex
+                                        : nil,
+                                    onQueryChange: { documentFindQuery = $0 },
+                                    onHistoryChange: { documentFindHistory = $0 },
+                                    onRecognizeText: {
+                                        openRecognitionSettings(afterDismissal: true)
+                                    }
+                                ) {
+                                    result,
+                                    query in
+                                    guard let result else {
+                                        pdfSearchHighlight = nil
+                                        return
+                                    }
+                                    pdfSearchHighlight = PDFTextSearchHighlight(
+                                        query: query,
+                                        pageIndex: result.pageIndex,
+                                        contentRevisionID:
+                                            record.contentRevisionID
+                                    )
+                                    showPage(
+                                        result.pageIndex,
+                                        message: "Previewing search result",
+                                        dismissesPresentedSheet: false
+                                    )
+                                }
+                                .presentationDetents([.medium, .large])
+                                .presentationDragIndicator(.visible)
+                            case .annotations:
+                                AnnotationReviewView(recordID: recordID) { pageIndex in
+                                    showPage(pageIndex, message: "Opened annotation")
+                                }
+                            case .attachments:
+                                PDFAttachmentsView(recordID: recordID) { pageIndex in
+                                    showPage(pageIndex, message: "Opened page attachment")
+                                }
+                            case .compare:
+                                CompareVersionsView(
+                                    sourceRecordID: recordID,
+                                    onOpenRoute: { route in
+                                        queueWorkspaceHandoff(
+                                            .openDocument(route)
+                                        )
+                                    }
+                                )
+                            case .deliveryReceipt:
+                                DeliveryReceiptView(
+                                    recordID: recordID,
+                                    onOpenRoute: { route in
+                                        queueWorkspaceHandoff(
+                                            .openDocument(route)
+                                        )
+                                    }
+                                )
+                            case .deliveryHistory:
+                                DeliveryHistoryView(
+                                    sourceRecordID: recordID,
+                                    onOpen: { route in
+                                        queueWorkspaceHandoff(.openDocument(route))
+                                    },
+                                    onVerify: {
+                                        queueWorkspaceHandoff(.safeShare)
+                                    }
+                                )
+                            case .receivedPackage:
+                                ReceivedPackageProvenanceView(
+                                    recordID: recordID,
+                                    onVerify: {
+                                        queueWorkspaceHandoff(.safeShare)
+                                    }
+                                )
+                                .presentationDetents([.medium, .large])
+                                .presentationDragIndicator(.visible)
+                            case .sourceLocation:
+                                SourceLocationView(
+                                    recordID: recordID,
+                                    onOpenDocument: openCreatedDocument
+                                )
+                            case .technicalInspector:
+                                PDFTechnicalInspectorView(
+                                    recordID: recordID,
+                                    unlockPassword: sessionPassword
+                                )
+                            case .versionHistory:
+                                PDFVersionHistoryView(
+                                    recordID: recordID,
+                                    onOpenPage: openChangedPage
+                                )
+                            case .reader:
+                                FocusReaderSheet(
+                                    recordID: recordID,
+                                    initialPageIndex: currentPageIndex,
+                                    onOpenPage: { pageIndex in
+                                        showPage(
+                                            pageIndex,
+                                            message: "Opened from Focus Reader"
+                                        )
+                                    },
+                                    onRecognizeText: {
+                                        openRecognitionSettings(afterDismissal: true)
+                                    }
+                                )
+                            }
+                        }
+                    )
                 }
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-            case .insight:
-                DocumentInsightView(record: record)
+                .sheet(
+                    isPresented: $isConfiguringRecognition,
+                    onDismiss: completeRecognitionConfigurationDismissal
+                ) {
+                    OCRConfigurationSheet(
+                        recordID: recordID,
+                        initialConfiguration: recognitionConfiguration
+                    ) { configuration in
+                        recognitionConfiguration = configuration
+                        pendingRecognitionConfiguration = configuration
+                        isConfiguringRecognition = false
+                    }
+                    .id(recognitionConfiguration)
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
-            case .pages:
-                PageOrganizerView(
-                    recordID: recordID,
-                    startInSelectionMode: pageOrganizerStartsSelecting,
-                    onCreated: onOpenDocument
-                )
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
-            case .recognizedText:
-                RecognizedTextView(
-                    recordID: recordID,
-                    onCreated: onOpenDocument,
-                    onOpenPage: { pageIndex in
-                        showPage(
-                            pageIndex,
-                            message: "Reviewing recognized text"
-                        )
-                    },
-                    onRecognizeAgain: {
-                        openRecognitionSettings(
-                            afterDismissal: true
-                        )
-                    }
-                )
-                    .presentationDetents([.medium, .large])
-                    .presentationDragIndicator(.visible)
-            case .share:
-                ShareSheet(items: shareItems.isEmpty ? [url] : shareItems)
-                    .presentationDetents([.medium, .large])
-            case .tools:
-                DocumentToolPalette(
-                    recordTitle: record.displayName,
-                    documentURL: url,
-                    refreshToken: model.refreshToken(for: recordID),
-                    availableTools: availableTools(for: record),
-                    unavailableReasons: unavailableToolReasons(
-                        for: record
-                    ),
-                    recentTools: recentTools,
-                    contextualTools: contextualTools(for: record),
-                    onSelect: handle
-                )
-                .presentationDetents([.medium, .large])
-            case .stamp:
-                StampPickerView(pageIndex: currentPageIndex) { kind in
-                    Task {
-                        await model.addStamp(
-                            recordID: recordID,
-                            pageIndex: currentPageIndex,
-                            kind: kind
-                        )
-                    }
                 }
-                .presentationDetents([.medium, .large])
-            case .watermark:
-                WatermarkSheet(
-                    pageCount: record.profile.pageCount,
-                    onApply: { payload in
-                        await model.applyWatermark(
-                            recordID: recordID,
-                            payload: payload
-                        )
-                    },
-                    onRemoveAll: {
-                        await model.removeGeneratedWatermarks(
-                            recordID: recordID
-                        )
+        )
+
+        let workspaceEditors = AnyView(
+            workspaceSheets
+                .fullScreenCover(
+                    isPresented: $isPresentingSignature,
+                    onDismiss: {
+                        signaturePageIndex = nil
+                        signatureInitialBounds = nil
+                        handleWorkspacePresentationDismissal()
                     }
-                )
-                .presentationDetents([.large])
-            case .bates:
-                BatesNumberingSheet(
-                    pageCount: record.profile.pageCount,
-                    onApply: { payload in
-                        await model.applyBatesNumbers(
-                            recordID: recordID,
-                            payload: payload
-                        )
-                    },
-                    onRemoveAll: {
-                        await model.removeGeneratedBatesNumbers(
-                            recordID: recordID
-                        )
-                    }
-                )
-                .presentationDetents([.large])
-            case .compression:
-                CompressionSheet(
-                    recordID: recordID,
-                    onCreated: onOpenDocument
-                )
-            case .protection:
-                ProtectionSheet(
-                    recordID: recordID,
-                    onCreated: onOpenDocument
-                )
-            case .redaction:
-                RedactionReviewSheet(
-                    recordID: recordID,
-                    marks: $redactionMarks
-                ) { route in
-                    redactionMarks = []
-                    onOpenDocument(route)
-                }
-            case .export:
-                DocumentExportSheet(
-                    recordID: recordID,
-                    focus: exportFocus,
-                    onCreated: onOpenDocument,
-                    onReviewPage: { pageIndex in
-                        showPage(
-                            pageIndex,
-                            message: "Reviewing preflight issue"
-                        )
-                    }
-                )
-            case .reading:
-                ReadingSettingsSheet(preferences: $readingPreferences)
-                .presentationDetents([.medium])
-            case .privateNote:
-                DocumentPrivateNoteView(recordID: recordID)
-                    .presentationDetents([.medium, .large])
-            case .bookmarks:
-                BookmarksSheet(
-                    recordID: recordID,
-                    currentPageIndex: currentPageIndex,
-                    onSelect: { pageIndex in
-                        showPage(
-                            pageIndex,
-                            message: "Opened bookmark"
-                        )
-                    },
-                    onCreated: { route in
-                        presentedSheet = nil
-                        onOpenDocument(route)
-                    }
-                )
-            case .formReview:
-                FormReviewView(
-                    recordID: recordID,
-                    initialPageIndex: currentPageIndex,
-                    onSelectPage: { pageIndex in
-                        showPage(pageIndex, message: "Opened form field")
-                    },
-                    onSignField: { field in
-                        showPageThenSignature(
-                            field.pageIndex,
-                            initialBounds: field.normalizedBounds
-                        )
-                    },
-                    onPrepare: {
+                ) {
+                    InkCaptureView(
+                        recordID: recordID,
+                        pageIndex: signaturePageIndex ?? currentPageIndex,
+                        mode: .signature,
+                        initialSignatureBounds: signatureInitialBounds
+                    ) {
                         openSafeShareAfterDismissal()
                     }
-                )
-            case .find:
-                DocumentFindView(recordID: recordID) { pageIndex in
-                    showPage(
-                        pageIndex,
-                        message: "Previewing search result",
-                        dismissesPresentedSheet: false
+                }
+                .fullScreenCover(
+                    isPresented: $isPresentingPencil,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) {
+                    InkCaptureView(
+                        recordID: recordID,
+                        pageIndex: currentPageIndex,
+                        mode: .drawing
                     )
                 }
-                .presentationDetents([.medium, .large])
-                .presentationDragIndicator(.visible)
-            case .annotations:
-                AnnotationReviewView(recordID: recordID) { pageIndex in
-                    showPage(pageIndex, message: "Opened annotation")
+                .fullScreenCover(
+                    isPresented: $isPresentingContentEditor,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) {
+                    PDFContentEditorView(
+                        recordID: recordID,
+                        pageIndex: currentPageIndex,
+                        onCreated: openCreatedDocument
+                    )
                 }
-            case .attachments:
-                PDFAttachmentsView(recordID: recordID) { pageIndex in
-                    showPage(pageIndex, message: "Opened page attachment")
+                .fullScreenCover(
+                    isPresented: $isPresentingLinkEditor,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) {
+                    PDFLinkEditorView(
+                        recordID: recordID,
+                        pageIndex: currentPageIndex,
+                        onCreated: openCreatedDocument
+                    )
                 }
-            case .compare:
-                CompareVersionsView(
-                    sourceRecordID: recordID,
-                    onOpenPage: openChangedPage
-                )
-            case .deliveryReceipt:
-                DeliveryReceiptView(
-                    recordID: recordID,
-                    onOpenPage: openChangedPage
-                )
-            case .deliveryHistory:
-                DeliveryHistoryView(sourceRecordID: recordID) { route in
-                    presentedSheet = nil
-                    onOpenDocument(route)
+                .fullScreenCover(
+                    isPresented: $isPresentingImageReplacement,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) {
+                    PDFImageReplacementView(
+                        recordID: recordID,
+                        pageIndex: currentPageIndex,
+                        onCreated: openCreatedDocument
+                    )
                 }
-            case .sourceLocation:
-                SourceLocationView(
-                    recordID: recordID,
-                    onOpenDocument: onOpenDocument
-                )
-            case .technicalInspector:
-                PDFTechnicalInspectorView(
-                    recordID: recordID,
-                    unlockPassword: sessionPassword
-                )
-            case .versionHistory:
-                PDFVersionHistoryView(
-                    recordID: recordID,
-                    onOpenPage: openChangedPage
-                )
-            case .reader:
-                FocusReaderSheet(
-                    recordID: recordID,
-                    initialPageIndex: currentPageIndex
-                ) { pageIndex in
-                    showPage(pageIndex, message: "Opened from Focus Reader")
+                .fullScreenCover(
+                    item: $textSelectionForReplacement,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) { selection in
+                    PDFTextReplacementView(
+                        recordID: recordID,
+                        selection: selection,
+                        onCreated: openCreatedDocument
+                    )
                 }
-            }
-        }
-        .sheet(isPresented: $isConfiguringRecognition) {
-            OCRConfigurationSheet(
-                initialConfiguration: recognitionConfiguration
-            ) { configuration in
-                startRecognition(configuration)
-            }
-            .id(recognitionConfiguration)
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
-        }
-        .fullScreenCover(
-            isPresented: $isPresentingSignature,
-            onDismiss: {
-                signaturePageIndex = nil
-                signatureInitialBounds = nil
-            }
-        ) {
-            InkCaptureView(
-                recordID: recordID,
-                pageIndex: signaturePageIndex ?? currentPageIndex,
-                mode: .signature,
-                initialSignatureBounds: signatureInitialBounds
-            ) {
-                openSafeShareAfterDismissal()
-            }
-        }
-        .fullScreenCover(isPresented: $isPresentingPencil) {
-            InkCaptureView(
-                recordID: recordID,
-                pageIndex: currentPageIndex,
-                mode: .drawing
-            )
-        }
-        .fullScreenCover(isPresented: $isPresentingContentEditor) {
-            PDFContentEditorView(
-                recordID: recordID,
-                pageIndex: currentPageIndex,
-                onCreated: onOpenDocument
-            )
-        }
-        .fullScreenCover(isPresented: $isPresentingLinkEditor) {
-            PDFLinkEditorView(
-                recordID: recordID,
-                pageIndex: currentPageIndex,
-                onCreated: onOpenDocument
-            )
-        }
-        .fullScreenCover(isPresented: $isPresentingImageReplacement) {
-            PDFImageReplacementView(
-                recordID: recordID,
-                pageIndex: currentPageIndex,
-                onCreated: onOpenDocument
-            )
-        }
-        .fullScreenCover(
-            item: $textSelectionForReplacement
-        ) { selection in
-            PDFTextReplacementView(
-                recordID: recordID,
-                selection: selection,
-                onCreated: onOpenDocument
-            )
-        }
-        .alert("Rename working copy", isPresented: $isRenaming) {
-            TextField("Document name", text: $proposedName)
-            Button("Cancel", role: .cancel) {}
-            Button("Save") {
-                Task {
-                    await model.rename(recordID: recordID, to: proposedName)
+        )
+
+        return AnyView(
+            workspaceEditors
+                .alert("Rename working copy", isPresented: $isRenaming) {
+                    TextField("Document name", text: $proposedName)
+                        .focused($renameFieldFocused)
+                    Button("Cancel", role: .cancel) {}
+                    Button("Save") {
+                        renameWorkingCopy()
+                    }
+                    .disabled(
+                        workspaceMetadataTask != nil
+                            || proposedName
+                                .trimmingCharacters(
+                                    in: .whitespacesAndNewlines
+                                )
+                                .isEmpty
+                    )
+                } message: {
+                    Text("This changes only the name inside PaperPath.")
                 }
-            }
-            .disabled(
-                proposedName
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                    .isEmpty
-            )
-        } message: {
-            Text("This changes only the name inside PaperPath.")
-        }
-        .alert("Go to page", isPresented: $isJumpingToPage) {
-            TextField("Page number", text: $pageJumpInput)
-                .keyboardType(.numberPad)
-            Button("Cancel", role: .cancel) {
-                pageJumpInput = ""
-            }
-            Button("Go") {
-                jumpToEnteredPage()
-            }
-            .disabled(!pageJumpIsValid)
-        } message: {
-            Text(
-                "Enter a page from 1 to \(model.record(id: recordID)?.profile.pageCount ?? 1)."
-            )
-        }
-        .confirmationDialog(
-            "Move this private copy to Trash?",
-            isPresented: $isConfirmingDelete,
-            titleVisibility: .visible
-        ) {
-            Button("Move to Trash", role: .destructive) {
-                Task {
-                    if await model.delete(recordID: recordID) {
-                        dismiss()
+                .alert("Go to page", isPresented: $isJumpingToPage) {
+                    TextField("Page number", text: $pageJumpInput)
+                        .keyboardType(.numberPad)
+                        .focused($pageJumpFieldFocused)
+                    Button("Cancel", role: .cancel) {
+                        pageJumpInput = ""
+                    }
+                    Button("Go") {
+                        jumpToEnteredPage()
+                    }
+                    .disabled(!pageJumpIsValid)
+                } message: {
+                    Text(
+                        AppLocalization.format(
+                            "Enter a page from 1 to %lld.",
+                            model.record(id: recordID)?.profile.pageCount ?? 1
+                        )
+                    )
+                }
+                .confirmationDialog(
+                    "Move this private copy to Trash?",
+                    isPresented: $isConfirmingDelete,
+                    titleVisibility: .visible
+                ) {
+                    Button("Move to Trash", role: .destructive) {
+                        moveWorkingCopyToTrash()
+                    }
+                    Button("Cancel", role: .cancel) {}
+                } message: {
+                    Text(
+                        "The copy remains recoverable. The original imported file stays untouched."
+                    )
+                }
+                .sheet(
+                    isPresented: $isAddingNote,
+                    onDismiss: commitPendingNote
+                ) {
+                    NoteComposerSheet(pageIndex: currentPageIndex) { value in
+                        pendingNote = value
+                        isAddingNote = false
+                    }
+                    .presentationDetents([.medium, .large])
+                    .presentationDragIndicator(.visible)
+                }
+                .sheet(
+                    isPresented: $isUnlocking,
+                    onDismiss: {
+                        cancelUnlockValidation()
+                        unlockInput = ""
+                        unlockErrorMessage = nil
+                        if sessionPassword == nil {
+                            continuesVerifiedOutputAfterUnlock = false
+                        }
+                    }
+                ) {
+                    NavigationStack {
+                        Form {
+                            Section {
+                                ViewThatFits(in: .horizontal) {
+                                    HStack(spacing: PPSpacing.small) {
+                                        unlockPasswordField
+                                        unlockPasswordPasteButton
+                                    }
+                                    VStack(
+                                        alignment: .trailing,
+                                        spacing: PPSpacing.small
+                                    ) {
+                                        unlockPasswordField
+                                        unlockPasswordPasteButton
+                                    }
+                                }
+                            } footer: {
+                                VStack(
+                                    alignment: .leading,
+                                    spacing: PPSpacing.xSmall
+                                ) {
+                                    if let unlockErrorMessage {
+                                        Label(
+                                            unlockErrorMessage.localizedUI,
+                                            systemImage:
+                                                "exclamationmark.circle.fill"
+                                        )
+                                        .foregroundStyle(Color(uiColor: .systemRed))
+                                        .accessibilityIdentifier(
+                                            "protectedPDFUnlockError"
+                                        )
+                                    }
+                                    Text(
+                                        (
+                                            continuesVerifiedOutputAfterUnlock
+                                                ? "After unlocking, PaperPath creates a separate editable private copy and continues verification. The encrypted original stays unchanged."
+                                                : "The password is kept only while this document is open and PaperPath is active."
+                                        ).localizedUI
+                                    )
+                                }
+                            }
+                        }
+                        .scrollDismissesKeyboard(.interactively)
+                        .navigationTitle(
+                            (
+                                continuesVerifiedOutputAfterUnlock
+                                    ? "Unlock for verified output"
+                                    : "Unlock protected PDF"
+                            ).localizedUI
+                        )
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Cancel", role: .cancel) {
+                                    cancelUnlockValidation()
+                                    continuesVerifiedOutputAfterUnlock = false
+                                    isUnlocking = false
+                                }
+                                .keyboardShortcut(.cancelAction)
+                            }
+                            ToolbarItem(placement: .confirmationAction) {
+                                Button {
+                                    submitProtectedDocumentPassword()
+                                } label: {
+                                    if unlockValidationTask != nil {
+                                        ProgressView()
+                                            .controlSize(.small)
+                                    } else {
+                                        Text("Unlock")
+                                    }
+                                }
+                                .disabled(
+                                    unlockInput.isEmpty
+                                        || unlockValidationTask != nil
+                                )
+                                .accessibilityLabel(
+                                    unlockValidationTask == nil
+                                        ? "Unlock"
+                                        : "Checking password"
+                                )
+                                .keyboardShortcut(.defaultAction)
+                            }
+                        }
+                    }
+                    .presentationDetents([.medium])
+                    .presentationDragIndicator(.visible)
+                    .task {
+                        await Task.yield()
+                        unlockFieldFocused = true
                     }
                 }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text(
-                "The copy remains recoverable. The original imported file stays untouched."
-            )
-        }
-        .sheet(isPresented: $isAddingNote) {
-            NoteComposerSheet(pageIndex: currentPageIndex) { value in
-                pdfCommand = PDFViewCommand(action: .addNote(value))
-            }
-            .presentationDetents([.medium, .large])
-            .presentationDragIndicator(.visible)
-        }
-        .alert("Unlock protected PDF", isPresented: $isUnlocking) {
-            SecureField("Password", text: $unlockInput)
-                .textContentType(.password)
-            Button("Cancel", role: .cancel) {
-                unlockInput = ""
-            }
-            Button("Unlock") {
-                sessionPassword = unlockInput
-            }
-            .disabled(unlockInput.isEmpty)
-        } message: {
-            Text("The password is kept only while this document is open.")
-        }
-        .onAppear {
-            restoreReadingPreferences()
-        }
-        .onChange(of: readingPreferences) { _, preferences in
-            guard didRestoreReadingPreferences else { return }
-            savedReadingTheme = preferences.theme.rawValue
-            savedReadingLayout = preferences.layout.rawValue
-            savedHorizontalNavigation = preferences.scrollsHorizontally
-        }
-        .onChange(of: proposedName) { _, value in
-            if value.count > 80 {
-                proposedName = String(value.prefix(80))
-            }
-        }
-        .onChange(of: pageJumpInput) { _, value in
-            let digits = value.filter(\.isNumber)
-            if digits != value {
-                pageJumpInput = String(digits.prefix(6))
-            } else if value.count > 6 {
-                pageJumpInput = String(value.prefix(6))
-            }
-        }
-        .onChange(of: unlockInput) { _, value in
-            if value.count > 128 {
-                unlockInput = String(value.prefix(128))
-            }
-        }
-        .sensoryFeedback(.success, trigger: model.refreshToken(for: recordID))
-        .sensoryFeedback(.selection, trigger: recommendationTapCount)
+                .onAppear {
+                    restoreReadingPreferences()
+                }
+                .onChange(of: readingPreferences) { _, preferences in
+                    guard didRestoreReadingPreferences else { return }
+                    savedReadingTheme = preferences.theme.rawValue
+                    savedReadingLayout = preferences.layout.rawValue
+                    savedHorizontalNavigation = preferences.scrollsHorizontally
+                }
+                .onChange(of: proposedName) { _, value in
+                    if value.count > 80 {
+                        proposedName = String(value.prefix(80))
+                    }
+                }
+                .onChange(of: isRenaming) { _, isPresented in
+                    guard isPresented else { return }
+                    Task { @MainActor in
+                        await Task.yield()
+                        renameFieldFocused = true
+                    }
+                }
+                .onChange(of: isJumpingToPage) { _, isPresented in
+                    guard isPresented else { return }
+                    Task { @MainActor in
+                        await Task.yield()
+                        pageJumpFieldFocused = true
+                    }
+                }
+                .onChange(of: pageJumpInput) { _, value in
+                    let digits = value.filter(\.isNumber)
+                    if digits != value {
+                        pageJumpInput = String(digits.prefix(6))
+                    } else if value.count > 6 {
+                        pageJumpInput = String(value.prefix(6))
+                    }
+                }
+                .onChange(of: unlockInput) { _, value in
+                    if value.count > 128 {
+                        unlockInput = String(value.prefix(128))
+                    }
+                    unlockErrorMessage = nil
+                }
+                .onChange(
+                    of: model.record(id: recordID)?.profile.pageCount
+                ) { _, pageCount in
+                    reconcilePageState(pageCount: pageCount)
+                }
+                .onChange(of: record.contentRevisionID) {
+                    oldRevisionID,
+                    newRevisionID in
+                    rebuildPageStateForUpdatedPDF(
+                        from: oldRevisionID,
+                        to: newRevisionID
+                    )
+                }
+                .sensoryFeedback(
+                    .success,
+                    trigger: model.refreshToken(for: recordID)
+                )
+                .sensoryFeedback(.success, trigger: unlockSuccessFeedback)
+                .sensoryFeedback(.selection, trigger: pageNavigationFeedback)
+                .sensoryFeedback(.selection, trigger: workspaceHandoffFeedback)
+                .sensoryFeedback(.error, trigger: unlockAttemptFeedback)
+                .sensoryFeedback(.error, trigger: unlockCopyErrorFeedback)
+                .sensoryFeedback(.success, trigger: metadataSuccessFeedback)
+                .sensoryFeedback(.error, trigger: metadataErrorFeedback)
+        )
     }
 
     private var lockedDocumentOverlay: some View {
+        ViewThatFits(in: .vertical) {
+            lockedDocumentCard
+            ScrollView {
+                lockedDocumentCard
+                    .padding(.vertical, PPSpacing.small)
+            }
+            .scrollBounceBehavior(.basedOnSize)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var lockedDocumentCard: some View {
         VStack(spacing: PPSpacing.medium) {
             PPIllustration(kind: .locked, width: 156)
             Text("Protected PDF")
                 .font(.title3.bold())
                 .fontDesign(.serif)
-            Text("Enter the document password to read it in this session.")
+            Text(
+                (
+                    isApplyingSessionUnlock
+                        ? "Opening the protected PDF on this device."
+                        : "Enter the document password to read it in this session."
+                ).localizedUI
+            )
                 .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
                 .multilineTextAlignment(.center)
-            Button("Unlock") {
-                isUnlocking = true
+            if isApplyingSessionUnlock {
+                ProgressView()
+                    .controlSize(.regular)
+                    .accessibilityLabel("Opening protected PDF")
+                Button("Cancel", role: .cancel) {
+                    clearProtectedDocumentSession()
+                }
+                .buttonStyle(.plain)
+                .keyboardShortcut(.cancelAction)
+            } else {
+                Button("Unlock") {
+                    isUnlocking = true
+                }
+                .buttonStyle(.borderedProminent)
             }
-            .buttonStyle(.borderedProminent)
             Button("Share encrypted PDF") {
                 share(recordID: recordID)
             }
             .buttonStyle(.plain)
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(PPColor.accent)
+            .disabled(
+                shareTask != nil
+                    || isApplyingSessionUnlock
+            )
             .accessibilityIdentifier("shareEncryptedPDF")
         }
         .padding(PPSpacing.xLarge)
@@ -1000,6 +1845,247 @@ struct DocumentWorkspaceView: View {
         )
         .padding(PPSpacing.xLarge)
         .accessibilityElement(children: .contain)
+    }
+
+    private func unlockCopyRecoveryStrip(
+        _ issue: PDFBatchDeliveryIssue
+    ) -> some View {
+        let layout = horizontalSizeClass == .compact
+            || dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(
+                HStackLayout(
+                    alignment: .center,
+                    spacing: PPSpacing.medium
+                )
+            )
+        return layout {
+            HStack(alignment: .top, spacing: PPSpacing.small) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(PPColor.amber)
+                    .frame(width: 28, height: 28)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Editable copy not created")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PPColor.textPrimary)
+                    Text(issue.message.localizedUI)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(issue.recovery.localizedUI)
+                        .font(.caption2)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .layoutPriority(1)
+
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: PPSpacing.xSmall) {
+                if issue.isRetryable {
+                    Button {
+                        retryUnlockedPrivateCopy()
+                    } label: {
+                        Label(
+                            "Retry",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                    .buttonStyle(
+                        PPQuietButtonStyle(tint: PPColor.amber)
+                    )
+                    .disabled(
+                        unlockCopyTask != nil
+                            || model.isProcessing(recordID)
+                    )
+                    .accessibilityHint(
+                        "Retries with the password already verified for this session."
+                    )
+                }
+                Button {
+                    dismissUnlockCopyIssue()
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(PPColor.textSecondary)
+                .accessibilityLabel("Dismiss editable copy error")
+            }
+        }
+        .padding(.horizontal, PPSpacing.regular)
+        .padding(.vertical, PPSpacing.small)
+        .background(PPColor.amber.opacity(0.08))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(PPColor.amber.opacity(0.34))
+                .frame(height: 0.7)
+        }
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(PPColor.amber.opacity(0.24))
+                .frame(height: 0.7)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("unlockCopyRecovery")
+    }
+
+    private var unlockPasswordField: some View {
+        SecureField("Password", text: $unlockInput)
+            .textContentType(.password)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .submitLabel(.go)
+            .onSubmit {
+                submitProtectedDocumentPassword()
+            }
+            .frame(minHeight: 44)
+            .focused($unlockFieldFocused)
+            .disabled(unlockValidationTask != nil)
+    }
+
+    private var unlockPasswordPasteButton: some View {
+        PasteButton(payloadType: String.self) { values in
+            guard let value = values.first else { return }
+            unlockInput = String(value.prefix(128))
+        }
+        .frame(minWidth: 44, minHeight: 44)
+        .disabled(unlockValidationTask != nil)
+        .accessibilityHint(
+            "Pastes the document password without storing it in PaperPath"
+        )
+    }
+
+    private func submitProtectedDocumentPassword() {
+        guard unlockValidationTask == nil,
+              !unlockInput.isEmpty
+        else { return }
+        guard let url = model.url(for: recordID) else {
+            unlockErrorMessage =
+                "The private working copy is unavailable. Close this view and reopen the document."
+            unlockAttemptFeedback += 1
+            return
+        }
+        let password = unlockInput
+        let generation = UUID()
+        unlockValidationGeneration = generation
+        unlockErrorMessage = nil
+        unlockCopyIssue = nil
+        unlockValidationTask = Task { @MainActor in
+            defer {
+                if unlockValidationGeneration == generation {
+                    unlockValidationTask = nil
+                }
+            }
+            let result = await Task.detached(
+                priority: .userInitiated
+            ) {
+                autoreleasepool {
+                    guard let document = PDFDocument(url: url) else {
+                        return ProtectedPDFPasswordValidationResult
+                            .unavailable
+                    }
+                    guard document.isLocked else {
+                        return .valid
+                    }
+                    return document.unlock(withPassword: password)
+                        ? .valid
+                        : .invalid
+                }
+            }.value
+            guard unlockValidationGeneration == generation,
+                  !Task.isCancelled
+            else { return }
+            switch result {
+            case .valid:
+                sessionUnlockGeneration = UUID()
+                sessionPassword = password
+                isSessionUnlocked = false
+                isApplyingSessionUnlock = true
+                unlockInput = ""
+                isUnlocking = false
+            case .invalid:
+                sessionUnlockGeneration = UUID()
+                sessionPassword = nil
+                isSessionUnlocked = false
+                isApplyingSessionUnlock = false
+                unlockErrorMessage =
+                    "The password didn’t match. Check it and try again."
+                unlockAttemptFeedback += 1
+                unlockFieldFocused = true
+            case .unavailable:
+                isApplyingSessionUnlock = false
+                unlockErrorMessage =
+                    "The private working copy is unavailable. Close this view and reopen the document."
+                unlockAttemptFeedback += 1
+            }
+        }
+    }
+
+    private func handlePDFUnlockResult(
+        _ success: Bool,
+        expectedPassword: String?,
+        generation: UUID
+    ) {
+        guard generation == sessionUnlockGeneration,
+              let expectedPassword,
+              !expectedPassword.isEmpty,
+              sessionPassword == expectedPassword
+        else { return }
+
+        if success {
+            isSessionUnlocked = true
+            isApplyingSessionUnlock = false
+            unlockInput = ""
+            unlockErrorMessage = nil
+            unlockCopyIssue = nil
+            if confirmedSessionUnlockGeneration != generation {
+                confirmedSessionUnlockGeneration = generation
+                unlockSuccessFeedback += 1
+                model[noticeFor: paperPathSceneID] =
+                    "Protected PDF unlocked for this session"
+                        .localizedUI
+            }
+            if continuesVerifiedOutputAfterUnlock {
+                createUnlockedPrivateCopy()
+            }
+            return
+        }
+
+        sessionUnlockGeneration = UUID()
+        confirmedSessionUnlockGeneration = nil
+        sessionPassword = nil
+        isSessionUnlocked = false
+        isApplyingSessionUnlock = false
+        unlockInput = expectedPassword
+        unlockCopyIssue = nil
+        unlockErrorMessage =
+            "The PDF could not be opened with that password. Check it and try again."
+        unlockAttemptFeedback += 1
+        Task { @MainActor in
+            await Task.yield()
+            guard sessionPassword == nil,
+                  !isSessionUnlocked
+            else { return }
+            isUnlocking = true
+            await Task.yield()
+            unlockFieldFocused = true
+        }
+    }
+
+    private func cancelUnlockValidation() {
+        unlockValidationGeneration = UUID()
+        unlockValidationTask?.cancel()
+        unlockValidationTask = nil
     }
 
     private func readingProgressStrip(
@@ -1015,22 +2101,35 @@ struct DocumentWorkspaceView: View {
         )
         let percentage = Int((progress * 100).rounded())
         let minutes = estimatedMinutesRemaining(record)
+        let readingLabel = AppLocalization.format(
+            "%lld%% read",
+            percentage
+        )
+        let remainingLabel = minutes > 0
+            ? AppLocalization.format("~%lld min left", minutes)
+            : "Final page".localizedUI
+        let accessibilityLabel = minutes > 0
+            ? AppLocalization.format(
+                "%lld percent read. Approximately %lld minutes remaining.",
+                percentage,
+                minutes
+            )
+            : AppLocalization.format(
+                "%lld percent read. Final page.",
+                percentage
+            )
 
         return VStack(spacing: 5) {
             HStack {
                 Label(
-                    "\(percentage)% read",
+                    readingLabel,
                     systemImage: "book.pages"
                 )
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textPrimary)
                 .monospacedDigit()
                 Spacer()
-                Text(
-                    minutes > 0
-                        ? "~\(minutes) min left"
-                        : "Final page"
-                )
+                Text(remainingLabel)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(PPColor.textSecondary)
             }
@@ -1051,9 +2150,7 @@ struct DocumentWorkspaceView: View {
         .padding(.horizontal, PPSpacing.small)
         .padding(.vertical, 5)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(percentage) percent read. Approximately \(minutes) minutes remaining."
-        )
+        .accessibilityLabel(accessibilityLabel)
     }
 
     private func estimatedMinutesRemaining(
@@ -1066,9 +2163,11 @@ struct DocumentWorkspaceView: View {
         guard remainingPages > 0 else { return 0 }
 
         if let index = model.textIndices[recordID] {
-            let remainingCharacters = index.pages
-                .filter { $0.pageIndex > currentPageIndex }
-                .reduce(0) { $0 + $1.text.count }
+            var remainingCharacters = 0
+            for page in index.pages
+            where page.pageIndex > currentPageIndex {
+                remainingCharacters += page.text.count
+            }
             if remainingCharacters > 0 {
                 return max(
                     1,
@@ -1087,13 +2186,10 @@ struct DocumentWorkspaceView: View {
     }
 
     private func recentDocumentTabs(
-        current: DocumentRecord
+        current: DocumentRecord,
+        recent: [DocumentRecord]
     ) -> some View {
-        let records = [current]
-            + model.recentDocuments(
-                excluding: current.id,
-                limit: 3
-            )
+        let records = [current] + recent.prefix(3)
 
         return ScrollView(.horizontal) {
             HStack(spacing: PPSpacing.xSmall) {
@@ -1101,13 +2197,7 @@ struct DocumentWorkspaceView: View {
                     let isCurrent = record.id == current.id
                     Button {
                         guard !isCurrent else { return }
-                        readingPositionTask?.cancel()
-                        onOpenDocument(
-                            DocumentRoute(
-                                recordID: record.id,
-                                pageIndex: record.lastPageIndex
-                            )
-                        )
+                        openRecentDocument(record)
                     } label: {
                         HStack(spacing: PPSpacing.small) {
                             Image(
@@ -1156,11 +2246,22 @@ struct DocumentWorkspaceView: View {
                         }
                     }
                     .buttonStyle(.plain)
-                    .disabled(isCurrent)
+                    .hoverEffect(.highlight)
+                    .disabled(
+                        isCurrent
+                            || hasBlockingWorkspaceControlTask
+                    )
                     .accessibilityLabel(
                         isCurrent
-                            ? "\(record.displayName), current document"
-                            : "Open \(record.displayName) at page \(record.lastPageIndex + 1)"
+                            ? AppLocalization.format(
+                                "%@, current document",
+                                record.displayName
+                            )
+                            : AppLocalization.format(
+                                "Open %@ at page %lld",
+                                record.displayName,
+                                record.lastPageIndex + 1
+                            )
                     )
                 }
             }
@@ -1178,64 +2279,29 @@ struct DocumentWorkspaceView: View {
         _ record: DocumentRecord
     ) -> some View {
         let recommendation = model.recommendation(for: record)
-
-        return Group {
-            if horizontalSizeClass == .compact
-                || dynamicTypeSize.isAccessibilitySize {
-                VStack(
-                    alignment: .leading,
-                    spacing: PPSpacing.small
-                ) {
-                    HStack {
+        return HStack(alignment: .center, spacing: PPSpacing.medium) {
+            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.small) {
                         contextCategory(record)
-                        Spacer()
                         contextStatus(record)
                     }
-                    contextSummary(record)
-                    if horizontalSizeClass != .compact {
-                        HStack(spacing: PPSpacing.small) {
-                            routeEvidencePill(record)
-                            workspaceProgress(record)
-                            Spacer()
-                            if shouldShowWorkspaceNextAction(
-                                record: record,
-                                recommendation: recommendation
-                            ) {
-                                workspaceNextAction(
-                                    record: record,
-                                    recommendation: recommendation
-                                )
-                            }
-                        }
-                    } else if shouldShowWorkspaceNextAction(
-                        record: record,
-                        recommendation: recommendation
-                    ) {
-                        HStack(spacing: PPSpacing.small) {
-                            Spacer()
-                            workspaceNextAction(
-                                record: record,
-                                recommendation: recommendation
-                            )
-                        }
+                    VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                        contextCategory(record)
+                        contextStatus(record)
                     }
                 }
-            } else {
-                HStack(spacing: PPSpacing.small) {
-                    contextCategory(record)
-                    contextSummary(record)
-                    routeEvidencePill(record)
-                    workspaceProgress(record)
-                    contextStatus(record)
-                    workspaceNextAction(
-                        record: record,
-                        recommendation: recommendation
-                    )
-                }
+                Text(statusActionReason(record: record, recommendation: recommendation).localizedUI)
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            workspacePrimaryAction(record: record, recommendation: recommendation)
+                .disabled(hasBlockingWorkspaceControlTask || isRedactionMode)
         }
         .padding(.vertical, 4)
-        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(PPColor.border.opacity(0.62))
@@ -1245,165 +2311,116 @@ struct DocumentWorkspaceView: View {
         .accessibilityIdentifier("documentContext")
     }
 
-    private func routeEvidencePill(
-        _ record: DocumentRecord
-    ) -> some View {
-        let profile = model.commandProfile(for: record)
-        return Button {
-            if record.profile.isLocked {
-                presentedSheet = .technicalInspector
-            } else {
-                exportFocus = .text
-                presentedSheet = .export
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: profile.readiness.symbol)
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(commandTint(profile.readiness))
-                Text(profile.scoreLabel)
-                    .font(.caption2.monospacedDigit().weight(.bold))
-                    .foregroundStyle(PPColor.textPrimary)
-                Rectangle()
-                    .fill(PPColor.border.opacity(0.62))
-                    .frame(width: 0.6, height: 13)
-                Text(profile.officeRoute.localizedUI)
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(PPColor.cyan)
-                    .lineLimit(1)
-            }
-            .padding(.horizontal, 7)
-            .frame(minHeight: 28)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(
-                        commandTint(profile.readiness)
-                            .opacity(0.58)
-                    )
-                    .frame(height: 1)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .accessibilityLabel(
-            "Route intelligence \(profile.compactLine). \(profile.officeDetail)"
-        )
-        .accessibilityHint(
-            record.profile.isLocked
-                ? "Open technical inspector"
-                : "Open Office export"
-        )
-        .accessibilityIdentifier("routeEvidencePill")
-    }
-
-    @ViewBuilder
-    private func workspaceProgress(
-        _ record: DocumentRecord
-    ) -> some View {
-        if record.profile.pageCount > 1 {
-            Button {
-                pageJumpInput = "\(currentPageIndex + 1)"
-                isJumpingToPage = true
-            } label: {
-                Label(
-                    "\(currentPageIndex + 1)/\(record.profile.pageCount)",
-                    systemImage: "book.pages"
-                )
-                .font(.caption2.weight(.semibold))
-                .monospacedDigit()
-                .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(1)
-                .padding(.horizontal, 7)
-                .frame(minHeight: 28)
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(PPColor.border.opacity(0.72))
-                        .frame(height: 1)
-                }
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(
-                "Page \(currentPageIndex + 1) of \(record.profile.pageCount)"
-            )
-            .accessibilityHint("Jump to a page")
-        }
-    }
-
-    @ViewBuilder
-    private func workspaceNextAction(
+    private func workspacePrimaryAction(
         record: DocumentRecord,
         recommendation: DocumentActionPlanner.Recommendation
     ) -> some View {
-        let title = statusActionCompactTitle(
-            record: record,
-            recommendation: recommendation
-        )
         let fullTitle = statusActionTitle(
             record: record,
             recommendation: recommendation
         )
-        let deliveryTitle =
-            model.verifiedShareTarget(for: recordID) == nil
-                ? "Verify"
-                : "Share"
+        let isDeliveryAction = !workspacePrimaryContinuesTask(
+            record: record,
+            recommendation: recommendation
+        )
 
-        if title != deliveryTitle {
-            Button {
-                recommendationTapCount += 1
+        return DeskIconButton(
+            title: fullTitle,
+            symbol: statusActionSymbol(
+                record: record,
+                recommendation: recommendation
+            ),
+            tint: workspacePrimaryActionTint(
+                record: record,
+                isDeliveryAction: isDeliveryAction
+            ),
+            isProminent: true
+        ) {
+            if isDeliveryAction {
+                shareVerifiedOrCreate()
+            } else {
                 performStatusAction(
                     record: record,
                     recommendation: recommendation
                 )
-            } label: {
-                HStack(spacing: 6) {
-                    Text("NEXT")
-                        .font(.caption2.smallCaps().weight(.bold))
-                        .fontDesign(.monospaced)
-                        .foregroundStyle(PPColor.textSecondary)
-                    Label(
-                        title.localizedUI,
-                        systemImage: statusActionSymbol(
-                            record: record,
-                            recommendation: recommendation
-                        )
-                    )
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(PPColor.cyan)
-                    .lineLimit(1)
-                }
-                .padding(.horizontal, PPSpacing.small)
-                .frame(minHeight: 30)
-                .overlay(alignment: .bottom) {
-                    Rectangle()
-                        .fill(PPColor.cyan.opacity(0.72))
-                        .frame(height: 1.5)
-                }
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Next: \(fullTitle)")
-            .accessibilityHint(
+        }
+        .accessibilityLabel(
+            isDeliveryAction
+                ? (
+                    model.verifiedShareTarget(for: recordID) == nil
+                        ? "Create verified sharing copy"
+                        : "Share verified copy"
+                ).localizedUI
+                : AppLocalization.format(
+                    "Next: %@",
+                    fullTitle.localizedUI
+                )
+        )
+        .accessibilityHint(
+            isDeliveryAction
+                ? "PaperPath shares a checked output instead of the working copy"
+                    .localizedUI
+                : (
                 statusActionReason(
                     record: record,
                     recommendation: recommendation
                 )
-            )
-            .accessibilityIdentifier("workspaceNextAction")
-        }
+                )
+        )
+        .accessibilityIdentifier(
+            isDeliveryAction
+                ? "verifiedShareAction"
+                : "workspaceNextAction"
+        )
+        .disabled(
+            unlockCopyTask != nil
+                || workspaceMetadataTask != nil
+                || isWorkspaceHandoffActive
+                || model.isProcessing(recordID)
+                || (
+                    record.profile.isLocked
+                        && isApplyingSessionUnlock
+                )
+                || (
+                    record.profile.isLocked
+                        && isSessionUnlocked
+                        && unlockCopyIssue?.isRetryable == false
+                )
+        )
     }
 
-    private func shouldShowWorkspaceNextAction(
+    private func workspacePrimaryContinuesTask(
         record: DocumentRecord,
         recommendation: DocumentActionPlanner.Recommendation
     ) -> Bool {
-        let title = statusActionCompactTitle(
-            record: record,
-            recommendation: recommendation
-        )
-        let deliveryTitle =
-            model.verifiedShareTarget(for: recordID) == nil
-                ? "Verify"
-                : "Share"
-        return title != deliveryTitle
+        if record.profile.isLocked {
+            return true
+        }
+        if let checkpoint = record.taskCheckpoint {
+            switch checkpoint.stage {
+            case .fillForm, .sign:
+                return true
+            case .verify:
+                return false
+            }
+        }
+        switch recommendation.action {
+        case .safeShare, .shareCopy:
+            return false
+        default:
+            return true
+        }
+    }
+
+    private func workspacePrimaryActionTint(
+        record: DocumentRecord,
+        isDeliveryAction: Bool
+    ) -> Color {
+        if record.profile.isLocked {
+            return PPColor.amber
+        }
+        return isDeliveryAction ? PPColor.mint : PPColor.cyan
     }
 
     private func statusActionTitle(
@@ -1411,6 +2428,13 @@ struct DocumentWorkspaceView: View {
         recommendation: DocumentActionPlanner.Recommendation
     ) -> String {
         if record.profile.isLocked {
+            if isApplyingSessionUnlock {
+                return "Opening protected PDF"
+            }
+            if isSessionUnlocked,
+               unlockCopyIssue?.isRetryable == true {
+                return "Retry editable copy"
+            }
             return isSessionUnlocked
                 ? "Create editable copy"
                 : "Unlock to continue"
@@ -1419,38 +2443,18 @@ struct DocumentWorkspaceView: View {
             ?? recommendation.action.title
     }
 
-    private func statusActionCompactTitle(
-        record: DocumentRecord,
-        recommendation: DocumentActionPlanner.Recommendation
-    ) -> String {
-        if record.profile.isLocked {
-            return isSessionUnlocked ? "Copy" : "Unlock"
-        }
-        if let checkpoint = record.taskCheckpoint {
-            switch checkpoint.stage {
-            case .fillForm: return "Fill"
-            case .sign: return "Sign"
-            case .verify: return "Verify"
-            }
-        }
-        switch recommendation.action {
-        case .brief: return "Brief"
-        case .recognizeText: return "OCR"
-        case .makeSearchable: return "Searchable"
-        case .organizePages: return "Pages"
-        case .reviewForm: return "Fill"
-        case .sign: return "Sign"
-        case .safeShare: return "Verify"
-        case .inspect: return "Inspect"
-        case .shareCopy: return "Share"
-        }
-    }
-
     private func statusActionReason(
         record: DocumentRecord,
         recommendation: DocumentActionPlanner.Recommendation
     ) -> String {
         if record.profile.isLocked {
+            if isApplyingSessionUnlock {
+                return "Applying the password on this device."
+            }
+            if isSessionUnlocked,
+               let unlockCopyIssue {
+                return unlockCopyIssue.recovery
+            }
             return isSessionUnlocked
                 ? "Make a separate password-free private copy; the original stays encrypted."
                 : "Enter the PDF password for this session only."
@@ -1464,6 +2468,13 @@ struct DocumentWorkspaceView: View {
         recommendation: DocumentActionPlanner.Recommendation
     ) -> String {
         if record.profile.isLocked {
+            if isApplyingSessionUnlock {
+                return "hourglass"
+            }
+            if isSessionUnlocked,
+               unlockCopyIssue?.isRetryable == true {
+                return "arrow.clockwise"
+            }
             return isSessionUnlocked ? "doc.badge.plus" : "lock.open"
         }
         return record.taskCheckpoint?.stage.symbol
@@ -1475,7 +2486,9 @@ struct DocumentWorkspaceView: View {
         recommendation: DocumentActionPlanner.Recommendation
     ) {
         if record.profile.isLocked {
-            if isSessionUnlocked {
+            if isApplyingSessionUnlock {
+                return
+            } else if isSessionUnlocked {
                 createUnlockedPrivateCopy()
             } else {
                 isUnlocking = true
@@ -1504,7 +2517,8 @@ struct DocumentWorkspaceView: View {
         case .sign:
             showPageThenSignature(
                 checkpoint.pageIndex,
-                initialBounds: checkpoint.normalizedBounds
+                initialBounds: checkpoint.normalizedBounds,
+                fieldName: checkpoint.fieldName
             )
         case .verify:
             shareVerifiedOrCreate()
@@ -1512,21 +2526,194 @@ struct DocumentWorkspaceView: View {
     }
 
     private func createUnlockedPrivateCopy() {
+        guard unlockCopyTask == nil else { return }
         guard let password = sessionPassword,
-              !password.isEmpty
+              !password.isEmpty,
+              let sourceContentRevisionID =
+                model.record(id: recordID)?.contentRevisionID
         else {
             isSessionUnlocked = false
             isUnlocking = true
             return
         }
-        Task {
-            if let created = await model.createUnlockedCopy(
-                recordID: recordID,
-                password: password
-            ) {
-                onOpenDocument(DocumentRoute(recordID: created.id))
+        unlockCopyIssue = nil
+        unlockCopyStopRequested = false
+        let generation = UUID()
+        unlockCopyGeneration = generation
+        unlockCopyTask = Task { @MainActor in
+            defer {
+                if unlockCopyGeneration == generation {
+                    unlockCopyTask = nil
+                    unlockCopyStopRequested = false
+                }
             }
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createUnlockedCopy(
+                    recordID: recordID,
+                    password: password,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID,
+                    presentsFeedback: false
+                ) { issue in
+                    guard unlockCopyGeneration == generation,
+                          issue.phase != .cancelled
+                    else { return }
+                    unlockCopyIssue = issue
+                    unlockCopyErrorFeedback += 1
+                }
+            }
+            guard unlockCopyGeneration == generation,
+                  !Task.isCancelled,
+                  let created
+            else { return }
+            unlockCopyIssue = nil
+            let continuesToVerifiedOutput =
+                continuesVerifiedOutputAfterUnlock
+            if continuesToVerifiedOutput {
+                _ = await model.updateTaskCheckpoint(
+                    recordID: created.id,
+                    checkpoint: DocumentTaskCheckpoint(
+                        stage: .verify,
+                        contentRevisionID: created.contentRevisionID
+                    ),
+                    presentsFeedback: false
+                )
+            }
+            guard unlockCopyGeneration == generation,
+                  !Task.isCancelled
+            else { return }
+            continuesVerifiedOutputAfterUnlock = false
+            openCreatedDocument(
+                DocumentRoute(
+                    recordID: created.id,
+                    quickTask:
+                        continuesToVerifiedOutput
+                            ? .safeShare
+                            : nil
+                )
+            )
         }
+    }
+
+    private func stopUnlockCopyCreation() {
+        guard unlockCopyTask != nil,
+              !unlockCopyStopRequested
+        else { return }
+        unlockCopyStopRequested = true
+        unlockCopyTask?.cancel()
+        model[noticeFor: paperPathSceneID] =
+            "Stopping editable copy creation".localizedUI
+    }
+
+    private func dismissUnlockCopyIssue() {
+        unlockCopyIssue = nil
+    }
+
+    private func retryUnlockedPrivateCopy() {
+        guard unlockCopyIssue?.isRetryable == true else {
+            return
+        }
+        createUnlockedPrivateCopy()
+    }
+
+    private func resetUnlockCopyState() {
+        unlockCopyGeneration = UUID()
+        unlockCopyTask?.cancel()
+        unlockCopyTask = nil
+        unlockCopyIssue = nil
+        unlockCopyStopRequested = false
+        continuesVerifiedOutputAfterUnlock = false
+    }
+
+    private func clearProtectedDocumentSession() {
+        cancelUnlockValidation()
+        sessionUnlockGeneration = UUID()
+        confirmedSessionUnlockGeneration = nil
+        resetUnlockCopyState()
+        unlockInput = ""
+        sessionPassword = nil
+        isSessionUnlocked = false
+        isApplyingSessionUnlock = false
+        isUnlocking = false
+        redactionMarks = []
+        textSelectionForReplacement = nil
+    }
+
+    private func setImmersiveReading(_ isEnabled: Bool) {
+        guard isImmersiveReading != isEnabled else { return }
+        withAnimation(
+            reduceMotion ? nil : .snappy(duration: 0.24)
+        ) {
+            isImmersiveReading = isEnabled
+        }
+        model[noticeFor: paperPathSceneID] = isEnabled
+            ? "Immersive reading on".localizedUI
+            : "Immersive reading off".localizedUI
+    }
+
+    private func toggleImmersiveReading() {
+        if isImmersiveReading {
+            setImmersiveReading(false)
+            return
+        }
+        guard !hasBlockingWorkspacePresentation,
+              !hasBlockingWorkspaceControlTask
+        else { return }
+        setImmersiveReading(true)
+    }
+
+    private func openCurrentDocumentInNewWindow(
+        _ currentRecordID: UUID
+    ) {
+        guard UIDevice.current.userInterfaceIdiom == .pad,
+              !hasBlockingWorkspacePresentation,
+              !hasBlockingWorkspaceControlTask
+        else { return }
+        openWindow(value: currentRecordID)
+    }
+
+    private func handleWorkspaceEscape() {
+        if isWorkspaceHandoffActive {
+            stopWorkspaceHandoff(showsNotice: true)
+        } else if shareTask != nil || shareProgress != nil {
+            stopSharePreparation(showsNotice: true)
+        } else if isRedactionMode {
+            cancelRedactionMode()
+        } else if isImmersiveReading {
+            setImmersiveReading(false)
+        }
+    }
+
+    private func interruptProtectedWorkspaceWork() {
+        cancelWorkspaceTransition()
+        pendingWorkspaceHandoff = nil
+        pendingRecognitionConfiguration = nil
+        documentFindQuery = ""
+        documentFindHistory.removeAll(keepingCapacity: false)
+        isConfiguringRecognition = false
+        stopRecognition()
+        stopSearchableCopyCreation()
+        readingPositionTask?.cancel()
+        readingPositionTask = nil
+        pdfSearchHighlight = nil
+        pdfCommand = nil
+        originalName = ""
+        proposedName = ""
+        pageJumpInput = ""
+        isRenaming = false
+        isJumpingToPage = false
+        isAddingNote = false
+        pendingNote = nil
+        isRedactionMode = false
+        invalidateWorkspaceMetadataPresentation()
+        clearProtectedDocumentSession()
+        stopSharePreparation()
+        if presentedSheet == .share {
+            presentedSheet = nil
+        }
+        cleanupShareCopy()
     }
 
     @ViewBuilder
@@ -1539,22 +2726,60 @@ struct DocumentWorkspaceView: View {
                     receipt: receipt,
                     isCurrent: record.hasCurrentDeliveryReceipt
                 )
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityHint("Opens the delivery verification details")
             .accessibilityIdentifier("deliveryReceiptBadge")
-        } else if !model.verifiedOutputs(for: record.id).isEmpty {
+        } else if !model.deliveryHistoryOutputs(for: record.id).isEmpty {
             Button {
                 presentedSheet = .deliveryHistory
             } label: {
                 OutputHistoryBadge(
-                    count: model.verifiedOutputs(for: record.id).count
+                    count: model.deliveryHistoryOutputs(for: record.id).count
                 )
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+                .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityHint("Opens verified output history")
-        } else {
-            OnDeviceBadge(compact: true)
+        } else if let provenance =
+                    record.receivedPackageProvenance {
+            Button {
+                presentedSheet = .receivedPackage
+            } label: {
+                ReceivedPackageBadge(
+                    provenance: provenance,
+                    isCurrent:
+                        record.hasCurrentReceivedPackageProvenance
+                )
+                .frame(
+                    maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                        ? .infinity
+                        : nil,
+                    minHeight: 44,
+                    alignment: .leading
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint(
+                "Opens the received package evidence"
+            )
+            .accessibilityIdentifier("receivedPackageBadge")
         }
     }
 
@@ -1565,14 +2790,20 @@ struct DocumentWorkspaceView: View {
         )
         .font(.caption.smallCaps().weight(.semibold))
         .foregroundStyle(PPColor.cyan)
-        .padding(.vertical, dynamicTypeSize.isAccessibilitySize ? 6 : 3)
+        .padding(
+            .vertical,
+            dynamicTypeSize.ppPrefersExpandedLayout ? 6 : 3
+        )
         .frame(minHeight: 28)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(PPColor.cyan.opacity(0.5))
                 .frame(height: 1)
         }
-        .lineLimit(1)
+        .lineLimit(
+            dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+        )
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func contextCategoryTitle(
@@ -1600,30 +2831,6 @@ struct DocumentWorkspaceView: View {
             : "checkmark.seal"
     }
 
-    private func contextSummary(_ record: DocumentRecord) -> some View {
-        let summary = verifiedOutcomeSummary(record)
-                ?? record.brief?.summary
-                ?? record.profile.summary
-        return Text(summary.localizedUI)
-            .font(.caption)
-            .foregroundStyle(PPColor.textSecondary)
-            .lineLimit(
-                dynamicTypeSize.isAccessibilitySize ? 3 : 1
-            )
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func verifiedOutcomeSummary(
-        _ record: DocumentRecord
-    ) -> String? {
-        guard let receipt = record.deliveryReceipt else { return nil }
-        guard record.hasCurrentDeliveryReceipt else {
-            return "This output changed after it was checked. Verify it again before sharing."
-        }
-        return receipt.outcomeDetail
-    }
-
     private func commandTint(
         _ readiness: DocumentCommandReadiness
     ) -> Color {
@@ -1643,7 +2850,7 @@ struct DocumentWorkspaceView: View {
             && receipt?.isVerified == true
             && receipt?.isDeliveryOutput == true
         let tint = isCurrent ? PPColor.mint : PPColor.amber
-        let layout = dynamicTypeSize.isAccessibilitySize
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
             ? AnyLayout(
                 VStackLayout(
                     alignment: .leading,
@@ -1677,7 +2884,11 @@ struct DocumentWorkspaceView: View {
                         )
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
-                        .lineLimit(1)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : 2
+                        )
 
                         Text(
                             isCurrent
@@ -1686,7 +2897,11 @@ struct DocumentWorkspaceView: View {
                         )
                         .font(.caption2)
                         .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(1)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : 2
+                        )
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -1713,7 +2928,10 @@ struct DocumentWorkspaceView: View {
                         : "checkmark.shield"
                 )
                 .font(.caption.weight(.semibold))
-                .lineLimit(1)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                )
+                .fixedSize(horizontal: false, vertical: true)
             }
             .buttonStyle(.bordered)
             .tint(tint)
@@ -1736,9 +2954,58 @@ struct DocumentWorkspaceView: View {
     }
 
     private func actionBar(record: DocumentRecord) -> some View {
-        VStack(spacing: 0) {
-            if shouldShowWorkspaceCommandRail(record) {
-                workspaceCommandRail(record)
+        let commandSignals = workspaceCommandSignals(record)
+
+        return VStack(spacing: 0) {
+            if let shareProgress {
+                HStack(spacing: PPSpacing.small) {
+                    LocalOperationProgressView(
+                        progress: shareProgress
+                    )
+                    .frame(maxWidth: .infinity)
+
+                    Button {
+                        stopSharePreparation(showsNotice: true)
+                    } label: {
+                        Image(systemName: "stop.fill")
+                            .frame(width: 44, height: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(PPColor.amber)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityLabel(
+                        "Stop share preparation".localizedUI
+                    )
+                    .accessibilityHint(
+                        "The working copy stays unchanged."
+                            .localizedUI
+                    )
+                    .accessibilityIdentifier(
+                        "stopWorkspaceSharePreparation"
+                    )
+                }
+                .padding(.horizontal, PPSpacing.regular)
+                .padding(.vertical, PPSpacing.small)
+
+                Rectangle()
+                    .fill(PPColor.border.opacity(0.5))
+                    .frame(height: 0.6)
+            } else if isWorkspaceHandoffActive {
+                workspaceHandoffStatusBar(
+                    activeWorkspaceHandoff ?? pendingWorkspaceHandoff
+                )
+
+                Rectangle()
+                    .fill(PPColor.border.opacity(0.5))
+                    .frame(height: 0.6)
+            }
+
+            if horizontalSizeClass == .regular, toolMode == .deliver,
+               !commandSignals.isEmpty {
+                workspaceCommandRail(
+                    commandSignals,
+                    record: record
+                )
 
                 Rectangle()
                     .fill(PPColor.border.opacity(0.5))
@@ -1756,29 +3023,326 @@ struct DocumentWorkspaceView: View {
             }
 
             Group {
-                if dynamicTypeSize.isAccessibilitySize {
-                    ScrollView(.horizontal) {
-                        HStack(spacing: 0) {
-                            actionBarCommands(record)
+                if toolMode == .read, !isRedactionMode {
+                    HStack(spacing: PPSpacing.small) {
+                        toolModeMenu
+                        Spacer(minLength: 0)
+                        workspaceToolButton(.find, record: record)
+                            .accessibilityIdentifier("workspaceFindAction")
+                        Menu {
+                            Button("Bookmarks", systemImage: "bookmark") { presentedSheet = .bookmarks }
+                                .accessibilityIdentifier("readingBookmarks")
+                            Button("Reader", systemImage: "book") { presentedSheet = .reader }
+                                .accessibilityIdentifier("readingFocusReader")
+                            Button("Reading", systemImage: "textformat.size") { presentedSheet = .reading }
+                                .accessibilityIdentifier("readingSettings")
+                            Divider()
+                            Toggle("Show tool names".localizedUI, isOn: $showToolNames)
+                        } label: {
+                            Image(systemName: "textformat")
+                                .font(.system(size: 18))
+                                .frame(width: 44, height: 44)
                         }
-                        .frame(minWidth: 430)
+                        .accessibilityLabel("Reading options".localizedUI)
+                        .accessibilityIdentifier("readingOptions")
+                        DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right") {
+                            toggleImmersiveReading()
+                        }
+                        .accessibilityIdentifier("enterFocusReading")
                     }
-                    .scrollIndicators(.hidden)
+                    .environment(\.deskToolNamesVisible, false)
+                    .padding(.vertical, PPSpacing.xSmall)
+                } else if verticalSizeClass == .compact, !isRedactionMode {
+                    HStack(spacing: PPSpacing.medium) {
+                        toolModeMenu
+                        workspaceToolRow(record)
+                    }
+                    .padding(.vertical, PPSpacing.small)
                 } else {
-                    HStack(spacing: 0) {
-                        actionBarCommands(record)
+                    VStack(spacing: PPSpacing.small) {
+                        if !isRedactionMode {
+                            toolModePicker
+                        }
+                        workspaceToolRow(record)
                     }
+                    .padding(.vertical, PPSpacing.small)
                 }
             }
-            .padding(.horizontal, PPSpacing.small)
-            .padding(.top, 3)
-            .padding(.bottom, 5)
+            .padding(.horizontal, PPSpacing.regular)
+            .disabled(hasBlockingWorkspaceControlTask)
+            .opacity(
+                hasBlockingWorkspaceControlTask ? 0.46 : 1
+            )
         }
         .background(.bar)
+        .dynamicTypeSize(.xSmall ... .accessibility1)
         .overlay(alignment: .top) {
             Rectangle()
                 .fill(PPColor.border.opacity(0.72))
                 .frame(height: 0.7)
+        }
+    }
+
+    private func workspaceToolRow(_ record: DocumentRecord) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .top, spacing: PPSpacing.medium) {
+                actionBarCommands(record)
+            }
+            HStack(alignment: .top, spacing: PPSpacing.xSmall) {
+                actionBarCommands(record)
+            }
+            ScrollView(.horizontal) {
+                HStack(alignment: .top, spacing: PPSpacing.medium) {
+                    actionBarCommands(record)
+                }
+            }
+            .scrollIndicators(.hidden)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .environment(\.deskToolNamesVisible, showToolNames && verticalSizeClass != .compact)
+        .frame(minHeight: PPDeskLayout.touchTarget)
+    }
+
+    private func workspaceHandoffStatusBar(
+        _ handoff: PendingWorkspaceHandoff?
+    ) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                workspaceHandoffIdentity(handoff)
+                Spacer(minLength: PPSpacing.small)
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+                workspaceHandoffStopButton
+            }
+
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                HStack(spacing: PPSpacing.small) {
+                    workspaceHandoffIdentity(handoff)
+                    Spacer(minLength: PPSpacing.small)
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                }
+                workspaceHandoffStopButton
+            }
+        }
+        .padding(.horizontal, PPSpacing.regular)
+        .padding(.vertical, PPSpacing.small)
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(.updatesFrequently)
+        .accessibilityIdentifier("workspaceHandoffStatus")
+    }
+
+    private func workspaceHandoffIdentity(
+        _ handoff: PendingWorkspaceHandoff?
+    ) -> some View {
+        Label {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(workspaceHandoffTitle(handoff))
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                Text(workspaceHandoffDetail(handoff))
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        } icon: {
+            Image(systemName: workspaceHandoffSymbol(handoff))
+                .foregroundStyle(PPColor.mint)
+                .symbolEffect(
+                    .pulse,
+                    value: reduceMotion ? 0 : workspaceHandoffFeedback
+                )
+        }
+    }
+
+    private var workspaceHandoffStopButton: some View {
+        Button {
+            stopWorkspaceHandoff(showsNotice: true)
+        } label: {
+            Image(systemName: "xmark")
+                .font(.caption.weight(.bold))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(PPColor.textSecondary)
+        .keyboardShortcut(.cancelAction)
+        .accessibilityLabel("Stop opening next step".localizedUI)
+        .accessibilityHint(
+            "Keeps you in this workspace without changing the PDF."
+                .localizedUI
+        )
+        .help("Stop opening next step".localizedUI)
+        .accessibilityIdentifier("stopWorkspaceHandoff")
+    }
+
+    private func workspaceHandoffTitle(
+        _ handoff: PendingWorkspaceHandoff?
+    ) -> String {
+        guard let handoff else {
+            return "Opening next step".localizedUI
+        }
+        switch handoff {
+        case .tool(let tool):
+            return AppLocalization.format(
+                "Opening %@",
+                tool.title.localizedUI
+            )
+        case .action(let action):
+            return AppLocalization.format(
+                "Opening %@",
+                action.title.localizedUI
+            )
+        case .stamp:
+            return "Opening Stamp".localizedUI
+        case .openDocument(let route):
+            if let record = model.record(id: route.recordID) {
+                return AppLocalization.format(
+                    "Opening %@",
+                    record.displayName
+                )
+            }
+            return "Opening private copy".localizedUI
+        case .safeShare:
+            return "Opening trusted delivery".localizedUI
+        case .unlockForVerifiedOutput:
+            return "Opening secure unlock".localizedUI
+        case .recognitionSettings:
+            return "Opening OCR settings".localizedUI
+        case .presentSheet(let sheet):
+            return AppLocalization.format(
+                "Opening %@",
+                workspaceHandoffSheetTitle(sheet).localizedUI
+            )
+        case .navigate(let pageIndex, _, _, let sheet, _, _):
+            if let sheet {
+                return AppLocalization.format(
+                    "Opening %@",
+                    workspaceHandoffSheetTitle(sheet).localizedUI
+                )
+            }
+            return AppLocalization.format(
+                "Opening page %lld",
+                pageIndex + 1
+            )
+        case .signature:
+            return "Opening signature".localizedUI
+        }
+    }
+
+    private func workspaceHandoffDetail(
+        _ handoff: PendingWorkspaceHandoff?
+    ) -> String {
+        switch handoff {
+        case .safeShare:
+            return "PaperPath will verify a protected output before sharing."
+                .localizedUI
+        case .unlockForVerifiedOutput:
+            return "The encrypted original stays unchanged."
+                .localizedUI
+        case .openDocument:
+            return "The created copy stays in Library if you stop here."
+                .localizedUI
+        case .navigate:
+            return "The evidence page opens before the next panel."
+                .localizedUI
+        default:
+            return "Closing the current panel before the next step."
+                .localizedUI
+        }
+    }
+
+    private func workspaceHandoffSymbol(
+        _ handoff: PendingWorkspaceHandoff?
+    ) -> String {
+        guard let handoff else { return "arrow.turn.down.right" }
+        switch handoff {
+        case .tool(let tool): return tool.symbol
+        case .action(let action): return action.symbol
+        case .stamp: return "seal"
+        case .openDocument: return "doc.badge.arrow.up"
+        case .safeShare: return "checkmark.shield"
+        case .unlockForVerifiedOutput: return "lock.open"
+        case .recognitionSettings: return "text.viewfinder"
+        case .presentSheet(let sheet):
+            return workspaceHandoffSheetSymbol(sheet)
+        case .navigate(_, _, _, let sheet, _, _):
+            return sheet.map(workspaceHandoffSheetSymbol)
+                ?? "arrow.up.right.square"
+        case .signature: return "signature"
+        }
+    }
+
+    private func workspaceHandoffSheetTitle(_ sheet: Sheet) -> String {
+        switch sheet {
+        case .brief: return "Brief"
+        case .insight: return "Insight"
+        case .pages: return "Pages"
+        case .recognizedText: return "Recognized Text"
+        case .share: return "Share"
+        case .tools: return "Tools"
+        case .stamp: return "Stamp"
+        case .watermark: return "Watermark"
+        case .bates: return "Bates Numbering"
+        case .compression: return "Compress"
+        case .protection: return "Protect"
+        case .redaction: return "Redaction"
+        case .export: return "Export"
+        case .officeExport: return "Convert PDF"
+        case .imageExport: return "Save as Images"
+        case .verifiedExport: return "Finish & Share"
+        case .reading: return "Reading"
+        case .bookmarks: return "Bookmarks"
+        case .formReview: return "Forms"
+        case .find: return "Find"
+        case .annotations: return "Annotations"
+        case .attachments: return "Attachments"
+        case .compare: return "Compare"
+        case .deliveryReceipt: return "Receipt"
+        case .deliveryHistory: return "Delivery history"
+        case .receivedPackage: return "Received Package"
+        case .sourceLocation: return "Source"
+        case .technicalInspector: return "Inspector"
+        case .versionHistory: return "Version History"
+        case .reader: return "Reader"
+        case .privateNote: return "Private Note"
+        }
+    }
+
+    private func workspaceHandoffSheetSymbol(_ sheet: Sheet) -> String {
+        switch sheet {
+        case .brief: return "list.bullet.rectangle.portrait"
+        case .insight: return "sparkle.magnifyingglass"
+        case .pages: return "square.grid.2x2"
+        case .recognizedText: return "text.viewfinder"
+        case .share: return "square.and.arrow.up"
+        case .tools: return "wrench.and.screwdriver"
+        case .stamp: return "seal"
+        case .watermark: return "textformat.alt"
+        case .bates: return "number.square.fill"
+        case .compression:
+            return "arrow.down.right.and.arrow.up.left"
+        case .protection: return "lock.doc"
+        case .redaction: return "eye.slash"
+        case .export, .officeExport, .imageExport, .verifiedExport:
+            return "doc.badge.arrow.up"
+        case .reading: return "textformat.size"
+        case .bookmarks: return "bookmark"
+        case .formReview: return "pencil.and.list.clipboard"
+        case .find: return "text.magnifyingglass"
+        case .annotations: return "text.bubble"
+        case .attachments: return "paperclip"
+        case .compare: return "doc.on.doc"
+        case .deliveryReceipt: return "checkmark.seal"
+        case .deliveryHistory: return "clock.badge.checkmark"
+        case .receivedPackage: return "shippingbox"
+        case .sourceLocation: return "folder"
+        case .technicalInspector: return "info.circle"
+        case .versionHistory: return "clock.arrow.circlepath"
+        case .reader: return "book"
+        case .privateNote: return "note.text"
         }
     }
 
@@ -1787,10 +3351,13 @@ struct DocumentWorkspaceView: View {
         _ record: DocumentRecord
     ) -> some View {
         if isRedactionMode {
-            WorkspaceBarButton(
-                title: "Redact",
-                symbol: "eye.slash",
-                tint: PPColor.amber,
+            DeskIconButton(title: "Cancel redaction", symbol: "xmark", tint: PPColor.textSecondary) {
+                cancelRedactionMode()
+            }
+            .keyboardShortcut(.cancelAction)
+            .accessibilityIdentifier("cancelRedactionMode")
+            DeskIconButton(
+                title: "Redact", symbol: "eye.slash", tint: PPColor.amber,
                 isProminent: true
             ) {
                 runCommand(.markRedaction)
@@ -1798,70 +3365,161 @@ struct DocumentWorkspaceView: View {
             .accessibilityHint(
                 "Marks the currently selected text for permanent redaction"
             )
+            .accessibilityIdentifier("applyRedactionSelection")
         } else {
-            WorkspaceBarButton(
-                title: "Find",
-                symbol: "text.magnifyingglass",
-                tint: PPColor.cyan,
-                isProminent: true
-            ) {
-                presentedSheet = .find
+            switch toolMode {
+            case .read:
+                workspaceToolButton(.find, record: record)
+                    .accessibilityIdentifier("workspaceFindAction")
+                workspaceToolButton(.bookmarks, record: record)
+                DeskIconButton(title: "Reader", symbol: "book", tint: toolMode.tint) {
+                    presentedSheet = .reader
+                }
+                DeskIconButton(title: "Reading", symbol: "textformat.size", tint: toolMode.tint) {
+                    presentedSheet = .reading
+                }
+                DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right", tint: toolMode.tint) {
+                    toggleImmersiveReading()
+                }
+            case .annotate:
+                workspaceToolButton(.highlight, record: record)
+                workspaceToolButton(.underline, record: record)
+                workspaceToolButton(.ink, record: record)
+                workspaceToolButton(.note, record: record)
+                workspaceToolButton(.sign, record: record)
+                markUpMenu
+                    .disabled(record.profile.isLocked)
+            case .pages:
+                workspaceToolButton(.organize, record: record)
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                workspaceToolButton(.compare, record: record)
+                workspaceToolButton(.bates, record: record)
+                workspaceToolButton(.watermark, record: record)
+                DeskIconButton(title: "Version History", symbol: "clock.arrow.circlepath", tint: toolMode.tint) {
+                    presentedSheet = .versionHistory
+                }
+            case .deliver:
+                DeskIconButton(
+                    title: record.profile.isLocked ? "Unlock to continue" : "Verify & Share",
+                    symbol: record.profile.isLocked ? "lock.open" : "checkmark.shield",
+                    tint: PPColor.mint, isProminent: true
+                ) {
+                    if record.profile.isLocked {
+                        performStatusAction(record: record, recommendation: model.recommendation(for: record))
+                    } else {
+                        shareVerifiedOrCreate()
+                    }
+                }
+                .disabled(isApplyingSessionUnlock || unlockCopyIssue?.isRetryable == false)
+                workspaceToolButton(.fillForm, record: record)
+                workspaceToolButton(.compress, record: record)
+                workspaceToolButton(.protect, record: record)
+                workspaceToolButton(.export, record: record)
+                DeskIconButton(title: "Delivery history", symbol: "clock.badge.checkmark", tint: PPColor.mint) {
+                    presentedSheet = .deliveryHistory
+                }
             }
-            .keyboardShortcut("f", modifiers: .command)
-            .accessibilityIdentifier(
-                "workspaceFindAction"
-            )
+            if toolMode == .read || toolMode == .pages {
+                recentToolButton(record: record)
+            }
         }
+    }
 
-        markUpMenu
+    private var toolMode: ToolMode {
+        ToolMode(rawValue: savedToolMode) ?? .read
+    }
 
-        WorkspaceBarButton(
-            title: "Pages",
-            symbol: "square.grid.2x2"
-        ) {
-            pageOrganizerStartsSelecting = false
-            presentedSheet = .pages
+    private var toolModePicker: some View {
+        HStack(spacing: PPSpacing.small) {
+            Group {
+                if dynamicTypeSize.ppPrefersExpandedLayout {
+                    toolModeMenu
+                } else {
+                    Picker("Workspace tools".localizedUI, selection: $savedToolMode) {
+                        ForEach(ToolMode.allCases) { mode in
+                            Text(mode.title.localizedUI).tag(mode.rawValue)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+            }
+            Menu {
+                Toggle("Show tool names".localizedUI, isOn: $showToolNames)
+            } label: {
+                Image(systemName: "text.below.photo")
+                    .font(.system(size: 18))
+                    .frame(width: 44, height: 44)
+            }
+            .accessibilityLabel("Tool appearance".localizedUI)
+            .help("Tool appearance".localizedUI)
         }
-        .keyboardShortcut("p", modifiers: [.command, .shift])
+        .frame(maxWidth: 580, minHeight: PPDeskLayout.touchTarget)
+        .tint(toolMode.tint)
+        .disabled(hasBlockingWorkspaceControlTask)
+        .accessibilityIdentifier("workspaceToolModes")
+    }
 
-        WorkspaceBarButton(
-            title: model.verifiedShareTarget(for: recordID) == nil
-                ? "Verify"
-                : "Share",
-            symbol: model.verifiedShareTarget(for: recordID) == nil
-                ? "checkmark.shield"
-                : "square.and.arrow.up",
-            tint: PPColor.mint,
-            isProminent: true
-        ) {
-            shareVerifiedOrCreate()
+    private var toolModeMenu: some View {
+        Menu {
+            ForEach(ToolMode.allCases) { mode in
+                Button {
+                    savedToolMode = mode.rawValue
+                } label: {
+                    Label(mode.title.localizedUI, systemImage: mode == toolMode ? "checkmark" : "circle")
+                }
+                .accessibilityIdentifier("workspaceMode-\(mode.rawValue)")
+            }
+            Divider()
+            Toggle("Show tool names".localizedUI, isOn: $showToolNames)
+        } label: {
+            HStack {
+                Text(toolMode.title.localizedUI)
+                    .font(PPType.document)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption)
+            }
+            .frame(minHeight: PPDeskLayout.touchTarget)
         }
-        .accessibilityLabel(
-            (
-                model.verifiedShareTarget(for: recordID) == nil
-                    ? "Create verified sharing copy"
-                    : "Share verified copy"
-            ).localizedUI
-        )
-        .accessibilityHint(
-            "PaperPath shares a checked output instead of the working copy"
-                .localizedUI
-        )
-        .accessibilityIdentifier("verifiedShareAction")
+        .tint(toolMode.tint)
+        .accessibilityLabel("Workspace tools".localizedUI)
+        .accessibilityValue(toolMode.title.localizedUI)
+        .accessibilityIdentifier("workspaceModeMenu")
+    }
 
-        recentToolButton(record: record)
+    private func workspaceToolButton(_ tool: DocumentTool, record: DocumentRecord) -> some View {
+        DeskIconButton(title: tool.title, symbol: tool.symbol, tint: toolMode.tint) {
+            handle(tool)
+        }
+        .disabled(!isWorkspaceToolAvailable(tool, record: record))
+        .accessibilityIdentifier("workspaceTool-\(tool.rawValue)")
+    }
+
+    private func isWorkspaceToolAvailable(_ tool: DocumentTool, record: DocumentRecord) -> Bool {
+        if record.profile.isLocked, [.find, .bookmarks].contains(tool) {
+            return isSessionUnlocked
+        }
+        return availableTools(for: record).contains(tool)
     }
 
     private func workspaceCommandRail(
-        _ record: DocumentRecord
+        _ signals: [DocumentCommandSignal],
+        record: DocumentRecord
     ) -> some View {
-        let signals = workspaceCommandSignals(record)
-
         return ScrollView(.horizontal) {
             HStack(spacing: PPSpacing.small) {
                 ForEach(signals) { signal in
                     workspaceSignalChip(signal, record: record)
-                        .frame(minWidth: 112, maxWidth: 172)
+                        .frame(
+                            minWidth:
+                                dynamicTypeSize.ppPrefersExpandedLayout
+                                    ? 200
+                                    : 112,
+                            maxWidth:
+                                dynamicTypeSize.ppPrefersExpandedLayout
+                                    ? 260
+                                    : 172
+                        )
                 }
             }
         }
@@ -1873,19 +3531,87 @@ struct DocumentWorkspaceView: View {
         .accessibilityIdentifier("workspaceCommandRail")
     }
 
-    private func shouldShowWorkspaceCommandRail(
-        _ record: DocumentRecord
-    ) -> Bool {
-        horizontalSizeClass == .regular
-            && !workspaceCommandSignals(record).isEmpty
-    }
-
     private func workspaceCommandSignals(
         _ record: DocumentRecord
     ) -> [DocumentCommandSignal] {
-        model.commandProfile(for: record).signals.filter {
-            $0.readiness != .ready
+        let signals = model.commandProfile(for: record).signals
+        let relevant = signals.filter {
+            switch $0.id {
+            case "privacy":
+                return record.profile.isLocked
+            case "delivery":
+                return record.deliveryReceipt != nil && !record.hasCurrentDeliveryReceipt
+            case "text":
+                return !record.profile.isLocked
+                    && ($0.readiness == .review || model.hasRecognizedText(recordID: record.id))
+            default:
+                return false
+            }
         }
+        return relevant.filter { $0.readiness == .blocked }
+            + relevant.filter { $0.readiness != .blocked }
+    }
+
+    private func compactWorkspaceSignal(
+        _ signal: DocumentCommandSignal,
+        record: DocumentRecord
+    ) -> some View {
+        Button {
+            openSignal(signal, record: record)
+        } label: {
+            HStack(spacing: PPSpacing.small) {
+                Image(systemName: signal.symbol)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(commandTint(signal.readiness))
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(
+                        AppLocalization.format(
+                            "%@ · %@",
+                            signal.title.localizedUI,
+                            signal.value.localizedUI
+                        )
+                    )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                    .lineLimit(1)
+                    Text(signal.detail.localizedUI)
+                        .font(.caption2)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 3
+                                : 1
+                        )
+                }
+                Spacer(minLength: PPSpacing.small)
+                Image(systemName: "chevron.right")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(commandTint(signal.readiness))
+            }
+            .padding(.horizontal, PPSpacing.small)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(minHeight: 48)
+            .background(commandTint(signal.readiness).opacity(0.07))
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(commandTint(signal.readiness))
+                    .frame(width: 2)
+                    .padding(.vertical, 6)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(
+            AppLocalization.format(
+                "%@, %@. %@",
+                signal.title.localizedUI,
+                signal.value.localizedUI,
+                signal.detail.localizedUI
+            )
+        )
+        .accessibilityHint("Opens the relevant review step".localizedUI)
+        .accessibilityIdentifier("workspacePrioritySignal")
     }
 
     private func workspaceSignalChip(
@@ -1899,19 +3625,31 @@ struct DocumentWorkspaceView: View {
                 Image(systemName: signal.symbol)
                     .font(.caption2.weight(.bold))
                     .foregroundStyle(commandTint(signal.readiness))
-                Text(signal.value.localizedUI)
-                    .font(.caption2.monospacedDigit().weight(.semibold))
-                    .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(1)
-                Text(signal.title.localizedUI)
-                    .font(.caption2)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
+                Text(
+                    AppLocalization.format(
+                        "%@ · %@",
+                        signal.value.localizedUI,
+                        signal.title.localizedUI
+                    )
+                )
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 2
+                        : 1
+                )
+                .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 7)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(minHeight: 34)
+            .frame(
+                minHeight:
+                    dynamicTypeSize.ppPrefersExpandedLayout
+                        ? 56
+                        : 44
+            )
             .overlay(alignment: .leading) {
                 Rectangle()
                     .fill(commandTint(signal.readiness).opacity(0.38))
@@ -1942,8 +3680,9 @@ struct DocumentWorkspaceView: View {
                 shareVerifiedOrCreate()
             }
         case "office":
-            exportFocus = .text
-            presentedSheet = .export
+            presentedSheet = .officeExport
+        case "text":
+            handle(DocumentAction.recognizeText)
         case "structure":
             presentedSheet = record.brief == nil ? .insight : .brief
         case "privacy":
@@ -1966,14 +3705,31 @@ struct DocumentWorkspaceView: View {
         }
         let hasShortcuts = !favorites.isEmpty || !recents.isEmpty
 
-        WorkspaceBarButton(
-            title: "Tools",
-            symbol: "slider.horizontal.3",
-            tint: PPColor.cyan
+        DeskIconButton(
+            title: "All tools",
+            symbol: "ellipsis",
+            tint: PPColor.textSecondary
         ) {
+#if DEBUG
+            // #region debug-point B:tools-sheet-requested
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "B",
+                location:
+                    "DocumentWorkspaceView.recentToolButton",
+                message: "Tools sheet requested",
+                data: [
+                    "recordID": recordID.uuidString,
+                    "presentedSheet":
+                        presentedSheet?.rawValue ?? "nil",
+                    "hasBlockingTask": String(
+                        hasBlockingWorkspaceControlTask
+                    )
+                ]
+            )
+            // #endregion
+#endif
             presentedSheet = .tools
         }
-        .keyboardShortcut("t", modifiers: .command)
         .accessibilityHint(
             (
                 hasShortcuts
@@ -2032,11 +3788,12 @@ struct DocumentWorkspaceView: View {
                 Button {
                     showPage(
                         currentPageIndex - 1,
-                        message: "Previous page"
+                        message: "Previous page",
+                        showsNotice: false
                     )
                 } label: {
                     Image(systemName: "chevron.left")
-                        .frame(width: 40, height: 34)
+                        .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
                 .disabled(currentPageIndex <= 0)
@@ -2048,23 +3805,58 @@ struct DocumentWorkspaceView: View {
                         pageJumpInput = "\(displayedPage + 1)"
                         isJumpingToPage = true
                     } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "doc.text")
-                            Text(
-                                "Page \(displayedPage + 1) of \(pageCount)"
+                        ViewThatFits(in: .horizontal) {
+                            Label(
+                                AppLocalization.format(
+                                    "Page %lld of %lld",
+                                    displayedPage + 1,
+                                    pageCount
+                                ),
+                                systemImage: "doc.text"
                             )
-                            .monospacedDigit()
+                            Text(
+                                "\(displayedPage + 1) / \(pageCount)"
+                            )
                         }
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
-                        .frame(minHeight: 26)
+                        .monospacedDigit()
+                        .contentTransition(.numericText())
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(minHeight: 44)
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .keyboardShortcut("j", modifiers: .command)
                     .accessibilityLabel(
-                        "Page \(displayedPage + 1) of \(pageCount). Go to page"
+                        AppLocalization.format(
+                            "Page %lld of %lld. Go to page",
+                            displayedPage + 1,
+                            pageCount
+                        )
                     )
+                    .accessibilityAdjustableAction { direction in
+                        switch direction {
+                        case .increment:
+                            showPage(
+                                min(
+                                    currentPageIndex + 1,
+                                    pageCount - 1
+                                ),
+                                message: "Next page",
+                                showsNotice: false
+                            )
+                        case .decrement:
+                            showPage(
+                                max(currentPageIndex - 1, 0),
+                                message: "Previous page",
+                                showsNotice: false
+                            )
+                        @unknown default:
+                            break
+                        }
+                    }
 
                     if pageCount > 5 {
                         Slider(
@@ -2093,7 +3885,8 @@ struct DocumentWorkspaceView: View {
                                 isScrubbingPage = false
                                 showPage(
                                     page,
-                                    message: "Page \(page + 1)"
+                                    message: "Jumped",
+                                    showsNotice: false
                                 )
                             }
                         }
@@ -2101,11 +3894,11 @@ struct DocumentWorkspaceView: View {
                         .frame(minWidth: 112)
                         .accessibilityLabel("Page position")
                         .accessibilityValue(
-                            "\(displayedPage + 1) of \(pageCount)"
-                        )
-                        .sensoryFeedback(
-                            .selection,
-                            trigger: displayedPage
+                            AppLocalization.format(
+                                "Page %lld of %lld",
+                                displayedPage + 1,
+                                pageCount
+                            )
                         )
                     }
                 }
@@ -2114,11 +3907,12 @@ struct DocumentWorkspaceView: View {
                 Button {
                     showPage(
                         currentPageIndex + 1,
-                        message: "Next page"
+                        message: "Next page",
+                        showsNotice: false
                     )
                 } label: {
                     Image(systemName: "chevron.right")
-                        .frame(width: 40, height: 34)
+                        .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
                 .disabled(
@@ -2128,12 +3922,7 @@ struct DocumentWorkspaceView: View {
                 .accessibilityLabel("Next page")
 
                 Button {
-                    Task {
-                        await model.toggleBookmark(
-                            recordID: recordID,
-                            pageIndex: currentPageIndex
-                        )
-                    }
+                    toggleCurrentPageBookmark()
                 } label: {
                     Image(
                         systemName: record.bookmarkedPages
@@ -2141,7 +3930,7 @@ struct DocumentWorkspaceView: View {
                             ? "bookmark.fill"
                             : "bookmark"
                     )
-                    .frame(width: 40, height: 34)
+                    .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(
@@ -2159,6 +3948,7 @@ struct DocumentWorkspaceView: View {
                 )
                 .accessibilityIdentifier("bookmarkCurrentPage")
                 .keyboardShortcut("b", modifiers: .command)
+                .disabled(workspaceMetadataTask != nil)
             }
 
             if !pageBackHistory.isEmpty
@@ -2185,12 +3975,23 @@ struct DocumentWorkspaceView: View {
                     } ?? "Back".localizedUI,
                     systemImage: "arrow.uturn.backward"
                 )
-                .lineLimit(1)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                )
+                .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-                .frame(minHeight: 30)
+                .frame(minHeight: 44)
             }
             .buttonStyle(.plain)
             .disabled(pageBackHistory.isEmpty)
+            .keyboardShortcut(
+                .leftArrow,
+                modifiers: [.command, .option]
+            )
+            .accessibilityHint(
+                "Returns to the previous page jump.".localizedUI
+            )
+            .help("Back through page history".localizedUI)
 
             Rectangle()
                 .fill(PPColor.border.opacity(0.6))
@@ -2208,12 +4009,23 @@ struct DocumentWorkspaceView: View {
                     } ?? "Forward".localizedUI,
                     systemImage: "arrow.uturn.forward"
                 )
-                .lineLimit(1)
+                .lineLimit(
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                )
+                .multilineTextAlignment(.center)
                 .frame(maxWidth: .infinity)
-                .frame(minHeight: 30)
+                .frame(minHeight: 44)
             }
             .buttonStyle(.plain)
             .disabled(pageForwardHistory.isEmpty)
+            .keyboardShortcut(
+                .rightArrow,
+                modifiers: [.command, .option]
+            )
+            .accessibilityHint(
+                "Moves forward through page jump history.".localizedUI
+            )
+            .help("Forward through page history".localizedUI)
         }
         .font(.caption.weight(.semibold))
         .foregroundStyle(PPColor.textSecondary)
@@ -2227,136 +4039,145 @@ struct DocumentWorkspaceView: View {
 
     private var markUpMenu: some View {
         Menu {
-            Button {
-                runMarkup(.highlight)
+            Section("Mark up") {
+                Button {
+                    runMarkup(.highlight)
+                } label: {
+                    Label(
+                        AppLocalization.format(
+                            "%@ · %@",
+                            kindTitle(.highlight).localizedUI,
+                            markupColor(for: .highlight).title.localizedUI
+                        ),
+                        systemImage: "highlighter"
+                    )
+                }
+                Button {
+                    runMarkup(.underline)
+                } label: {
+                    Label(
+                        AppLocalization.format(
+                            "%@ · %@",
+                            kindTitle(.underline).localizedUI,
+                            markupColor(for: .underline).title.localizedUI
+                        ),
+                        systemImage: "underline"
+                    )
+                }
+                Button {
+                    runMarkup(.strikeOut)
+                } label: {
+                    Label(
+                        AppLocalization.format(
+                            "%@ · %@",
+                            kindTitle(.strikeOut).localizedUI,
+                            markupColor(for: .strikeOut).title.localizedUI
+                        ),
+                        systemImage: "strikethrough"
+                    )
+                }
+                Button {
+                    isPresentingPencil = true
+                } label: {
+                    Label(
+                        "Draw on Page",
+                        systemImage: "pencil.tip.crop.circle"
+                    )
+                }
+                Button {
+                    isAddingNote = true
+                } label: {
+                    Label("Add Note", systemImage: "note.text.badge.plus")
+                }
+            }
+
+            Menu {
+                Button {
+                    presentedSheet = .stamp
+                } label: {
+                    Label("Stamp", systemImage: "seal")
+                }
+                Button {
+                    isPresentingContentEditor = true
+                } label: {
+                    Label(
+                        "Text, Photo, or Link",
+                        systemImage: "text.badge.plus"
+                    )
+                }
+                Button {
+                    presentSignature()
+                } label: {
+                    Label("Signature", systemImage: "signature")
+                }
             } label: {
-                Label(
-                    AppLocalization.format(
-                        "%@ · %@",
-                        kindTitle(.highlight).localizedUI,
-                        markupColor(for: .highlight).title.localizedUI
-                    ),
-                    systemImage: "highlighter"
+                Label("Add to Page", systemImage: "plus.circle")
+            }
+
+            Menu {
+                Button {
+                    runCommand(.captureTextForEditing)
+                } label: {
+                    Label(
+                        "Selected Text",
+                        systemImage: "character.cursor.ibeam"
+                    )
+                }
+                Button {
+                    isPresentingLinkEditor = true
+                } label: {
+                    Label("Existing Links", systemImage: "link")
+                }
+                Button {
+                    isPresentingImageReplacement = true
+                } label: {
+                    Label(
+                        "Existing Image",
+                        systemImage: "photo.badge.arrow.down"
+                    )
+                }
+            } label: {
+                Label("Edit Page Content", systemImage: "doc.text")
+            }
+
+            Menu {
+                markupColorMenu(
+                    kind: .highlight,
+                    title: "Highlight Color"
                 )
-            }
-            Button {
-                runMarkup(.underline)
-            } label: {
-                Label(
-                    AppLocalization.format(
-                        "%@ · %@",
-                        kindTitle(.underline).localizedUI,
-                        markupColor(for: .underline).title.localizedUI
-                    ),
-                    systemImage: "underline"
+                markupColorMenu(
+                    kind: .underline,
+                    title: "Underline Color"
                 )
-            }
-            Button {
-                runMarkup(.strikeOut)
-            } label: {
-                Label(
-                    AppLocalization.format(
-                        "%@ · %@",
-                        kindTitle(.strikeOut).localizedUI,
-                        markupColor(for: .strikeOut).title.localizedUI
-                    ),
-                    systemImage: "strikethrough"
+                markupColorMenu(
+                    kind: .strikeOut,
+                    title: "Strike Color"
                 )
-            }
-            Divider()
-            markupColorMenu(
-                kind: .highlight,
-                title: "Highlight Color"
-            )
-            markupColorMenu(
-                kind: .underline,
-                title: "Underline Color"
-            )
-            markupColorMenu(
-                kind: .strikeOut,
-                title: "Strike Color"
-            )
-            Divider()
-            Button {
-                isPresentingPencil = true
             } label: {
-                Label("Draw on Page", systemImage: "pencil.tip.crop.circle")
+                Label("Markup Colors", systemImage: "paintpalette")
             }
-            Button {
-                isAddingNote = true
-            } label: {
-                Label("Add Note", systemImage: "note.text.badge.plus")
-            }
-            Button {
-                presentedSheet = .stamp
-            } label: {
-                Label("Add Stamp", systemImage: "seal")
-            }
-            Button {
-                isPresentingContentEditor = true
-            } label: {
-                Label(
-                    "Add Text, Photo, or Link",
-                    systemImage: "text.badge.plus"
-                )
-            }
-            Button {
-                isPresentingLinkEditor = true
-            } label: {
-                Label(
-                    "Edit Existing Links",
-                    systemImage: "link"
-                )
-            }
-            Button {
-                isPresentingImageReplacement = true
-            } label: {
-                Label(
-                    "Replace Existing Image",
-                    systemImage: "photo.badge.arrow.down"
-                )
-            }
-            Button {
-                runCommand(.captureTextForEditing)
-            } label: {
-                Label(
-                    "Edit Selected Text",
-                    systemImage: "character.cursor.ibeam"
-                )
-            }
-            Button {
-                presentSignature()
-            } label: {
-                Label("Add Signature", systemImage: "signature")
-            }
-            Button {
-                runCommand(.markRedaction)
-            } label: {
-                Label("Mark Redaction", systemImage: "eye.slash")
-            }
+
             Button {
                 presentedSheet = .annotations
             } label: {
-                Label("Review Annotations", systemImage: "text.bubble")
+                Label("Comments & Markup", systemImage: "text.bubble")
             }
-            Button {
-                presentedSheet = .attachments
-            } label: {
-                Label("Embedded Files", systemImage: "paperclip")
-            }
+
             Button {
                 runCommand(.removeAnnotation)
             } label: {
                 Label("Undo Last on Page", systemImage: "arrow.uturn.backward")
             }
         } label: {
-            WorkspaceBarLabel(
-                title: "Edit",
-                symbol: "pencil.tip",
-                tint: PPColor.amber
+            DeskToolLabel(
+                title: "More editing tools",
+                symbol: "ellipsis",
+                tint: PPColor.textSecondary
             )
         }
-        .frame(maxWidth: .infinity)
+        .help("More editing tools".localizedUI)
+        .accessibilityLabel("More editing tools".localizedUI)
+        .hoverEffect(.highlight)
         .keyboardShortcut("a", modifiers: [.command, .shift])
     }
 
@@ -2415,7 +4236,11 @@ struct DocumentWorkspaceView: View {
               let page = Int(pageJumpInput)
         else { return }
         pageJumpInput = ""
-        showPage(page - 1, message: "Jumped to page")
+        showPage(
+            page - 1,
+            message: "Jumped",
+            showsNotice: false
+        )
     }
 
     private func availableTools(
@@ -2483,31 +4308,53 @@ struct DocumentWorkspaceView: View {
     ) -> [DocumentTool] {
         var result: [DocumentTool] = []
         for action in model.actions(for: record) {
-            let tool: DocumentTool?
-            switch action {
-            case .brief:
-                tool = .brief
-            case .recognizeText:
-                tool = .recognize
-            case .makeSearchable:
-                tool = nil
-            case .organizePages:
-                tool = .organize
-            case .reviewForm:
-                tool = .fillForm
-            case .sign:
-                tool = .sign
-            case .safeShare, .shareCopy:
-                tool = .export
-            case .inspect:
-                tool = record.brief == nil ? .find : .brief
-            }
+            let tool = contextualTool(for: action, record: record)
             if let tool,
                !result.contains(tool) {
                 result.append(tool)
             }
         }
         return Array(result.prefix(4))
+    }
+
+    private func contextualToolReasons(
+        for record: DocumentRecord
+    ) -> [DocumentTool: String] {
+        let recommendation = model.recommendation(for: record)
+        guard let tool = contextualTool(
+            for: recommendation.action,
+            record: record
+        ) else { return [:] }
+        return [
+            tool: statusActionReason(
+                record: record,
+                recommendation: recommendation
+            )
+        ]
+    }
+
+    private func contextualTool(
+        for action: DocumentAction,
+        record: DocumentRecord
+    ) -> DocumentTool? {
+        switch action {
+        case .brief:
+            return .brief
+        case .recognizeText:
+            return .recognize
+        case .makeSearchable:
+            return nil
+        case .organizePages:
+            return .organize
+        case .reviewForm:
+            return .fillForm
+        case .sign:
+            return .sign
+        case .safeShare, .shareCopy:
+            return .export
+        case .inspect:
+            return record.brief == nil ? .find : .brief
+        }
     }
 
     private func handle(_ tool: DocumentTool) {
@@ -2562,22 +4409,37 @@ struct DocumentWorkspaceView: View {
             presentedSheet = .bookmarks
         case .organize:
             pageOrganizerStartsSelecting = false
+            pageOrganizerInitialSelection = []
             presentedSheet = .pages
         case .compress:
             presentedSheet = .compression
         case .protect:
             presentedSheet = .protection
         case .export:
-            exportFocus = nil
             presentedSheet = .export
         }
     }
 
     private func runCommand(_ action: PDFViewCommand.Action) {
+        if directMutationVersionLabel(for: action) != nil,
+           model.isProcessing(recordID) {
+            model[noticeFor: paperPathSceneID] =
+                "Wait for the current document task to finish"
+            return
+        }
+        guard let contentRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else { return }
         presentedSheet = nil
-        Task {
-            try? await Task.sleep(for: .milliseconds(220))
+        scheduleWorkspaceTransition(
+            expectedContentRevisionID: contentRevisionID
+        ) {
             if let label = directMutationVersionLabel(for: action) {
+                guard !model.isProcessing(recordID) else {
+                    model[noticeFor: paperPathSceneID] =
+                        "Wait for the current document task to finish"
+                    return
+                }
                 guard await model.createVersionSnapshot(
                     recordID: recordID,
                     label: label
@@ -2587,11 +4449,55 @@ struct DocumentWorkspaceView: View {
         }
     }
 
+    private func runViewportCommand(
+        _ action: PDFViewCommand.Action
+    ) {
+        switch action {
+        case .zoomIn, .zoomOut, .fitToWindow:
+            break
+        default:
+            return
+        }
+        guard !hasBlockingWorkspacePresentation,
+              !isWorkspaceHandoffActive,
+              shareTask == nil,
+              shareProgress == nil
+        else { return }
+        pdfCommand = PDFViewCommand(action: action)
+    }
+
+    private func commitPendingNote() {
+        guard let pendingNote else { return }
+        self.pendingNote = nil
+        runCommand(.addNote(pendingNote))
+    }
+
+    private func cancelRedactionMode() {
+        redactionMarks.removeAll(keepingCapacity: false)
+        isRedactionMode = false
+        model[noticeFor: paperPathSceneID] =
+            "Redaction cancelled · PDF unchanged".localizedUI
+    }
+
     private func runMarkup(_ kind: PDFMarkupKind) {
+        guard !model.isProcessing(recordID) else {
+            model[noticeFor: paperPathSceneID] =
+                "Wait for the current document task to finish"
+            return
+        }
         presentedSheet = nil
         let color = markupColor(for: kind)
-        Task {
-            try? await Task.sleep(for: .milliseconds(220))
+        guard let contentRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else { return }
+        scheduleWorkspaceTransition(
+            expectedContentRevisionID: contentRevisionID
+        ) {
+            guard !model.isProcessing(recordID) else {
+                model[noticeFor: paperPathSceneID] =
+                    "Wait for the current document task to finish"
+                return
+            }
             guard await model.createVersionSnapshot(
                 recordID: recordID,
                 label: AppLocalization.format(
@@ -2604,6 +4510,126 @@ struct DocumentWorkspaceView: View {
                 markupColor: color
             )
         }
+    }
+
+    private func openCreatedDocument(_ route: DocumentRoute) {
+        queueWorkspaceHandoff(.openDocument(route))
+        presentedSheet = nil
+        isPresentingContentEditor = false
+        isPresentingLinkEditor = false
+        isPresentingImageReplacement = false
+        textSelectionForReplacement = nil
+    }
+
+    private func scheduleWorkspaceTransition(
+        handoff: PendingWorkspaceHandoff? = nil,
+        expectedContentRevisionID: UUID? = nil,
+        operation: @escaping @MainActor () async -> Void
+    ) {
+        workspaceTransitionTask?.cancel()
+        let generation = UUID()
+        workspaceTransitionGeneration = generation
+        activeWorkspaceHandoff = handoff
+        workspaceHandoffFeedback += 1
+        workspaceTransitionTask = Task { @MainActor in
+#if DEBUG
+            // #region debug-point D:workspace-transition-started
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "D",
+                location:
+                    "DocumentWorkspaceView.scheduleWorkspaceTransition",
+                message: "Workspace transition task started",
+                data: [
+                    "recordID": recordID.uuidString,
+                    "isCurrent": String(
+                        workspaceTransitionGeneration == generation
+                    )
+                ]
+            )
+            // #endregion
+#endif
+            defer {
+#if DEBUG
+                // #region debug-point D:workspace-transition-finished
+                reportFrequentUIFreezeDebugEvent(
+                    hypothesisID: "D",
+                    location:
+                        "DocumentWorkspaceView.scheduleWorkspaceTransition",
+                    message: "Workspace transition task finished",
+                    data: [
+                        "recordID": recordID.uuidString,
+                        "cancelled": String(Task.isCancelled),
+                        "isCurrent": String(
+                            workspaceTransitionGeneration == generation
+                        )
+                    ]
+                )
+                // #endregion
+#endif
+                if workspaceTransitionGeneration == generation {
+                    workspaceTransitionTask = nil
+                    activeWorkspaceHandoff = nil
+                }
+            }
+            await Task.yield()
+#if DEBUG
+            // #region debug-point D:workspace-transition-resumed
+            reportFrequentUIFreezeDebugEvent(
+                hypothesisID: "D",
+                location:
+                    "DocumentWorkspaceView.scheduleWorkspaceTransition",
+                message: "Workspace transition resumed after yield",
+                data: [
+                    "recordID": recordID.uuidString,
+                    "cancelled": String(Task.isCancelled),
+                    "isCurrent": String(
+                        workspaceTransitionGeneration == generation
+                    )
+                ]
+            )
+            // #endregion
+#endif
+            guard !Task.isCancelled,
+                  workspaceTransitionGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else {
+                return
+            }
+            if let expectedContentRevisionID,
+               model.record(id: recordID)?.contentRevisionID
+                    != expectedContentRevisionID {
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                return
+            }
+            await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await operation()
+            }
+        }
+    }
+
+    private func cancelWorkspaceTransition(
+        showsNotice: Bool = false
+    ) {
+        workspaceTransitionGeneration = UUID()
+        workspaceTransitionTask?.cancel()
+        workspaceTransitionTask = nil
+        activeWorkspaceHandoff = nil
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] =
+                "Opening next step stopped · PDF unchanged".localizedUI
+        }
+    }
+
+    private func stopWorkspaceHandoff(
+        showsNotice: Bool = false
+    ) {
+        pendingWorkspaceHandoff = nil
+        cancelWorkspaceTransition(showsNotice: showsNotice)
     }
 
     private func directMutationVersionLabel(
@@ -2619,7 +4645,11 @@ struct DocumentWorkspaceView: View {
             return "Add note".localizedUI
         case .removeAnnotation:
             return "Remove annotation".localizedUI
-        case .markRedaction, .captureTextForEditing:
+        case .markRedaction,
+             .captureTextForEditing,
+             .zoomIn,
+             .zoomOut,
+             .fitToWindow:
             return nil
         }
     }
@@ -2655,7 +4685,7 @@ struct DocumentWorkspaceView: View {
         case .strikeOut:
             savedStrikeColor = color.rawValue
         }
-        model.noticeMessage = AppLocalization.format(
+        model[noticeFor: paperPathSceneID] = AppLocalization.format(
             "%@ · %@",
             kindTitle(kind).localizedUI,
             color.title.localizedUI
@@ -2683,52 +4713,344 @@ struct DocumentWorkspaceView: View {
     }
 
     private func scheduleReadingPositionSave(
-        _ pageIndex: Int
+        _ pageIndex: Int,
+        expectedContentRevisionID: UUID? = nil
     ) {
         readingPositionTask?.cancel()
+        let viewedAt = Date()
+        guard let contentRevisionID =
+            expectedContentRevisionID
+                ?? model.record(id: recordID)?.contentRevisionID,
+              pageStateContentRevisionID == contentRevisionID
+        else { return }
         readingPositionTask = Task {
             try? await Task.sleep(for: .milliseconds(450))
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  model.record(id: recordID)?.contentRevisionID
+                    == contentRevisionID,
+                  pageStateContentRevisionID
+                    == contentRevisionID
+            else { return }
             await model.updateReadingPosition(
                 recordID: recordID,
-                pageIndex: pageIndex
+                pageIndex: pageIndex,
+                expectedContentRevisionID:
+                    contentRevisionID,
+                viewedAt: viewedAt
             )
         }
     }
 
+    private func performWorkspaceMetadataOperation(
+        _ operation: WorkspaceMetadataOperation,
+        action: @escaping @MainActor () async -> Bool,
+        onSuccess: @escaping @MainActor () -> Void = {}
+    ) {
+        guard workspaceMetadataTask == nil,
+              !model.isProcessing(recordID)
+        else { return }
+        let generation = UUID()
+        workspaceMetadataGeneration = generation
+        workspaceMetadataStopRequested = false
+        activeMetadataOperation = operation
+        workspaceMetadataTask = Task { @MainActor in
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await action()
+            }
+            guard workspaceMetadataGeneration == generation else {
+                return
+            }
+            let wasStopped =
+                workspaceMetadataStopRequested || Task.isCancelled
+            workspaceMetadataTask = nil
+            activeMetadataOperation = nil
+            workspaceMetadataStopRequested = false
+            if wasStopped {
+                if succeeded {
+                    metadataSuccessFeedback &+= 1
+                    switch operation {
+                    case .trash:
+                        onSuccess()
+                    default:
+                        model[noticeFor: paperPathSceneID] =
+                            "Metadata update finished before stopping · changes kept"
+                                .localizedUI
+                    }
+                } else {
+                    model[noticeFor: paperPathSceneID] =
+                        "Metadata update stopped".localizedUI
+                }
+                return
+            }
+            if succeeded {
+                metadataSuccessFeedback &+= 1
+                onSuccess()
+            } else {
+                metadataErrorFeedback &+= 1
+            }
+        }
+    }
+
+    private func updateWorkflow(
+        _ status: DocumentWorkflowStatus
+    ) {
+        performWorkspaceMetadataOperation(.workflow) {
+            await model.updateWorkflow(
+                recordID: recordID,
+                status: status
+            )
+        }
+    }
+
+    private func togglePinned(
+        expectedIsPinned: Bool
+    ) {
+        performWorkspaceMetadataOperation(.pin) {
+            await model.togglePinned(
+                recordID: recordID,
+                expectedIsPinned: expectedIsPinned
+            )
+        }
+    }
+
+    private func renameWorkingCopy() {
+        let requestedName = proposedName
+        let expectedName = originalName
+        performWorkspaceMetadataOperation(.rename) {
+            await model.rename(
+                recordID: recordID,
+                to: requestedName,
+                expectedName: expectedName
+            )
+        }
+    }
+
+    private func toggleCurrentPageBookmark() {
+        let requestedPageIndex = currentPageIndex
+        guard let contentRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else { return }
+        performWorkspaceMetadataOperation(.bookmark) {
+            await model.toggleBookmark(
+                recordID: recordID,
+                pageIndex: requestedPageIndex,
+                expectedContentRevisionID:
+                    contentRevisionID
+            )
+        }
+    }
+
+    private func moveWorkingCopyToTrash() {
+        performWorkspaceMetadataOperation(
+            .trash,
+            action: {
+                await model.withFeedbackTarget(
+                    paperPathSceneID
+                ) {
+                    await model.delete(recordID: recordID)
+                }
+            },
+            onSuccess: {
+                dismiss()
+            }
+        )
+    }
+
+    private func invalidateWorkspaceMetadataPresentation() {
+        stopWorkspaceMetadataOperation(invalidateResult: true)
+    }
+
+    private func stopWorkspaceMetadataOperation(
+        invalidateResult: Bool = false,
+        showsNotice: Bool = false
+    ) {
+        if invalidateResult {
+            workspaceMetadataGeneration = UUID()
+            workspaceMetadataStopRequested = false
+        } else {
+            guard workspaceMetadataTask != nil,
+                  !workspaceMetadataStopRequested
+            else { return }
+            workspaceMetadataStopRequested = true
+        }
+        workspaceMetadataTask?.cancel()
+        if invalidateResult {
+            workspaceMetadataTask = nil
+            activeMetadataOperation = nil
+        } else if showsNotice {
+            model[noticeFor: paperPathSceneID] =
+                "Finishing metadata update".localizedUI
+        }
+    }
+
+    private var hasBlockingWorkspaceControlTask: Bool {
+        shareTask != nil
+            || workspaceMetadataTask != nil
+            || isWorkspaceHandoffActive
+            || model.isProcessing(recordID)
+    }
+
+    private var isWorkspaceHandoffActive: Bool {
+        pendingWorkspaceHandoff != nil
+            || activeWorkspaceHandoff != nil
+            || workspaceTransitionTask != nil
+    }
+
     private var processingPill: some View {
         let progress = model.progress(for: recordID)
-        return HStack(spacing: PPSpacing.small) {
+        let isAnalyzing = model.isAnalyzing(recordID)
+        let isComparing = model.isComparing(recordID)
+        let metadataOperation = activeMetadataOperation
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.small
+                )
+            )
+            : AnyLayout(HStackLayout(spacing: PPSpacing.small))
+        return layout {
             ToolSymbolPlate(
-                symbol: recognitionTask == nil ? "gearshape.2" : "text.viewfinder",
-                tint: recognitionTask == nil ? PPColor.accent : PPColor.cyan,
+                symbol:
+                    metadataOperation?.symbol
+                    ?? (
+                    isAnalyzing && progress == nil
+                    ? "text.magnifyingglass"
+                    : isComparing
+                        ? "rectangle.2.swap"
+                        : recognitionTask == nil
+                            ? "gearshape.2"
+                            : "text.viewfinder"
+                    ),
+                tint:
+                    metadataOperation != nil
+                    ? PPColor.cyan
+                    : isAnalyzing && progress == nil
+                    ? PPColor.cyan
+                    : isComparing
+                        ? PPColor.amber
+                        : recognitionTask == nil
+                            ? PPColor.accent
+                            : PPColor.cyan,
                 size: 30
             )
-            if let progress {
+            if recognitionStopRequested
+                || searchableCopyStopRequested {
+                Text(
+                    (
+                        searchableCopyStopRequested
+                            ? "Stopping searchable copy"
+                            : "Stopping text recognition"
+                    ).localizedUI
+                )
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(2)
+            } else if let progress {
                 LocalOperationProgressView(progress: progress)
                     .frame(minWidth: 190, maxWidth: 280)
             } else {
                 Text(
-                    "Working on device".localizedUI
+                    (
+                        metadataOperation != nil
+                            ? (
+                                workspaceMetadataStopRequested
+                                    ? "Finishing metadata update"
+                                    : metadataOperation?.title
+                                        ?? "Updating document metadata"
+                            )
+                            : (
+                        isAnalyzing
+                            ? "Indexing on device"
+                            : isComparing
+                                ? "Comparing on device"
+                                : "Working on device"
+                        )
+                    ).localizedUI
                 )
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textPrimary)
                 .lineLimit(2)
             }
-            if recognitionTask != nil {
+            if workspaceMetadataTask != nil
+                || recognitionTask != nil
+                || searchableCopyTask != nil
+                || unlockCopyTask != nil
+                || isComparing {
                 Button {
-                    recognitionTask?.cancel()
-                    recognitionTask = nil
-                    model.noticeMessage = "Text recognition stopped"
+                    if workspaceMetadataTask != nil {
+                        stopWorkspaceMetadataOperation(
+                            showsNotice: true
+                        )
+                    } else if unlockCopyTask != nil {
+                        stopUnlockCopyCreation()
+                    } else if recognitionTask != nil {
+                        stopRecognition(
+                            showsNotice: true,
+                            invalidateResult: false
+                        )
+                    } else if searchableCopyTask != nil {
+                        stopSearchableCopyCreation(
+                            showsNotice: true,
+                            invalidateResult: false
+                        )
+                    } else {
+                        model.stopComparisons(recordID: recordID)
+                    }
                 } label: {
-                    Image(systemName: "stop.fill")
-                        .frame(width: 40, height: 40)
+                    if workspaceMetadataStopRequested
+                        || unlockCopyStopRequested
+                        || recognitionStopRequested
+                        || searchableCopyStopRequested {
+                        ProgressView()
+                            .controlSize(.small)
+                            .frame(width: 44, height: 44)
+                    } else {
+                        Image(systemName: "stop.fill")
+                            .frame(width: 44, height: 44)
+                    }
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(PPColor.amber)
-                .accessibilityLabel("Stop text recognition")
+                .disabled(
+                    workspaceMetadataStopRequested
+                        || unlockCopyStopRequested
+                        || recognitionStopRequested
+                        || searchableCopyStopRequested
+                )
+                .accessibilityLabel(
+                    (
+                        workspaceMetadataTask != nil
+                            ? (
+                                workspaceMetadataStopRequested
+                                    ? "Finishing metadata update"
+                                    : "Stop updating document metadata"
+                            )
+                        : unlockCopyTask != nil
+                            ? (
+                                unlockCopyStopRequested
+                                    ? "Stopping editable copy"
+                                    : "Stop creating editable copy"
+                            )
+                        : isComparing
+                            ? "Stop comparison"
+                            : searchableCopyTask != nil
+                                ? (
+                                    searchableCopyStopRequested
+                                        ? "Stopping searchable copy"
+                                        : "Stop creating searchable copy"
+                                )
+                                : recognitionStopRequested
+                                    ? "Stopping text recognition"
+                                    : "Stop text recognition"
+                    ).localizedUI
+                )
+                .keyboardShortcut(.cancelAction)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, PPSpacing.regular)
         .padding(.vertical, PPSpacing.small)
         .frame(maxWidth: 380)
@@ -2747,6 +5069,8 @@ struct DocumentWorkspaceView: View {
                 .stroke(PPColor.accent.opacity(0.22), lineWidth: 0.7)
         }
         .shadow(color: .black.opacity(0.14), radius: 10, y: 5)
+        .accessibilityElement(children: .contain)
+        .accessibilityAddTraits(.updatesFrequently)
     }
 
     private func handle(_ action: DocumentAction) {
@@ -2754,21 +5078,16 @@ struct DocumentWorkspaceView: View {
         case .brief:
             presentedSheet = .brief
         case .recognizeText:
-            if model.ocrResults[recordID] != nil {
+            if model.hasRecognizedText(recordID: recordID) {
                 presentedSheet = .recognizedText
             } else {
                 openRecognitionSettings()
             }
         case .makeSearchable:
-            Task {
-                if let created = await model.createSearchableCopy(
-                    recordID: recordID
-                ) {
-                    onOpenDocument(DocumentRoute(recordID: created.id))
-                }
-            }
+            createSearchableCopy()
         case .organizePages:
             pageOrganizerStartsSelecting = false
+            pageOrganizerInitialSelection = []
             presentedSheet = .pages
         case .reviewForm:
             presentedSheet = .formReview
@@ -2789,13 +5108,25 @@ struct DocumentWorkspaceView: View {
 
     private func open(_ task: PDFQuickTask) {
         switch task {
+        case .signPDF:
+            savedToolMode = ToolMode.annotate.rawValue
+        case .organizePages, .splitPDF:
+            savedToolMode = ToolMode.pages.rawValue
+        case .fillForms, .safeShare, .compressPDF, .protectPDF, .exportText, .exportImages:
+            savedToolMode = ToolMode.deliver.rawValue
+        default:
+            break
+        }
+        switch task {
         case .scanToPDF, .imagesToPDF, .mergePDFs:
             break
         case .splitPDF:
             pageOrganizerStartsSelecting = true
+            pageOrganizerInitialSelection = []
             presentedSheet = .pages
         case .organizePages:
             pageOrganizerStartsSelecting = false
+            pageOrganizerInitialSelection = []
             presentedSheet = .pages
         case .compressPDF:
             presentedSheet = .compression
@@ -2805,7 +5136,7 @@ struct DocumentWorkspaceView: View {
             presentSignature()
         case .redactPDF:
             isRedactionMode = true
-            model.noticeMessage = "Select text, then tap Redact"
+            model[noticeFor: paperPathSceneID] = "Select text, then tap Redact"
         case .protectPDF:
             presentedSheet = .protection
         case .safeShare:
@@ -2813,11 +5144,9 @@ struct DocumentWorkspaceView: View {
         case .recognizeText:
             handle(.recognizeText)
         case .exportText:
-            exportFocus = .text
-            presentedSheet = .export
+            presentedSheet = .officeExport
         case .exportImages:
-            exportFocus = .images
-            presentedSheet = .export
+            presentedSheet = .imageExport
         }
     }
 
@@ -2825,14 +5154,7 @@ struct DocumentWorkspaceView: View {
         if let target = model.verifiedShareTarget(for: recordID) {
             share(recordID: target.id)
         } else {
-            Task {
-                await model.updateTaskCheckpoint(
-                    recordID: recordID,
-                    checkpoint: DocumentTaskCheckpoint(stage: .verify)
-                )
-            }
-            exportFocus = .safeShare
-            presentedSheet = .export
+            queueWorkspaceHandoff(.safeShare)
         }
     }
 
@@ -2843,12 +5165,20 @@ struct DocumentWorkspaceView: View {
             model.ocrResults[recordID]?.configuration
                 ?? recognitionConfiguration
         if afterDismissal {
-            Task {
-                try? await Task.sleep(for: .milliseconds(240))
-                isConfiguringRecognition = true
-            }
+            queueWorkspaceHandoff(.recognitionSettings)
         } else {
+            cancelWorkspaceTransition()
             isConfiguringRecognition = true
+        }
+    }
+
+    private func completeRecognitionConfigurationDismissal() {
+        guard let configuration = pendingRecognitionConfiguration else {
+            return
+        }
+        pendingRecognitionConfiguration = nil
+        scheduleWorkspaceTransition {
+            startRecognition(configuration)
         }
     }
 
@@ -2856,44 +5186,467 @@ struct DocumentWorkspaceView: View {
         _ configuration: OCRRecognitionConfiguration
     ) {
         guard recognitionTask == nil else { return }
+        guard !model.isProcessing(recordID) else {
+            model[noticeFor: paperPathSceneID] =
+                "Wait for the current document task to finish".localizedUI
+            return
+        }
         recognitionConfiguration = configuration
+        recognitionStopRequested = false
+        let generation = UUID()
+        recognitionGeneration = generation
         recognitionTask = Task {
-            let succeeded = await model.recognizeText(
-                recordID: recordID,
-                configuration: configuration
-            )
-            guard !Task.isCancelled else {
-                recognitionTask = nil
+            let succeeded = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.recognizeText(
+                    recordID: recordID,
+                    configuration: configuration
+                )
+            }
+            let wasStopped =
+                recognitionStopRequested || Task.isCancelled
+            guard recognitionGeneration == generation else { return }
+            recognitionTask = nil
+            recognitionStopRequested = false
+            guard !wasStopped else {
+                model[noticeFor: paperPathSceneID] = succeeded
+                    ? "Text recognition finished before stopping · results kept"
+                        .localizedUI
+                    : "Text recognition stopped".localizedUI
                 return
             }
             if succeeded {
                 presentedSheet = .recognizedText
             }
+        }
+    }
+
+    private func stopRecognition(
+        showsNotice: Bool = false,
+        invalidateResult: Bool = true
+    ) {
+        guard recognitionTask != nil else { return }
+        if invalidateResult {
+            recognitionGeneration = UUID()
+            recognitionStopRequested = false
+        } else {
+            recognitionStopRequested = true
+        }
+        recognitionTask?.cancel()
+        if invalidateResult {
             recognitionTask = nil
+        }
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] =
+                "Stopping text recognition".localizedUI
+        }
+    }
+
+    private func createSearchableCopy() {
+        guard searchableCopyTask == nil,
+              !model.isProcessing(recordID),
+              let sourceContentRevisionID =
+                model.record(id: recordID)?.contentRevisionID
+        else { return }
+        searchableCopyStopRequested = false
+        let generation = UUID()
+        searchableCopyGeneration = generation
+        searchableCopyTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createSearchableCopy(
+                    recordID: recordID,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
+            }
+            let wasStopped =
+                searchableCopyStopRequested || Task.isCancelled
+            guard searchableCopyGeneration == generation else { return }
+            searchableCopyTask = nil
+            searchableCopyStopRequested = false
+            guard !wasStopped else {
+                model[noticeFor: paperPathSceneID] = created == nil
+                    ? "Searchable copy stopped".localizedUI
+                    : "Searchable copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return
+            }
+            guard let created else { return }
+            openCreatedDocument(
+                DocumentRoute(recordID: created.id)
+            )
+        }
+    }
+
+    private func stopSearchableCopyCreation(
+        showsNotice: Bool = false,
+        invalidateResult: Bool = true
+    ) {
+        guard searchableCopyTask != nil else { return }
+        if invalidateResult {
+            searchableCopyGeneration = UUID()
+            searchableCopyStopRequested = false
+        } else {
+            searchableCopyStopRequested = true
+        }
+        searchableCopyTask?.cancel()
+        if invalidateResult {
+            searchableCopyTask = nil
+        }
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] =
+                "Stopping searchable copy".localizedUI
         }
     }
 
     private func openSafeShareAfterDismissal() {
-        Task {
-            await model.updateTaskCheckpoint(
-                recordID: recordID,
-                checkpoint: DocumentTaskCheckpoint(stage: .verify)
+        queueWorkspaceHandoff(.safeShare)
+    }
+
+    private func handleWorkspacePresentationDismissal() {
+#if DEBUG
+        // #region debug-point C:workspace-presentation-dismissed
+        reportFrequentUIFreezeDebugEvent(
+            hypothesisID: "C",
+            location:
+                "DocumentWorkspaceView.handleWorkspacePresentationDismissal",
+            message: "Workspace presentation dismissed",
+            data: [
+                "recordID": recordID.uuidString,
+                "hasActivePresentation": String(
+                    hasActiveWorkspacePresentation
+                ),
+                "hasPendingHandoff": String(
+                    pendingWorkspaceHandoff != nil
+                ),
+                "hasTransitionTask": String(
+                    workspaceTransitionTask != nil
+                )
+            ]
+        )
+        // #endregion
+#endif
+        cleanupShareCopy()
+        guard !hasActiveWorkspacePresentation,
+              let handoff = pendingWorkspaceHandoff
+        else { return }
+        pendingWorkspaceHandoff = nil
+        scheduleWorkspaceTransition(handoff: handoff) {
+            await performWorkspaceHandoff(handoff)
+        }
+    }
+
+    private var hasActiveWorkspacePresentation: Bool {
+        presentedSheet != nil
+            || isPresentingSignature
+            || isPresentingPencil
+            || isPresentingContentEditor
+            || isPresentingLinkEditor
+            || isPresentingImageReplacement
+            || textSelectionForReplacement != nil
+    }
+
+    private var hasBlockingWorkspacePresentation: Bool {
+        hasActiveWorkspacePresentation
+            || isAddingNote
+            || isUnlocking
+            || isConfiguringRecognition
+            || isRenaming
+            || isJumpingToPage
+            || isConfirmingDelete
+    }
+
+    private func queueWorkspaceHandoff(
+        _ handoff: PendingWorkspaceHandoff
+    ) {
+#if DEBUG
+        // #region debug-point C:workspace-handoff-queued
+        reportFrequentUIFreezeDebugEvent(
+            hypothesisID: "C",
+            location: "DocumentWorkspaceView.queueWorkspaceHandoff",
+            message: "Workspace handoff queued",
+            data: [
+                "recordID": recordID.uuidString,
+                "handoff": String(describing: handoff),
+                "hasActivePresentation": String(
+                    hasActiveWorkspacePresentation
+                ),
+                "hadPendingHandoff": String(
+                    pendingWorkspaceHandoff != nil
+                ),
+                "hadTransitionTask": String(
+                    workspaceTransitionTask != nil
+                )
+            ]
+        )
+        // #endregion
+#endif
+        cancelWorkspaceTransition()
+        let revisionBoundHandoff: PendingWorkspaceHandoff
+        switch handoff {
+        case .openDocument(let route):
+            revisionBoundHandoff = .openDocument(
+                route.bindingExpectedRevision(
+                    model.record(id: route.recordID)?
+                        .contentRevisionID
+                )
             )
-            try? await Task.sleep(for: .milliseconds(260))
-            exportFocus = .safeShare
-            presentedSheet = .export
+        default:
+            revisionBoundHandoff = handoff
+        }
+        pendingWorkspaceHandoff = revisionBoundHandoff
+        workspaceHandoffFeedback += 1
+        if presentedSheet != nil {
+            presentedSheet = nil
+            return
+        }
+        guard !hasActiveWorkspacePresentation else { return }
+        handleWorkspacePresentationDismissal()
+    }
+
+    @MainActor
+    private func performWorkspaceHandoff(
+        _ handoff: PendingWorkspaceHandoff
+    ) async {
+        guard !Task.isCancelled else { return }
+        switch handoff {
+        case .tool(let tool):
+            handle(tool)
+        case .action(let action):
+            handle(action)
+        case .stamp(
+            let kind,
+            let pageIndex,
+            let contentRevisionID
+        ):
+            guard model.record(id: recordID)?.contentRevisionID
+                    == contentRevisionID
+            else {
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                return
+            }
+            await model.addStamp(
+                recordID: recordID,
+                pageIndex: pageIndex,
+                kind: kind
+            )
+        case .openDocument(let route):
+            guard model.record(id: route.recordID) != nil else {
+                model[noticeFor: paperPathSceneID] =
+                    "The document is no longer available".localizedUI
+                return
+            }
+            onOpenDocument(route)
+        case .safeShare:
+            guard let record = model.record(id: recordID) else {
+                model[noticeFor: paperPathSceneID] =
+                    "The document is no longer available".localizedUI
+                return
+            }
+            let checkpointSaved: Bool
+            if record.taskCheckpoint?.stage == .verify,
+               record.taskCheckpoint?.contentRevisionID
+                == record.contentRevisionID {
+                checkpointSaved = true
+            } else {
+                checkpointSaved =
+                    await model.updateTaskCheckpoint(
+                        recordID: recordID,
+                        checkpoint: DocumentTaskCheckpoint(
+                            stage: .verify,
+                            contentRevisionID:
+                                record.contentRevisionID
+                        ),
+                        presentsFeedback: false
+                    )
+            }
+            guard !Task.isCancelled else { return }
+            guard model.record(id: recordID) != nil else {
+                model[noticeFor: paperPathSceneID] =
+                    "The document is no longer available".localizedUI
+                return
+            }
+            if let target =
+                model.verifiedShareTarget(for: recordID) {
+                share(recordID: target.id)
+                return
+            }
+            presentedSheet = .verifiedExport
+            if !checkpointSaved {
+                model[noticeFor: paperPathSceneID] =
+                    "Opening verified output · resume point not saved"
+                        .localizedUI
+            }
+        case .unlockForVerifiedOutput:
+            guard let record = model.record(id: recordID) else {
+                model[noticeFor: paperPathSceneID] =
+                    "The document is no longer available".localizedUI
+                return
+            }
+            guard record.profile.isLocked else {
+                presentedSheet = .verifiedExport
+                return
+            }
+            continuesVerifiedOutputAfterUnlock = true
+            unlockCopyIssue = nil
+            if isSessionUnlocked {
+                createUnlockedPrivateCopy()
+            } else {
+                isUnlocking = true
+            }
+        case .recognitionSettings:
+            guard recognitionTask == nil else { return }
+            isConfiguringRecognition = true
+        case .presentSheet(let sheet):
+            presentedSheet = sheet
+        case .navigate(
+            let pageIndex,
+            let message,
+            let recordsHistory,
+            let nextSheet,
+            let showsNotice,
+            let contentRevisionID
+        ):
+            guard model.record(id: recordID)?.contentRevisionID
+                    == contentRevisionID
+            else {
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                return
+            }
+            _ = commitPageNavigation(
+                pageIndex,
+                message: message,
+                recordsHistory: recordsHistory,
+                showsNotice: showsNotice
+            )
+            if let nextSheet {
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                presentedSheet = nextSheet
+            }
+        case .signature(
+            let pageIndex,
+            let initialBounds,
+            let fieldName,
+            let navigationMessage,
+            let updatesCheckpoint,
+            let contentRevisionID
+        ):
+            guard model.record(id: recordID)?.contentRevisionID
+                    == contentRevisionID
+            else {
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this field opened. Review the updated form."
+                        .localizedUI
+                return
+            }
+            let resolvedPageIndex = commitPageNavigation(
+                pageIndex,
+                message: navigationMessage,
+                recordsHistory: true
+            ) ?? pageIndex
+            await Task.yield()
+            guard !Task.isCancelled,
+                  model.record(id: recordID)?.contentRevisionID
+                    == contentRevisionID
+            else { return }
+            presentSignature(
+                pageIndex: resolvedPageIndex,
+                initialBounds: initialBounds,
+                fieldName: fieldName,
+                updatesCheckpoint: updatesCheckpoint
+            )
         }
     }
 
     private func share(recordID targetID: UUID) {
-        guard let url = model.url(for: targetID) else {
-            model.noticeMessage = "The PDF could not be found"
+        guard shareTask == nil else { return }
+        guard model.url(for: targetID) != nil else {
+            model[noticeFor: paperPathSceneID] = "The PDF could not be found"
             return
         }
-        shareItems = [url]
-        presentedSheet = .share
-        if targetID != recordID {
-            model.noticeMessage = "Sharing the latest verified copy"
+        cleanupShareCopy()
+        let generation = UUID()
+        shareGeneration = generation
+        shareRateWindow.reset()
+        shareProgress = PDFOperationProgress(
+            label: "Verifying protected share copy",
+            fractionCompleted: 0,
+            byteStage: .checksumming
+        )
+        model[noticeFor: paperPathSceneID] = "Preparing protected share copy".localizedUI
+        shareTask = Task { @MainActor in
+            let url = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.makeFilesExportCopy(
+                    recordID: targetID
+                ) { update in
+                    guard shareGeneration == generation else { return }
+                    if let progress =
+                        shareRateWindow.operationProgress(
+                            label: "Verifying protected share copy",
+                            update: update,
+                            current: shareProgress
+                        ) {
+                        shareProgress = progress
+                    }
+                }
+            }
+            guard shareGeneration == generation else {
+                if let url {
+                    await model.discardFilesExportCopy(at: url)
+                }
+                return
+            }
+            shareTask = nil
+            shareProgress = nil
+            shareRateWindow.reset()
+            guard !Task.isCancelled, let url else {
+                if let url {
+                    await model.discardFilesExportCopy(at: url)
+                }
+                return
+            }
+            temporaryShareURL = url
+            shareItems = [url]
+            presentedSheet = .share
+            model[noticeFor: paperPathSceneID] = (
+                targetID == recordID
+                    ? "Protected share copy ready"
+                    : "Sharing the latest verified copy"
+            ).localizedUI
+        }
+    }
+
+    private func stopSharePreparation(
+        showsNotice: Bool = false
+    ) {
+        shareGeneration = UUID()
+        shareTask?.cancel()
+        shareTask = nil
+        shareProgress = nil
+        shareRateWindow.reset()
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] =
+                "Share preparation stopped".localizedUI
+        }
+    }
+
+    private func cleanupShareCopy() {
+        let url = temporaryShareURL
+        temporaryShareURL = nil
+        shareItems = []
+        guard let url else { return }
+        Task {
+            await model.discardFilesExportCopy(at: url)
         }
     }
 
@@ -2904,7 +5657,7 @@ struct DocumentWorkspaceView: View {
         guard UIPrintInteractionController.isPrintingAvailable,
               UIPrintInteractionController.canPrint(url)
         else {
-            model.noticeMessage = "Printing is unavailable for this PDF"
+            model[noticeFor: paperPathSceneID] = "Printing is unavailable for this PDF"
             return
         }
 
@@ -2921,9 +5674,9 @@ struct DocumentWorkspaceView: View {
             _, completed, error in
             Task { @MainActor in
                 if let error {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 } else if completed {
-                    model.noticeMessage = "Print job handed to iOS"
+                    model[noticeFor: paperPathSceneID] = "Print job handed to iOS"
                 }
             }
         }
@@ -2968,23 +5721,15 @@ struct DocumentWorkspaceView: View {
     ) {
         switch step.kind {
         case .recognize:
-            presentedSheet = nil
             openRecognitionSettings(afterDismissal: true)
         case .organize:
-            presentedSheet = nil
-            Task {
-                try? await Task.sleep(for: .milliseconds(220))
-                presentedSheet = .pages
-            }
+            pageOrganizerStartsSelecting = false
+            pageOrganizerInitialSelection = []
+            queueWorkspaceHandoff(.presentSheet(.pages))
         case .share:
-            presentedSheet = nil
-            Task {
-                try? await Task.sleep(for: .milliseconds(220))
-                exportFocus = .safeShare
-                presentedSheet = .export
-            }
+            queueWorkspaceHandoff(.safeShare)
         case .completeForm:
-            presentedSheet = .formReview
+            queueWorkspaceHandoff(.presentSheet(.formReview))
         case .reviewSignature:
             showPageThenSignature(pageIndex)
         case .reviewDate, .reviewAmount:
@@ -2997,19 +5742,69 @@ struct DocumentWorkspaceView: View {
         message: String,
         thenPresent sheet: Sheet? = nil,
         recordsHistory: Bool = true,
-        dismissesPresentedSheet: Bool = true
+        dismissesPresentedSheet: Bool = true,
+        showsNotice: Bool = true
     ) {
         guard let pageIndex else {
+            cancelWorkspaceTransition()
             if let sheet {
                 presentedSheet = sheet
-                model.noticeMessage = "Evidence page unavailable · continuing"
+                model[noticeFor: paperPathSceneID] = "Evidence page unavailable · continuing"
             } else {
-                model.noticeMessage = "The evidence page could not be located"
+                model[noticeFor: paperPathSceneID] = "The evidence page could not be located"
             }
             return
         }
+        if !dismissesPresentedSheet {
+            cancelWorkspaceTransition()
+            _ = commitPageNavigation(
+                pageIndex,
+                message: message,
+                recordsHistory: recordsHistory,
+                showsNotice: showsNotice
+            )
+            return
+        }
+        guard let contentRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else {
+            model[noticeFor: paperPathSceneID] =
+                "The document is no longer available".localizedUI
+            return
+        }
+        queueWorkspaceHandoff(
+            .navigate(
+                pageIndex: pageIndex,
+                message: message,
+                recordsHistory: recordsHistory,
+                thenPresent: sheet,
+                showsNotice: showsNotice,
+                contentRevisionID: contentRevisionID
+            )
+        )
+    }
+
+    @discardableResult
+    private func commitPageNavigation(
+        _ pageIndex: Int,
+        message: String,
+        recordsHistory: Bool,
+        showsNotice: Bool = true
+    ) -> Int? {
+        guard let record = model.record(id: recordID),
+              record.profile.pageCount > 0,
+              pageStateContentRevisionID
+                == record.contentRevisionID
+        else { return nil }
+        let resolvedPageIndex = min(
+            max(0, pageIndex),
+            record.profile.pageCount - 1
+        )
+        if pdfSearchHighlight?.pageIndex != resolvedPageIndex {
+            pdfSearchHighlight = nil
+        }
         if recordsHistory,
-           pageIndex != currentPageIndex {
+           resolvedPageIndex != currentPageIndex {
             if pageBackHistory.last != currentPageIndex {
                 pageBackHistory.append(currentPageIndex)
                 if pageBackHistory.count > 32 {
@@ -3020,46 +5815,175 @@ struct DocumentWorkspaceView: View {
             }
             pageForwardHistory.removeAll()
         }
-        if !dismissesPresentedSheet {
-            requestedPageIndex = pageIndex
-            pageNavigationToken += 1
-            model.noticeMessage = "\(message) · page \(pageIndex + 1)"
+        if resolvedPageIndex != currentPageIndex {
+            pageNavigationFeedback &+= 1
+        }
+        requestedPageIndex = resolvedPageIndex
+        pageNavigationToken += 1
+        currentPageIndex = resolvedPageIndex
+        if !isScrubbingPage {
+            pageScrubberValue = Double(resolvedPageIndex)
+        }
+        scheduleReadingPositionSave(
+            resolvedPageIndex,
+            expectedContentRevisionID:
+                record.contentRevisionID
+        )
+        onReadingPositionChange(
+            resolvedPageIndex,
+            record.contentRevisionID
+        )
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] = AppLocalization.format(
+                "%@ · page %lld",
+                message.localizedUI,
+                resolvedPageIndex + 1
+            )
+        }
+        return resolvedPageIndex
+    }
+
+    private func reconcilePageState(pageCount: Int?) {
+        guard let pageCount, pageCount > 0 else {
+            pageBackHistory.removeAll(keepingCapacity: false)
+            pageForwardHistory.removeAll(keepingCapacity: false)
+            currentPageIndex = 0
+            pageScrubberValue = 0
+            requestedPageIndex = nil
             return
         }
-        presentedSheet = nil
+        let maximumPageIndex = pageCount - 1
+        pageBackHistory.removeAll {
+            $0 < 0 || $0 > maximumPageIndex
+        }
+        pageForwardHistory.removeAll {
+            $0 < 0 || $0 > maximumPageIndex
+        }
+        let resolvedCurrent = min(
+            max(0, currentPageIndex),
+            maximumPageIndex
+        )
+        let requestedWasOutOfRange = requestedPageIndex.map {
+            $0 < 0 || $0 > maximumPageIndex
+        } ?? false
+        guard resolvedCurrent != currentPageIndex
+                || requestedWasOutOfRange
+        else {
+            pageScrubberValue = min(
+                max(0, pageScrubberValue),
+                Double(maximumPageIndex)
+            )
+            return
+        }
+        currentPageIndex = resolvedCurrent
+        pageScrubberValue = Double(resolvedCurrent)
+        requestedPageIndex = resolvedCurrent
+        pageNavigationToken += 1
+        if let contentRevisionID = pageStateContentRevisionID {
+            onReadingPositionChange(
+                resolvedCurrent,
+                contentRevisionID
+            )
+        }
+        model[noticeFor: paperPathSceneID] = AppLocalization.format(
+            "Moved to the last available page · page %lld",
+            resolvedCurrent + 1
+        )
+    }
+
+    private func rebuildPageStateForUpdatedPDF(
+        from oldRevisionID: UUID,
+        to newRevisionID: UUID
+    ) {
+        guard oldRevisionID != newRevisionID,
+              let record = model.record(id: recordID),
+              record.contentRevisionID == newRevisionID
+        else { return }
+
+        readingPositionTask?.cancel()
+        readingPositionTask = nil
+        cancelWorkspaceTransition()
+        pendingWorkspaceHandoff = nil
+        activeWorkspaceHandoff = nil
+        pendingRecognitionConfiguration = nil
+        pageOrganizerStartsSelecting = false
+        pageOrganizerInitialSelection.removeAll(
+            keepingCapacity: false
+        )
+        signaturePageIndex = nil
+        signatureInitialBounds = nil
+        pdfSearchHighlight = nil
+        pdfCommand = nil
+        textSelectionForReplacement = nil
+        redactionMarks.removeAll(keepingCapacity: false)
+        isAddingNote = false
+        pendingNote = nil
+        pageBackHistory.removeAll(keepingCapacity: false)
+        pageForwardHistory.removeAll(keepingCapacity: false)
+        documentFindQuery = ""
+        documentFindHistory.removeAll(keepingCapacity: false)
+        pageJumpInput = ""
+        isJumpingToPage = false
+        isScrubbingPage = false
+        pageStateContentRevisionID = newRevisionID
+
+        let pageCount = record.profile.pageCount
+        guard pageCount > 0 else {
+            currentPageIndex = 0
+            pageScrubberValue = 0
+            requestedPageIndex = nil
+            pageNavigationToken &+= 1
+            return
+        }
+        let restoredPageIndex = min(
+            max(0, currentPageIndex),
+            pageCount - 1
+        )
+        let didMoveReadingPosition =
+            restoredPageIndex != currentPageIndex
+        currentPageIndex = restoredPageIndex
+        pageScrubberValue = Double(restoredPageIndex)
+        requestedPageIndex = restoredPageIndex
+        pageNavigationToken &+= 1
+        onReadingPositionChange(
+            restoredPageIndex,
+            newRevisionID
+        )
+        if didMoveReadingPosition,
+           !hasActiveWorkspacePresentation {
+            model[noticeFor: paperPathSceneID] =
+                "PDF updated · reading position refreshed".localizedUI
+        }
         Task {
-            try? await Task.sleep(for: .milliseconds(220))
-            requestedPageIndex = pageIndex
-            pageNavigationToken += 1
-            model.noticeMessage = "\(message) · page \(pageIndex + 1)"
-            if let sheet {
-                try? await Task.sleep(for: .milliseconds(260))
-                presentedSheet = sheet
-            }
+            await model.ensureAnalysisLoaded(for: recordID)
         }
     }
 
     private func navigateBack() {
+        cancelWorkspaceTransition()
         guard let page = pageBackHistory.popLast() else { return }
         if pageForwardHistory.last != currentPageIndex {
             pageForwardHistory.append(currentPageIndex)
         }
-        showPage(
+        commitPageNavigation(
             page,
             message: "Back",
-            recordsHistory: false
+            recordsHistory: false,
+            showsNotice: false
         )
     }
 
     private func navigateForward() {
+        cancelWorkspaceTransition()
         guard let page = pageForwardHistory.popLast() else { return }
         if pageBackHistory.last != currentPageIndex {
             pageBackHistory.append(currentPageIndex)
         }
-        showPage(
+        commitPageNavigation(
             page,
             message: "Forward",
-            recordsHistory: false
+            recordsHistory: false,
+            showsNotice: false
         )
     }
 
@@ -3068,76 +5992,109 @@ struct DocumentWorkspaceView: View {
         pageIndex: Int
     ) {
         guard model.record(id: targetRecordID) != nil else {
-            model.noticeMessage = "The changed page is no longer available"
+            model[noticeFor: paperPathSceneID] = "The changed page is no longer available"
             return
         }
         guard targetRecordID != recordID else {
-            presentedSheet = nil
-            Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(180))
-                showPage(
-                    pageIndex,
-                    message: "Opened changed page"
-                )
-            }
+            showPage(
+                pageIndex,
+                message: "Opened linked evidence"
+            )
             return
         }
-        let targetName = model.record(id: targetRecordID)?
-            .displayName ?? "PDF"
-        presentedSheet = nil
-        Task {
-            try? await Task.sleep(for: .milliseconds(220))
-            model.noticeMessage = AppLocalization.format(
-                "Opened change in %@ · page %lld",
-                targetName,
-                pageIndex + 1
-            )
-            onOpenDocument(
+        queueWorkspaceHandoff(
+            .openDocument(
                 DocumentRoute(
                     recordID: targetRecordID,
                     pageIndex: pageIndex
                 )
             )
-        }
+        )
+    }
+
+    private func openRecentDocument(
+        _ record: DocumentRecord
+    ) {
+        guard record.id != recordID,
+              model.record(id: record.id) != nil
+        else { return }
+        readingPositionTask?.cancel()
+        queueWorkspaceHandoff(
+            .openDocument(
+                DocumentRoute(
+                    recordID: record.id,
+                    pageIndex: record.lastPageIndex,
+                    expectedContentRevisionID:
+                        record.contentRevisionID
+                )
+            )
+        )
     }
 
     private func showPageThenSignature(
         _ pageIndex: Int?,
-        initialBounds: PDFNormalizedRect? = nil
+        initialBounds: PDFNormalizedRect? = nil,
+        fieldName: String? = nil,
+        navigationMessage: String = "Signature evidence",
+        updatesCheckpoint: Bool = true
     ) {
-        guard let pageIndex else {
-            presentSignature(initialBounds: initialBounds)
-            model.noticeMessage = "Evidence page unavailable · continuing"
+        guard let contentRevisionID =
+            model.record(id: recordID)?.contentRevisionID
+        else {
+            model[noticeFor: paperPathSceneID] =
+                "The document is no longer available".localizedUI
             return
         }
-        presentedSheet = nil
-        Task {
-            try? await Task.sleep(for: .milliseconds(220))
-            requestedPageIndex = pageIndex
-            pageNavigationToken += 1
-            model.noticeMessage = "Signature evidence · page \(pageIndex + 1)"
-            try? await Task.sleep(for: .milliseconds(260))
-            presentSignature(
-                pageIndex: pageIndex,
-                initialBounds: initialBounds
+        guard let pageIndex else {
+            queueWorkspaceHandoff(
+                .signature(
+                    pageIndex: currentPageIndex,
+                    initialBounds: initialBounds,
+                    fieldName: fieldName,
+                    navigationMessage:
+                        navigationMessage == "Signature evidence"
+                            ? "Evidence page unavailable · continuing"
+                            : navigationMessage,
+                    updatesCheckpoint: updatesCheckpoint,
+                    contentRevisionID: contentRevisionID
+                )
             )
+            return
         }
+        queueWorkspaceHandoff(
+            .signature(
+                pageIndex: pageIndex,
+                initialBounds: initialBounds,
+                fieldName: fieldName,
+                navigationMessage: navigationMessage,
+                updatesCheckpoint: updatesCheckpoint,
+                contentRevisionID: contentRevisionID
+            )
+        )
     }
 
     private func presentSignature(
         pageIndex: Int? = nil,
-        initialBounds: PDFNormalizedRect? = nil
+        initialBounds: PDFNormalizedRect? = nil,
+        fieldName: String? = nil,
+        updatesCheckpoint: Bool = true
     ) {
         let targetPageIndex = pageIndex ?? currentPageIndex
-        Task {
-            await model.updateTaskCheckpoint(
-                recordID: recordID,
-                checkpoint: DocumentTaskCheckpoint(
-                    stage: .sign,
-                    pageIndex: targetPageIndex,
-                    normalizedBounds: initialBounds
+        if updatesCheckpoint,
+           let contentRevisionID =
+            model.record(id: recordID)?.contentRevisionID {
+            Task {
+                await model.updateTaskCheckpoint(
+                    recordID: recordID,
+                    checkpoint: DocumentTaskCheckpoint(
+                        stage: .sign,
+                        pageIndex: targetPageIndex,
+                        fieldName: fieldName,
+                        normalizedBounds: initialBounds,
+                        contentRevisionID: contentRevisionID
+                    )
                 )
-            )
+            }
         }
         signaturePageIndex = targetPageIndex
         signatureInitialBounds = initialBounds

@@ -6,6 +6,8 @@ struct CombineDocumentsView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
     @AppStorage("privacy.hideLibraryPreviews")
     private var hideLibraryPreviews = false
 
@@ -13,9 +15,16 @@ struct CombineDocumentsView: View {
 
     @State private var selectedIDs: [UUID] = []
     @State private var outputName = ""
+    @State private var sourceQuery = ""
+    @FocusState private var sourceSearchFocused: Bool
     @State private var isAddingFiles = false
+    @State private var importTask: Task<Void, Never>?
     @State private var operationTask: Task<Void, Never>?
+    @State private var importGeneration = UUID()
+    @State private var operationGeneration = UUID()
     @State private var createdID: UUID?
+    @State private var createdSourceCount = 0
+    @State private var isStopRequested = false
 
     var body: some View {
         NavigationStack {
@@ -39,23 +48,45 @@ struct CombineDocumentsView: View {
             .navigationTitle("Merge PDFs".localizedUI)
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                if createdID == nil {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button {
+                            sourceSearchFocused = true
+                        } label: {
+                            Image(systemName: "magnifyingglass")
+                                .frame(minWidth: 44, minHeight: 44)
+                        }
+                        .keyboardShortcut("f", modifiers: .command)
+                        .accessibilityLabel("Search PDFs to merge".localizedUI)
+                        .disabled(hasActiveTask)
+                    }
+                }
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            operationTask != nil
-                                ? "Stop"
+                            hasActiveTask
+                                ? isStopRequested
+                                    ? "Stopping"
+                                    : "Stop"
                                 : createdID == nil
                                     ? "Cancel"
                                     : "Done"
                         ).localizedUI
                     ) {
-                        if let operationTask {
-                            operationTask.cancel()
-                            self.operationTask = nil
+                        if hasActiveTask {
+                            stopActiveTask()
                         } else {
                             dismiss()
                         }
                     }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(hasActiveTask && isStopRequested)
+                    .accessibilityHint(
+                        hasActiveTask
+                            ? "Stops safely. Finished private copies remain in the Library."
+                                .localizedUI
+                            : ""
+                    )
                 }
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
@@ -69,22 +100,82 @@ struct CombineDocumentsView: View {
         ) { result in
             guard case .success(let urls) = result, !urls.isEmpty else {
                 if case .failure(let error) = result {
-                    model.present(error)
+                    model.present(error, in: paperPathSceneID)
                 }
                 return
             }
-            Task {
-                let imported = await model.importPDFs(from: urls)
+            cancelImport()
+            let generation = UUID()
+            importGeneration = generation
+            isStopRequested = false
+            importTask = Task { @MainActor in
+                let imported = await model.withFeedbackTarget(paperPathSceneID) {
+                    await model.importPDFs(
+                        from: urls,
+                        progressID: generation
+                    )
+                }
+                guard !Task.isCancelled,
+                      importGeneration == generation
+                else { return }
+                var skippedForCapacity = 0
                 for record in imported
                 where !record.profile.isLocked
                     && !selectedIDs.contains(record.id) {
+                    guard canAdd(record) else {
+                        skippedForCapacity += 1
+                        continue
+                    }
                     selectedIDs.append(record.id)
                 }
+                if skippedForCapacity > 0 {
+                    model.present(
+                        PaperPathError.insufficientSelection(
+                            "Some imported PDFs remain in the library because this merge reached its 64-PDF or 100,000-page limit."
+                        ),
+                        in: paperPathSceneID
+                    )
+                }
+                importTask = nil
             }
         }
-        .interactiveDismissDisabled(operationTask != nil)
+        .interactiveDismissDisabled(hasActiveTask)
+        .accessibilityAction(.escape) {
+            if hasActiveTask {
+                stopActiveTask()
+            } else {
+                dismiss()
+            }
+        }
         .onDisappear {
-            operationTask?.cancel()
+            cancelImport()
+            cancelOperation(invalidateResult: true)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            guard phase == .background else { return }
+            interruptProtectedMerge()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            interruptProtectedMerge()
+        }
+        .onChange(of: outputName) { _, value in
+            if value.count > 80 {
+                outputName = String(value.prefix(80))
+            }
+        }
+        .onChange(of: sourceQuery) { _, value in
+            if value.count > 256 { sourceQuery = String(value.prefix(256)) }
+        }
+        .onChange(of: mergeEligibleRecordIDs) { _, _ in
+            reconcileSelection()
+        }
+        .onAppear {
+            reconcileSelection()
         }
         .sensoryFeedback(.selection, trigger: selectedIDs.count)
         .sensoryFeedback(.success, trigger: createdID)
@@ -94,9 +185,15 @@ struct CombineDocumentsView: View {
         VStack(alignment: .leading, spacing: PPSpacing.large) {
             taskHeader
             sourceActions
+            TextField("Search PDFs to merge".localizedUI, text: $sourceQuery)
+                .textFieldStyle(.roundedBorder)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($sourceSearchFocused)
+                .disabled(hasActiveTask)
 
             if horizontalSizeClass == .regular,
-               !dynamicTypeSize.isAccessibilitySize {
+               !dynamicTypeSize.ppPrefersExpandedLayout {
                 HStack(alignment: .top, spacing: PPSpacing.large) {
                     VStack(alignment: .leading, spacing: PPSpacing.medium) {
                         if !selectedIDs.isEmpty {
@@ -138,16 +235,14 @@ struct CombineDocumentsView: View {
                     tint: PPColor.mint
                 ),
                 WorkflowMetric(
-                    value: "\(selectedRecords.reduce(0) { $0 + $1.profile.pageCount })",
+                    value: "\(selectedPageCount)",
                     label: "Pages",
                     symbol: "doc.on.doc",
                     tint: PPColor.accent
                 ),
                 WorkflowMetric(
                     value: ByteCountFormatter.string(
-                        fromByteCount: selectedRecords.reduce(0) {
-                            $0 + $1.profile.byteCount
-                        },
+                        fromByteCount: selectedByteCount,
                         countStyle: .file
                     ),
                     label: "Input",
@@ -186,7 +281,30 @@ struct CombineDocumentsView: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.accent))
-            .disabled(model.isImporting || operationTask != nil)
+            .disabled(
+                model.isImporting
+                    || hasActiveTask
+                    || !canAddMoreSources
+            )
+            .accessibilityHint(
+                (
+                    selectionLimitMessage
+                        ?? (
+                            hasActiveTask || model.isImporting
+                                ? "Wait for the current operation to finish."
+                                : "Choose one or more PDFs from Files."
+                        )
+                ).localizedUI
+            )
+
+            if let selectionLimitMessage {
+                Label(
+                    selectionLimitMessage.localizedUI,
+                    systemImage: "checkmark.shield"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.amber)
+            }
         }
     }
 
@@ -199,6 +317,36 @@ struct CombineDocumentsView: View {
                     .font(.caption.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(PPColor.mint)
+                Menu {
+                    Button {
+                        selectedIDs = selectedRecords.sorted {
+                            $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                        }.map(\.id)
+                    } label: {
+                        Label("Sort merge order by name".localizedUI, systemImage: "textformat.abc")
+                    }
+                    Button {
+                        selectedIDs.reverse()
+                    } label: {
+                        Label("Reverse merge order".localizedUI, systemImage: "arrow.up.arrow.down")
+                    }
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .frame(width: 44, height: 44)
+                }
+                .disabled(hasActiveTask || selectedIDs.count < 2)
+                .accessibilityLabel("Arrange merge order".localizedUI)
+                .help("Arrange merge order".localizedUI)
+                Button {
+                    selectedIDs.removeAll(keepingCapacity: false)
+                } label: {
+                    Image(systemName: "xmark.circle")
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(PPColor.textSecondary)
+                .disabled(hasActiveTask)
+                .accessibilityLabel("Clear merge order".localizedUI)
             }
 
             LazyVStack(spacing: 0) {
@@ -232,30 +380,50 @@ struct CombineDocumentsView: View {
         _ record: DocumentRecord,
         at index: Int
     ) -> some View {
-        HStack(spacing: PPSpacing.small) {
-            Text("\(index + 1)")
-                .font(.caption.weight(.bold))
-                .monospacedDigit()
-                .foregroundStyle(.white)
-                .frame(width: 28, height: 28)
-                .background(PPColor.mint)
-                .clipShape(Circle())
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(
+                VStackLayout(
+                    alignment: .leading,
+                    spacing: PPSpacing.xSmall
+                )
+            )
+            : AnyLayout(
+                HStackLayout(spacing: PPSpacing.small)
+            )
 
-            sourcePreview(record)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(record.displayName)
-                    .font(.body.weight(.semibold))
-                    .fontDesign(.serif)
-                    .foregroundStyle(PPColor.textPrimary)
-                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 2 : 1)
-                Text(record.subtitle)
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
+        return layout {
+            HStack(spacing: PPSpacing.small) {
+                Text("\(index + 1)")
+                    .font(.caption.weight(.bold))
                     .monospacedDigit()
-            }
+                    .foregroundStyle(.white)
+                    .frame(width: 28, height: 28)
+                    .background(PPColor.mint)
+                    .clipShape(Circle())
 
-            Spacer(minLength: 0)
+                sourcePreview(record)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(record.displayName)
+                        .font(.body.weight(.semibold))
+                        .fontDesign(.serif)
+                        .foregroundStyle(PPColor.textPrimary)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : 1
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(record.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .monospacedDigit()
+                }
+
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
+            }
 
             HStack(spacing: 0) {
                 orderButton(
@@ -280,8 +448,28 @@ struct CombineDocumentsView: View {
                     selectedIDs.remove(at: index)
                 }
             }
+            .frame(
+                maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                    ? .infinity
+                    : nil,
+                alignment: .trailing
+            )
         }
         .padding(.vertical, PPSpacing.small)
+        .contextMenu {
+            Button {
+                move(from: index, to: 0)
+            } label: {
+                Label("Move to Beginning".localizedUI, systemImage: "arrow.up.to.line")
+            }
+            .disabled(index == 0 || hasActiveTask)
+            Button {
+                move(from: index, to: selectedIDs.count - 1)
+            } label: {
+                Label("Move to End".localizedUI, systemImage: "arrow.down.to.line")
+            }
+            .disabled(index == selectedIDs.count - 1 || hasActiveTask)
+        }
     }
 
     private func orderButton(
@@ -295,11 +483,11 @@ struct CombineDocumentsView: View {
             Image(systemName: symbol)
                 .font(.caption.weight(.bold))
                 .foregroundStyle(tint)
-                .frame(width: 36, height: 44)
+                .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(disabled || operationTask != nil)
+        .disabled(disabled || hasActiveTask)
         .opacity(disabled ? 0.28 : 1)
         .accessibilityLabel(label.localizedUI)
         .help(label.localizedUI)
@@ -308,18 +496,54 @@ struct CombineDocumentsView: View {
     private var nameField: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             SectionEyebrow(text: "NEW COPY NAME")
-            TextField("Combined document".localizedUI, text: $outputName)
-                .textInputAutocapitalization(.words)
-                .font(.body)
-                .padding(PPSpacing.medium)
-                .background(PPColor.surfaceMuted)
-                .clipShape(
-                    RoundedRectangle(
-                        cornerRadius: PPRadius.control,
-                        style: .continuous
-                    )
-                )
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.small) {
+                    mergeNameTextField
+                    mergeNamePasteButton
+                }
+                VStack(
+                    alignment: .trailing,
+                    spacing: PPSpacing.xSmall
+                ) {
+                    mergeNameTextField
+                    mergeNamePasteButton
+                }
+            }
         }
+        .disabled(hasActiveTask)
+    }
+
+    private var mergeNameTextField: some View {
+        TextField("Combined document".localizedUI, text: $outputName)
+            .textInputAutocapitalization(.words)
+            .submitLabel(.done)
+            .font(.body)
+            .padding(PPSpacing.medium)
+            .background(PPColor.surfaceMuted)
+            .clipShape(
+                RoundedRectangle(
+                    cornerRadius: PPRadius.control,
+                    style: .continuous
+                )
+            )
+    }
+
+    private var mergeNamePasteButton: some View {
+        PasteButton(payloadType: String.self) { values in
+            guard let value = values.first else { return }
+            outputName = String(
+                value
+                    .trimmingCharacters(
+                        in: .whitespacesAndNewlines
+                    )
+                    .prefix(80)
+            )
+        }
+        .frame(minWidth: 44, minHeight: 44)
+        .accessibilityHint(
+            "Pastes a name without changing the source PDFs."
+                .localizedUI
+        )
     }
 
     private var availableDocuments: some View {
@@ -331,6 +555,25 @@ struct CombineDocumentsView: View {
                     .font(.caption.weight(.semibold))
                     .monospacedDigit()
                     .foregroundStyle(PPColor.textSecondary)
+                if addableRecords.count > 1 {
+                    Button {
+                        addAllAvailableRecords()
+                    } label: {
+                        Label(
+                            (normalizedSourceQuery.isEmpty ? "Add All" : "Add matching PDFs").localizedUI,
+                            systemImage: "plus.circle"
+                        )
+                        .font(.caption.weight(.semibold))
+                        .frame(minHeight: 44)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(PPColor.accent)
+                    .disabled(hasActiveTask)
+                    .accessibilityHint(
+                        "Adds matching unlocked PDFs within the merge limits."
+                            .localizedUI
+                    )
+                }
             }
 
             if availableRecords.isEmpty {
@@ -339,12 +582,20 @@ struct CombineDocumentsView: View {
                         .font(.title2)
                         .foregroundStyle(PPColor.accent)
                     Text(
-                        selectedIDs.isEmpty
+                        !normalizedSourceQuery.isEmpty
+                            ? "No matching PDFs".localizedUI
+                            : selectedIDs.isEmpty
                             ? "Add PDFs from Files".localizedUI
                             : "All available PDFs are selected".localizedUI
                     )
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(PPColor.textSecondary)
+                    if !normalizedSourceQuery.isEmpty {
+                        Button("Clear search".localizedUI) {
+                            sourceQuery = ""
+                        }
+                        .frame(minHeight: 44)
+                    }
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, PPSpacing.large)
@@ -380,19 +631,25 @@ struct CombineDocumentsView: View {
 
     private func availableRow(_ record: DocumentRecord) -> some View {
         let supported = !record.profile.isLocked
+        let hasCapacity = canAdd(record)
+        let selectable = supported && hasCapacity
 
         return Button {
             selectedIDs.append(record.id)
         } label: {
             HStack(spacing: PPSpacing.medium) {
                 Image(
-                    systemName: supported
-                        ? "plus.circle"
-                        : "lock.circle"
+                    systemName: !supported
+                        ? "lock.circle"
+                        : hasCapacity
+                            ? "plus.circle"
+                            : "exclamationmark.circle"
                 )
                     .font(.title3)
                     .foregroundStyle(
-                        supported ? PPColor.accent : PPColor.textSecondary
+                        selectable
+                            ? PPColor.accent
+                            : PPColor.textSecondary
                     )
                     .frame(width: 28)
 
@@ -404,12 +661,17 @@ struct CombineDocumentsView: View {
                         .fontDesign(.serif)
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(
-                            dynamicTypeSize.isAccessibilitySize ? 2 : 1
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : 1
                         )
+                        .fixedSize(horizontal: false, vertical: true)
                     Text(
-                        supported
-                            ? record.subtitle
-                            : "Locked PDF".localizedUI
+                        !supported
+                            ? "Locked PDF".localizedUI
+                            : hasCapacity
+                                ? record.subtitle
+                                : "Merge limit reached".localizedUI
                     )
                         .font(.caption)
                         .foregroundStyle(PPColor.textSecondary)
@@ -422,10 +684,21 @@ struct CombineDocumentsView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(!supported || operationTask != nil)
-        .opacity(supported ? 1 : 0.48)
+        .disabled(!selectable || hasActiveTask)
+        .opacity(selectable ? 1 : 0.48)
         .accessibilityLabel(
             AppLocalization.format("Add %@", record.displayName)
+        )
+        .accessibilityHint(
+            hasActiveTask
+                ? "Wait for the current operation to finish.".localizedUI
+                : selectable
+                    ? ""
+                    : (
+                    supported
+                        ? "Remove another PDF before adding this one."
+                        : "Unlock this PDF before merging it."
+                    ).localizedUI
         )
     }
 
@@ -460,7 +733,7 @@ struct CombineDocumentsView: View {
                 tint: PPColor.mint,
                 metrics: [
                     WorkflowMetric(
-                        value: "\(selectedIDs.count)",
+                        value: "\(createdSourceCount)",
                         label: "Sources",
                         symbol: "square.stack.3d.up",
                         tint: PPColor.mint
@@ -480,39 +753,52 @@ struct CombineDocumentsView: View {
                 ]
             )
 
-            Button {
-                dismiss()
-                onCreated(record.id)
-            } label: {
+            let layout = dynamicTypeSize.ppPrefersExpandedLayout
+                ? AnyLayout(
+                    VStackLayout(
+                        alignment: .leading,
+                        spacing: PPSpacing.small
+                    )
+                )
+                : AnyLayout(
+                    HStackLayout(spacing: PPSpacing.medium)
+                )
+            layout {
                 HStack(spacing: PPSpacing.medium) {
                     sourcePreview(record)
-
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(record.displayName)
-                            .font(.body.weight(.semibold))
-                            .fontDesign(.serif)
-                            .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(2)
-                        Text(record.subtitle)
-                            .font(.caption)
-                            .foregroundStyle(PPColor.textSecondary)
-                            .monospacedDigit()
-                    }
-
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.bold))
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.title3)
                         .foregroundStyle(PPColor.mint)
                 }
-                .padding(.vertical, PPSpacing.medium)
-                .contentShape(Rectangle())
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(record.displayName)
+                        .font(.body.weight(.semibold))
+                        .fontDesign(.serif)
+                        .foregroundStyle(PPColor.textPrimary)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? nil
+                                : 2
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(record.subtitle)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .monospacedDigit()
+                }
+
+                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                    Spacer(minLength: 0)
+                }
             }
-            .buttonStyle(.plain)
+            .padding(.vertical, PPSpacing.medium)
             .overlay(alignment: .top) {
                 Rectangle()
                     .fill(PPColor.border.opacity(0.62))
                     .frame(height: 0.6)
             }
+            .accessibilityElement(children: .combine)
             .overlay(alignment: .bottom) {
                 Rectangle()
                     .fill(PPColor.border.opacity(0.62))
@@ -524,36 +810,86 @@ struct CombineDocumentsView: View {
     @ViewBuilder
     private var actionBar: some View {
         VStack(spacing: PPSpacing.small) {
-            if operationTask != nil {
-                HStack(spacing: PPSpacing.medium) {
-                    ProgressView()
-                    Text("Merging PDFs on this device".localizedUI)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(PPColor.textSecondary)
-                    Spacer()
+            if let activeTaskLabel {
+                if importTask != nil,
+                   let progress = model.foregroundImportProgress(
+                       for: importGeneration
+                   ) {
+                    LocalOperationProgressView(progress: progress)
+                        .accessibilityIdentifier(
+                            "mergePDFImportProgress"
+                        )
+                } else {
+                    HStack(spacing: PPSpacing.medium) {
+                        ProgressView()
+                        Text(activeTaskLabel.localizedUI)
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(PPColor.textSecondary)
+                        Spacer()
+                    }
+                    .frame(minHeight: 52)
                 }
-                .frame(minHeight: 52)
+                Button {
+                    stopActiveTask()
+                } label: {
+                    Label(
+                        isStopRequested ? "Stopping" : "Stop",
+                        systemImage: isStopRequested
+                            ? "hourglass"
+                            : "stop.fill"
+                    )
+                        .frame(minHeight: 44)
+                }
+                .buttonStyle(
+                    PPQuietButtonStyle(tint: PPColor.amber)
+                )
+                .disabled(isStopRequested)
+                .accessibilityHint(
+                    "Finished private copies remain in the Library."
+                        .localizedUI
+                )
             } else if let createdRecord {
                 Button {
-                    dismiss()
                     onCreated(createdRecord.id)
                 } label: {
                     Label("Open Result", systemImage: "doc.text.magnifyingglass")
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
+                .keyboardShortcut(.defaultAction)
             } else {
                 Button {
-                    operationTask = Task {
-                        let created = await model.combineDocuments(
-                            recordIDs: selectedIDs,
-                            name: outputName
-                        )
-                        guard !Task.isCancelled else {
-                            operationTask = nil
+                    let generation = UUID()
+                    let sourceIDs = selectedIDs
+                    let requestedName = outputName
+                    createdSourceCount = sourceIDs.count
+                    operationGeneration = generation
+                    isStopRequested = false
+                    operationTask = Task { @MainActor in
+                        defer {
+                            if operationGeneration == generation {
+                                operationTask = nil
+                                isStopRequested = false
+                            }
+                        }
+                        let created = await model.withFeedbackTarget(
+                            paperPathSceneID
+                        ) {
+                            await model.combineDocuments(
+                                recordIDs: sourceIDs,
+                                name: requestedName
+                            )
+                        }
+                        guard operationGeneration == generation else {
+                            return
+                        }
+                        if Task.isCancelled {
+                            createdID = created?.id
                             return
                         }
                         createdID = created?.id
-                        operationTask = nil
                     }
                 } label: {
                     Label(
@@ -567,7 +903,23 @@ struct CombineDocumentsView: View {
                     )
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(selectedIDs.count < 2 || model.isImporting)
+                .keyboardShortcut(.defaultAction)
+                .disabled(
+                    selectedIDs.count < 2
+                        || selectedIDs.count
+                            > PDFCompositionService
+                                .maximumSourceDocumentCount
+                        || selectedPageCount
+                            > PDFCompositionService.maximumPageCount
+                        || model.isImporting
+                        || hasActiveTask
+                )
+                .accessibilityHint(
+                    (
+                        mergeDisabledReason
+                            ?? "Creates a separate private working copy."
+                    ).localizedUI
+                )
             }
         }
         .padding(.horizontal, PPSpacing.regular)
@@ -584,10 +936,92 @@ struct CombineDocumentsView: View {
         selectedIDs.compactMap { model.record(id: $0) }
     }
 
+    private var mergeEligibleRecordIDs: Set<UUID> {
+        Set(
+            model.workingDocuments.lazy
+                .filter {
+                    $0.workflowStatus != .archived
+                        && !$0.profile.isLocked
+                }
+                .map(\.id)
+        )
+    }
+
+    private var selectedPageCount: Int {
+        selectedRecords.reduce(0) { total, record in
+            let (next, overflow) = total.addingReportingOverflow(
+                record.profile.pageCount
+            )
+            return overflow ? .max : next
+        }
+    }
+
+    private var selectedByteCount: Int64 {
+        selectedRecords.reduce(0) { total, record in
+            let (next, overflow) = total.addingReportingOverflow(
+                max(0, record.profile.byteCount)
+            )
+            return overflow ? .max : next
+        }
+    }
+
+    private var canAddMoreSources: Bool {
+        selectedIDs.count
+            < PDFCompositionService.maximumSourceDocumentCount
+            && selectedPageCount
+                < PDFCompositionService.maximumPageCount
+    }
+
+    private var selectionLimitMessage: String? {
+        if selectedIDs.count
+            >= PDFCompositionService.maximumSourceDocumentCount {
+            return "64-PDF merge limit reached"
+        }
+        if selectedPageCount
+            >= PDFCompositionService.maximumPageCount {
+            return "100,000-page merge limit reached"
+        }
+        return nil
+    }
+
+    private var mergeDisabledReason: String? {
+        if selectedIDs.count < 2 {
+            return "Choose at least 2 PDFs."
+        }
+        if selectedIDs.count
+            > PDFCompositionService.maximumSourceDocumentCount {
+            return "Choose no more than 64 PDFs."
+        }
+        if selectedPageCount
+            > PDFCompositionService.maximumPageCount {
+            return "Choose no more than 100,000 pages."
+        }
+        if model.isImporting {
+            return "Wait for PDF import to finish."
+        }
+        if hasActiveTask {
+            return "Wait for the current operation to finish."
+        }
+        return nil
+    }
+
     private var availableRecords: [DocumentRecord] {
         model.workingDocuments.filter {
             $0.workflowStatus != .archived
                 && !selectedIDs.contains($0.id)
+                && (normalizedSourceQuery.isEmpty
+                    || $0.displayName.localizedStandardContains(normalizedSourceQuery)
+                    || $0.tags.contains { $0.localizedStandardContains(normalizedSourceQuery) })
+        }
+    }
+
+    private var normalizedSourceQuery: String {
+        sourceQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var addableRecords: [DocumentRecord] {
+        availableRecords.filter {
+            !$0.profile.isLocked && canAdd($0)
         }
     }
 
@@ -595,12 +1029,112 @@ struct CombineDocumentsView: View {
         createdID.flatMap { model.record(id: $0) }
     }
 
+    private var hasActiveTask: Bool {
+        importTask != nil || operationTask != nil
+    }
+
+    private var activeTaskLabel: String? {
+        if importTask != nil {
+            return "Importing PDFs on this device"
+        }
+        if operationTask != nil {
+            return "Merging PDFs on this device"
+        }
+        return nil
+    }
+
     private func move(from source: Int, to destination: Int) {
-        guard selectedIDs.indices.contains(source),
+        guard !hasActiveTask, selectedIDs.indices.contains(source),
               selectedIDs.indices.contains(destination),
               source != destination
         else { return }
         let id = selectedIDs.remove(at: source)
         selectedIDs.insert(id, at: destination)
+    }
+
+    private func reconcileSelection() {
+        guard createdID == nil else { return }
+        let reconciled = selectedIDs.filter(
+            mergeEligibleRecordIDs.contains
+        )
+        guard reconciled != selectedIDs else { return }
+        let removedCount = selectedIDs.count - reconciled.count
+        selectedIDs = reconciled
+        model[noticeFor: paperPathSceneID] = AppLocalization.format(
+            "%lld unavailable PDF%@ removed from merge order",
+            removedCount,
+            removedCount == 1 ? "" : "s"
+        )
+    }
+
+    private func canAdd(_ record: DocumentRecord) -> Bool {
+        guard selectedIDs.count
+                < PDFCompositionService.maximumSourceDocumentCount
+        else { return false }
+        let (nextPageCount, overflow) = selectedPageCount
+            .addingReportingOverflow(record.profile.pageCount)
+        return !overflow
+            && nextPageCount
+                <= PDFCompositionService.maximumPageCount
+    }
+
+    private func addAllAvailableRecords() {
+        guard !hasActiveTask else { return }
+        for record in availableRecords
+        where !record.profile.isLocked && canAdd(record) {
+            selectedIDs.append(record.id)
+        }
+    }
+
+    private func stopActiveTask() {
+        guard !isStopRequested else { return }
+        isStopRequested = true
+        if operationTask != nil {
+            cancelOperation()
+        } else {
+            cancelImport(showsNotice: true)
+        }
+    }
+
+    private func cancelImport(
+        showsNotice: Bool = false
+    ) {
+        let cancelledProgressID = importGeneration
+        importGeneration = UUID()
+        importTask?.cancel()
+        importTask = nil
+        isStopRequested = false
+        model.clearForegroundImportProgress(
+            cancelledProgressID
+        )
+        if showsNotice {
+            model[noticeFor: paperPathSceneID] =
+                "PDF import stopped · finished copies stay in the Library"
+                    .localizedUI
+        }
+    }
+
+    private func cancelOperation(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            operationGeneration = UUID()
+        }
+        operationTask?.cancel()
+        if invalidateResult {
+            operationTask = nil
+            isStopRequested = false
+        }
+    }
+
+    private func interruptProtectedMerge() {
+        cancelImport()
+        cancelOperation(invalidateResult: true)
+        selectedIDs.removeAll(keepingCapacity: false)
+        outputName = ""
+        createdID = nil
+        createdSourceCount = 0
+        isAddingFiles = false
+        dismiss()
     }
 }

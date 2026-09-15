@@ -51,6 +51,34 @@ final class PaperPathTests: XCTestCase {
         XCTAssertEqual(profile.recommendedActions, [.inspect, .shareCopy])
     }
 
+    func testDeviceGoldenPathsCompleteEndToEnd() async throws {
+        let reportURL = temporaryDirectory
+            .appendingPathComponent("device-golden-paths.json")
+
+        await DeviceGoldenPathDiagnostics.run(reportURL: reportURL)
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let report = try decoder.decode(
+            DeviceGoldenPathReport.self,
+            from: Data(contentsOf: reportURL)
+        )
+        XCTAssertTrue(
+            report.passed,
+            report.results.compactMap { result in
+                result.failure.map { "\(result.id): \($0)" }
+            }.joined(separator: "\n")
+        )
+        XCTAssertEqual(
+            Set(report.results.map(\.id)),
+            [
+                "fill-sign-verify",
+                "redact-verify",
+                "scan-ocr-verify"
+            ]
+        )
+    }
+
     func testInspectorRecommendsOCRAndPageToolsForScannedPDF() throws {
         let url = temporaryDirectory.appendingPathComponent("scan.pdf")
         try makePDF(at: url, pages: ["", ""])
@@ -684,7 +712,11 @@ final class PaperPathTests: XCTestCase {
         let record = try await store.importPDF(from: source)
         let originalURL = await store.url(for: record)
 
-        let renamed = try await store.rename(record, to: "Signed contract")
+        let renamed = try await store.rename(
+            record,
+            to: "Signed contract",
+            expectedName: record.displayName
+        )
         let renamedURL = await store.url(for: renamed)
 
         XCTAssertEqual(renamed.displayName, "Signed contract")
@@ -793,6 +825,55 @@ final class PaperPathTests: XCTestCase {
         XCTAssertEqual(reloaded.first?.workflowStatus, .reviewing)
         XCTAssertEqual(reloaded.first?.brief?.category, .invoice)
         XCTAssertEqual(indices[record.id]?.text, index.text)
+    }
+
+    func testStoreRepeatedAnalysisReplacementRemainsReadable()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("repeated-index.pdf")
+        try makePDF(at: source, pages: ["Initial searchable text"])
+        let root = temporaryDirectory
+            .appendingPathComponent("RepeatedIndexStore")
+        let store = DocumentStore(rootURL: root)
+        var record = try await store.importPDF(from: source)
+
+        for revision in 0..<32 {
+            let text = "Replacement index revision \(revision)"
+            let index = DocumentTextIndex(
+                source: .vision,
+                pages: [
+                    IndexedPageText(pageIndex: 0, text: text)
+                ],
+                indexedAt: Date(
+                    timeIntervalSince1970: Double(revision + 1)
+                )
+            )
+            let brief = DocumentUnderstandingService().analyze(
+                index: index,
+                profile: record.profile
+            )
+
+            record = try await store.saveAnalysis(
+                record,
+                brief: brief,
+                textIndex: index
+            )
+
+            let sameStoreIndices = try await store.loadTextIndices()
+            XCTAssertEqual(
+                sameStoreIndices[record.id],
+                index,
+                "Same-store read failed after replacement \(revision)"
+            )
+
+            let reopenedStore = DocumentStore(rootURL: root)
+            let reopenedIndices = try await reopenedStore.loadTextIndices()
+            XCTAssertEqual(
+                reopenedIndices[record.id],
+                index,
+                "Reopened-store read failed after replacement \(revision)"
+            )
+        }
     }
 
     func testTaskCheckpointPersistsExactSignatureResume()
@@ -986,8 +1067,9 @@ final class PaperPathTests: XCTestCase {
         let viewedAt = Date(timeIntervalSince1970: 1_800_000_000)
 
         let updated = try await store.updateReadingPosition(
-            record,
+            recordID: record.id,
             pageIndex: 3,
+            expectedRevisionID: record.contentRevisionID,
             viewedAt: viewedAt
         )
         let loaded = try await store.load()
@@ -1009,7 +1091,8 @@ final class PaperPathTests: XCTestCase {
     }
 
     @MainActor
-    func testMetadataSyncMergesIndependentDeviceChangesByField() throws {
+    func testMetadataSyncMergesIndependentDeviceChangesByField()
+        async throws {
         let base = Date(timeIntervalSince1970: 1_800_000_000)
         let fingerprint = String(repeating: "a", count: 64)
         let cloud = TestMetadataKeyValueStore(isCloudBacked: true)
@@ -1050,7 +1133,7 @@ final class PaperPathTests: XCTestCase {
             shadowStore: shadowA,
             now: { base.addingTimeInterval(10) }
         )
-        let resultA = try firstA.synchronize(records: [deviceA])
+        let resultA = try await firstA.synchronize(records: [deviceA])
         XCTAssertTrue(resultA.isCloudAvailable)
         XCTAssertTrue(resultA.updates.isEmpty)
 
@@ -1059,7 +1142,7 @@ final class PaperPathTests: XCTestCase {
             shadowStore: shadowB,
             now: { base.addingTimeInterval(20) }
         )
-        let resultB = try firstB.synchronize(records: [deviceB])
+        let resultB = try await firstB.synchronize(records: [deviceB])
         let imported = try XCTUnwrap(resultB.updates.first)
         XCTAssertEqual(imported.lastPageIndex, 3)
         XCTAssertEqual(imported.bookmarkedPages, [1, 5])
@@ -1080,7 +1163,7 @@ final class PaperPathTests: XCTestCase {
             shadowStore: shadowB,
             now: { base.addingTimeInterval(31) }
         )
-        _ = try secondB.synchronize(records: [deviceB])
+        _ = try await secondB.synchronize(records: [deviceB])
 
         deviceA.tags = ["Priority"]
         deviceA.modifiedAt = base.addingTimeInterval(40)
@@ -1089,7 +1172,7 @@ final class PaperPathTests: XCTestCase {
             shadowStore: shadowA,
             now: { base.addingTimeInterval(41) }
         )
-        let mergedResult = try secondA.synchronize(
+        let mergedResult = try await secondA.synchronize(
             records: [deviceA]
         )
         let merged = try XCTUnwrap(mergedResult.updates.first)
@@ -1106,7 +1189,226 @@ final class PaperPathTests: XCTestCase {
     }
 
     @MainActor
-    func testMetadataSyncSeparatesChangedWorkingCopies() throws {
+    func testMetadataSyncEqualTimestampConflictsConvergeDeterministically()
+        async throws {
+        let modifiedAt = Date(timeIntervalSince1970: 1_800_000_000)
+        let fingerprint = String(repeating: "d", count: 64)
+
+        func record(tags: [String]) -> DocumentRecord {
+            let subsecondOffset = tags == ["Zulu"] ? 0.8 : 0.2
+            return DocumentRecord(
+                displayName: tags.joined(separator: "-"),
+                fileName: "\(tags.joined()).pdf",
+                importedAt: modifiedAt,
+                modifiedAt: modifiedAt.addingTimeInterval(
+                    subsecondOffset
+                ),
+                profile: textProfile(pageCount: 2),
+                tags: tags,
+                contentFingerprint: fingerprint
+            )
+        }
+
+        func apply(
+            _ result: PDFMetadataSyncResult,
+            to record: inout DocumentRecord
+        ) {
+            guard let update = result.updates.first else { return }
+            record.tags = update.tags
+            record.modifiedAt = max(record.modifiedAt, update.updatedAt)
+        }
+
+        func converge(
+            firstTags: [String],
+            secondTags: [String]
+        ) async throws -> ([String], [String]) {
+            let cloud = TestMetadataKeyValueStore(isCloudBacked: true)
+            let firstShadow = TestMetadataKeyValueStore(
+                isCloudBacked: false
+            )
+            let secondShadow = TestMetadataKeyValueStore(
+                isCloudBacked: false
+            )
+            var firstRecord = record(tags: firstTags)
+            var secondRecord = record(tags: secondTags)
+
+            _ = try await PDFMetadataSyncService(
+                cloudStore: cloud,
+                shadowStore: firstShadow,
+                now: { modifiedAt.addingTimeInterval(10) }
+            ).synchronize(records: [firstRecord])
+
+            let secondResult = try await PDFMetadataSyncService(
+                cloudStore: cloud,
+                shadowStore: secondShadow,
+                now: { modifiedAt.addingTimeInterval(20) }
+            ).synchronize(records: [secondRecord])
+            apply(secondResult, to: &secondRecord)
+
+            let firstResult = try await PDFMetadataSyncService(
+                cloudStore: cloud,
+                shadowStore: firstShadow,
+                now: { modifiedAt.addingTimeInterval(30) }
+            ).synchronize(records: [firstRecord])
+            apply(firstResult, to: &firstRecord)
+
+            let stableResult = try await PDFMetadataSyncService(
+                cloudStore: cloud,
+                shadowStore: secondShadow,
+                now: { modifiedAt.addingTimeInterval(40) }
+            ).synchronize(records: [secondRecord])
+            XCTAssertTrue(stableResult.updates.isEmpty)
+            return (firstRecord.tags, secondRecord.tags)
+        }
+
+        let alphaFirst = try await converge(
+            firstTags: ["Alpha"],
+            secondTags: ["Zulu"]
+        )
+        let zuluFirst = try await converge(
+            firstTags: ["Zulu"],
+            secondTags: ["Alpha"]
+        )
+
+        XCTAssertEqual(alphaFirst.0, ["Zulu"])
+        XCTAssertEqual(alphaFirst.1, ["Zulu"])
+        XCTAssertEqual(zuluFirst.0, ["Zulu"])
+        XCTAssertEqual(zuluFirst.1, ["Zulu"])
+    }
+
+    func testMetadataSyncLocalStateMatchesPersistedDatePrecision() {
+        let persistedDate = Date(
+            timeIntervalSince1970: 1_800_000_000
+        )
+        var resident = DocumentRecord(
+            displayName: "Resident",
+            fileName: "resident.pdf",
+            importedAt: persistedDate,
+            modifiedAt: persistedDate.addingTimeInterval(0.8),
+            profile: textProfile(pageCount: 2),
+            tags: ["Legal"],
+            bookmarkedPages: [1],
+            lastPageIndex: 1,
+            lastViewedAt: persistedDate.addingTimeInterval(0.9),
+            contentFingerprint: String(repeating: "e", count: 64)
+        )
+        var persisted = resident
+        persisted.modifiedAt = persistedDate
+        persisted.lastViewedAt = persistedDate
+        let expected = PDFMetadataSyncLocalState(persisted)
+
+        XCTAssertTrue(
+            expected.matchesPersistenceRepresentation(of: resident)
+        )
+
+        resident.tags = ["Changed"]
+        XCTAssertFalse(
+            expected.matchesPersistenceRepresentation(of: resident)
+        )
+    }
+
+    @MainActor
+    func testMetadataSyncConflictRetryPreservesFieldTimestamps()
+        async throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let fingerprint = String(repeating: "f", count: 64)
+        let cloud = TestMetadataKeyValueStore(isCloudBacked: true)
+        let shadowA = TestMetadataKeyValueStore(isCloudBacked: false)
+        let shadowB = TestMetadataKeyValueStore(isCloudBacked: false)
+        let serviceA = PDFMetadataSyncService(
+            cloudStore: cloud,
+            shadowStore: shadowA,
+            now: { base.addingTimeInterval(10) }
+        )
+        var deviceA = DocumentRecord(
+            displayName: "Device A",
+            fileName: "a.pdf",
+            importedAt: base,
+            modifiedAt: base.addingTimeInterval(1),
+            profile: textProfile(pageCount: 2),
+            tags: ["Alpha"],
+            contentFingerprint: fingerprint
+        )
+        var deviceB = DocumentRecord(
+            displayName: "Device B",
+            fileName: "b.pdf",
+            importedAt: base,
+            modifiedAt: base.addingTimeInterval(2),
+            profile: textProfile(pageCount: 2),
+            tags: ["Beta"],
+            contentFingerprint: fingerprint
+        )
+
+        _ = try await serviceA.synchronize(records: [deviceA])
+        let serviceB = PDFMetadataSyncService(
+            cloudStore: cloud,
+            shadowStore: shadowB,
+            now: { base.addingTimeInterval(10) }
+        )
+        _ = try await serviceB.synchronize(records: [deviceB])
+        deviceB.lastPageIndex = 1
+        deviceB.lastViewedAt = base.addingTimeInterval(5)
+        _ = try await serviceB.synchronize(records: [deviceB])
+
+        let preparation = try await serviceA.prepareSynchronization(
+            records: [deviceA]
+        )
+        let appliedUpdate = try XCTUnwrap(preparation.updates.first)
+        deviceA.lastPageIndex = appliedUpdate.lastPageIndex
+        deviceA.lastViewedAt = appliedUpdate.lastViewedAt
+        deviceA.bookmarkedPages = appliedUpdate.bookmarkedPages
+        deviceA.workflowStatus = appliedUpdate.workflowStatus
+        deviceA.isPinned = appliedUpdate.isPinned
+        deviceA.tags = appliedUpdate.tags
+        deviceA.completedActions = appliedUpdate.completedActions
+        deviceA.deliveryReceipt = appliedUpdate.deliveryReceipt
+        deviceA.modifiedAt = max(
+            deviceA.modifiedAt,
+            appliedUpdate.updatedAt
+        )
+        try serviceA.checkpointAppliedMetadata(preparation)
+
+        let shadowC = TestMetadataKeyValueStore(
+            isCloudBacked: false
+        )
+        shadowC.set(
+            cloud.data(
+                forKey: PDFMetadataSyncService.cloudStorageKey
+            ),
+            forKey: "paperpath.metadata.shadow.v1"
+        )
+        let deviceC = DocumentRecord(
+            displayName: "Device C",
+            fileName: "c.pdf",
+            importedAt: base,
+            modifiedAt: base.addingTimeInterval(3),
+            profile: textProfile(pageCount: 2),
+            tags: ["Gamma"],
+            contentFingerprint: fingerprint
+        )
+        _ = try await PDFMetadataSyncService(
+            cloudStore: cloud,
+            shadowStore: shadowC,
+            now: { base.addingTimeInterval(10) }
+        ).synchronize(records: [deviceC])
+
+        XCTAssertThrowsError(try serviceA.commit(preparation)) { error in
+            guard case PDFMetadataSyncCommitError.remoteStateChanged = error
+            else {
+                XCTFail("Unexpected commit error: \(error)")
+                return
+            }
+        }
+
+        let retry = try await serviceA.prepareSynchronization(
+            records: [deviceA]
+        )
+        XCTAssertEqual(retry.updates.first?.tags, ["Gamma"])
+        XCTAssertEqual(retry.updates.first?.lastPageIndex, 1)
+    }
+
+    @MainActor
+    func testMetadataSyncSeparatesChangedWorkingCopies() async throws {
         let base = Date(timeIntervalSince1970: 1_800_000_000)
         let sourceFingerprint = String(repeating: "a", count: 64)
         let firstContent = String(repeating: "b", count: 64)
@@ -1132,14 +1434,14 @@ final class PaperPathTests: XCTestCase {
             contentFingerprint: secondContent
         )
 
-        _ = try PDFMetadataSyncService(
+        _ = try await PDFMetadataSyncService(
             cloudStore: cloud,
             shadowStore: TestMetadataKeyValueStore(
                 isCloudBacked: false
             ),
             now: { base.addingTimeInterval(10) }
         ).synchronize(records: [first])
-        let result = try PDFMetadataSyncService(
+        let result = try await PDFMetadataSyncService(
             cloudStore: cloud,
             shadowStore: TestMetadataKeyValueStore(
                 isCloudBacked: false
@@ -1151,7 +1453,417 @@ final class PaperPathTests: XCTestCase {
         XCTAssertEqual(result.cloudEntryCount, 2)
     }
 
-    func testSourceLocationDetectsExternalChangeAndBlocksWriteback() async throws {
+    @MainActor
+    func testMetadataSyncLargeLibraryKeepsMainActorResponsive()
+        async throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let profile = textProfile(pageCount: 2)
+        let records = (0..<10_000).map { index in
+            DocumentRecord(
+                displayName: "Document \(index)",
+                fileName: "\(index).pdf",
+                importedAt: base,
+                modifiedAt: base.addingTimeInterval(
+                    TimeInterval(index)
+                ),
+                profile: profile,
+                tags: ["Batch \(index % 8)"],
+                contentFingerprint: String(
+                    format: "%064llx",
+                    UInt64(index + 1)
+                )
+            )
+        }
+        let service = PDFMetadataSyncService(
+            cloudStore: TestMetadataKeyValueStore(
+                isCloudBacked: true
+            ),
+            shadowStore: TestMetadataKeyValueStore(
+                isCloudBacked: false
+            ),
+            now: { base.addingTimeInterval(20_000) }
+        )
+        var heartbeatCount = 0
+        let heartbeat = Task { @MainActor in
+            while !Task.isCancelled {
+                heartbeatCount += 1
+                await Task.yield()
+            }
+        }
+        await Task.yield()
+        let countBeforeSync = heartbeatCount
+
+        let result = try await service.synchronize(records: records)
+
+        heartbeat.cancel()
+        _ = await heartbeat.result
+        XCTAssertGreaterThan(
+            heartbeatCount - countBeforeSync,
+            0,
+            "Metadata preparation monopolized the main actor"
+        )
+        XCTAssertEqual(result.eligibleDocumentCount, records.count)
+        XCTAssertEqual(result.cloudEntryCount, 128)
+    }
+
+    @MainActor
+    func testCancelledMetadataSyncDoesNotCommitPayload() async throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let profile = textProfile(pageCount: 2)
+        let records = (0..<2_000).map { index in
+            DocumentRecord(
+                displayName: "Document \(index)",
+                fileName: "\(index).pdf",
+                importedAt: base,
+                modifiedAt: base,
+                profile: profile,
+                contentFingerprint: String(
+                    format: "%064llx",
+                    UInt64(index + 1)
+                )
+            )
+        }
+        let cloud = TestMetadataKeyValueStore(isCloudBacked: true)
+        let shadow = TestMetadataKeyValueStore(isCloudBacked: false)
+        let service = PDFMetadataSyncService(
+            cloudStore: cloud,
+            shadowStore: shadow,
+            now: { base.addingTimeInterval(1) }
+        )
+        let task = Task { @MainActor in
+            try await service.synchronize(records: records)
+        }
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            XCTFail("Cancelled metadata sync committed a payload")
+        } catch is CancellationError {
+        } catch {
+            XCTFail("Unexpected cancellation error: \(error)")
+        }
+        XCTAssertTrue(cloud.storage.isEmpty)
+        XCTAssertTrue(shadow.storage.isEmpty)
+    }
+
+    @MainActor
+    func testMetadataSyncPreparationDoesNotCommitBeforeLocalApply()
+        async throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let cloud = TestMetadataKeyValueStore(isCloudBacked: true)
+        let shadow = TestMetadataKeyValueStore(isCloudBacked: false)
+        let service = PDFMetadataSyncService(
+            cloudStore: cloud,
+            shadowStore: shadow,
+            now: { base.addingTimeInterval(10) }
+        )
+        let record = DocumentRecord(
+            displayName: "Prepared",
+            fileName: "prepared.pdf",
+            importedAt: base,
+            modifiedAt: base.addingTimeInterval(1),
+            profile: textProfile(pageCount: 1),
+            tags: ["Local"],
+            contentFingerprint: String(repeating: "a", count: 64)
+        )
+
+        let preparation = try await service.prepareSynchronization(
+            records: [record]
+        )
+
+        XCTAssertTrue(cloud.storage.isEmpty)
+        XCTAssertTrue(shadow.storage.isEmpty)
+        let result = try service.commit(preparation)
+        XCTAssertEqual(result.eligibleDocumentCount, 1)
+        XCTAssertFalse(cloud.storage.isEmpty)
+        XCTAssertFalse(shadow.storage.isEmpty)
+    }
+
+    func testMetadataSyncBatchConflictDoesNotPartiallyCommit()
+        async throws {
+        let firstSource = temporaryDirectory
+            .appendingPathComponent("metadata-first.pdf")
+        let secondSource = temporaryDirectory
+            .appendingPathComponent("metadata-second.pdf")
+        try makePDF(at: firstSource, pages: ["First"])
+        try makePDF(at: secondSource, pages: ["Second"])
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("MetadataBatchStore")
+        )
+        let first = try await store.importPDF(from: firstSource)
+        let second = try await store.importPDF(from: secondSource)
+        let updateDate = Date().addingTimeInterval(60)
+        let firstUpdate = PDFMetadataSyncUpdate(
+            recordID: first.id,
+            fingerprint: try XCTUnwrap(first.contentFingerprint),
+            expectedLocalState: PDFMetadataSyncLocalState(first),
+            lastPageIndex: 0,
+            lastViewedAt: updateDate,
+            bookmarkedPages: [],
+            workflowStatus: .ready,
+            isPinned: false,
+            tags: ["Remote"],
+            completedActions: [],
+            deliveryReceipt: nil,
+            updatedAt: updateDate
+        )
+        let conflictingUpdate = PDFMetadataSyncUpdate(
+            recordID: second.id,
+            fingerprint: String(repeating: "f", count: 64),
+            expectedLocalState: PDFMetadataSyncLocalState(second),
+            lastPageIndex: 0,
+            lastViewedAt: updateDate,
+            bookmarkedPages: [],
+            workflowStatus: .ready,
+            isPinned: false,
+            tags: ["Remote"],
+            completedActions: [],
+            deliveryReceipt: nil,
+            updatedAt: updateDate
+        )
+
+        do {
+            _ = try await store.applyMetadataSync(
+                [firstUpdate, conflictingUpdate]
+            )
+            XCTFail("A conflicting sync batch should not commit")
+        } catch PDFMetadataSyncApplyError.localStateChanged {
+        } catch {
+            XCTFail("Unexpected metadata conflict error: \(error)")
+        }
+
+        let reopened = try await store.load()
+        XCTAssertEqual(
+            reopened.first(where: { $0.id == first.id })?.tags,
+            []
+        )
+    }
+
+    func testMetadataSyncRejectsConcurrentLocalMetadataEdit()
+        async throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("metadata-concurrent.pdf")
+        try makePDF(at: source, pages: ["Concurrent metadata"])
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("MetadataConcurrentStore")
+        )
+        let record = try await store.importPDF(from: source)
+        let updateDate = Date().addingTimeInterval(300)
+        let preparedUpdate = PDFMetadataSyncUpdate(
+            recordID: record.id,
+            fingerprint: try XCTUnwrap(record.contentFingerprint),
+            expectedLocalState: PDFMetadataSyncLocalState(record),
+            lastPageIndex: 0,
+            lastViewedAt: updateDate,
+            bookmarkedPages: [],
+            workflowStatus: .ready,
+            isPinned: false,
+            tags: ["Remote"],
+            completedActions: [],
+            deliveryReceipt: nil,
+            updatedAt: updateDate
+        )
+        _ = try await store.updateTags(
+            record,
+            tags: ["Local"],
+            expectedTags: record.tags
+        )
+
+        do {
+            _ = try await store.applyMetadataSync([preparedUpdate])
+            XCTFail("A prepared update must not overwrite a local edit")
+        } catch PDFMetadataSyncApplyError.localStateChanged {
+        } catch {
+            XCTFail("Unexpected metadata conflict error: \(error)")
+        }
+
+        let reopened = try await store.load()
+        XCTAssertEqual(
+            reopened.first(where: { $0.id == record.id })?.tags,
+            ["Local"]
+        )
+    }
+
+    @MainActor
+    func testMetadataSyncCommitRejectsChangedCloudBaseline()
+        async throws {
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let cloud = TestMetadataKeyValueStore(isCloudBacked: true)
+        let shadow = TestMetadataKeyValueStore(isCloudBacked: false)
+        let service = PDFMetadataSyncService(
+            cloudStore: cloud,
+            shadowStore: shadow,
+            now: { base.addingTimeInterval(10) }
+        )
+        let record = DocumentRecord(
+            displayName: "Concurrent cloud",
+            fileName: "concurrent-cloud.pdf",
+            importedAt: base,
+            modifiedAt: base,
+            profile: textProfile(pageCount: 1),
+            contentFingerprint: String(repeating: "c", count: 64)
+        )
+        let preparation = try await service.prepareSynchronization(
+            records: [record]
+        )
+        let concurrentCloudData = Data("new remote value".utf8)
+        cloud.set(
+            concurrentCloudData,
+            forKey: PDFMetadataSyncService.cloudStorageKey
+        )
+
+        XCTAssertThrowsError(try service.commit(preparation)) { error in
+            guard case PDFMetadataSyncCommitError.remoteStateChanged = error
+            else {
+                XCTFail("Unexpected commit error: \(error)")
+                return
+            }
+        }
+        XCTAssertEqual(
+            cloud.data(forKey: PDFMetadataSyncService.cloudStorageKey),
+            concurrentCloudData
+        )
+        XCTAssertTrue(shadow.storage.isEmpty)
+    }
+
+    @MainActor
+    func testAppLockCoversMultipleScenesDelayAndProtectedData()
+        async throws {
+        let suiteName = "PaperPath-AppLock-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: suiteName)
+        )
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let clock = TestUptimeClock(value: 100)
+        let controller = AppLockController(
+            defaults: defaults,
+            authenticationOverride: { _ in true },
+            uptimeProvider: { clock.read() }
+        )
+        let enabled = await controller.enable()
+        XCTAssertTrue(enabled)
+        controller.setDelay(.oneMinute)
+
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+        let firstScene = UUID()
+        let secondScene = UUID()
+        XCTAssertTrue(
+            controller.sceneDidBecomeActive(firstScene, at: base)
+        )
+        XCTAssertFalse(
+            controller.sceneDidBecomeActive(secondScene, at: base)
+        )
+        XCTAssertTrue(controller.hasActiveScenes)
+        XCTAssertFalse(
+            controller.sceneDidEnterBackground(firstScene, at: base)
+        )
+        XCTAssertTrue(controller.hasActiveScenes)
+        XCTAssertFalse(controller.isLocked)
+
+        clock.advance(by: 90)
+        XCTAssertTrue(
+            controller.sceneDidEnterBackground(secondScene, at: base)
+        )
+        XCTAssertFalse(controller.hasActiveScenes)
+        XCTAssertFalse(controller.isLocked)
+
+        clock.advance(by: 30)
+        XCTAssertTrue(
+            controller.sceneDidBecomeActive(
+                firstScene,
+                at: base.addingTimeInterval(30)
+            )
+        )
+        XCTAssertTrue(controller.hasActiveScenes)
+        XCTAssertFalse(controller.isLocked)
+        XCTAssertTrue(
+            controller.sceneDidEnterBackground(
+                firstScene,
+                at: base.addingTimeInterval(30)
+            )
+        )
+
+        clock.advance(by: 61)
+        XCTAssertTrue(
+            controller.sceneDidBecomeActive(
+                firstScene,
+                at: base.addingTimeInterval(91)
+            )
+        )
+        XCTAssertTrue(controller.isLocked)
+        XCTAssertEqual(controller.lockGeneration, 1)
+
+        let unlocked = await controller.unlock()
+        XCTAssertTrue(unlocked)
+        XCTAssertFalse(controller.isLocked)
+        controller.setDelay(.fifteenMinutes)
+        controller.protectedDataWillBecomeUnavailable()
+        XCTAssertTrue(controller.isLocked)
+        XCTAssertEqual(controller.lockGeneration, 2)
+    }
+
+    @MainActor
+    func testAppLock_repeatedSceneChurnKeepsOverlayDismissed_BitsUT()
+        async throws {
+        let suiteName = "PaperPath-AppLock-Churn-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(
+            UserDefaults(suiteName: suiteName)
+        )
+        defer {
+            defaults.removePersistentDomain(forName: suiteName)
+        }
+        let clock = TestUptimeClock(value: 1_000)
+        let controller = AppLockController(
+            defaults: defaults,
+            authenticationOverride: { _ in true },
+            uptimeProvider: { clock.read() }
+        )
+        let enabled = await controller.enable()
+        XCTAssertTrue(enabled)
+        controller.setDelay(.fiveMinutes)
+        let base = Date(timeIntervalSince1970: 1_800_000_000)
+
+        for index in 0..<50 {
+            let primaryScene = UUID()
+            let secondaryScene = UUID()
+            let date = base.addingTimeInterval(Double(index))
+
+            XCTAssertTrue(
+                controller.sceneDidBecomeActive(
+                    primaryScene,
+                    at: date
+                )
+            )
+            XCTAssertFalse(
+                controller.sceneDidBecomeActive(
+                    secondaryScene,
+                    at: date
+                )
+            )
+            XCTAssertFalse(
+                controller.sceneDidEnterBackground(
+                    primaryScene,
+                    at: date
+                )
+            )
+            XCTAssertTrue(controller.hasActiveScenes)
+            XCTAssertFalse(controller.isLocked)
+            XCTAssertTrue(
+                controller.sceneDidDisconnect(
+                    secondaryScene,
+                    at: date
+                )
+            )
+            XCTAssertFalse(controller.hasActiveScenes)
+            XCTAssertFalse(controller.isLocked)
+        }
+    }
+
+    func testSourceLocationDetectsExternalChange() async throws {
         let source = temporaryDirectory
             .appendingPathComponent("source-location.pdf")
         try makePDF(at: source, pages: ["Original source"])
@@ -1168,15 +1880,9 @@ final class PaperPathTests: XCTestCase {
         try makePDF(at: source, pages: ["Changed outside PaperPath"])
         snapshot = try await store.sourceLocation(for: record)
         XCTAssertEqual(snapshot.status, .changed)
-        do {
-            _ = try await store.writeBackToSource(record)
-            XCTFail("Changed source should block writeback")
-        } catch {
-            XCTAssertFalse(error.localizedDescription.isEmpty)
-        }
     }
 
-    func testSourceWritebackReplacesUnchangedOriginal() async throws {
+    func testEditingPrivateCopyNeverChangesOriginal() async throws {
         let source = temporaryDirectory
             .appendingPathComponent("writeback-source.pdf")
         try makePDF(at: source, pages: ["Original source"])
@@ -1191,17 +1897,24 @@ final class PaperPathTests: XCTestCase {
             pages: ["Edited private copy", "Second page"]
         )
 
-        let updated = try await store.writeBackToSource(record)
         let sourceDocument = try XCTUnwrap(PDFDocument(url: source))
+        let workingDocument = try XCTUnwrap(
+            PDFDocument(url: workingURL)
+        )
 
-        XCTAssertEqual(sourceDocument.pageCount, 2)
+        XCTAssertEqual(sourceDocument.pageCount, 1)
         XCTAssertTrue(
             sourceDocument.page(at: 0)?.string?
+                .contains("Original source") == true
+        )
+        XCTAssertEqual(workingDocument.pageCount, 2)
+        XCTAssertTrue(
+            workingDocument.page(at: 0)?.string?
                 .contains("Edited private copy") == true
         )
-        XCTAssertNotNil(updated.sourceWritebackAt)
+        XCTAssertNil(record.sourceWritebackAt)
         let finalSnapshot = try await store.sourceLocation(
-            for: updated
+            for: record
         )
         XCTAssertEqual(
             finalSnapshot.status,
@@ -1226,7 +1939,10 @@ final class PaperPathTests: XCTestCase {
         let exportResult = await model.makeFilesExportCopy(
             recordID: imported.id
         )
-        let exportURL = try XCTUnwrap(exportResult)
+        let exportURL = try XCTUnwrap(
+            exportResult,
+            model.errorMessage ?? "Files export returned no URL"
+        )
         let exportDirectory = exportURL.deletingLastPathComponent()
 
         XCTAssertEqual(exportURL.lastPathComponent, "Client Review.pdf")
@@ -1248,7 +1964,10 @@ final class PaperPathTests: XCTestCase {
         let interruptedResult = await model.makeFilesExportCopy(
             recordID: imported.id
         )
-        let interruptedURL = try XCTUnwrap(interruptedResult)
+        let interruptedURL = try XCTUnwrap(
+            interruptedResult,
+            model.errorMessage ?? "Files export returned no URL"
+        )
         let interruptedDirectory = interruptedURL.deletingLastPathComponent()
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: interruptedURL.path)
@@ -1266,14 +1985,14 @@ final class PaperPathTests: XCTestCase {
     func testSignatureStorePersistsAndRemovesProtectedData() async throws {
         let root = temporaryDirectory.appendingPathComponent("SignatureStore")
         let store = SignatureStore(rootURL: root)
-        let signature = Data([1, 3, 5, 7, 9])
+        let signature = PDFTestFixtureFactory.makeSignaturePNG(seed: 1)
 
         try await store.save(signature)
-        let loaded = await store.load()
+        let loaded = try await store.load()
         XCTAssertEqual(loaded, signature)
 
         try await store.remove()
-        let removed = await store.load()
+        let removed = try await store.load()
         XCTAssertNil(removed)
     }
 
@@ -1286,7 +2005,9 @@ final class PaperPathTests: XCTestCase {
         let signatureRoot = temporaryDirectory
             .appendingPathComponent("NoBackupSignature")
         let signatureStore = SignatureStore(rootURL: signatureRoot)
-        try await signatureStore.save(Data([2, 4, 6]))
+        try await signatureStore.save(
+            PDFTestFixtureFactory.makeSignaturePNG(seed: 2)
+        )
 
         let documentValues = try documentRoot.resourceValues(
             forKeys: [.isExcludedFromBackupKey]
@@ -1307,7 +2028,7 @@ final class PaperPathTests: XCTestCase {
             try await store.save(Data(count: 5 * 1_024 * 1_024 + 1))
             XCTFail("Expected oversized signature data to be rejected")
         } catch PaperPathError.storageFailure(_) {
-            let saved = await store.load()
+            let saved = try await store.load()
             XCTAssertNil(saved)
         }
     }
@@ -3275,7 +3996,9 @@ final class PaperPathTests: XCTestCase {
             checkpoint: DocumentTaskCheckpoint(stage: .verify)
         )
         let createdRecord = await model.createSafeShareCopy(
-            recordID: imported.id
+            recordID: imported.id,
+            expectedContentRevisionID:
+                imported.contentRevisionID
         )
         let created = try XCTUnwrap(createdRecord)
         let updatedSource = try XCTUnwrap(model.record(id: imported.id))
@@ -3329,7 +4052,9 @@ final class PaperPathTests: XCTestCase {
 
         let createdRecord = await model.createUnlockedCopy(
             recordID: imported.id,
-            password: "local-only"
+            password: "local-only",
+            expectedContentRevisionID:
+                imported.contentRevisionID
         )
         let created = try XCTUnwrap(createdRecord)
         let output = try XCTUnwrap(model.record(id: created.id))
@@ -3421,7 +4146,9 @@ final class PaperPathTests: XCTestCase {
                 ],
                 placement: .signature,
                 normalizedBounds: signatureBounds
-            )
+            ),
+            expectedContentRevisionID:
+                imported.contentRevisionID
         )
 
         XCTAssertTrue(saved)
@@ -3438,6 +4165,377 @@ final class PaperPathTests: XCTestCase {
             ).action,
             .reviewForm
         )
+    }
+
+    func testProfessionalWorkflow_litigationParalegalProducesRedactedBatesSet()
+        throws {
+        let filing = temporaryDirectory
+            .appendingPathComponent("public-filing.pdf")
+        let exhibit = temporaryDirectory
+            .appendingPathComponent("supporting-exhibit.pdf")
+        let redacted = temporaryDirectory
+            .appendingPathComponent("public-filing-redacted.pdf")
+        let production = temporaryDirectory
+            .appendingPathComponent("production-set.pdf")
+        let verified = temporaryDirectory
+            .appendingPathComponent("production-set-verified.pdf")
+
+        try makePDF(
+            at: filing,
+            pages: [
+                """
+                ACME v. Roe public filing
+                Social Security number: 111-22-3333
+                Responsive contract follows below.
+                """,
+                "Filing declaration and signature page"
+            ]
+        )
+        try makePDF(
+            at: exhibit,
+            pages: [
+                "Exhibit A vendor agreement",
+                "Exhibit B payment history"
+            ]
+        )
+        let filingDocument = try XCTUnwrap(PDFDocument(url: filing))
+        filingDocument.documentAttributes = [
+            PDFDocumentAttribute.authorAttribute:
+                "Privileged Litigation Team",
+            PDFDocumentAttribute.subjectAttribute:
+                "Attorney work product"
+        ]
+        guard filingDocument.write(to: filing) else {
+            return XCTFail("Could not persist the legal fixture.")
+        }
+        let originalFiling = try Data(contentsOf: filing)
+        let originalExhibit = try Data(contentsOf: exhibit)
+
+        try PDFOutputService().secureRedact(
+            sourceURL: filing,
+            destination: redacted,
+            marks: [
+                PDFRedactionMark(
+                    pageIndex: 0,
+                    normalizedX: 0.06,
+                    normalizedY: 0.66,
+                    normalizedWidth: 0.88,
+                    normalizedHeight: 0.18
+                )
+            ]
+        )
+        let redactionReceipt = try PDFDeliveryAuditService().audit(
+            sourceURL: filing,
+            outputURL: redacted,
+            operation: .redacted
+        )
+        XCTAssertTrue(redactionReceipt.isVerified)
+        XCTAssertEqual(redactionReceipt.textCharacterCount, 0)
+        XCTAssertEqual(redactionReceipt.personalMetadataEntryCount, 0)
+
+        try PDFCompositionService().combine(
+            urls: [redacted, exhibit],
+            to: production
+        )
+        let productionPageCount = try XCTUnwrap(
+            PDFDocument(url: production)
+        ).pageCount
+        XCTAssertEqual(productionPageCount, 4)
+
+        let payload = PDFBatesNumberingPayload(
+            pageIndices: Array(0..<productionPageCount),
+            startNumber: 1,
+            digitCount: 6,
+            prefix: "ACME-",
+            suffix: "",
+            position: .bottomRight
+        )
+        try PDFMutationService().applyBatesNumbers(
+            payload,
+            in: production
+        )
+        let numbered = try XCTUnwrap(PDFDocument(url: production))
+        for pageIndex in 0..<numbered.pageCount {
+            let expected = payload.text(
+                number: Int64(pageIndex + 1)
+            )
+            XCTAssertTrue(
+                numbered.page(at: pageIndex)?.annotations.contains {
+                    $0.contents == expected
+                        && $0.shouldDisplay
+                        && $0.shouldPrint
+                } == true,
+                "Missing visible Bates identifier \(expected)"
+            )
+        }
+
+        try PDFOutputService().safeShare(
+            sourceURL: production,
+            destination: verified
+        )
+        let deliveryReceipt = try PDFDeliveryAuditService().audit(
+            sourceURL: production,
+            outputURL: verified,
+            operation: .safeShare
+        )
+        XCTAssertTrue(deliveryReceipt.isVerified)
+        XCTAssertEqual(deliveryReceipt.outputPageCount, 4)
+        XCTAssertEqual(deliveryReceipt.renderedPageCount, 4)
+        XCTAssertEqual(deliveryReceipt.annotationCount, 0)
+        XCTAssertEqual(deliveryReceipt.sha256.count, 64)
+        XCTAssertEqual(try Data(contentsOf: filing), originalFiling)
+        XCTAssertEqual(try Data(contentsOf: exhibit), originalExhibit)
+    }
+
+    func testProfessionalWorkflow_bookkeeperBuildsSearchableOrganizedAuditPacket()
+        async throws {
+        let scan = temporaryDirectory
+            .appendingPathComponent("august-receipts-scan.pdf")
+        let searchable = temporaryDirectory
+            .appendingPathComponent("august-receipts-searchable.pdf")
+        let workbook = temporaryDirectory
+            .appendingPathComponent("august-expenses.xlsx")
+        let protected = temporaryDirectory
+            .appendingPathComponent("august-receipts-protected.pdf")
+        let receiptTexts = [
+            "INVOICE ACME 1001\nDATE 08/08/2026\nTOTAL 1280.50",
+            "RECEIPT NORTHSTAR 2002\nDATE 08/14/2026\nTOTAL 84.20",
+            "INVOICE ORBIT 3003\nDATE 08/21/2026\nTOTAL 410.00"
+        ]
+        let images = receiptTexts.map(makeReceiptImage)
+        try ScanPDFRenderer().render(images: images, to: scan)
+        let originalScan = try Data(contentsOf: scan)
+
+        let recognition = try await VisionOCRService().recognize(
+            url: scan,
+            configuration: OCRRecognitionConfiguration(
+                languageMode: .selected,
+                languageIdentifiers: [
+                    OCRRecognitionLanguage.english.rawValue
+                ],
+                customWords: ["ACME", "NORTHSTAR", "ORBIT"]
+            )
+        )
+        let normalizedText = recognition.text.uppercased()
+        XCTAssertTrue(normalizedText.contains("INVOICE"))
+        XCTAssertTrue(normalizedText.contains("1280.50"))
+        XCTAssertEqual(recognition.pages.count, 3)
+
+        try SearchablePDFService().createSearchableCopy(
+            sourceURL: scan,
+            ocrResult: recognition,
+            destination: searchable
+        )
+        let searchableDocument = try XCTUnwrap(
+            PDFDocument(url: searchable)
+        )
+        XCTAssertEqual(searchableDocument.pageCount, 3)
+        XCTAssertTrue(
+            searchableDocument.string?.uppercased()
+                .contains("NORTHSTAR") == true
+        )
+
+        let index = DocumentTextIndex(
+            source: .vision,
+            pages: recognition.pages.map {
+                IndexedPageText(
+                    pageIndex: $0.pageIndex,
+                    text: $0.text
+                )
+            },
+            indexedAt: Date()
+        )
+        let evidence = try XCTUnwrap(
+            PDFOutputService().exportText(
+                sourceURL: scan,
+                destination: workbook,
+                textIndex: index,
+                title: "August 2026 expense packet",
+                format: .excelWorkbook
+            )
+        )
+        XCTAssertEqual(evidence.outputPageCount, 3)
+        XCTAssertEqual(evidence.searchablePageCount, 3)
+        let archive = try StoredZIPArchiveFixture(
+            data: Data(contentsOf: workbook)
+        )
+        try archive.validateXMLAndRelationships()
+        let worksheetText = archive.entries
+            .filter { $0.key.hasPrefix("xl/worksheets/") }
+            .values
+            .reduce(into: Data()) { $0.append($1) }
+        XCTAssertNotNil(
+            worksheetText.range(of: Data("1280.50".utf8))
+        )
+
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("BookkeepingStore")
+        )
+        var record = try await store.importPDF(
+            from: searchable,
+            preferredName: "2026-08 Expense Packet",
+            preserveSourceLocation: false
+        )
+        record = try await store.updateTags(
+            record,
+            tags: ["2026", "Expenses", "August"],
+            expectedTags: record.tags
+        )
+        record = try await store.updatePrivateNote(
+            record,
+            note: "Matched to August ledger.",
+            expectedNote: record.privateNote
+        )
+        XCTAssertEqual(record.tags, ["2026", "Expenses", "August"])
+        XCTAssertEqual(
+            record.privateNote,
+            "Matched to August ledger."
+        )
+
+        let privateURL = await store.url(for: record)
+        try PDFOutputService().protect(
+            sourceURL: privateURL,
+            destination: protected,
+            password: "ledger-2026"
+        )
+        let protectionReceipt = try PDFDeliveryAuditService().audit(
+            sourceURL: privateURL,
+            outputURL: protected,
+            operation: .protected,
+            unlockPassword: "ledger-2026"
+        )
+        XCTAssertTrue(protectionReceipt.isVerified)
+        XCTAssertTrue(protectionReceipt.isEncrypted)
+        XCTAssertEqual(protectionReceipt.outputPageCount, 3)
+        XCTAssertEqual(try Data(contentsOf: scan), originalScan)
+    }
+
+    func testProfessionalWorkflow_operationsCoordinatorCompletesSignedHandoff()
+        throws {
+        let original = temporaryDirectory
+            .appendingPathComponent("vendor-acceptance-original.pdf")
+        let working = temporaryDirectory
+            .appendingPathComponent("vendor-acceptance-working.pdf")
+        let appendix = temporaryDirectory
+            .appendingPathComponent("scope-appendix.pdf")
+        let package = temporaryDirectory
+            .appendingPathComponent("vendor-handoff-package.pdf")
+        let verified = temporaryDirectory
+            .appendingPathComponent("vendor-handoff-verified.pdf")
+        try DemoPDFBuilder.create(at: original)
+        let originalData = try Data(contentsOf: original)
+        try FileManager.default.copyItem(at: original, to: working)
+
+        let workingDocument = try XCTUnwrap(PDFDocument(url: working))
+        let recipientField = try XCTUnwrap(
+            workingDocument.page(at: 0)?.annotations.first {
+                $0.fieldName == "Recipient name"
+            }
+        )
+        recipientField.widgetStringValue = "Jordan Lee"
+        guard workingDocument.write(to: working) else {
+            return XCTFail("Could not save the completed form.")
+        }
+        let signatureBounds = PDFNormalizedRect(
+            x: 0.49,
+            y: 0.81,
+            width: 0.36,
+            height: 0.08
+        )
+        try PDFMutationService().addInk(
+            PDFInkPayload(
+                pageIndex: 1,
+                strokes: [
+                    PDFInkStroke(
+                        points: [
+                            PDFInkPoint(x: 0.08, y: 0.72),
+                            PDFInkPoint(x: 0.31, y: 0.24),
+                            PDFInkPoint(x: 0.52, y: 0.68),
+                            PDFInkPoint(x: 0.86, y: 0.18)
+                        ]
+                    )
+                ],
+                placement: .signature,
+                normalizedBounds: signatureBounds
+            ),
+            in: working
+        )
+        let formReport = try PDFFormInspectionService().inspect(
+            url: working
+        )
+        XCTAssertTrue(
+            formReport.incompleteRequiredFields.isEmpty,
+            formReport.incompleteRequiredFields
+                .map(\.name)
+                .joined(separator: ", ")
+        )
+
+        try makePDF(
+            at: appendix,
+            pages: ["Scope appendix: implementation and acceptance criteria"]
+        )
+        try PDFCompositionService().combine(
+            urls: [working, appendix],
+            to: package
+        )
+        try PDFOutputService().safeShare(
+            sourceURL: package,
+            destination: verified
+        )
+        let receipt = try PDFDeliveryAuditService().audit(
+            sourceURL: package,
+            outputURL: verified,
+            operation: .safeShare
+        )
+        XCTAssertTrue(receipt.isVerified)
+        XCTAssertEqual(receipt.outputPageCount, 3)
+        XCTAssertEqual(receipt.renderedPageCount, 3)
+        XCTAssertEqual(receipt.annotationCount, 0)
+        XCTAssertEqual(receipt.personalMetadataEntryCount, 0)
+        XCTAssertEqual(receipt.sha256.count, 64)
+        XCTAssertEqual(try Data(contentsOf: original), originalData)
+    }
+
+    private func makeReceiptImage(_ text: String) -> UIImage {
+        let size = CGSize(width: 1_600, height: 2_200)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        return UIGraphicsImageRenderer(
+            size: size,
+            format: format
+        ).image { context in
+            UIColor.white.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            UIColor.black.setStroke()
+            let border = UIBezierPath(
+                roundedRect: CGRect(
+                    x: 90,
+                    y: 100,
+                    width: 1_420,
+                    height: 2_000
+                ),
+                cornerRadius: 24
+            )
+            border.lineWidth = 8
+            border.stroke()
+            text.draw(
+                in: CGRect(
+                    x: 180,
+                    y: 420,
+                    width: 1_240,
+                    height: 1_000
+                ),
+                withAttributes: [
+                    .font: UIFont.monospacedSystemFont(
+                        ofSize: 92,
+                        weight: .bold
+                    ),
+                    .foregroundColor: UIColor.black
+                ]
+            )
+        }
     }
 
     private func solidJPEG(
@@ -4050,19 +5148,45 @@ final class PaperPathTests: XCTestCase {
             id: UUID(),
             operation: operation,
             createdAt: Date(),
-            sourcePageCount: 1,
-            outputPageCount: 1,
-            renderedPageCount: 1,
+            sourcePageCount: 2,
+            outputPageCount: 2,
+            renderedPageCount: 2,
             sourceByteCount: 1_024,
-            outputByteCount: 768,
+            outputByteCount: 1_024,
             unexpectedBlankPageIndices: [],
             annotationCount: 0,
             textCharacterCount: 0,
             personalMetadataEntryCount: 0,
             isEncrypted: false,
             sha256: String(repeating: "a", count: 64),
-            checks: []
+            checks: [
+                PDFDeliveryCheck(
+                    id: "reopened",
+                    title: "Output reopened",
+                    detail: "Output passed local verification.",
+                    status: .passed
+                )
+            ]
         )
+    }
+}
+
+private final class TestUptimeClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: TimeInterval
+
+    init(value: TimeInterval) {
+        self.value = value
+    }
+
+    func read() -> TimeInterval {
+        lock.withLock { value }
+    }
+
+    func advance(by interval: TimeInterval) {
+        lock.withLock {
+            value += interval
+        }
     }
 }
 

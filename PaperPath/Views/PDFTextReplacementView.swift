@@ -5,6 +5,10 @@ struct PDFTextReplacementView: View {
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.verticalSizeClass) private var verticalSizeClass
+    @Environment(\.paperPathSceneID) private var paperPathSceneID
 
     let recordID: UUID
     let selection: PDFTextSelectionSnapshot
@@ -16,12 +20,42 @@ struct PDFTextReplacementView: View {
     @State private var assessment: PDFTextReplacementAssessment?
     @State private var pagePreviews: [Int: UIImage] = [:]
     @State private var pagePointSizes: [Int: CGSize] = [:]
+    @State private var previewLoadingPageIndices: Set<Int> = []
+    @State private var previewErrorMessages: [Int: String] = [:]
+    @State private var validatedPreviewPageIndices: Set<Int> = []
+    @State private var previewOrder: [Int] = []
+    @State private var previewRevision = -1
     @State private var activePageIndex = 0
     @State private var assessmentTask: Task<Void, Never>?
     @State private var saveTask: Task<Void, Never>?
+    @State private var isAssessing = false
     @State private var isSaving = false
+    @State private var saveStopRequested = false
     @State private var assessmentGeneration = 0
     @State private var previewGeneration = 0
+    @State private var previewReloadToken = UUID()
+    @State private var saveGeneration = UUID()
+    @State private var isConfirmingDiscard = false
+    @State private var sourceContentRevisionID: UUID?
+
+    init(
+        recordID: UUID,
+        selection: PDFTextSelectionSnapshot,
+        onCreated: @escaping (DocumentRoute) -> Void
+    ) {
+        self.recordID = recordID
+        self.selection = selection
+        self.onCreated = onCreated
+        _replacement = State(
+            initialValue: String(
+                selection.originalText.prefix(16_000)
+            )
+        )
+        _activePageIndex = State(
+            initialValue: selection.pageIndices.first
+                ?? selection.pageIndex
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -53,62 +87,50 @@ struct PDFTextReplacementView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button(
                         (
-                            isSaving
+                            saveStopRequested
+                                ? "Stopping"
+                                : isSaving
                                 ? "Stop"
                                 : "Cancel"
                         ).localizedUI
                     ) {
                         if isSaving {
-                            saveTask?.cancel()
-                            saveTask = nil
-                            isSaving = false
+                            stopSaving()
                         } else {
-                            dismiss()
+                            requestDismissal()
                         }
                     }
+                    .disabled(saveStopRequested)
                     .accessibilityHint(
-                        isSaving
-                            ? "Stops creation and discards the temporary copy"
+                        saveStopRequested
+                            ? "Waiting for the current file commit to finish safely"
+                            : isSaving
+                            ? "Stops waiting; a copy already committed remains in the Library"
                             : "Closes without creating a copy"
                     )
+                    .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Create Copy") {
                         createCopy()
                     }
-                    .disabled(
-                        assessment?.isReady != true || isSaving
-                    )
+                    .disabled(!canCreateCopy)
+                    .accessibilityHint(createCopyHint.localizedUI)
                 }
+            }
+            .task(id: previewRequestID) {
+                await loadRequiredPagePreviews()
             }
             .task {
-                previewGeneration += 1
-                let generation = previewGeneration
-                guard let url = model.url(for: recordID) else { return }
-                activePageIndex = pageIndices.first
-                    ?? selection.pageIndex
-                for pageIndex in pageIndices {
-                    guard !Task.isCancelled,
-                          generation == previewGeneration
-                    else { return }
-                    let preview = await PDFEditorPreviewLoader.shared.preview(
-                        url: url,
-                        pageIndex: pageIndex,
-                        revision: model.refreshToken(for: recordID),
-                        longEdge: 1_800
-                    )
-                    guard !Task.isCancelled,
-                          generation == previewGeneration,
-                          let preview
-                    else { return }
-                    pagePointSizes[pageIndex] = CGSize(
-                        width: CGFloat(preview.pageWidth),
-                        height: CGFloat(preview.pageHeight)
-                    )
-                    pagePreviews[pageIndex] = preview.image
-                }
+                sourceContentRevisionID =
+                    model.record(id: recordID)?.contentRevisionID
+                scheduleAssessment()
             }
-            .onChange(of: replacement) { _, _ in
+            .onChange(of: replacement) { _, value in
+                if value.count > 16_000 {
+                    replacement = String(value.prefix(16_000))
+                    return
+                }
                 scheduleAssessment()
             }
             .onChange(of: fontStyle) { _, _ in
@@ -117,56 +139,100 @@ struct PDFTextReplacementView: View {
             .onChange(of: alignment) { _, _ in
                 scheduleAssessment()
             }
-            .onDisappear {
-                assessmentGeneration += 1
-                previewGeneration += 1
-                assessmentTask?.cancel()
-                saveTask?.cancel()
+            .onChange(
+                of: model.record(id: recordID)?
+                    .contentRevisionID
+            ) { _, revisionID in
+                guard let sourceContentRevisionID,
+                      revisionID != sourceContentRevisionID
+                else { return }
+                model[noticeFor: paperPathSceneID] =
+                    "The PDF changed before this action started. Review the updated PDF."
+                        .localizedUI
+                interruptProtectedReplacementEditing()
+                dismiss()
             }
-            .interactiveDismissDisabled(isSaving)
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .active {
+                    previewReloadToken = UUID()
+                    scheduleAssessment()
+                } else if phase == .background {
+                    interruptProtectedReplacementEditing()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: UIApplication
+                        .protectedDataWillBecomeUnavailableNotification
+                )
+            ) { _ in
+                interruptProtectedReplacementEditing()
+            }
+            .onDisappear {
+                interruptProtectedReplacementWork()
+                replacement = ""
+            }
+            .confirmationDialog(
+                "Discard replacement draft?".localizedUI,
+                isPresented: $isConfirmingDiscard,
+                titleVisibility: .visible
+            ) {
+                Button(
+                    "Discard Draft".localizedUI,
+                    role: .destructive
+                ) {
+                    dismiss()
+                }
+                Button("Keep Editing".localizedUI, role: .cancel) {}
+            } message: {
+                Text(
+                    "Your replacement text and layout choices have not been applied."
+                        .localizedUI
+                )
+            }
+            .interactiveDismissDisabled(isSaving || hasDraftChanges)
+            .accessibilityAction(.escape) {
+                if isSaving {
+                    stopSaving()
+                } else {
+                    requestDismissal()
+                }
+            }
         }
     }
 
     private var replacementContextBar: some View {
-        HStack(spacing: PPSpacing.medium) {
-            Label(
-                "\(selection.originalText.count)",
-                systemImage: "textformat"
-            )
-            Label(
-                "\(selection.lineCount)",
-                systemImage: "text.alignleft"
-            )
-            Label(
-                "\(selection.flowRegions.count)",
-                systemImage: "square.dashed"
-            )
-            Label(
-                "\(pageIndices.count)",
-                systemImage: "doc.on.doc"
-            )
-            Spacer(minLength: 0)
-            Label(
-                assessment?.isReady == true
-                    ? "Fits"
-                    : replacement.isEmpty
-                        ? "Waiting"
-                        : "Checking",
-                systemImage: assessment?.isReady == true
-                    ? "checkmark.circle"
-                    : "text.magnifyingglass"
-            )
-            .foregroundStyle(
-                assessment?.isReady == true
-                    ? PPColor.mint
-                    : PPColor.textSecondary
-            )
+        ScrollView(.horizontal) {
+            HStack(spacing: PPSpacing.medium) {
+                Label(
+                    "\(selection.originalText.count)",
+                    systemImage: "textformat"
+                )
+                Label(
+                    "\(selection.lineCount)",
+                    systemImage: "text.alignleft"
+                )
+                Label(
+                    "\(selection.flowRegions.count)",
+                    systemImage: "square.dashed"
+                )
+                Label(
+                    "\(pageIndices.count)",
+                    systemImage: "doc.on.doc"
+                )
+                Label(
+                    replacementReadinessTitle,
+                    systemImage: replacementReadinessSymbol
+                )
+                .foregroundStyle(replacementReadinessColor)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, PPSpacing.regular)
         }
+        .scrollIndicators(.hidden)
         .font(.caption.weight(.semibold))
         .foregroundStyle(PPColor.textSecondary)
-        .lineLimit(1)
-        .padding(.horizontal, PPSpacing.regular)
-        .frame(minHeight: 38)
+        .frame(minHeight: 44)
         .background(.bar)
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -214,17 +280,81 @@ struct PDFTextReplacementView: View {
                 Image(uiImage: preview)
                     .resizable()
                     .scaledToFit()
+                replacementOverlays(
+                    pageIndex: pageIndex,
+                    pageSize: pageSize
+                )
+            } else if let message = previewErrorMessages[pageIndex] {
+                previewFailureState(
+                    message: message,
+                    pageIndex: pageIndex
+                )
+            } else if previewLoadingPageIndices.contains(pageIndex) {
+                previewLoadingState(pageIndex: pageIndex)
             } else {
-                ProgressView()
+                previewFailureState(
+                    message:
+                        "The page preview could not be loaded. Try again."
+                            .localizedUI,
+                    pageIndex: pageIndex
+                )
             }
-            replacementOverlays(
-                pageIndex: pageIndex,
-                pageSize: pageSize
-            )
         }
         .frame(width: pageSize.width, height: pageSize.height)
         .clipped()
         .shadow(color: .black.opacity(0.12), radius: 14, y: 6)
+    }
+
+    private func previewLoadingState(
+        pageIndex: Int
+    ) -> some View {
+        VStack(spacing: PPSpacing.small) {
+            ProgressView()
+            Text(
+                AppLocalization.format(
+                    "Loading page %lld preview",
+                    pageIndex + 1
+                )
+            )
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(PPColor.textSecondary)
+        }
+        .accessibilityElement(children: .combine)
+    }
+
+    private func previewFailureState(
+        message: String,
+        pageIndex: Int
+    ) -> some View {
+        VStack(spacing: PPSpacing.small) {
+            Image(systemName: "doc.questionmark")
+                .font(.title2)
+                .foregroundStyle(PPColor.amber)
+            Text("Preview unavailable".localizedUI)
+                .font(.headline)
+                .foregroundStyle(PPColor.textPrimary)
+            Text(message)
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                retryPreview(pageIndex)
+            } label: {
+                Label(
+                    "Load Preview Again",
+                    systemImage: "arrow.clockwise"
+                )
+            }
+            .buttonStyle(
+                PPQuietButtonStyle(tint: PPColor.cyan)
+            )
+            .disabled(isSaving)
+            .accessibilityIdentifier(
+                "retryTextReplacementPreview-\(pageIndex)"
+            )
+        }
+        .padding(PPSpacing.medium)
     }
 
     private func replacementOverlays(
@@ -269,13 +399,17 @@ struct PDFTextReplacementView: View {
                         .font(
                             .system(
                                 size: previewFontSize(
-                                    pageSize: pageSize
+                                    pageSize: pageSize,
+                                    pageIndex: region.pageIndex
                                 ),
                                 design: previewFontDesign
                             )
                         )
                         .lineSpacing(
-                            previewLineSpacing(pageSize: pageSize)
+                            previewLineSpacing(
+                                pageSize: pageSize,
+                                pageIndex: region.pageIndex
+                            )
                         )
                         .multilineTextAlignment(textAlignment)
                         .foregroundStyle(
@@ -320,8 +454,16 @@ struct PDFTextReplacementView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
             selection.flowRegions.count > 1
-                ? "Text box \(index + 1) of \(selection.flowRegions.count) on page \(region.pageIndex + 1)"
-                : "Selected text on page \(selection.pageIndex + 1)"
+                ? AppLocalization.format(
+                    "Text box %lld of %lld on page %lld",
+                    index + 1,
+                    selection.flowRegions.count,
+                    region.pageIndex + 1
+                )
+                : AppLocalization.format(
+                    "Selected text on page %lld",
+                    selection.pageIndex + 1
+                )
         )
     }
 
@@ -331,14 +473,18 @@ struct PDFTextReplacementView: View {
                 movePage(by: -1)
             } label: {
                 Image(systemName: "chevron.left")
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
             .disabled(activePagePosition == 0)
             .accessibilityLabel("Previous selected page")
 
             Text(
-                "PAGE \(activePagePosition + 1) OF \(pageIndices.count)"
+                AppLocalization.format(
+                    "PAGE %lld OF %lld",
+                    activePagePosition + 1,
+                    pageIndices.count
+                )
             )
             .font(.caption2.smallCaps().weight(.bold))
             .monospacedDigit()
@@ -349,7 +495,7 @@ struct PDFTextReplacementView: View {
                 movePage(by: 1)
             } label: {
                 Image(systemName: "chevron.right")
-                    .frame(width: 32, height: 32)
+                    .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
             .disabled(activePagePosition >= pageIndices.count - 1)
@@ -361,89 +507,150 @@ struct PDFTextReplacementView: View {
     }
 
     private var controls: some View {
-        VStack(alignment: .leading, spacing: PPSpacing.small) {
-            HStack(spacing: PPSpacing.small) {
-                Text("ORIGINAL")
-                    .font(.caption2.smallCaps().weight(.bold))
-                    .foregroundStyle(PPColor.textSecondary)
-                Text(selection.originalText)
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(1)
-            }
-
-            TextField(
-                selection.flowRegions.count > 1
-                    ? "Replacement text flow"
-                    : (
-                        selection.lineCount > 4
-                            ? "Replacement paragraph"
-                            : "Replacement text"
-                    ),
-                text: $replacement,
-                axis: .vertical
-            )
-            .lineLimit(1...8)
-            .textFieldStyle(.roundedBorder)
-            .submitLabel(.done)
-            .disabled(isSaving)
-
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: PPSpacing.medium) {
-                    fontPicker
-                    alignmentPicker
+        ScrollView {
+            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                if isSaving {
+                    HStack(spacing: PPSpacing.small) {
+                        ProgressView()
+                            .controlSize(.small)
+                        Text(
+                            (
+                                saveStopRequested
+                                    ? "Finishing current file commit"
+                                    : "Creating private copy"
+                            ).localizedUI
+                        )
+                        .font(.caption.weight(.semibold))
+                        Spacer(minLength: 0)
+                        OnDeviceBadge(compact: true)
+                    }
+                    .frame(minHeight: 44)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityAddTraits(.updatesFrequently)
                 }
-                VStack(spacing: PPSpacing.small) {
-                    fontPicker
-                    alignmentPicker
-                }
-            }
 
-            HStack(alignment: .top, spacing: PPSpacing.small) {
-                if assessment == nil,
-                   !replacement.isEmpty {
-                    ProgressView()
-                        .controlSize(.small)
+                HStack(alignment: .top, spacing: PPSpacing.small) {
+                    Text("ORIGINAL")
+                        .font(.caption2.smallCaps().weight(.bold))
+                        .foregroundStyle(PPColor.textSecondary)
+                    Text(selection.originalText)
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 3
+                                : 1
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                VStack(alignment: .trailing, spacing: PPSpacing.xSmall) {
+                    TextField(
+                        selection.flowRegions.count > 1
+                            ? "Replacement text flow"
+                            : (
+                                selection.lineCount > 4
+                                    ? "Replacement paragraph"
+                                    : "Replacement text"
+                            ),
+                        text: $replacement,
+                        axis: .vertical
+                    )
+                    .lineLimit(1...8)
+                    .textFieldStyle(.roundedBorder)
+                    .submitLabel(.done)
+                    .disabled(isSaving)
+
+                    HStack(spacing: PPSpacing.small) {
+                        Text("\(replacement.count) / 16,000")
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(PPColor.textSecondary)
+                        Spacer(minLength: PPSpacing.small)
+                        PasteButton(payloadType: String.self) { values in
+                            pasteReplacement(values.first)
+                        }
+                        .labelStyle(.iconOnly)
+                        .frame(minWidth: 44, minHeight: 44)
+                        .disabled(isSaving)
+                        .accessibilityLabel("Paste replacement text")
+                    }
+                }
+
+                if dynamicTypeSize.ppPrefersExpandedLayout {
+                    VStack(spacing: PPSpacing.small) {
+                        fontPicker
+                        alignmentPicker
+                    }
                 } else {
-                    Image(
-                        systemName: assessment?.isReady == true
-                            ? "checkmark.circle.fill"
-                            : "exclamationmark.triangle.fill"
-                    )
-                    .foregroundStyle(
-                        assessment?.isReady == true
-                            ? PPColor.mint
-                            : PPColor.amber
-                    )
+                    HStack(spacing: PPSpacing.medium) {
+                        fontPicker
+                        alignmentPicker
+                    }
                 }
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(
-                        (
-                            assessment?.title
-                            ?? (
-                                replacement.isEmpty
-                                    ? "Enter replacement text"
-                                    : "Checking layout"
-                            )
-                        ).localizedUI
+                HStack(alignment: .top, spacing: PPSpacing.small) {
+                    if isAssessing {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Image(systemName: assessmentStatusSymbol)
+                            .foregroundStyle(assessmentStatusColor)
+                    }
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(
+                            (
+                                assessment?.title
+                                ?? (
+                                    replacement.isEmpty
+                                        ? "Enter replacement text"
+                                        : "Checking layout"
+                                )
+                            ).localizedUI
+                        )
+                        .font(.subheadline.weight(.semibold))
+                        Text(
+                            (
+                                assessment?.detail
+                                    ?? "The source PDF stays unchanged."
+                            ).localizedUI
+                        )
+                        .font(.caption)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .lineLimit(
+                            dynamicTypeSize.ppPrefersExpandedLayout
+                                ? 5
+                                : 3
+                        )
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .accessibilityElement(children: .combine)
+
+                if assessment?.status == .unavailable {
+                    Button {
+                        scheduleAssessment(immediate: true)
+                    } label: {
+                        Label(
+                            "Check Layout Again",
+                            systemImage: "arrow.clockwise"
+                        )
+                        .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(
+                        PPQuietButtonStyle(tint: PPColor.cyan)
                     )
-                    .font(.subheadline.weight(.semibold))
-                    Text(
-                        (
-                            assessment?.detail
-                                ?? "The source PDF stays unchanged."
-                        ).localizedUI
+                    .disabled(isAssessing || isSaving)
+                    .accessibilityIdentifier(
+                        "retryTextReplacementAssessment"
                     )
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(3)
                 }
             }
-            .accessibilityElement(children: .combine)
+            .padding(PPSpacing.regular)
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility2)
-        .padding(PPSpacing.regular)
+        .scrollDismissesKeyboard(.interactively)
+        .scrollBounceBehavior(.basedOnSize)
+        .frame(maxHeight: controlsMaximumHeight)
         .background(.bar)
         .overlay(alignment: .top) {
             Rectangle()
@@ -452,14 +659,46 @@ struct PDFTextReplacementView: View {
         }
     }
 
+    @ViewBuilder
     private var fontPicker: some View {
-        Picker("Font style", selection: $fontStyle) {
-            ForEach(PDFTextReplacementFontStyle.allCases) { style in
-                Text(style.title.localizedUI).tag(style)
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            Menu {
+                ForEach(PDFTextReplacementFontStyle.allCases) { style in
+                    Button {
+                        fontStyle = style
+                    } label: {
+                        Label(
+                            style.title.localizedUI,
+                            systemImage: fontStyle == style
+                                ? "checkmark"
+                                : "textformat"
+                        )
+                    }
+                }
+            } label: {
+                HStack {
+                    Label("Font style", systemImage: "textformat")
+                    Spacer(minLength: PPSpacing.small)
+                    Text(fontStyle.title.localizedUI)
+                        .foregroundStyle(PPColor.textSecondary)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(PPColor.textSecondary)
+                }
+                .frame(minHeight: 44)
+                .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .disabled(isSaving)
+        } else {
+            Picker("Font style", selection: $fontStyle) {
+                ForEach(PDFTextReplacementFontStyle.allCases) { style in
+                    Text(style.title.localizedUI).tag(style)
+                }
+            }
+            .pickerStyle(.segmented)
+            .disabled(isSaving)
         }
-        .pickerStyle(.segmented)
-        .disabled(isSaving)
     }
 
     private var alignmentPicker: some View {
@@ -474,60 +713,232 @@ struct PDFTextReplacementView: View {
         .disabled(isSaving)
     }
 
-    private func scheduleAssessment() {
+    private var controlsMaximumHeight: CGFloat {
+        if verticalSizeClass == .compact {
+            return 220
+        }
+        return dynamicTypeSize.ppPrefersExpandedLayout ? 340 : 280
+    }
+
+    private var previewValidationComplete: Bool {
+        let requiredPageIndices = Set(pageIndices)
+        return !requiredPageIndices.isEmpty
+            && requiredPageIndices.isSubset(
+                of: validatedPreviewPageIndices
+            )
+    }
+
+    private var canCreateCopy: Bool {
+        assessment?.isReady == true
+            && previewValidationComplete
+            && !isAssessing
+            && !isSaving
+    }
+
+    private var hasDraftChanges: Bool {
+        replacement
+            != String(selection.originalText.prefix(16_000))
+            || fontStyle != .sans
+            || alignment != .left
+    }
+
+    private func requestDismissal() {
+        if hasDraftChanges {
+            isConfirmingDiscard = true
+        } else {
+            dismiss()
+        }
+    }
+
+    private var createCopyHint: String {
+        if assessment?.isReady == true,
+           !previewValidationComplete {
+            return "Wait for every selected page preview to be verified"
+        }
+        if assessment?.isReady == true {
+            return "Creates a separate edited PDF copy"
+        }
+        return assessment?.detail
+            ?? "Wait for the local layout check"
+    }
+
+    private var replacementReadinessTitle: String {
+        if !previewErrorMessages.isEmpty {
+            return "Preview unavailable"
+        }
+        if assessment?.isReady == true {
+            return previewValidationComplete
+                ? "Ready"
+                : "Checking previews"
+        }
+        if replacement.isEmpty {
+            return "Waiting"
+        }
+        if isAssessing {
+            return "Checking"
+        }
+        if assessment?.status == .unavailable {
+            return "Check failed"
+        }
+        return "Needs review"
+    }
+
+    private var replacementReadinessSymbol: String {
+        if !previewErrorMessages.isEmpty {
+            return "doc.questionmark"
+        }
+        if assessment?.isReady == true,
+           previewValidationComplete {
+            return "checkmark.circle"
+        }
+        if assessment?.status == .unavailable {
+            return "exclamationmark.arrow.triangle.2.circlepath"
+        }
+        return "text.magnifyingglass"
+    }
+
+    private var replacementReadinessColor: Color {
+        if assessment?.isReady == true,
+           previewValidationComplete {
+            return PPColor.mint
+        }
+        if assessment?.status == .unavailable
+            || !previewErrorMessages.isEmpty {
+            return PPColor.amber
+        }
+        return PPColor.textSecondary
+    }
+
+    private var assessmentStatusSymbol: String {
+        guard let assessment else {
+            return replacement.isEmpty
+                ? "text.cursor"
+                : "text.magnifyingglass"
+        }
+        switch assessment.status {
+        case .ready:
+            return "checkmark.circle.fill"
+        case .blocked:
+            return "exclamationmark.triangle.fill"
+        case .unavailable:
+            return "exclamationmark.arrow.triangle.2.circlepath"
+        }
+    }
+
+    private var assessmentStatusColor: Color {
+        switch assessment?.status {
+        case .ready:
+            return PPColor.mint
+        case .blocked, .unavailable:
+            return PPColor.amber
+        case nil:
+            return PPColor.textSecondary
+        }
+    }
+
+    private func scheduleAssessment(immediate: Bool = false) {
         assessmentTask?.cancel()
         assessmentGeneration += 1
         let generation = assessmentGeneration
         assessment = nil
+        isAssessing = false
         let value = replacement
         let requestedFontStyle = fontStyle
         let requestedAlignment = alignment
+        guard let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID
+        else { return }
         guard !value.trimmingCharacters(
             in: .whitespacesAndNewlines
         ).isEmpty else { return }
-        assessmentTask = Task {
-            try? await Task.sleep(for: .milliseconds(220))
+        isAssessing = true
+        assessmentTask = Task { @MainActor in
+            defer {
+                if generation == assessmentGeneration {
+                    isAssessing = false
+                    assessmentTask = nil
+                }
+            }
+            if !immediate {
+                do {
+                    try await Task.sleep(for: .milliseconds(220))
+                } catch {
+                    return
+                }
+            }
             guard !Task.isCancelled else { return }
-            let result = await model.assessTextReplacement(
-                recordID: recordID,
-                selection: selection,
-                replacement: value,
-                fontStyle: requestedFontStyle,
-                alignment: requestedAlignment
-            )
+            let result = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.assessTextReplacement(
+                    recordID: recordID,
+                    selection: selection,
+                    replacement: value,
+                    fontStyle: requestedFontStyle,
+                    alignment: requestedAlignment,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
+            }
             guard !Task.isCancelled,
                   generation == assessmentGeneration,
                   replacement == value,
                   fontStyle == requestedFontStyle,
-                  alignment == requestedAlignment
+                  alignment == requestedAlignment,
+                  model.record(id: recordID)?.contentRevisionID
+                    == sourceContentRevisionID
             else { return }
             assessment = result
         }
     }
 
     private func createCopy() {
-        guard let assessment, assessment.isReady else { return }
+        guard canCreateCopy,
+              let assessment,
+              let sourceContentRevisionID,
+              model.record(id: recordID)?.contentRevisionID
+                == sourceContentRevisionID
+        else { return }
         assessmentTask?.cancel()
         isSaving = true
+        saveStopRequested = false
         let value = replacement
-        saveTask = Task {
-            let created = await model.createTextReplacementCopy(
-                recordID: recordID,
-                selection: selection,
-                replacement: value,
-                assessment: assessment
-            )
-            guard !Task.isCancelled else {
-                isSaving = false
-                saveTask = nil
-                return
+        let generation = UUID()
+        saveGeneration = generation
+        saveTask = Task { @MainActor in
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.createTextReplacementCopy(
+                    recordID: recordID,
+                    selection: selection,
+                    replacement: value,
+                    assessment: assessment,
+                    expectedContentRevisionID:
+                        sourceContentRevisionID
+                )
             }
+            guard saveGeneration == generation else { return }
+            let wasStopped = saveStopRequested || Task.isCancelled
             isSaving = false
             saveTask = nil
+            saveStopRequested = false
+            guard !wasStopped else {
+                model[noticeFor: paperPathSceneID] = created == nil
+                    ? "Copy creation stopped".localizedUI
+                    : "Copy finished before stopping · copy kept in Library"
+                        .localizedUI
+                return
+            }
             guard let created else { return }
-            dismiss()
             onCreated(DocumentRoute(recordID: created.id))
         }
+    }
+
+    private func pasteReplacement(_ value: String?) {
+        guard let value else { return }
+        replacement = String(value.prefix(16_000))
     }
 
     private var pageIndices: [Int] {
@@ -591,8 +1002,163 @@ struct PDFTextReplacementView: View {
         )
     }
 
-    private func previewFontSize(pageSize: CGSize) -> CGFloat {
-        let pagePointSize = pagePointSizes[activePageIndex]
+    private var previewRequestID: String {
+        [
+            String(activePageIndex),
+            model.record(id: recordID)?
+                .contentRevisionID.uuidString ?? "missing",
+            String(model.refreshToken(for: recordID)),
+            previewReloadToken.uuidString
+        ].joined(separator: "-")
+    }
+
+    private func loadRequiredPagePreviews() async {
+        guard let requestedRevisionID =
+                model.record(id: recordID)?.contentRevisionID
+        else { return }
+        if sourceContentRevisionID == nil {
+            sourceContentRevisionID = requestedRevisionID
+        }
+        guard sourceContentRevisionID == requestedRevisionID else {
+            return
+        }
+        previewGeneration += 1
+        let generation = previewGeneration
+        previewLoadingPageIndices.removeAll(keepingCapacity: true)
+        let revision = model.refreshToken(for: recordID)
+        if previewRevision != revision {
+            previewRevision = revision
+            pagePreviews.removeAll(keepingCapacity: false)
+            pagePointSizes.removeAll(keepingCapacity: false)
+            previewErrorMessages.removeAll(keepingCapacity: false)
+            validatedPreviewPageIndices.removeAll(keepingCapacity: false)
+            previewOrder.removeAll(keepingCapacity: false)
+        }
+        guard let url = model.url(for: recordID) else {
+            for pageIndex in pageIndices {
+                previewErrorMessages[pageIndex] =
+                    "The working copy is unavailable.".localizedUI
+            }
+            return
+        }
+        let requestedPageIndices = [activePageIndex]
+            + pageIndices.filter { $0 != activePageIndex }
+        for pageIndex in requestedPageIndices {
+            guard !Task.isCancelled,
+                  generation == previewGeneration,
+                  model.refreshToken(for: recordID) == revision,
+                  model.record(id: recordID)?.contentRevisionID
+                    == requestedRevisionID
+            else { return }
+            if pagePreviews[pageIndex] != nil {
+                validatedPreviewPageIndices.insert(pageIndex)
+                touchPreview(pageIndex)
+                continue
+            }
+            if pageIndex != activePageIndex,
+               validatedPreviewPageIndices.contains(pageIndex) {
+                continue
+            }
+            previewErrorMessages[pageIndex] = nil
+            previewLoadingPageIndices.insert(pageIndex)
+            let preview = await PDFEditorPreviewLoader.shared.preview(
+                url: url,
+                pageIndex: pageIndex,
+                revision: revision,
+                longEdge: 1_800
+            )
+            guard !Task.isCancelled,
+                  generation == previewGeneration,
+                  model.refreshToken(for: recordID) == revision,
+                  model.record(id: recordID)?.contentRevisionID
+                    == requestedRevisionID
+            else { return }
+            previewLoadingPageIndices.remove(pageIndex)
+            guard let preview else {
+                previewErrorMessages[pageIndex] =
+                    "The page preview could not be loaded. Try again."
+                        .localizedUI
+                validatedPreviewPageIndices.remove(pageIndex)
+                continue
+            }
+            pagePointSizes[pageIndex] = CGSize(
+                width: CGFloat(preview.pageWidth),
+                height: CGFloat(preview.pageHeight)
+            )
+            pagePreviews[pageIndex] = preview.image
+            validatedPreviewPageIndices.insert(pageIndex)
+            touchPreview(pageIndex)
+        }
+    }
+
+    private func retryPreview(_ pageIndex: Int) {
+        previewGeneration += 1
+        pagePreviews[pageIndex] = nil
+        previewErrorMessages[pageIndex] = nil
+        validatedPreviewPageIndices.remove(pageIndex)
+        previewLoadingPageIndices.insert(pageIndex)
+        activePageIndex = pageIndex
+        previewReloadToken = UUID()
+    }
+
+    private func touchPreview(_ pageIndex: Int) {
+        previewOrder.removeAll { $0 == pageIndex }
+        previewOrder.append(pageIndex)
+        while previewOrder.count > 3 {
+            guard let evictionIndex = previewOrder.firstIndex(
+                where: { $0 != activePageIndex }
+            ) else { break }
+            let evicted = previewOrder.remove(at: evictionIndex)
+            pagePreviews[evicted] = nil
+        }
+    }
+
+    private func interruptProtectedReplacementWork() {
+        assessmentGeneration += 1
+        previewGeneration += 1
+        assessmentTask?.cancel()
+        assessmentTask = nil
+        stopSaving(invalidateResult: true)
+        assessment = nil
+        isAssessing = false
+        pagePreviews.removeAll(keepingCapacity: false)
+        pagePointSizes.removeAll(keepingCapacity: false)
+        previewLoadingPageIndices.removeAll(keepingCapacity: false)
+        previewErrorMessages.removeAll(keepingCapacity: false)
+        validatedPreviewPageIndices.removeAll(keepingCapacity: false)
+        previewOrder.removeAll(keepingCapacity: false)
+    }
+
+    private func interruptProtectedReplacementEditing() {
+        interruptProtectedReplacementWork()
+        replacement = ""
+        dismiss()
+    }
+
+    private func stopSaving(
+        invalidateResult: Bool = false
+    ) {
+        if invalidateResult {
+            saveGeneration = UUID()
+        } else {
+            guard saveTask != nil,
+                  !saveStopRequested
+            else { return }
+            saveStopRequested = true
+        }
+        saveTask?.cancel()
+        if invalidateResult {
+            saveTask = nil
+            isSaving = false
+            saveStopRequested = false
+        }
+    }
+
+    private func previewFontSize(
+        pageSize: CGSize,
+        pageIndex: Int
+    ) -> CGFloat {
+        let pagePointSize = pagePointSizes[pageIndex]
             ?? CGSize(width: 612, height: 792)
         let scale = pageSize.height
             / max(1, pagePointSize.height)
@@ -603,8 +1169,11 @@ struct PDFTextReplacementView: View {
         )
     }
 
-    private func previewLineSpacing(pageSize: CGSize) -> CGFloat {
-        let pagePointSize = pagePointSizes[activePageIndex]
+    private func previewLineSpacing(
+        pageSize: CGSize,
+        pageIndex: Int
+    ) -> CGFloat {
+        let pagePointSize = pagePointSizes[pageIndex]
             ?? CGSize(width: 612, height: 792)
         let scale = pageSize.height
             / max(1, pagePointSize.height)
