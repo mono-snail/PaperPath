@@ -68,14 +68,24 @@ const backgrounds = asset.colors.map(entry => {
 });
 const design = readFileSync('PaperPath/Core/DesignSystem.swift', 'utf8');
 function colorPair(name) {
-  const start = design.indexOf(`static let ${name} = Color(`);
-  assert(start >= 0, `Missing semantic color: ${name}`);
-  const block = design.slice(start, design.indexOf('\n    static let ', start + 1));
-  const matches = [...block.matchAll(
-    /UIColor\(red:\s*([\d.]+),\s*green:\s*([\d.]+),\s*blue:\s*([\d.]+),\s*alpha:\s*1\)/g
-  )];
-  assert.equal(matches.length, 2, `Unexpected semantic color encoding: ${name}`);
-  return matches.map(match => match.slice(1).map(Number));
+  const match = design.match(new RegExp(`static let ${name} = Color\\("([^"]+)"\\)`));
+  assert(match, `Missing semantic color asset: ${name}`);
+  const catalog = JSON.parse(readFileSync(
+    `PaperPath/Resources/Assets.xcassets/${match[1]}.colorset/Contents.json`, 'utf8'
+  ));
+  return ['light', 'dark'].map(theme => {
+    const matches = catalog.colors.filter(entry =>
+      (entry.appearances?.some(a => a.appearance === 'luminosity' && a.value === 'dark') ? 'dark' : 'light') === theme
+    );
+    assert.equal(matches.length, 1, `${name}/${theme} requires exactly one asset variant`);
+    const c = matches[0].color.components;
+    assert.equal(Number(c.alpha), 1, `${name}/${theme} must be opaque`);
+    return ['red', 'green', 'blue'].map(key => {
+      const value = c[key].startsWith('0x') ? Number(c[key]) / 255 : Number(c[key]);
+      assert(Number.isFinite(value) && value >= 0 && value <= 1, `${name}/${theme}: invalid ${key}`);
+      return value;
+    });
+  });
 }
 function luminance(rgb) {
   const linear = rgb.map(c => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);

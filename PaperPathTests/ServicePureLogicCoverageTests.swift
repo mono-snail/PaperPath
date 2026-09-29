@@ -1,5 +1,6 @@
 import CryptoKit
 import CoreImage
+import Darwin
 import PDFKit
 import UIKit
 import UniformTypeIdentifiers
@@ -27,6 +28,41 @@ final class ServicePureLogicCoverageTests: XCTestCase {
             try? FileManager.default.removeItem(at: temporaryDirectory)
         }
         try super.tearDownWithError()
+    }
+
+    func testInsufficientStorageRecognitionIncludesQuotaAndNestedErrors_BitsUT() {
+        XCTAssertTrue(
+            LocalFileSecurity.isInsufficientStorageError(
+                POSIXError(.ENOSPC)
+            )
+        )
+        XCTAssertTrue(
+            LocalFileSecurity.isInsufficientStorageError(
+                NSError(
+                    domain: NSPOSIXErrorDomain,
+                    code: Int(EDQUOT)
+                )
+            )
+        )
+        XCTAssertTrue(
+            LocalFileSecurity.isInsufficientStorageError(
+                NSError(
+                    domain: NSCocoaErrorDomain,
+                    code: CocoaError.Code.fileWriteUnknown.rawValue,
+                    userInfo: [
+                        NSUnderlyingErrorKey: NSError(
+                            domain: NSPOSIXErrorDomain,
+                            code: Int(ENOSPC)
+                        )
+                    ]
+                )
+            )
+        )
+        XCTAssertFalse(
+            LocalFileSecurity.isInsufficientStorageError(
+                POSIXError(.EACCES)
+            )
+        )
     }
 
     func testPDFObjectSyntaxHandlesStringsArraysAndReferences_BitsUT()
@@ -400,7 +436,14 @@ final class ServicePureLogicCoverageTests: XCTestCase {
             confidence: 0.4,
             blocks: [block("Weak", x: 0.1, y: 0.5, confidence: 0.2)]
         )
+        let conciseStrong = OCRPageResult(
+            pageIndex: 0,
+            text: "Approved",
+            confidence: 0.96,
+            blocks: [block("Approved", x: 0.1, y: 0.5, confidence: 0.96)]
+        )
         XCTAssertFalse(service.shouldRetry(strong))
+        XCTAssertFalse(service.shouldRetry(conciseStrong))
         XCTAssertTrue(service.shouldRetry(weak))
         XCTAssertGreaterThan(
             service.recognitionScore(strong),
@@ -661,8 +704,22 @@ final class ServicePureLogicCoverageTests: XCTestCase {
             bodySize: 11,
             pageBounds: pageBounds
         ))
-        XCTAssertEqual(paragraph.text, "A wrapped example.")
+        XCTAssertEqual(paragraph.text, "A wrapped exam-ple.")
         XCTAssertEqual(paragraph.style.wordStyle, "Normal")
+        let softHyphenLine = DOCXLine(
+            text: "A wrapped exam\u{00ad}",
+            bounds: bodyLine.bounds,
+            fontSize: bodyLine.fontSize,
+            isBold: false,
+            isItalic: false,
+            cells: []
+        )
+        let softHyphenParagraph = try XCTUnwrap(service.paragraph(
+            from: [softHyphenLine, continuation],
+            bodySize: 11,
+            pageBounds: pageBounds
+        ))
+        XCTAssertEqual(softHyphenParagraph.text, "A wrapped example.")
         XCTAssertEqual(
             service.inferredAlignment(
                 bounds: titleLine.bounds,
@@ -1923,7 +1980,8 @@ final class ServicePureLogicCoverageTests: XCTestCase {
             sharedContainerURL: sharedContainer
         )
         XCTAssertEqual(duplicateSnapshot.items.count, 1)
-        XCTAssertEqual(duplicateSnapshot.discardedInvalidItemCount, 1)
+        XCTAssertEqual(duplicateSnapshot.discardedInvalidItemCount, 0)
+        XCTAssertTrue(duplicateSnapshot.deferredItems.isEmpty)
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: claimedA.containerURL.path
         ))

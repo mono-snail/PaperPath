@@ -1,0 +1,146 @@
+[
+  {
+    "file": "iphone-tools.png",
+    "size": [
+      1206,
+      2622
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-phone-ui",
+    "test": "PaperPathUITests/testLibraryAndWorkspaceSmokeFlow()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-phone-ui/E11ECFDB-3C4B-4EEB-BEE2-F53197B713FD.png",
+    "sha256": "87bab040ebe75a96fed1a6685fea4c0973bfe6be65653f99c0351a40002851a7"
+  },
+  {
+    "file": "iphone-workspace.png",
+    "size": [
+      1206,
+      2622
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-phone-ui",
+    "test": "PaperPathUITests/testLibraryAndWorkspaceSmokeFlow()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-phone-ui/E3B5F326-49AB-4BD4-BE52-D42A3972E222.png",
+    "sha256": "06149b3201aabde7f1c0a5a0105a0a862f1dfea2e0680cc450b35bc1369fe0cd"
+  },
+  {
+    "file": "iphone-privacy-review.png",
+    "size": [
+      1206,
+      2622
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-phone-ui",
+    "test": "PaperPathUITests/testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-phone-ui/7CB54662-8F40-4A5E-852D-26B5CF1FCCAC.png",
+    "sha256": "519858a3106a0eb1734837d101a24fb490bff00b85e63fbbae634149f83f2847"
+  },
+  {
+    "file": "iphone-redaction-confirmation.png",
+    "size": [
+      1206,
+      2622
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-phone-ui",
+    "test": "PaperPathUITests/testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-phone-ui/B5080630-A1A4-4BC5-B412-135D0F716C38.png",
+    "sha256": "c85e9bbfdf157d1f618ed2f2ca2a40ba0de0e432a3287e11d549a501af30e7a0"
+  },
+  {
+    "file": "iphone-resume-signing.png",
+    "size": [
+      1206,
+      2622
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-phone-ui",
+    "test": "PaperPathUITests/testInterruptedSignatureResumesAfterRelaunch()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-phone-ui/E8009A18-B7B7-4C38-9AF4-B4F75052D5E3.png",
+    "sha256": "8921279c7420f27206e62c96ab1ec69f9989cf93e3aeb421fa374affd2bab126"
+  },
+  {
+    "file": "ipad-reader-landscape.png",
+    "size": [
+      2752,
+      2064
+    ],
+    "source_orientation": 8,
+    "result_bundle": "final-ipad-ui",
+    "test": "PaperPathUITests/testIntroductionSampleRemainsReadableAfterRotation()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-ipad-ui/D29E182A-EB6A-43CE-AD74-88D2A0EE5B8E.png",
+    "sha256": "32b3c264c9aa7560a44b37aba41fe68b0d55601f90c2293ac02d646074bd98ff"
+  },
+  {
+    "file": "ipad-reader-portrait.png",
+    "size": [
+      2064,
+      2752
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-ipad-ui",
+    "test": "PaperPathUITests/testIntroductionSampleRemainsReadableAfterRotation()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-ipad-ui/4A8A7335-E0FD-4EA8-8508-C3863A81B1B0.png",
+    "sha256": "2bb9aa6c48837388a7f0735beba29133639cc2301171e349df97f61d5198232f"
+  },
+  {
+    "file": "ipad-privacy-review.png",
+    "size": [
+      2064,
+      2752
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-ipad-ui",
+    "test": "PaperPathUITests/testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-ipad-ui/C1A9E0D6-9AC2-49D9-8727-715084B35C15.png",
+    "sha256": "41596f0240d2929fa36d3a813873c085a56a0649a2880fe8239037438535e9ea"
+  },
+  {
+    "file": "ipad-scan-undo.png",
+    "size": [
+      2064,
+      2752
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-ipad-ui",
+    "test": "PaperPathUITests/testScanUnchangedCropPreservesPreviousUndo()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-ipad-ui/135B872F-9587-4C97-98D8-FA1C19C92753.png",
+    "sha256": "54251b6f77ba546a34533e0fb7593c07c2485d6feb0eeaa4d70856cb6e146058"
+  },
+  {
+    "file": "iphone-brightness.png",
+    "size": [
+      1206,
+      2622
+    ],
+    "source_orientation": 1,
+    "result_bundle": "phone-scan-layout",
+    "test": "PaperPathUITests/testScanBrightnessRepeatedValueFinishesPreview()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/phone-scan-layout/37C9FBCA-A3B3-43F7-89B5-D41ED01BEF20.png",
+    "sha256": "5c0039bf15fc103f1dc46a6f72054090e1cc884778b835adaaa14f7278ad9346"
+  },
+  {
+    "file": "iphone-se-brightness.png",
+    "size": [
+      750,
+      1334
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-se-scan-layout",
+    "test": "PaperPathUITests/testScanBrightnessRepeatedValueFinishesPreview()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-se-scan-layout/DA4E1499-4FBA-47C7-B4F4-33CCEDB2B646.png",
+    "sha256": "0aac81a88521cc683d0355d0040f800da3d4d52f3c8545d8b62d5b6c3782fa73"
+  },
+  {
+    "file": "ipad-brightness.png",
+    "size": [
+      2064,
+      2752
+    ],
+    "source_orientation": 1,
+    "result_bundle": "final-ipad-scan-layout",
+    "test": "PaperPathUITests/testScanBrightnessRepeatedValueFinishesPreview()",
+    "source": ".artifacts/app-excellence-50-v2-2026-09-27/screenshots/final-ipad-scan-layout/77E030AB-C86D-4DE8-B018-0592395BEDDF.png",
+    "sha256": "f10d62e2e26b497ce3853cc326c95c65954820a493bb60de4590933dce388d23"
+  }
+]

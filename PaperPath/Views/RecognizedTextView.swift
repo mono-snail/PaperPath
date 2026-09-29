@@ -384,6 +384,7 @@ struct RecognizedTextView: View {
     private func content(_ result: OCRResult) -> some View {
         let reviewPages = result.pagesNeedingReview
         let visiblePages = visibleRecognizedPages(result)
+        let copyablePageCount = visiblePages.filter { !$0.text.isEmpty }.count
         let containsReadableText = hasReadableText(in: result)
         let statusTitle = !containsReadableText
             ? "No readable text found"
@@ -398,61 +399,56 @@ struct RecognizedTextView: View {
             LazyVStack(alignment: .leading, spacing: PPSpacing.large) {
                 VStack(alignment: .leading, spacing: PPSpacing.small) {
                     Text(model.record(id: recordID)?.displayName ?? "")
-                        .font(PPType.document)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
                     Label(
                         statusTitle.localizedUI,
                         systemImage: !containsReadableText || !reviewPages.isEmpty
                             ? "exclamationmark.circle" : "checkmark.circle"
                     )
-                    .font(PPType.section)
+                    .font(PPType.display)
                     .foregroundStyle(!containsReadableText || !reviewPages.isEmpty ? PPColor.amber : PPColor.textPrimary)
                     Text(result.configuration.languageSummary)
                         .font(PPType.metadata)
                         .foregroundStyle(PPColor.textSecondary)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .ppCard()
                 recognizedCopyStatusLabel
                 if showsReviewOnly || !searchRequest.query.isEmpty {
-                    Button {
-                        copyRecognizedPages(visiblePages)
-                    } label: {
-                        Label("Copy filtered pages".localizedUI, systemImage: "doc.on.doc")
-                            .font(PPType.document)
+                    VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                        Button {
+                            copyRecognizedPages(visiblePages)
+                        } label: {
+                            Label(
+                                copyablePageCount == 1
+                                    ? "Copy text from 1 page".localizedUI
+                                    : AppLocalization.format(
+                                        "Copy text from %lld pages",
+                                        copyablePageCount
+                                    ),
+                                systemImage: "doc.on.doc"
+                            )
+                            .font(.subheadline.weight(.semibold))
                             .frame(minHeight: 44)
+                        }
+                        .disabled(
+                            displayedSearchRequest != searchRequest
+                                || !visiblePages.contains { !$0.text.isEmpty }
+                        )
+                        .accessibilityIdentifier("copyFilteredRecognizedPages")
+                        Text("Copies full page text, including words outside the current matches.".localizedUI)
+                            .font(.caption)
+                            .foregroundStyle(PPColor.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                    .disabled(
-                        displayedSearchRequest != searchRequest
-                            || !visiblePages.contains { !$0.text.isEmpty }
-                    )
-                    .accessibilityIdentifier("copyFilteredRecognizedPages")
                 }
 
                 if result.pages.contains(where: { !$0.blocks.isEmpty }) {
-                    ViewThatFits(in: .horizontal) {
-                        HStack(spacing: PPSpacing.small) {
-                            recognizedPagesFilter(
-                                pageCount: result.pages.count,
-                                reviewCount: reviewPages.count
-                            )
-                            searchableCopyButton
-                        }
-
-                        VStack(spacing: PPSpacing.small) {
-                            recognizedPagesFilter(
-                                pageCount: result.pages.count,
-                                reviewCount: reviewPages.count
-                            )
-                            searchableCopyButton
-                        }
-                    }
-                    if let creationErrorMessage {
-                        Label(
-                            creationErrorMessage,
-                            systemImage: "exclamationmark.circle"
-                        )
-                        .font(.caption)
-                        .foregroundStyle(PPColor.rose)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
+                    recognizedPagesFilter(
+                        pageCount: result.pages.count,
+                        reviewCount: reviewPages.count
+                    )
                 }
 
                 if !containsReadableText {
@@ -498,29 +494,53 @@ struct RecognizedTextView: View {
                                     .foregroundStyle(confidenceColor(page.confidence))
                             }
 
-                            Text(page.text.isEmpty ? "No readable text" : page.text)
-                                .font(.body)
-                                .foregroundStyle(
-                                    page.text.isEmpty
-                                        ? PPColor.textSecondary
-                                        : PPColor.textPrimary
-                                )
-                                .textSelection(.enabled)
-                                .frame(maxWidth: .infinity, alignment: .leading)
+                            ViewThatFits(in: .horizontal) {
+                                HStack(spacing: PPSpacing.large) {
+                                    recognizedPageActions(page)
+                                }
+                                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                                    recognizedPageActions(page)
+                                }
+                            }
+
+                            if showsReviewOnly, !page.blocks.isEmpty {
+                                DisclosureGroup {
+                                    recognizedPageText(page)
+                                        .padding(.vertical, PPSpacing.small)
+                                } label: {
+                                    Label(
+                                        "Full page text".localizedUI,
+                                        systemImage: "text.alignleft"
+                                    )
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(minHeight: 44)
+                                }
+                            } else {
+                                recognizedPageText(page)
+                            }
 
                             if !page.blocks.isEmpty {
                                 let reviewsAllLines = allLinesPageIndices.contains(page.pageIndex)
                                 let reviewBlocks = reviewsAllLines ? page.blocks : page.lowConfidenceBlocks
                                 let visibleLimit = reviewLineLimits[page.pageIndex, default: 6]
                                 VStack(alignment: .leading, spacing: 0) {
-                                    HStack(spacing: PPSpacing.small) {
-                                        Text(AppLocalization.format(
-                                            reviewsAllLines ? "%lld lines" : "Review %lld uncertain lines",
-                                            reviewBlocks.count
-                                        ))
+                                    let reviewLayout = dynamicTypeSize.ppPrefersExpandedLayout
+                                        ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.small))
+                                        : AnyLayout(HStackLayout(spacing: PPSpacing.small))
+                                    reviewLayout {
+                                        Text(
+                                            !reviewsAllLines && reviewBlocks.isEmpty
+                                                ? "No uncertain lines".localizedUI
+                                                : AppLocalization.format(
+                                                    reviewsAllLines ? "%lld lines" : "Review %lld uncertain lines",
+                                                    reviewBlocks.count
+                                                )
+                                        )
                                         .font(.caption.weight(.semibold))
                                         .foregroundStyle(PPColor.textSecondary)
-                                        Spacer()
+                                        if !dynamicTypeSize.ppPrefersExpandedLayout {
+                                            Spacer()
+                                        }
                                         Button {
                                             if reviewsAllLines {
                                                 allLinesPageIndices.remove(page.pageIndex)
@@ -598,14 +618,6 @@ struct RecognizedTextView: View {
                                 }
                             }
 
-                            ViewThatFits(in: .horizontal) {
-                                HStack(spacing: PPSpacing.large) {
-                                    recognizedPageActions(page)
-                                }
-                                VStack(alignment: .leading, spacing: PPSpacing.small) {
-                                    recognizedPageActions(page)
-                                }
-                            }
                         }
                         .padding(.vertical, PPSpacing.small)
                         .overlay(alignment: .bottom) {
@@ -620,6 +632,44 @@ struct RecognizedTextView: View {
             .padding(PPSpacing.regular)
             .frame(maxWidth: .infinity)
         }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if result.pages.contains(where: { !$0.blocks.isEmpty }) {
+                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                    if let creationErrorMessage {
+                        Label(
+                            creationErrorMessage,
+                            systemImage: "exclamationmark.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(PPColor.rose)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Text(
+                        "Adds searchable text to the whole PDF. The original stays unchanged."
+                            .localizedUI
+                    )
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    searchableCopyButton
+                }
+                .frame(maxWidth: 880)
+                .padding(.horizontal, PPSpacing.regular)
+                .padding(.vertical, PPSpacing.small)
+                .frame(maxWidth: .infinity)
+                .background(.bar)
+            }
+        }
+    }
+
+    private func recognizedPageText(_ page: OCRPageResult) -> some View {
+        Text(page.text.isEmpty ? "No readable text".localizedUI : page.text)
+            .font(.body)
+            .foregroundStyle(
+                page.text.isEmpty ? PPColor.textSecondary : PPColor.textPrimary
+            )
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -637,6 +687,7 @@ struct RecognizedTextView: View {
         .foregroundStyle(PPColor.cyan)
         .frame(minHeight: 44)
         .disabled(creationTask != nil)
+        .accessibilityValue(AppLocalization.format("Page %lld", page.pageIndex + 1))
         Button {
             copyRecognizedText(page.text)
         } label: {
@@ -646,6 +697,7 @@ struct RecognizedTextView: View {
         }
         .buttonStyle(.plain)
         .disabled(page.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .accessibilityValue(AppLocalization.format("Page %lld", page.pageIndex + 1))
     }
 
     private var searchRequest: OCRSearchRequest {
@@ -971,7 +1023,7 @@ struct RecognizedTextView: View {
             }
             .lineLimit(2)
         }
-        .buttonStyle(PPQuietButtonStyle(tint: PPColor.mint))
+        .buttonStyle(PPPrimaryButtonStyle())
         .disabled(
             model.isProcessing(recordID)
                 || creationTask != nil
@@ -1367,6 +1419,7 @@ struct OCRConfigurationSheet: View {
     @State private var recoveryRequest = UUID()
     @State private var isConfirmingReplacement = false
     @State private var pendingConfiguration: OCRRecognitionConfiguration?
+    @State private var showsCustomTerms: Bool
 
     init(
         recordID: UUID? = nil,
@@ -1392,6 +1445,9 @@ struct OCRConfigurationSheet: View {
             initialValue:
                 initialConfiguration.customWords
                     .joined(separator: "\n")
+        )
+        _showsCustomTerms = State(
+            initialValue: !initialConfiguration.customWords.isEmpty
         )
     }
 
@@ -1455,7 +1511,9 @@ struct OCRConfigurationSheet: View {
 
                         if mode == .selected {
                             LazyVGrid(
-                                columns: [
+                                columns: dynamicTypeSize.ppPrefersExpandedLayout
+                                    ? [GridItem(.flexible())]
+                                    : [
                                     GridItem(
                                         .adaptive(
                                             minimum: 148,
@@ -1499,15 +1557,7 @@ struct OCRConfigurationSheet: View {
                             }
                         }
 
-                        WorkflowSectionHeader(
-                            eyebrow: "LOCAL VOCABULARY",
-                            title: "Custom Terms",
-                            count: customWords.count,
-                            tint: customWordsAreValid
-                                ? PPColor.mint
-                                : PPColor.amber
-                        )
-
+                        DisclosureGroup(isExpanded: $showsCustomTerms) {
                         ViewThatFits(in: .horizontal) {
                             HStack(
                                 alignment: .top,
@@ -1539,6 +1589,23 @@ struct OCRConfigurationSheet: View {
                                 ? PPColor.textSecondary
                                 : Color.red
                         )
+                        } label: {
+                            HStack(spacing: PPSpacing.small) {
+                                Label(
+                                    "Custom Terms".localizedUI,
+                                    systemImage: "text.badge.plus"
+                                )
+                                Spacer()
+                                if !customWords.isEmpty {
+                                    Text("\(customWords.count)")
+                                        .monospacedDigit()
+                                        .foregroundStyle(PPColor.textSecondary)
+                                }
+                            }
+                            .font(.subheadline.weight(.semibold))
+                            .frame(minHeight: 44)
+                        }
+                        .accessibilityIdentifier("ocrCustomTerms")
 
                         if let configurationValidationMessage {
                             Label(

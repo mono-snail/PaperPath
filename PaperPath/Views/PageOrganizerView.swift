@@ -194,7 +194,7 @@ struct PageOrganizerView: View {
                             Image(systemName: "plus")
                         }
                         .disabled(isPageMutationBusy)
-                        .accessibilityLabel("Add pages")
+                        .accessibilityLabel("Add pages".localizedUI)
                     }
                 }
             }
@@ -252,6 +252,12 @@ struct PageOrganizerView: View {
         .alert("Go to page".localizedUI, isPresented: $isJumpingToPage) {
             TextField("Page number".localizedUI, text: $pageJumpText)
                 .keyboardType(.numberPad)
+                .submitLabel(.go)
+                .onSubmit {
+                    guard let page = validJumpPage else { return }
+                    pageToReveal = page
+                    isJumpingToPage = false
+                }
             Button("Go".localizedUI) { pageToReveal = validJumpPage }
                 .disabled(validJumpPage == nil)
             Button("Cancel", role: .cancel) {}
@@ -261,7 +267,11 @@ struct PageOrganizerView: View {
             ))
         }
         .onChange(of: pageJumpText) { _, value in
-            if value.count > 8 { pageJumpText = String(value.prefix(8)) }
+            let digits = value.filter(\.isNumber)
+            let bounded = String(digits.prefix(6))
+            if bounded != value {
+                pageJumpText = bounded
+            }
         }
         .confirmationDialog(
             "Remove this page?",
@@ -1136,7 +1146,9 @@ struct PageOrganizerView: View {
             return true
         }
         .accessibilityElement(children: .contain)
-        .accessibilityHint("Drag to reorder this page")
+        .accessibilityHint(
+            "Drag to reorder this page".localizedUI
+        )
     }
 
     private func tileAction(
@@ -1315,7 +1327,10 @@ struct PageOrganizerView: View {
         }
         .buttonStyle(.plain)
         .disabled(isPageMutationBusy)
-        .accessibilityLabel("More page actions")
+        .accessibilityLabel("More page actions".localizedUI)
+        .accessibilityValue(
+            AppLocalization.format("Page %lld", index + 1)
+        )
     }
 
     private var extractionBar: some View {
@@ -1378,7 +1393,7 @@ struct PageOrganizerView: View {
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.textPrimary))
             .accessibilityIdentifier("pageSelectionMenu")
-            .accessibilityLabel("Page selection")
+            .accessibilityLabel("Page selection".localizedUI)
             .accessibilityValue(
                 AppLocalization.format(
                     "%lld pages selected",
@@ -1510,7 +1525,7 @@ struct PageOrganizerView: View {
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.textPrimary))
             .accessibilityIdentifier("pageSelectionActions")
-            .accessibilityLabel("Page actions")
+            .accessibilityLabel("Page actions".localizedUI)
             .accessibilityValue(
                 AppLocalization.format(
                     "%lld pages selected",
@@ -1539,7 +1554,9 @@ struct PageOrganizerView: View {
                             >= (model.record(id: recordID)?
                                 .profile.pageCount ?? 0)
                 )
-                .accessibilityLabel("Remove selected pages")
+                .accessibilityLabel(
+                    "Remove selected pages".localizedUI
+                )
                 .accessibilityHint(
                     "Asks for confirmation before changing the private working copy."
                         .localizedUI
@@ -1924,7 +1941,9 @@ struct PageOrganizerView: View {
               !model.isProcessing(recordID),
               !selectedIndices.isEmpty,
               scenePhase == .active,
-              UIApplication.shared.isProtectedDataAvailable
+              UIApplication.shared.isProtectedDataAvailable,
+              let sourceRevisionID = model.record(id: recordID)?
+                .contentRevisionID
         else { return }
         pageMutationErrorMessage = nil
         pageMutationStopRequested = false
@@ -1939,12 +1958,19 @@ struct PageOrganizerView: View {
                 }
             }
             guard mutationGeneration == generation,
-                  !Task.isCancelled
+                  !Task.isCancelled,
+                  model.record(id: recordID)?.contentRevisionID
+                    == sourceRevisionID
             else { return }
-            let created = await model.extractPages(
-                recordID: recordID,
-                indices: indices
-            )
+            let created = await model.withFeedbackTarget(
+                paperPathSceneID
+            ) {
+                await model.extractPages(
+                    recordID: recordID,
+                    indices: indices,
+                    expectedContentRevisionID: sourceRevisionID
+                )
+            }
             guard mutationGeneration == generation else { return }
             let wasStopped =
                 pageMutationStopRequested || Task.isCancelled
@@ -2118,6 +2144,8 @@ private struct PageReplacementSheet: View {
         PDFPagePreparationItem?
     @State private var destinationGeometryItem:
         PDFPagePreparationItem?
+    @State private var sourceGeometryRevisionID: UUID?
+    @State private var destinationGeometryRevisionID: UUID?
     @State private var externalPreparationTask:
         Task<Void, Never>?
     @State private var externalPreparationGeneration = UUID()
@@ -2216,6 +2244,7 @@ private struct PageReplacementSheet: View {
         }
         .task(id: destinationGeometryRequestID) {
             destinationGeometryItem = nil
+            destinationGeometryRevisionID = nil
             let revision = model.record(id: destinationRecordID)?
                 .contentRevisionID
             let loaded = await model.pageGeometryItem(
@@ -2227,9 +2256,11 @@ private struct PageReplacementSheet: View {
                     .contentRevisionID == revision
             else { return }
             destinationGeometryItem = loaded
+            destinationGeometryRevisionID = revision
         }
         .task(id: sourceGeometryRequestID) {
             sourceGeometryItem = nil
+            sourceGeometryRevisionID = nil
             switch sourceMode {
             case .library:
                 guard let sourceRecordID else { return }
@@ -2246,6 +2277,7 @@ private struct PageReplacementSheet: View {
                         .contentRevisionID == revision
                 else { return }
                 sourceGeometryItem = loaded
+                sourceGeometryRevisionID = revision
             case .files, .photos, .camera:
                 guard let externalSource else { return }
                 let loaded = await model.pageGeometryItem(
@@ -3127,6 +3159,8 @@ private struct PageReplacementSheet: View {
                         && (
                             effectiveSourceURL == nil
                                 || isPreparingExternalSource
+                                || destinationGeometryItem == nil
+                                || sourceGeometryItem == nil
                                 || model.isProcessing(
                                     destinationRecordID
                                 )
@@ -3201,7 +3235,13 @@ private struct PageReplacementSheet: View {
               !replacementCommittedAfterStop,
               !model.isProcessing(destinationRecordID),
               scenePhase == .active,
-              UIApplication.shared.isProtectedDataAvailable
+              UIApplication.shared.isProtectedDataAvailable,
+              let destinationRevisionID =
+                destinationGeometryRevisionID,
+              model.record(id: destinationRecordID)?
+                .contentRevisionID == destinationRevisionID,
+              destinationGeometryItem != nil,
+              sourceGeometryItem != nil
         else { return }
         replacementErrorMessage = nil
         replacementStopRequested = false
@@ -3220,12 +3260,22 @@ private struct PageReplacementSheet: View {
             ) {
                 switch sourceMode {
                 case .library:
-                    guard let sourceRecordID else { return false }
+                    guard let sourceRecordID,
+                          let sourceRevisionID =
+                            sourceGeometryRevisionID,
+                          model.record(id: sourceRecordID)?
+                            .contentRevisionID
+                            == sourceRevisionID
+                    else { return false }
                     return await model.replacePage(
                         recordID: destinationRecordID,
                         index: destinationPageIndex,
                         from: sourceRecordID,
-                        sourceIndex: sourcePageIndex
+                        sourceIndex: sourcePageIndex,
+                        expectedDestinationContentRevisionID:
+                            destinationRevisionID,
+                        expectedSourceContentRevisionID:
+                            sourceRevisionID
                     )
                 case .files, .photos, .camera:
                     guard let externalSource else { return false }
@@ -3233,7 +3283,9 @@ private struct PageReplacementSheet: View {
                         recordID: destinationRecordID,
                         index: destinationPageIndex,
                         from: externalSource,
-                        sourceIndex: sourcePageIndex
+                        sourceIndex: sourcePageIndex,
+                        expectedContentRevisionID:
+                            destinationRevisionID
                     )
                 }
             }
@@ -3342,14 +3394,42 @@ private struct PageReplacementSheet: View {
     private func preparePhotoSource(_ item: PhotosPickerItem) {
         let generation = beginExternalPreparation()
         externalPreparationTask = Task { @MainActor in
-            guard let transfer = try? await item.loadTransferable(
-                type: ProtectedPhotoTransfer.self
-            )
-            else {
+            let transfer: ProtectedPhotoTransfer?
+            do {
+                transfer = try await item.loadTransferable(
+                    type: ProtectedPhotoTransfer.self
+                )
+            } catch is CancellationError {
+                return
+            } catch {
                 guard !Task.isCancelled,
                       externalPreparationGeneration == generation,
-                      sourceMode == .photos
+                      sourceMode == .photos,
+                      scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
                 else { return }
+                photoItem = nil
+                finishExternalPreparation(generation)
+                if LocalFileSecurity.isInsufficientStorageError(error) {
+                    model.present(
+                        PaperPathError.insufficientStorage,
+                        in: paperPathSceneID
+                    )
+                    return
+                }
+                model.present(
+                    PaperPathError.unreadableImage,
+                    in: paperPathSceneID
+                )
+                return
+            }
+            guard !Task.isCancelled,
+                  externalPreparationGeneration == generation,
+                  sourceMode == .photos,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            guard let transfer else {
                 photoItem = nil
                 finishExternalPreparation(generation)
                 model.present(
@@ -3378,7 +3458,9 @@ private struct PageReplacementSheet: View {
             }
             guard !Task.isCancelled,
                   externalPreparationGeneration == generation,
-                  sourceMode == .photos
+                  sourceMode == .photos,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
             else { return }
             isPreparingExternalSource = false
             photoItem = nil
@@ -5541,6 +5623,12 @@ private struct PageCropEditorView: View {
     private var cropControls: some View {
         ScrollView {
             VStack(spacing: PPSpacing.small) {
+                OperationBoundaryNotice(
+                    title: "Cropping changes visibility, not the source content",
+                    detail: "Other PDF tools may reveal content outside the crop box. Use Redact when information must be permanently removed.",
+                    identifier: "pageCropBoundary",
+                    symbol: "rectangle.dashed.badge.record"
+                )
                 cropPresetControl
                 cropEdgeControls
 
@@ -5837,6 +5925,7 @@ private struct PageCropEditorView: View {
 
 private struct PageRangeSelectionSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     let pageCount: Int
     let onSelect: (Set<Int>) -> Void
@@ -5859,11 +5948,7 @@ private struct PageRangeSelectionSheet: View {
         NavigationStack {
             Form {
                 Section {
-                    Picker("Page selection".localizedUI, selection: $usesPageNumbers) {
-                        Text("Range".localizedUI).tag(false)
-                        Text("Page numbers".localizedUI).tag(true)
-                    }
-                    .pickerStyle(.segmented)
+                    selectionModePicker
                     if usesPageNumbers {
                         TextField("1, 3-5, 9", text: $pageNumbers)
                             .keyboardType(.numbersAndPunctuation)
@@ -5920,6 +6005,24 @@ private struct PageRangeSelectionSheet: View {
     private var selection: Set<Int> {
         if !usesPageNumbers { return Set((startPage - 1)..<endPage) }
         return Set((try? PDFPageSelection.parse(pageNumbers, pageCount: pageCount)) ?? [])
+    }
+
+    @ViewBuilder
+    private var selectionModePicker: some View {
+        let picker = Picker(
+            "Page selection".localizedUI,
+            selection: $usesPageNumbers
+        ) {
+            Text("Range".localizedUI).tag(false)
+            Text("Page numbers".localizedUI).tag(true)
+        }
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            picker
+                .pickerStyle(.menu)
+                .frame(minHeight: 44)
+        } else {
+            picker.pickerStyle(.segmented)
+        }
     }
 
     private var selectionError: String? {

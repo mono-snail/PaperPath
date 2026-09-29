@@ -1,0 +1,36 @@
+{
+  "configurations": [
+    {
+      "id": "3D8B8392-C73C-4E0F-9A7C-4C45786932E2",
+      "name": "Local StoreKit",
+      "options": {}
+    }
+  ],
+  "defaultOptions": {
+    "environmentVariableEntries": [
+      {
+        "key": "PAPERPATH_LOCAL_STOREKIT",
+        "value": "1"
+      }
+    ],
+    "targetForVariableExpansion": {
+      "containerPath": "container:PaperPath.xcodeproj",
+      "identifier": "8770A2D61788C95F71631A80",
+      "name": "PaperPath"
+    }
+  },
+  "testTargets": [
+    {
+      "parallelizable": false,
+      "selectedTests": [
+        "ReleaseReadinessUITests/testPendingPurchaseSurvivesRecheckAndReopenThenApproves()"
+      ],
+      "target": {
+        "containerPath": "container:PaperPath.xcodeproj",
+        "identifier": "260FD09801B22CA53C6D2E41",
+        "name": "PaperPathUITests"
+      }
+    }
+  ],
+  "version": 1
+}

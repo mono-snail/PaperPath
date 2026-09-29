@@ -102,7 +102,7 @@ struct BatchCompressionView: View {
                         if operationTask != nil {
                             interruptBatchCompression()
                         } else if importTask != nil {
-                            cancelImport()
+                            cancelImport(showsNotice: true)
                         } else {
                             dismiss()
                         }
@@ -120,8 +120,17 @@ struct BatchCompressionView: View {
             allowedContentTypes: [.pdf],
             allowsMultipleSelection: true
         ) { result in
-            guard case .success(let urls) = result, !urls.isEmpty else {
-                if case .failure(let error) = result {
+            let urls: [URL]
+            switch result {
+            case .success(let selectedURLs):
+                var seenPaths = Set<String>()
+                urls = selectedURLs.filter {
+                    seenPaths.insert(
+                        $0.standardizedFileURL.path
+                    ).inserted
+                }
+            case .failure(let error):
+                if !Self.isFileImportCancellation(error) {
                     model.present(error, in: paperPathSceneID)
                     presentImportError(
                         "The selected PDFs could not be imported. Try again."
@@ -130,15 +139,20 @@ struct BatchCompressionView: View {
                 }
                 return
             }
+            guard !urls.isEmpty else { return }
             cancelImport()
             importErrorMessage = nil
             let generation = UUID()
             importGeneration = generation
             importTask = Task { @MainActor in
-                let imported = await model.importPDFs(
-                    from: urls,
-                    progressID: generation
-                )
+                let imported = await model.withFeedbackTarget(
+                    paperPathSceneID
+                ) {
+                    await model.importPDFs(
+                        from: urls,
+                        progressID: generation
+                    )
+                }
                 guard !Task.isCancelled,
                       importGeneration == generation
                 else { return }
@@ -165,6 +179,15 @@ struct BatchCompressionView: View {
         }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .background else { return }
+            cancelImport()
+            interruptBatchCompression(invalidateResult: true)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication
+                    .protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
             cancelImport()
             interruptBatchCompression(invalidateResult: true)
         }
@@ -234,6 +257,12 @@ struct BatchCompressionView: View {
                 .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
+
+            OperationBoundaryNotice(
+                title: "Image-based compressed copies",
+                detail: "Searchable text, links, forms, and editable annotations are removed from every compressed copy.",
+                identifier: "batchCompressionOutputBoundary"
+            )
         }
     }
 
@@ -354,7 +383,7 @@ struct BatchCompressionView: View {
             Label("Add from Files", systemImage: "folder.badge.plus")
         }
         .buttonStyle(PPQuietButtonStyle(tint: PPColor.accent))
-        .disabled(operationTask != nil || model.isImporting)
+        .disabled(hasActiveTask)
     }
 
     private func sourceRow(_ record: DocumentRecord) -> some View {
@@ -499,18 +528,12 @@ struct BatchCompressionView: View {
     private var resultHeader: some View {
         WorkflowCommandHeader(
             eyebrow: "COMPRESSION RESULT",
-            title: AppLocalization.format(
-                "%lld of %lld ready",
-                successfulCount,
-                results.count
-            ),
-            detail: "Each result is a separate private PDF.",
-            symbol: successfulCount == results.count
+            title: batchResultTitle,
+            detail: batchResultDetail,
+            symbol: failedCount == 0
                 ? "checkmark.circle.fill"
                 : "exclamationmark.triangle.fill",
-            tint: successfulCount == results.count
-                ? PPColor.mint
-                : PPColor.amber,
+            tint: failedCount == 0 ? PPColor.mint : PPColor.amber,
             metrics: [
                 WorkflowMetric(
                     value: formattedResultInputSize,
@@ -537,19 +560,24 @@ struct BatchCompressionView: View {
     private func resultRow(
         _ result: CompressionTaskResult
     ) -> some View {
-        Button {
+        let alreadyOptimized = isAlreadyOptimized(result)
+        return Button {
             guard let outputID = result.outputID else { return }
             onOpen(DocumentRoute(recordID: outputID))
         } label: {
             HStack(spacing: PPSpacing.medium) {
                 Image(
-                    systemName: result.outputID == nil
-                        ? "xmark.circle.fill"
-                        : "checkmark.circle.fill"
+                    systemName: result.outputID != nil
+                        ? "checkmark.circle.fill"
+                        : alreadyOptimized
+                            ? "checkmark.shield.fill"
+                            : "xmark.circle.fill"
                 )
                 .font(.title3)
                 .foregroundStyle(
-                    result.outputID == nil ? Color.red : PPColor.mint
+                    result.outputID == nil && !alreadyOptimized
+                        ? Color.red
+                        : PPColor.mint
                 )
                 .frame(width: 30)
 
@@ -695,12 +723,12 @@ struct BatchCompressionView: View {
                     )
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
-                .disabled(selectedIDs.isEmpty || model.isImporting)
+                .disabled(selectedIDs.isEmpty || hasActiveTask)
                 .accessibilityHint(
                     selectedIDs.isEmpty
                         ? "Choose at least one unlocked PDF."
                             .localizedUI
-                        : model.isImporting
+                        : hasActiveTask
                             ? "Wait for PDF import to finish."
                                 .localizedUI
                             : "Creates a separate compressed copy for each selected PDF."
@@ -749,6 +777,43 @@ struct BatchCompressionView: View {
         results.filter { $0.outputID != nil }.count
     }
 
+    private var alreadyOptimizedCount: Int {
+        results.filter(isAlreadyOptimized).count
+    }
+
+    private var failedCount: Int {
+        max(0, results.count - successfulCount - alreadyOptimizedCount)
+    }
+
+    private var batchResultTitle: String {
+        if successfulCount == 0,
+           alreadyOptimizedCount == results.count,
+           !results.isEmpty {
+            return "Originals already smaller".localizedUI
+        }
+        return AppLocalization.format(
+            "%lld smaller · %lld original%@ kept",
+            successfulCount,
+            alreadyOptimizedCount,
+            alreadyOptimizedCount == 1 ? "" : "s"
+        )
+    }
+
+    private var batchResultDetail: String {
+        if failedCount > 0 {
+            return AppLocalization.format(
+                "%lld PDF%@ could not be processed.",
+                failedCount,
+                failedCount == 1 ? "" : "s"
+            )
+        }
+        if alreadyOptimizedCount > 0 {
+            return "PaperPath did not create copies that would be larger than their originals."
+                .localizedUI
+        }
+        return "Each result is a separate private PDF.".localizedUI
+    }
+
     private var retryableCompressionIDs: [UUID] {
         results.compactMap { result in
             guard result.outputID == nil,
@@ -785,17 +850,29 @@ struct BatchCompressionView: View {
     }
 
     private var formattedResultOutputSize: String {
-        ByteCountFormatter.string(
+        guard successfulCount > 0 else {
+            return "No new copy".localizedUI
+        }
+        return ByteCountFormatter.string(
             fromByteCount: resultOutputBytes,
             countStyle: .file
         )
     }
 
     private var resultSavings: String {
-        guard resultInputBytes > 0,
-              resultOutputBytes < resultInputBytes
+        let compressedInputBytes = results.reduce(Int64.zero) {
+            partial,
+            result in
+            guard result.outputID != nil else { return partial }
+            let (next, overflow) = partial.addingReportingOverflow(
+                max(0, result.sourceByteCount)
+            )
+            return overflow ? .max : next
+        }
+        guard compressedInputBytes > 0,
+              resultOutputBytes < compressedInputBytes
         else { return "0%" }
-        return "\(Int((1 - Double(resultOutputBytes) / Double(resultInputBytes)) * 100))%"
+        return "\(Int((1 - Double(resultOutputBytes) / Double(compressedInputBytes)) * 100))%"
     }
 
     private func toggle(_ id: UUID) {
@@ -807,7 +884,10 @@ struct BatchCompressionView: View {
         }
     }
 
-    private func cancelImport() {
+    private func cancelImport(
+        showsNotice: Bool = false
+    ) {
+        let hadActiveImport = importTask != nil
         let cancelledProgressID = importGeneration
         importGeneration = UUID()
         importTask?.cancel()
@@ -815,6 +895,11 @@ struct BatchCompressionView: View {
         model.clearForegroundImportProgress(
             cancelledProgressID
         )
+        if showsNotice, hadActiveImport {
+            model[noticeFor: paperPathSceneID] =
+                "PDF import stopped · finished copies stay in the Library"
+                    .localizedUI
+        }
     }
 
     private func presentImportError(_ message: String) {
@@ -878,6 +963,12 @@ struct BatchCompressionView: View {
             output,
             savings
         )
+    }
+
+    private func isAlreadyOptimized(
+        _ result: CompressionTaskResult
+    ) -> Bool {
+        result.outputID == nil && result.issue?.code == "V-102"
     }
 
     private func startCompression(
@@ -950,6 +1041,47 @@ struct BatchCompressionView: View {
             if Task.isCancelled { break }
             guard operationGeneration == generation else { return }
             currentRecordID = source.id
+            do {
+                let estimate = try await model.compressionEstimate(
+                    recordID: source.id,
+                    quality: quality,
+                    expectedContentRevisionID:
+                        source.contentRevisionID
+                )
+                guard operationGeneration == generation else { return }
+                if !estimate.isBeneficial {
+                    let issue = PDFBatchDeliveryIssue
+                        .compressionNotBeneficial(
+                            AppLocalization.userFacingErrorDescription(
+                                PaperPathError.compressionNotBeneficial(
+                                    sourceByteCount:
+                                        estimate.sourceByteCount,
+                                    candidateByteCount:
+                                        estimate.estimatedByteCount
+                                )
+                            )
+                        )
+                    replaceCompressionResult(
+                        CompressionTaskResult(
+                            sourceID: source.id,
+                            sourceName: source.displayName,
+                            sourceByteCount:
+                                source.profile.byteCount,
+                            outputID: nil,
+                            outputName: nil,
+                            outputByteCount: nil,
+                            issue: issue
+                        )
+                    )
+                    completedCount += 1
+                    continue
+                }
+            } catch is CancellationError {
+                break
+            } catch {
+                // Final output verification remains the fallback when
+                // a lightweight estimate is unavailable.
+            }
             var issue: PDFBatchDeliveryIssue?
             let created = await model.createCompressedCopy(
                 recordID: source.id,
@@ -977,11 +1109,19 @@ struct BatchCompressionView: View {
         }
 
         guard !Task.isCancelled else { return }
-        model[noticeFor: paperPathSceneID] = AppLocalization.format(
-            "%lld compressed cop%@ ready",
-            successfulCount,
-            successfulCount == 1 ? "y" : "ies"
-        )
+        if successfulCount == 0,
+           alreadyOptimizedCount == results.count,
+           !results.isEmpty {
+            model[noticeFor: paperPathSceneID] =
+                "The selected PDFs are already smaller. PaperPath kept the originals."
+                    .localizedUI
+        } else {
+            model[noticeFor: paperPathSceneID] = AppLocalization.format(
+                "%lld compressed cop%@ ready",
+                successfulCount,
+                successfulCount == 1 ? "y" : "ies"
+            )
+        }
     }
 
     private func replaceCompressionResult(
@@ -994,6 +1134,17 @@ struct BatchCompressionView: View {
         } else {
             results.append(result)
         }
+    }
+
+    private nonisolated static func isFileImportCancellation(
+        _ error: Error
+    ) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSCocoaErrorDomain
+            && nsError.code == NSUserCancelledError
     }
 }
 
@@ -1014,6 +1165,7 @@ struct CompressionSheet: View {
     @State private var estimateFailed = false
     @State private var estimateTask: Task<Void, Never>?
     @State private var estimateGeneration = UUID()
+    @State private var operationNoticeMessage: String?
     @State private var operationErrorMessage: String?
     @State private var errorFeedback = 0
     @State private var sourceContentRevisionID: UUID?
@@ -1084,13 +1236,14 @@ struct CompressionSheet: View {
                                     vertical: true
                                 )
 
+                            OperationBoundaryNotice(
+                                title: "The whole copy becomes image-based",
+                                detail: "Searchable text, links, forms, and editable annotations are removed from the compressed copy.",
+                                identifier: "compressionOutputBoundary"
+                            )
+
                             if let estimate {
-                                Label(
-                                    estimate.summary,
-                                    systemImage: "info.circle"
-                                )
-                                .font(.caption)
-                                .foregroundStyle(PPColor.textSecondary)
+                                compressionEstimateStatus(estimate)
                             }
                             if estimateFailed {
                                 HStack(spacing: PPSpacing.small) {
@@ -1111,6 +1264,18 @@ struct CompressionSheet: View {
                                         )
                                     )
                                 }
+                            }
+                            if let operationNoticeMessage {
+                                Label(
+                                    operationNoticeMessage,
+                                    systemImage: "checkmark.shield.fill"
+                                )
+                                .font(.caption)
+                                .foregroundStyle(PPColor.mint)
+                                .fixedSize(
+                                    horizontal: false,
+                                    vertical: true
+                                )
                             }
                             if let operationErrorMessage {
                                 Label(
@@ -1147,20 +1312,17 @@ struct CompressionSheet: View {
                         startCompression()
                     } label: {
                         Label(
-                            operationStopRequested
-                                ? "Finishing current file commit"
-                                : operationTask == nil
-                                    ? "Create Compressed Copy"
-                                    : "Compressing",
-                            systemImage: operationTask == nil
-                                ? "arrow.down.right.and.arrow.up.left"
-                                : "hourglass"
+                            compressionActionTitle,
+                            systemImage: compressionActionSymbol
                         )
                     }
                     .buttonStyle(PPPrimaryButtonStyle())
-                    .disabled(operationTask != nil)
+                    .disabled(compressionActionDisabled)
                     .keyboardShortcut(.defaultAction)
                     .accessibilityHint(compressionActionHint)
+                    .accessibilityIdentifier(
+                        "compressionCreateAction"
+                    )
                 }
                 .padding(.horizontal, PPSpacing.regular)
                 .padding(.vertical, PPSpacing.small)
@@ -1243,6 +1405,50 @@ struct CompressionSheet: View {
         .sensoryFeedback(.error, trigger: errorFeedback)
     }
 
+    @ViewBuilder
+    private func compressionEstimateStatus(
+        _ estimate: PDFCompressionEstimate
+    ) -> some View {
+        if estimate.isBeneficial {
+            Label(
+                estimate.summary,
+                systemImage: "info.circle"
+            )
+            .font(.caption)
+            .foregroundStyle(PPColor.textSecondary)
+        } else {
+            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                Label(
+                    "Original is already smaller".localizedUI,
+                    systemImage: "checkmark.shield.fill"
+                )
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PPColor.mint)
+
+                Text(
+                    AppLocalization.format(
+                        "At this quality, rebuilding the PDF is estimated at %@ instead of %@. PaperPath will keep the smaller original.",
+                        estimate.formattedSize,
+                        estimate.formattedSourceSize
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, PPSpacing.small)
+            .padding(.vertical, PPSpacing.small)
+            .background(PPColor.mint.opacity(0.08))
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(PPColor.mint)
+                    .frame(width: 2)
+            }
+            .accessibilityIdentifier("compressionAlreadyOptimized")
+        }
+    }
+
     private func startEstimate() {
         guard let sourceContentRevisionID,
               model.record(id: recordID)?.contentRevisionID
@@ -1254,6 +1460,7 @@ struct CompressionSheet: View {
         estimateTask?.cancel()
         estimate = nil
         estimateFailed = false
+        operationNoticeMessage = nil
         operationErrorMessage = nil
         estimateTask = Task { @MainActor in
             defer {
@@ -1306,24 +1513,28 @@ struct CompressionSheet: View {
         operationTask?.cancel()
         if invalidateResult {
             operationTask = nil
+            operationNoticeMessage = nil
             operationErrorMessage = nil
         }
     }
 
     private func startCompression() {
         guard operationTask == nil,
+              estimate?.isBeneficial == true || estimateFailed,
               let sourceContentRevisionID,
               model.record(id: recordID)?.contentRevisionID
                 == sourceContentRevisionID,
               scenePhase == .active,
               UIApplication.shared.isProtectedDataAvailable
         else { return }
+        operationNoticeMessage = nil
         operationErrorMessage = nil
         operationStopRequested = false
         let generation = UUID()
         operationGeneration = generation
         let requestedQuality = quality
         operationTask = Task { @MainActor in
+            var operationIssue: PDFBatchDeliveryIssue?
             let created = await model.withFeedbackTarget(
                 paperPathSceneID
             ) {
@@ -1331,8 +1542,11 @@ struct CompressionSheet: View {
                     recordID: recordID,
                     quality: requestedQuality,
                     expectedContentRevisionID:
-                        sourceContentRevisionID
-                )
+                        sourceContentRevisionID,
+                    presentsFeedback: false
+                ) {
+                    operationIssue = $0
+                }
             }
             guard operationGeneration == generation else { return }
             let wasStopped =
@@ -1349,10 +1563,16 @@ struct CompressionSheet: View {
             }
             guard let created else {
                 if !Task.isCancelled {
-                    operationErrorMessage =
-                        "The compressed copy could not be created. Your quality setting is unchanged."
-                            .localizedUI
-                    errorFeedback += 1
+                    if operationIssue?.code == "V-102" {
+                        operationNoticeMessage = operationIssue?
+                            .message.localizedUI
+                    } else {
+                        operationErrorMessage = operationIssue?
+                            .message.localizedUI
+                            ?? "The compressed copy could not be created. Your quality setting is unchanged."
+                                .localizedUI
+                        errorFeedback += 1
+                    }
                 }
                 return
             }
@@ -1364,8 +1584,48 @@ struct CompressionSheet: View {
         if operationTask != nil {
             return "Wait for compression to finish.".localizedUI
         }
+        if estimate?.isBeneficial == false {
+            return "The original is already smaller, so no larger copy will be created."
+                .localizedUI
+        }
+        if estimate == nil, !estimateFailed {
+            return "Wait for PaperPath to check the expected file size."
+                .localizedUI
+        }
         return "Creates a separate compressed private copy."
             .localizedUI
+    }
+
+    private var compressionActionTitle: String {
+        if operationStopRequested {
+            return "Finishing current file commit".localizedUI
+        }
+        if operationTask != nil {
+            return "Compressing".localizedUI
+        }
+        if estimate == nil, !estimateFailed {
+            return "Checking PDF".localizedUI
+        }
+        if estimate?.isBeneficial == false {
+            return "Original Is Already Smaller".localizedUI
+        }
+        return "Create Compressed Copy".localizedUI
+    }
+
+    private var compressionActionSymbol: String {
+        if operationTask != nil {
+            return "hourglass"
+        }
+        if estimate?.isBeneficial == false {
+            return "checkmark.shield.fill"
+        }
+        return "arrow.down.right.and.arrow.up.left"
+    }
+
+    private var compressionActionDisabled: Bool {
+        operationTask != nil
+            || (estimate == nil && !estimateFailed)
+            || estimate?.isBeneficial == false
     }
 }
 
@@ -1404,6 +1664,7 @@ struct ProtectionSheet: View {
     @State private var confirmation = ""
     @State private var permissions = PDFProtectionPermissions.restricted
     @State private var permissionProfile = PermissionProfile.restricted
+    @State private var showsPermissionDetails = false
     @State private var operationTask: Task<Void, Never>?
     @State private var operationGeneration = UUID()
     @State private var operationStopRequested = false
@@ -1419,6 +1680,21 @@ struct ProtectionSheet: View {
         if password.count < 8 { return "Use at least eight characters." }
         if password != confirmation { return "Passwords do not match." }
         return nil
+    }
+
+    private var visibleValidationMessage: String? {
+        if focusedPasswordField == .password, password.count < 8 {
+            return nil
+        }
+        if confirmation.isEmpty, password.count >= 8 {
+            return nil
+        }
+        if focusedPasswordField == .confirmation,
+           confirmation.count < password.count,
+           password.hasPrefix(confirmation) {
+            return nil
+        }
+        return validationMessage
     }
 
     var body: some View {
@@ -1440,82 +1716,73 @@ struct ProtectionSheet: View {
                             showsOnDevice: true
                         )
 
-                        WorkflowSectionHeader(
-                            eyebrow: "OPEN PASSWORD",
-                            title: "Required to open"
-                        )
-                        securePasteField(
-                            "Password",
-                            text: $password,
-                            field: .password
-                        )
-                        securePasteField(
-                            "Confirm password",
-                            text: $confirmation,
-                            field: .confirmation
-                        )
-                        if let validationMessage {
-                            Text(validationMessage.localizedUI)
+                        VStack(alignment: .leading, spacing: PPSpacing.small) {
+                            WorkflowSectionHeader(
+                                eyebrow: "OPEN PASSWORD",
+                                title: "Required to open"
+                            )
+                            Text("Use at least eight characters.".localizedUI)
+                                .font(.caption)
+                                .foregroundStyle(PPColor.textSecondary)
+                            securePasteField(
+                                "Password",
+                                text: $password,
+                                field: .password
+                            )
+                            securePasteField(
+                                "Confirm password",
+                                text: $confirmation,
+                                field: .confirmation
+                            )
+                            if let visibleValidationMessage {
+                                Label(
+                                    visibleValidationMessage.localizedUI,
+                                    systemImage: "exclamationmark.circle"
+                                )
                                 .font(.caption)
                                 .foregroundStyle(PPColor.amber)
-                        }
-                        Text(
-                            "PaperPath does not store this password. Losing it can make the new copy inaccessible."
-                        )
-                        .font(.caption)
-                        .foregroundStyle(PPColor.textSecondary)
-
-                        WorkflowSectionHeader(
-                            eyebrow: "PERMISSIONS",
-                            title: "Allowed after opening",
-                            count: allowedPermissionCount,
-                            tint: PPColor.cyan
-                        )
-                        permissionProfilePicker
-
-                    Toggle(
-                        "Print",
-                        isOn: $permissions.allowsPrinting
-                    )
-                    Toggle(
-                        "Copy text and images",
-                        isOn: $permissions.allowsCopying
-                    )
-                    Toggle(
-                        "Comments and annotations",
-                        isOn: Binding(
-                            get: {
-                                permissions.allowsCommenting
-                            },
-                            set: { enabled in
-                                permissions.allowsCommenting = enabled
-                                if enabled {
-                                    permissions.allowsFormFilling = true
-                                }
+                                .accessibilityIdentifier("protectionValidation")
                             }
+                            Text(
+                                "PaperPath does not store this password. Losing it can make the new copy inaccessible."
+                            )
+                                .font(.caption)
+                                .foregroundStyle(PPColor.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        VStack(alignment: .leading, spacing: PPSpacing.small) {
+                            WorkflowSectionHeader(
+                                eyebrow: "PERMISSIONS",
+                                title: "Allowed after opening",
+                                count: allowedPermissionCount,
+                                tint: PPColor.cyan
+                            )
+                            permissionProfilePicker
+                            Text(permissionProfileDetail.localizedUI)
+                                .font(.subheadline)
+                                .foregroundStyle(PPColor.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        DisclosureGroup(isExpanded: $showsPermissionDetails) {
+                            permissionDetails
+                        } label: {
+                            Label(
+                                "Customize permissions".localizedUI,
+                                systemImage: "slider.horizontal.3"
+                            )
+                            .font(.subheadline.weight(.semibold))
+                            .frame(minHeight: 44)
+                        }
+                        .accessibilityIdentifier("protectionPermissionDetails")
+
+                        OperationBoundaryNotice(
+                            title: "Opening and permissions are enforced differently",
+                            detail: "The open password encrypts access. Other restrictions depend on the receiving PDF reader honoring standard permission flags; accessibility text remains available.",
+                            identifier: "protectionPermissionBoundary",
+                            symbol: "lock.trianglebadge.exclamationmark"
                         )
-                    )
-                    Toggle(
-                        "Fill forms",
-                        isOn: $permissions.allowsFormFilling
-                    )
-                    .disabled(permissions.allowsCommenting)
-                    .accessibilityHint(
-                        permissions.allowsCommenting
-                            ? "Form filling is required when comments are allowed."
-                                .localizedUI
-                            : "Controls whether forms can be filled after opening."
-                                .localizedUI
-                    )
-                    Toggle(
-                        "Insert, remove, or rotate pages",
-                        isOn: $permissions.allowsPageChanges
-                    )
-                        Text(
-                            "Accessibility text access remains enabled. A separate owner key enforces permissions and is not stored."
-                        )
-                        .font(.caption)
-                        .foregroundStyle(PPColor.textSecondary)
 
                     if let progress = model.progress(for: recordID) {
                         LocalOperationProgressView(progress: progress)
@@ -1574,6 +1841,9 @@ struct ProtectionSheet: View {
                     )
                     .keyboardShortcut(.defaultAction)
                     .accessibilityHint(protectionActionHint)
+                    .accessibilityIdentifier(
+                        "protectionCreateAction"
+                    )
                     .padding(.horizontal, PPSpacing.regular)
                     .padding(.vertical, PPSpacing.small)
                     .background(.bar)
@@ -1620,6 +1890,9 @@ struct ProtectionSheet: View {
             }
             .onChange(of: permissionProfile) { _, profile in
                 applyPermissionProfile(profile)
+                if profile == .custom {
+                    showsPermissionDetails = true
+                }
             }
             .onChange(of: permissions) { _, permissions in
                 let resolved = profile(for: permissions)
@@ -1755,10 +2028,33 @@ struct ProtectionSheet: View {
                     focusedPasswordField = .confirmation
                 } else if validationMessage == nil,
                           !password.isEmpty {
-                    startProtection()
+                    if requiresUpdatedPDFConfirmation {
+                        confirmUpdatedPDFForProtection()
+                    } else {
+                        startProtection()
+                    }
                 }
             }
+            .padding(.horizontal, PPSpacing.medium)
             .frame(minHeight: 44)
+            .background(
+                PPColor.surface,
+                in: RoundedRectangle(cornerRadius: PPRadius.control)
+            )
+            .overlay {
+                RoundedRectangle(cornerRadius: PPRadius.control)
+                    .stroke(
+                        focusedPasswordField == field
+                            ? PPColor.accent
+                            : PPColor.border,
+                        lineWidth: 1
+                    )
+            }
+            .accessibilityIdentifier(
+                field == .password
+                    ? "protectionPassword"
+                    : "protectionConfirmation"
+            )
     }
 
     private func passwordPasteButton(
@@ -1782,6 +2078,52 @@ struct ProtectionSheet: View {
             permissions.allowsFormFilling,
             permissions.allowsPageChanges
         ].filter { $0 }.count
+    }
+
+    private var permissionProfileDetail: String {
+        switch permissionProfile {
+        case .restricted:
+            return "Allow printing, comments, and form filling. Copying and page changes are restricted."
+        case .review:
+            return "Allow comments and form filling. Printing, copying, and page changes are restricted."
+        case .flexible:
+            return "Allow printing, copying, comments, form filling, and page changes."
+        case .custom:
+            return "Choose what readers can do after opening this copy."
+        }
+    }
+
+    private var permissionDetails: some View {
+        VStack(spacing: PPSpacing.medium) {
+            Toggle("Print", isOn: $permissions.allowsPrinting)
+            Toggle("Copy text and images", isOn: $permissions.allowsCopying)
+            Toggle(
+                "Comments and annotations",
+                isOn: Binding(
+                    get: { permissions.allowsCommenting },
+                    set: { enabled in
+                        permissions.allowsCommenting = enabled
+                        if enabled {
+                            permissions.allowsFormFilling = true
+                        }
+                    }
+                )
+            )
+            Toggle("Fill forms", isOn: $permissions.allowsFormFilling)
+                .disabled(permissions.allowsCommenting)
+                .accessibilityHint(
+                    permissions.allowsCommenting
+                        ? "Form filling is required when comments are allowed."
+                            .localizedUI
+                        : "Controls whether forms can be filled after opening."
+                            .localizedUI
+                )
+            Toggle(
+                "Insert, remove, or rotate pages",
+                isOn: $permissions.allowsPageChanges
+            )
+        }
+        .padding(.vertical, PPSpacing.small)
     }
 
     private var hasProtectionDraft: Bool {
@@ -2021,6 +2363,13 @@ struct RedactionReviewSheet: View {
                             showsOnDevice: true
                         )
 
+                        OperationBoundaryNotice(
+                            title: "The whole copy becomes image-based",
+                            detail: "Marked content is removed securely. Search, selection, links, forms, and editable annotations are removed from every page.",
+                            identifier: "redactionOutputBoundary",
+                            symbol: "eye.slash.fill"
+                        )
+
                         if marks.isEmpty {
                             VStack(spacing: PPSpacing.medium) {
                                 PPEmptyState(
@@ -2243,6 +2592,7 @@ struct RedactionReviewSheet: View {
                 .disabled(marks.isEmpty || operationTask != nil)
                 .keyboardShortcut(.defaultAction)
                 .accessibilityHint(redactionActionHint)
+                .accessibilityIdentifier("redactionCreateAction")
                 .padding(.horizontal, PPSpacing.regular)
                 .padding(.vertical, PPSpacing.small)
                 .background(.bar)
@@ -5385,6 +5735,13 @@ struct DocumentExportSheet: View {
         if activeFocus == .safeShare,
            model.record(id: recordID)?
             .hasCurrentDeliveryReceipt != true {
+            OperationBoundaryNotice(
+                title: "Verification checks a new image-based copy",
+                detail: "PaperPath reopens every page and records a fingerprint. Search, links, forms, and editable layers are removed; this is not legal or standards certification.",
+                identifier: "safeShareOutputBoundary",
+                symbol: "checkmark.seal.fill",
+                tint: PPColor.mint
+            )
             preflightPanel
             if currentPreflight?.status == .blocked
                 || preflightError != nil {
@@ -5588,8 +5945,9 @@ struct DocumentExportSheet: View {
 
                 exportButton(
                     "Flattened PDF Copy",
-                    detail: "Lock annotations into an image-based copy",
-                    symbol: "square.stack.3d.down.right"
+                    detail: "Image-based: removes search, links, forms, and editable layers",
+                    symbol: "square.stack.3d.down.right",
+                    identifier: "flattenedOutputOption"
                 ) {
                     guard let sourceContentRevisionID =
                             currentContentRevisionID
@@ -5828,7 +6186,9 @@ struct DocumentExportSheet: View {
                         preset.title,
                         detail: preset.detail,
                         symbol: preset.symbol,
-                        badge: pageImageBadge(preset)
+                        badge: pageImageBadge(preset),
+                        identifier:
+                            "exportPageImages-\(preset.rawValue)"
                     ) {
                         let generation = beginExport(
                             label: preset.title.lowercased()
@@ -6502,7 +6862,6 @@ struct DocumentExportSheet: View {
                 }
             }
         }
-        .accessibilityIdentifier("exportCatalogMode")
     }
 
     private func exportCatalogButton(
@@ -6559,6 +6918,9 @@ struct DocumentExportSheet: View {
         .buttonStyle(.plain)
         .disabled(exportTask != nil || temporaryOfficeResultURL != nil)
         .accessibilityValue(selected ? "Selected" : "")
+        .accessibilityIdentifier(
+            "exportCatalogMode-\(mode.rawValue)"
+        )
     }
 
     private func exportCatalogSymbol(
@@ -6948,7 +7310,7 @@ struct DocumentExportSheet: View {
                             .foregroundStyle(verifiedAccessTint)
                     }
                     Text(
-                        "Makes a separate copy, reopens it, and saves the receipt."
+                        "Creates an image-based copy, reopens every page, and saves a fingerprinted receipt."
                     )
                     .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
@@ -7908,6 +8270,7 @@ struct DocumentExportSheet: View {
         detail: String,
         symbol: String,
         badge: String? = nil,
+        identifier: String? = nil,
         action: @escaping () -> Void
     ) -> some View {
         Button(action: action) {
@@ -7954,6 +8317,9 @@ struct DocumentExportSheet: View {
                 || exportTask != nil
                 || isPreparedOutputTransitionActive
                 || temporaryOfficeResultURL != nil
+        )
+        .accessibilityIdentifier(
+            identifier ?? "documentExport-\(title)"
         )
     }
 
@@ -10035,20 +10401,6 @@ struct DocumentExportSheet: View {
                         "UITEST_OFFICE_SOAK_DEMO"
                     )
 
-                // #region debug-point H:office-export-started
-                reportFrequentUIFreezeDebugEvent(
-                    hypothesisID: "H",
-                    location: "DocumentOutputView.startOfficeBatch",
-                    message: "Office export task started",
-                    data: [
-                        "format": format.rawValue,
-                        "usesUITestCancellationWindow": String(
-                            usesUITestCancellationWindow
-                        )
-                    ]
-                )
-                // #endregion
-
                 if usesUITestCancellationWindow {
                     try await Task.sleep(for: .seconds(20))
                 }
@@ -10093,21 +10445,6 @@ struct DocumentExportSheet: View {
                     officeFailureFeedback += 1
                 }
             } catch is CancellationError {
-#if DEBUG
-                // #region debug-point H:office-export-cancelled
-                reportFrequentUIFreezeDebugEvent(
-                    hypothesisID: "H",
-                    location: "DocumentOutputView.startOfficeBatch",
-                    message: "Office export task cancelled",
-                    data: [
-                        "format": format.rawValue,
-                        "generationIsCurrent": String(
-                            exportGeneration == generation
-                        )
-                    ]
-                )
-                // #endregion
-#endif
                 return
             } catch {
                 guard exportIsCurrent(generation) else { return }
@@ -11087,6 +11424,13 @@ struct DocumentExportSheet: View {
                 finishExport(taskGeneration)
             }
             do {
+#if DEBUG
+                if ProcessInfo.processInfo.arguments.contains(
+                    "UITEST_OFFICE_SOAK_DEMO"
+                ) {
+                    try await Task.sleep(for: .seconds(20))
+                }
+#endif
                 let artifact = try await model.makeTextExport(
                     recordID: recordID,
                     format: format,
@@ -11402,21 +11746,6 @@ struct DocumentExportSheet: View {
     private func stopExportPreparation(
         invalidateResult: Bool = false
     ) {
-#if DEBUG
-        // #region debug-point H:office-export-stop
-        reportFrequentUIFreezeDebugEvent(
-            hypothesisID: "H",
-            location: "DocumentOutputView.stopExportPreparation",
-            message: "Office export stop requested",
-            data: [
-                "hasExportTask": String(exportTask != nil),
-                "activeOfficeFormat":
-                    activeOfficeFormat?.rawValue ?? "nil"
-            ]
-        )
-        // #endregion
-#endif
-
         guard exportTask != nil else { return }
         if invalidateResult {
             exportGeneration = UUID()
@@ -11579,16 +11908,17 @@ private struct OfficeInlineOutputPreview: View {
             }
             .frame(height: dynamicTypeSize.isAccessibilitySize ? 150 : 210)
             .clipped()
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel("Preview output".localizedUI)
-            .accessibilityValue(
-                previewStatus.localizedUI
-            )
-            .accessibilityIdentifier("officeOutputPreview")
             HStack {
                 Label("Output preview".localizedUI, systemImage: "doc.viewfinder")
                     .font(PPType.metadata)
                     .foregroundStyle(PPColor.textSecondary)
+                    .accessibilityElement(children: .combine)
+                    .accessibilityValue(
+                        previewStatus.localizedUI
+                    )
+                    .accessibilityIdentifier(
+                        "officeOutputPreviewStatus"
+                    )
                 Spacer()
                 if previewURL == nil, permitsPreview, permitsAutomaticPreview, !loading {
                     Button { retry += 1 } label: {
@@ -11670,17 +12000,10 @@ private struct OfficeInlineOutputPreview: View {
 
 private struct OfficeNoticeDisclosureStyle: DisclosureGroupStyle {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @Environment(\.scenePhase) private var scenePhase
-    @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
         VStack(alignment: .leading, spacing: 0) {
             Button {
-#if DEBUG
-                // #region debug-point A:ipad-notice-hit
-                if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "A", "msg": "[DEBUG] Notice action", "data": ["expanded": configuration.isExpanded]]); URLSession.shared.dataTask(with: request).resume() }
-                // #endregion
-#endif
                 withAnimation(reduceMotion ? nil : PPMotion.selection) {
                     configuration.isExpanded.toggle()
                 }
@@ -11697,44 +12020,10 @@ private struct OfficeNoticeDisclosureStyle: DisclosureGroupStyle {
             }
             .buttonStyle(.plain)
             .accessibilityValue((configuration.isExpanded ? "Expanded" : "Collapsed").localizedUI)
-#if DEBUG
-            .background {
-                GeometryReader { geometry in
-                    Color.clear.task {
-                        // #region debug-point C:ipad-notice-hit-geometry
-                        if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "C", "msg": "[DEBUG] Button geometry", "data": ["frame": "\(geometry.frame(in: .global))"]]); URLSession.shared.dataTask(with: request).resume() }
-                        // #endregion
-                    }
-                }
-            }
-#endif
             if configuration.isExpanded {
                 configuration.content
             }
         }
-#if DEBUG
-        .task {
-            // #region debug-point A:ipad-notice-hit-probe
-            if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) {
-                for _ in 0..<8 {
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
-                    guard !Task.isCancelled else { return }
-                    let window = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.flatMap(\.windows).first(where: \.isKeyWindow)
-                    let hit = window?.hitTest(CGPoint(x: 417, y: 540), with: nil)
-                    var chain: [String] = []
-                    var view = hit
-                    while let current = view { chain.append("\(type(of: current)) \(current.frame) interactive=\(current.isUserInteractionEnabled) gestures=\((current.gestureRecognizers ?? []).map { "\(type(of: $0)):\($0.state.rawValue):\($0.isEnabled)" })"); view = current.superview }
-                    var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "F", "msg": "[DEBUG] Hit-test probe", "data": ["chain": chain, "expanded": configuration.isExpanded, "phase": "\(scenePhase)", "enabled": isEnabled, "protected": UIApplication.shared.isProtectedDataAvailable]]); URLSession.shared.dataTask(with: request).resume()
-                }
-            }
-            // #endregion
-        }
-        .onChange(of: configuration.isExpanded) { _, expanded in
-            // #region debug-point B:ipad-notice-hit
-            if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "B", "msg": "[DEBUG] Notice state", "data": ["expanded": expanded]]); URLSession.shared.dataTask(with: request).resume() }
-            // #endregion
-        }
-#endif
     }
 }
 
@@ -14749,27 +15038,6 @@ struct SourceLocationView: View {
                 }
                 return
             }
-#if DEBUG
-            // #region debug-point F:files-export-view-result
-            reportFrequentUIFreezeDebugEvent(
-                hypothesisID: "F",
-                location: "SourceLocationView.prepareExport",
-                message: "Files export preparation finished",
-                data: [
-                    "recordID": recordID.uuidString,
-                    "hasPreparedURL": String(preparedURL != nil),
-                    "hasError": String(
-                        model.presentationError(
-                            for: paperPathSceneID
-                        ) != nil
-                    ),
-                    "generationIsCurrent": String(
-                        operationGeneration == generation
-                    )
-                ]
-            )
-            // #endregion
-#endif
             exportURL = preparedURL
             isExporting = preparedURL != nil
         }

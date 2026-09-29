@@ -81,7 +81,8 @@ enum PDFTestFixtureFactory {
 
     static func makeSparsePDF(
         at url: URL,
-        paddingBytes: Int64
+        paddingBytes: Int64,
+        trailerEntries: String = ""
     ) throws {
         precondition(paddingBytes >= 0)
         FileManager.default.createFile(
@@ -159,7 +160,7 @@ enum PDFTestFixtureFactory {
         try append(
             """
             trailer
-            << /Size 6 /Root 1 0 R >>
+            << /Size 6 /Root 1 0 R \(trailerEntries) >>
             startxref
             \(xrefOffset)
             %%EOF
@@ -170,10 +171,11 @@ enum PDFTestFixtureFactory {
 
     static func makeTrailingPaddedPDF(
         at url: URL,
-        paddingBytes: Int64
+        paddingBytes: Int64,
+        pageCount: Int = 1
     ) throws {
         precondition(paddingBytes > 0)
-        try makeTextPDF(at: url, pageCount: 1)
+        try makeTextPDF(at: url, pageCount: pageCount)
         let handle = try FileHandle(forWritingTo: url)
         defer { try? handle.close() }
         let endOffset = try handle.seekToEnd()

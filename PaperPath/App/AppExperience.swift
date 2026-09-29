@@ -16,7 +16,18 @@ enum AppPreferences {
         "performance.previewQuality"
     static let latestReleaseSeenKey =
         "experience.latestReleaseSeen"
-    static let currentRelease = "v4"
+    static var currentRelease: String {
+        Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "1.1.0"
+    }
+
+    static var versionDescription: String {
+        let build = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String ?? "4"
+        return "\(currentRelease) (\(build))"
+    }
 
     static func registerDefaults(
         defaults: UserDefaults = .standard
@@ -395,18 +406,20 @@ final class PurchaseController: ObservableObject {
             if isUnlocked {
                 status = .purchased
             } else {
-                status = product == nil
-                    ? .unavailable
-                    : preservesPendingStatus ? .pending : .idle
+                status = preservesPendingStatus
+                    ? .pending
+                    : product == nil ? .unavailable : .idle
             }
         } catch is CancellationError {
             restoreStableStatus(
                 preservingPending: preservesPendingStatus
             )
         } catch {
-            status = .failed(
-                AppLocalization.userFacingErrorDescription(error)
-            )
+            status = preservesPendingStatus
+                ? .pending
+                : .failed(
+                    AppLocalization.userFacingErrorDescription(error)
+                )
         }
     }
 
@@ -509,9 +522,9 @@ final class PurchaseController: ObservableObject {
             restoreStableStatus(preservingPending: true)
             return
         }
-        status = isUnlocked
-            ? .purchased
-            : .failed("No approved purchase was found yet.")
+        // Ask to Buy remains pending until StoreKit delivers a decision.
+        // An empty entitlement snapshot is not a rejected transaction.
+        status = isUnlocked ? .purchased : .pending
     }
 
     private func refreshEntitlement() async -> Bool {

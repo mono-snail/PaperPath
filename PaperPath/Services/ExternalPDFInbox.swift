@@ -184,9 +184,7 @@ enum ExternalPDFInbox {
             forKeys: [
                 .fileSizeKey,
                 .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .contentModificationDateKey,
-                .fileResourceIdentifierKey
+                .isSymbolicLinkKey
             ]
         )
         guard sourceValues.isRegularFile == true,
@@ -262,11 +260,6 @@ enum ExternalPDFInbox {
             else {
                 throw ExternalPDFInboxError.incompleteCopy
             }
-            try requireUnchangedFile(
-                at: sourceURL,
-                initialValues: sourceValues,
-                expectedByteCount: Int64(sourceSize)
-            )
             let payloadSHA256 = copiedPayload.sha256
 
             let preferredName = normalizedName(
@@ -618,8 +611,13 @@ enum ExternalPDFInbox {
     }
 
     private static func readMetadata(at url: URL) throws -> Metadata? {
+        var refreshedURL = URL(
+            fileURLWithPath: url.path,
+            isDirectory: false
+        )
+        refreshedURL.removeAllCachedResourceValues()
         guard let values = try resourceValuesIfPresent(
-            at: url,
+            at: refreshedURL,
             forKeys: [
                 .isRegularFileKey,
                 .isSymbolicLinkKey,
@@ -633,7 +631,7 @@ enum ExternalPDFInbox {
               fileSize <= maximumMetadataBytes
         else { return nil }
         let data = try boundedData(
-            at: url,
+            at: refreshedURL,
             maximumBytes: maximumMetadataBytes
         )
         return try? JSONDecoder().decode(Metadata.self, from: data)
@@ -746,12 +744,18 @@ enum ExternalPDFInbox {
             try? output.close()
             throw error
         }
-        guard try metadataMatches(metadata, at: stagingURL),
-              try fileFingerprint(
-                  at: stagingURL,
-                  expectedByteCount: Int64(data.count)
-              ) == expectedFingerprint
-        else {
+        let stagingMetadataMatches = try metadataMatches(
+            metadata,
+            at: stagingURL
+        )
+        guard stagingMetadataMatches else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
+        let stagingFingerprint = try fileFingerprint(
+            at: stagingURL,
+            expectedByteCount: Int64(data.count)
+        )
+        guard stagingFingerprint == expectedFingerprint else {
             throw ExternalPDFInboxError.incompleteCopy
         }
         try protectionHandler(stagingURL)
@@ -1410,8 +1414,17 @@ enum ExternalPDFInbox {
     ) -> Bool {
         let rootPath = root.resolvingSymlinksInPath()
             .standardizedFileURL.path
-        let candidatePath = url.resolvingSymlinksInPath()
-            .standardizedFileURL.path
+        let standardizedURL = url.standardizedFileURL
+        let candidateURL: URL
+        if FileManager.default.fileExists(atPath: standardizedURL.path) {
+            candidateURL = standardizedURL.resolvingSymlinksInPath()
+        } else {
+            candidateURL = standardizedURL
+                .deletingLastPathComponent()
+                .resolvingSymlinksInPath()
+                .appendingPathComponent(standardizedURL.lastPathComponent)
+        }
+        let candidatePath = candidateURL.standardizedFileURL.path
         return candidatePath.hasPrefix(rootPath + "/")
     }
 
@@ -1526,6 +1539,50 @@ enum ExternalPDFInbox {
             ) == .orderedSame
     }
 
+    private struct RegularFileIdentity: Equatable {
+        let deviceID: UInt64
+        let fileID: UInt64
+        let byteCount: Int64
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let changeSeconds: Int64
+        let changeNanoseconds: Int64
+    }
+
+    private static func regularFileIdentity(
+        for fileDescriptor: Int32
+    ) throws -> RegularFileIdentity {
+        var status = stat()
+        guard Darwin.fstat(fileDescriptor, &status) == 0,
+              status.st_mode & S_IFMT == S_IFREG
+        else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
+        return RegularFileIdentity(
+            deviceID: UInt64(status.st_dev),
+            fileID: UInt64(status.st_ino),
+            byteCount: Int64(status.st_size),
+            modificationSeconds: Int64(status.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(status.st_mtimespec.tv_nsec),
+            changeSeconds: Int64(status.st_ctimespec.tv_sec),
+            changeNanoseconds: Int64(status.st_ctimespec.tv_nsec)
+        )
+    }
+
+    private static func regularFileIdentity(
+        at url: URL
+    ) throws -> RegularFileIdentity {
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
+        defer { _ = Darwin.close(descriptor) }
+        return try regularFileIdentity(for: descriptor)
+    }
+
     private static func copyPayload(
         from sourceURL: URL,
         to destinationURL: URL,
@@ -1548,6 +1605,12 @@ enum ExternalPDFInbox {
 
         let input = try FileHandle(forReadingFrom: sourceURL)
         defer { try? input.close() }
+        let initialSourceIdentity = try regularFileIdentity(
+            for: input.fileDescriptor
+        )
+        guard initialSourceIdentity.byteCount == expectedByteCount else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
         let output = try FileHandle(forWritingTo: destinationURL)
         defer { try? output.close() }
 
@@ -1585,7 +1648,14 @@ enum ExternalPDFInbox {
         }
         try cancellationCheck()
         try output.synchronize()
-        guard byteCount == expectedByteCount else {
+        let finalSourceIdentity = try regularFileIdentity(
+            for: input.fileDescriptor
+        )
+        let currentSourceIdentity = try regularFileIdentity(at: sourceURL)
+        guard byteCount == expectedByteCount,
+              finalSourceIdentity == initialSourceIdentity,
+              currentSourceIdentity == finalSourceIdentity
+        else {
             throw ExternalPDFInboxError.incompleteCopy
         }
         if byteCount != lastReportedByteCount {
@@ -1618,9 +1688,7 @@ enum ExternalPDFInbox {
             forKeys: [
                 .fileSizeKey,
                 .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .contentModificationDateKey,
-                .fileResourceIdentifierKey
+                .isSymbolicLinkKey
             ]
         )
         guard values.isRegularFile == true,
@@ -1635,6 +1703,12 @@ enum ExternalPDFInbox {
         }
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
+        let initialIdentity = try regularFileIdentity(
+            for: handle.fileDescriptor
+        )
+        guard initialIdentity.byteCount == Int64(fileSize) else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
         var hasher = SHA256()
         var processedByteCount: Int64 = 0
         let byteCount = Int64(fileSize)
@@ -1661,11 +1735,15 @@ enum ExternalPDFInbox {
         else {
             throw ExternalPDFInboxError.incompleteCopy
         }
-        try requireUnchangedFile(
-            at: url,
-            initialValues: values,
-            expectedByteCount: byteCount
+        let finalIdentity = try regularFileIdentity(
+            for: handle.fileDescriptor
         )
+        let currentIdentity = try regularFileIdentity(at: url)
+        guard finalIdentity == initialIdentity,
+              currentIdentity == finalIdentity
+        else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
         try Task.checkCancellation()
         return hasher.finalize().map {
             String(format: "%02x", $0)
@@ -1700,9 +1778,7 @@ enum ExternalPDFInbox {
             forKeys: [
                 .fileSizeKey,
                 .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .contentModificationDateKey,
-                .fileResourceIdentifierKey
+                .isSymbolicLinkKey
             ]
         )
         guard values.isRegularFile == true,
@@ -1716,6 +1792,12 @@ enum ExternalPDFInbox {
         try Task.checkCancellation()
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
+        let initialIdentity = try regularFileIdentity(
+            for: handle.fileDescriptor
+        )
+        guard initialIdentity.byteCount == Int64(byteCount) else {
+            throw ExternalPDFInboxError.incompleteCopy
+        }
         var data = Data()
         data.reserveCapacity(byteCount)
         while data.count < byteCount {
@@ -1739,58 +1821,17 @@ enum ExternalPDFInbox {
         else {
             throw ExternalPDFInboxError.incompleteCopy
         }
-        try requireUnchangedFile(
-            at: url,
-            initialValues: values,
-            expectedByteCount: Int64(byteCount)
+        let finalIdentity = try regularFileIdentity(
+            for: handle.fileDescriptor
         )
-        try Task.checkCancellation()
-        return data
-    }
-
-    private static func requireUnchangedFile(
-        at url: URL,
-        initialValues: URLResourceValues,
-        expectedByteCount: Int64
-    ) throws {
-        var verificationURL = url
-        verificationURL.removeAllCachedResourceValues()
-        let finalValues = try verificationURL.resourceValues(
-            forKeys: [
-                .fileSizeKey,
-                .isRegularFileKey,
-                .isSymbolicLinkKey,
-                .contentModificationDateKey,
-                .fileResourceIdentifierKey
-            ]
-        )
-        guard finalValues.isRegularFile == true,
-              finalValues.isSymbolicLink != true,
-              Int64(finalValues.fileSize ?? -1)
-                == expectedByteCount,
-              finalValues.contentModificationDate
-                == initialValues.contentModificationDate,
-              fileResourceIdentifiersMatch(
-                  initialValues.fileResourceIdentifier,
-                  finalValues.fileResourceIdentifier
-              )
+        let currentIdentity = try regularFileIdentity(at: url)
+        guard finalIdentity == initialIdentity,
+              currentIdentity == finalIdentity
         else {
             throw ExternalPDFInboxError.incompleteCopy
         }
-    }
-
-    private static func fileResourceIdentifiersMatch(
-        _ first: Any?,
-        _ second: Any?
-    ) -> Bool {
-        switch (first, second) {
-        case (nil, nil):
-            return true
-        case let (first as NSObject, second):
-            return first.isEqual(second)
-        default:
-            return false
-        }
+        try Task.checkCancellation()
+        return data
     }
 
     private static func requireCompleteProtection(

@@ -5183,6 +5183,13 @@ struct DeviceGoldenPathCaseResult: Codable, Sendable {
 }
 
 struct DeviceGoldenPathReport: Codable, Sendable {
+    private static let requiredCaseIDs: Set<String> = [
+        "fill-sign-verify",
+        "redact-verify",
+        "scan-ocr-verify",
+        "ocr-page-recovery"
+    ]
+
     let schemaVersion: Int
     let startedAt: Date
     let finishedAt: Date
@@ -5191,7 +5198,8 @@ struct DeviceGoldenPathReport: Codable, Sendable {
     let results: [DeviceGoldenPathCaseResult]
 
     var passed: Bool {
-        results.count == 3 && results.allSatisfy(\.passed)
+        Self.requiredCaseIDs.isSubset(of: Set(results.map(\.id)))
+            && results.allSatisfy(\.passed)
     }
 }
 

@@ -423,7 +423,25 @@ actor SignatureStore {
         let (pixels, overflow) = widthValue.multipliedReportingOverflow(
             by: heightValue
         )
-        return !overflow && pixels <= Self.maximumSignaturePixels
+        guard !overflow,
+              pixels <= Self.maximumSignaturePixels,
+              CGImageSourceGetStatus(source) == .statusComplete,
+              CGImageSourceGetStatusAtIndex(source, 0) == .statusComplete
+        else { return false }
+        return autoreleasepool {
+            guard let image = CGImageSourceCreateImageAtIndex(
+                source,
+                0,
+                [kCGImageSourceShouldCacheImmediately: true] as CFDictionary
+            ),
+                  let pixels = image.dataProvider?.data
+            else { return false }
+            let (requiredBytes, byteOverflow) = image.bytesPerRow
+                .multipliedReportingOverflow(by: image.height)
+            return !byteOverflow
+                && requiredBytes > 0
+                && CFDataGetLength(pixels) >= requiredBytes
+        }
     }
 
     private func protectedBoundedData(

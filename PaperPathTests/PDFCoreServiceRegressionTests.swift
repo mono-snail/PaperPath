@@ -7,6 +7,162 @@ import XCTest
 
 @testable import PaperPath
 
+final class AnnotationRecoveryTests: XCTestCase {
+    func testStartupPreservesInterruptedAnnotationBackup() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AnnotationRecovery-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DocumentStore(rootURL: root)
+        _ = try await store.load()
+        let directory = root.appendingPathComponent("Documents")
+        let backup = directory.appendingPathComponent(
+            ".annotation-rollback-\(UUID()).pdf"
+        )
+        let staging = directory.appendingPathComponent(
+            ".annotation-\(UUID()).pdf"
+        )
+        let ordinaryFile = directory.appendingPathComponent("unrelated.txt")
+        let original = Data("original private PDF bytes".utf8)
+        try original.write(to: backup)
+        try Data("uncommitted annotation".utf8).write(to: staging)
+        try Data("unrelated".utf8).write(to: ordinaryFile)
+
+        _ = try await DocumentStore(rootURL: root).load()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: ordinaryFile.path))
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: backup.path),
+            "An interrupted original must survive cleanup even when its destination is unknown."
+        )
+        if FileManager.default.fileExists(atPath: backup.path) {
+            XCTAssertEqual(try Data(contentsOf: backup), original)
+        }
+    }
+
+    func testAnnotationPublicationCommitsOrPreservesOriginal() throws {
+        for scenario in ["success", "changed-source", "protection-failure"] {
+            try XCTContext.runActivity(named: scenario) { _ in
+                let directory = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("AnnotationPublish-\(UUID())")
+                try FileManager.default.createDirectory(
+                    at: directory,
+                    withIntermediateDirectories: true
+                )
+                defer { try? FileManager.default.removeItem(at: directory) }
+                let destination = directory.appendingPathComponent("\(UUID()).pdf")
+                let staging = directory.appendingPathComponent(".annotation-new.pdf")
+                let original = Data("original".utf8)
+                let updated = Data("annotated".utf8)
+                try original.write(to: destination)
+                try updated.write(to: staging)
+                let manager = ProtectionFailingFileManager()
+                let transaction = PDFAnnotationTransaction(fileManager: manager)
+                var checks = 0
+                if scenario == "protection-failure" {
+                    manager.deniedPathFragment = destination.path
+                }
+                let publish = {
+                    try transaction.publish(staging: staging, to: destination) {
+                        checks += 1
+                        return scenario != "changed-source" || checks == 1
+                    }
+                }
+                if scenario == "success" {
+                    try publish()
+                    XCTAssertEqual(try Data(contentsOf: destination), updated)
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path))
+                } else {
+                    XCTAssertThrowsError(try publish())
+                    XCTAssertEqual(try Data(contentsOf: destination), original)
+                }
+                manager.deniedPathFragment = nil
+                try transaction.recoverAll(in: directory)
+                let remaining = try FileManager.default.contentsOfDirectory(
+                    atPath: directory.path
+                )
+                XCTAssertFalse(remaining.contains { $0.hasPrefix(".annotation-recovery-") })
+                XCTAssertEqual(
+                    try Data(contentsOf: destination),
+                    scenario == "success" ? updated : original
+                )
+            }
+        }
+    }
+
+    func testStartupRecoversAnnotationAfterFailedRestoration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AnnotationRelaunch-\(UUID())")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = DocumentStore(rootURL: root)
+        _ = try await store.load()
+        let directory = root.appendingPathComponent("Documents")
+        let source = root.appendingPathComponent("source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(at: source, pageCount: 1)
+        let record = try await store.importPDF(
+            from: source,
+            preserveSourceLocation: false
+        )
+        let destination = await store.url(for: record)
+        let staging = directory.appendingPathComponent(".annotation-new.pdf")
+        let original = try Data(contentsOf: destination)
+        try (original + Data("\n% annotation update\n".utf8)).write(to: staging)
+        let manager = ProtectionFailingFileManager()
+        manager.deniedPathFragment = destination.path
+        XCTAssertThrowsError(
+            try PDFAnnotationTransaction(fileManager: manager).publish(
+                staging: staging,
+                to: destination,
+                sourceIsCurrent: { true }
+            )
+        )
+        let recovery = directory.appendingPathComponent(
+            ".annotation-recovery-\(destination.lastPathComponent)"
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: recovery.appendingPathComponent("original.pdf")),
+            original
+        )
+        // A failed replacement may leave the destination missing.
+        try FileManager.default.removeItem(at: destination)
+        _ = try await DocumentStore(rootURL: root).load()
+        XCTAssertEqual(try Data(contentsOf: destination), original)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: recovery.path))
+    }
+
+    func testAnnotationRecoveryPreservesIndependentEdit() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("AnnotationConflict-\(UUID())")
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let destination = directory.appendingPathComponent("\(UUID()).pdf")
+        let staging = directory.appendingPathComponent(".annotation-new.pdf")
+        try Data("original".utf8).write(to: destination)
+        try Data("annotated".utf8).write(to: staging)
+        let manager = ProtectionFailingFileManager()
+        manager.deniedPathFragment = destination.path
+        XCTAssertThrowsError(
+            try PDFAnnotationTransaction(fileManager: manager).publish(
+                staging: staging,
+                to: destination,
+                sourceIsCurrent: { true }
+            )
+        )
+        let independentEdit = Data("a later independent edit".utf8)
+        try independentEdit.write(to: destination)
+        let transaction = PDFAnnotationTransaction()
+        XCTAssertThrowsError(try transaction.recoverAll(in: directory))
+        XCTAssertEqual(try Data(contentsOf: destination), independentEdit)
+        let backup = directory.appendingPathComponent(
+            ".annotation-recovery-\(destination.lastPathComponent)/original.pdf"
+        )
+        XCTAssertEqual(try Data(contentsOf: backup), Data("original".utf8))
+    }
+}
+
 final class PDFCoreServiceRegressionTests: XCTestCase {
     private static let mebibyte = 1_024 * 1_024
     private var temporaryDirectory: URL!
@@ -162,6 +318,116 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
         XCTAssertEqual(profile.kind, .form)
         XCTAssertEqual(profile.sampledPageCount, 0)
         XCTAssertEqual(profile.byteCount, byteCount)
+    }
+
+    func testMetadataOnlyInspection_ignoresSparseStreamMetadataLookalikes_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("sparse-stream-lookalikes.pdf")
+        try PDFTestFixtureFactory.makeSparsePDF(
+            at: source,
+            paddingBytes: Int64(16 * Self.mebibyte)
+        )
+        let handle = try FileHandle(forUpdating: source)
+        defer { try? handle.close() }
+        let prefix = try handle.read(upToCount: 8_192) ?? Data()
+        let objectMarker = Data("5 0 obj".utf8)
+        let streamMarker = Data("stream\n".utf8)
+        let objectRange = try XCTUnwrap(
+            prefix.range(of: objectMarker)
+        )
+        let streamRange = try XCTUnwrap(
+            prefix.range(
+                of: streamMarker,
+                in: objectRange.upperBound..<prefix.endIndex
+            )
+        )
+        try handle.seek(toOffset: UInt64(streamRange.upperBound))
+        try handle.write(
+            contentsOf: Data(
+                """
+                /Type /Pages /Count 999
+                /Encrypt 9 0 R
+                /Subtype /Widget
+
+                """.utf8
+            )
+        )
+        try handle.synchronize()
+
+        let byteCount = Int64(
+            try XCTUnwrap(
+                source.resourceValues(forKeys: [.fileSizeKey])
+                    .fileSize
+            )
+        )
+        let profile = try PDFInspectionService()
+            .inspectMetadataOnly(
+                url: source,
+                byteCount: byteCount
+            )
+
+        XCTAssertEqual(profile.pageCount, 1)
+        XCTAssertEqual(profile.formFieldCount, 0)
+        XCTAssertFalse(profile.isEncrypted)
+        XCTAssertFalse(profile.isLocked)
+        XCTAssertEqual(profile.kind, .mixed)
+    }
+
+    func testMetadataOnlyInspection_ignoresSparseTrailerStringTokens_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("sparse-trailer-string.pdf")
+        try PDFTestFixtureFactory.makeSparsePDF(
+            at: source,
+            paddingBytes: Int64(16 * Self.mebibyte),
+            trailerEntries: "/Info (Text mentioning /Encrypt 9 0 R)"
+        )
+        let byteCount = Int64(
+            try XCTUnwrap(
+                source.resourceValues(forKeys: [.fileSizeKey])
+                    .fileSize
+            )
+        )
+
+        let profile = try PDFInspectionService()
+            .inspectMetadataOnly(
+                url: source,
+                byteCount: byteCount
+            )
+
+        XCTAssertFalse(profile.isEncrypted)
+        XCTAssertFalse(profile.isLocked)
+        XCTAssertEqual(profile.kind, .mixed)
+    }
+
+    func testSparseStructuralText_ignoresLiteralStringsAndComments_BitsUT()
+        throws {
+        let source = #"""
+        /Info (Text /Encrypt 9 0 R (nested /AcroForm) escaped \) /Subtype /Widget)
+        % /Encrypt 8 0 R /AcroForm 8 0 R /Subtype /Widget
+        /Encrypt 7 0 R
+        /AcroForm 4 0 R
+        /Subtype /Widget
+        """#
+
+        let structuralText = try PDFInspectionService()
+            .sparseStructuralText(from: source)
+
+        XCTAssertFalse(structuralText.contains("/Encrypt 9 0 R"))
+        XCTAssertFalse(structuralText.contains("/Encrypt 8 0 R"))
+        XCTAssertTrue(structuralText.contains("/Encrypt 7 0 R"))
+        XCTAssertTrue(structuralText.contains("/AcroForm 4 0 R"))
+        XCTAssertEqual(
+            structuralText.components(
+                separatedBy: "/Subtype /Widget"
+            ).count - 1,
+            1
+        )
+        XCTAssertThrowsError(
+            try PDFInspectionService()
+                .sparseStructuralText(from: "(unterminated")
+        )
     }
 
     func testImportPDF_cancelledSparseCopyLeavesNoRecord_BitsUT()
@@ -1072,6 +1338,227 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
         )
     }
 
+    func testCombine_twoHundredPagesUsesBoundedMemory_BitsUT()
+        throws {
+        let first = temporaryDirectory
+            .appendingPathComponent("combine-100-a.pdf")
+        let second = temporaryDirectory
+            .appendingPathComponent("combine-100-b.pdf")
+        let output = temporaryDirectory
+            .appendingPathComponent("combine-200-output.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: first,
+            pageCount: 100
+        )
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: second,
+            pageCount: 100
+        )
+        let baseline = testResidentMemory()
+        let sampler = TestProcessMemorySampler()
+        sampler.start()
+        let startedAt = ContinuousClock.now
+
+        try PDFCompositionService().combine(
+            urls: [first, second],
+            to: output
+        )
+
+        let elapsed = startedAt.duration(to: .now)
+        let peakDelta = sampler.stop()
+            .saturatingSubtracting(baseline)
+        let document = try XCTUnwrap(PDFDocument(url: output))
+        XCTAssertEqual(document.pageCount, 200)
+        XCTAssertTrue(
+            document.page(at: 0)?.string?
+                .contains("Fixture page 1") == true
+        )
+        XCTAssertTrue(
+            document.page(at: 199)?.string?
+                .contains("Fixture page 100") == true
+        )
+        XCTAssertLessThan(elapsed, .seconds(20))
+        XCTAssertLessThan(
+            peakDelta,
+            UInt64(256 * Self.mebibyte),
+            "200-page combine exceeded 256 MiB peak RSS growth"
+        )
+    }
+
+    func testCompression_fortyPagesUsesBoundedMemory_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("compression-40-source.pdf")
+        let output = temporaryDirectory
+            .appendingPathComponent("compression-40-output.pdf")
+        try PDFTestFixtureFactory.makeTrailingPaddedPDF(
+            at: source,
+            paddingBytes: Int64(64 * Self.mebibyte),
+            pageCount: 40
+        )
+        let sourceByteCount = try XCTUnwrap(
+            source.resourceValues(forKeys: [.fileSizeKey])
+                .fileSize
+        )
+        let baseline = testResidentMemory()
+        let sampler = TestProcessMemorySampler()
+        sampler.start()
+        let startedAt = ContinuousClock.now
+
+        try PDFOutputService().compress(
+            sourceURL: source,
+            destination: output,
+            quality: .balanced
+        )
+
+        let elapsed = startedAt.duration(to: .now)
+        let peakDelta = sampler.stop()
+            .saturatingSubtracting(baseline)
+        let document = try XCTUnwrap(PDFDocument(url: output))
+        let outputByteCount = try XCTUnwrap(
+            output.resourceValues(forKeys: [.fileSizeKey])
+                .fileSize
+        )
+        XCTAssertEqual(document.pageCount, 40)
+        XCTAssertLessThan(outputByteCount, sourceByteCount)
+        XCTAssertLessThan(elapsed, .seconds(45))
+        XCTAssertLessThan(
+            peakDelta,
+            UInt64(256 * Self.mebibyte),
+            "40-page compression exceeded 256 MiB peak RSS growth"
+        )
+    }
+
+    func testSafeShare_fortyPagesUsesBoundedMemory_BitsUT()
+        throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("safe-share-40-source.pdf")
+        let output = temporaryDirectory
+            .appendingPathComponent("safe-share-40-output.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 40
+        )
+        let sourceDocument = try XCTUnwrap(
+            PDFDocument(url: source)
+        )
+        sourceDocument.documentAttributes = [
+            PDFDocumentAttribute.authorAttribute: "Private Author",
+            PDFDocumentAttribute.titleAttribute: "Private Title"
+        ]
+        XCTAssertTrue(sourceDocument.write(to: source))
+        let baseline = testResidentMemory()
+        let sampler = TestProcessMemorySampler()
+        sampler.start()
+        let startedAt = ContinuousClock.now
+
+        try PDFOutputService().safeShare(
+            sourceURL: source,
+            destination: output
+        )
+
+        let elapsed = startedAt.duration(to: .now)
+        let peakDelta = sampler.stop()
+            .saturatingSubtracting(baseline)
+        let document = try XCTUnwrap(PDFDocument(url: output))
+        XCTAssertEqual(document.pageCount, 40)
+        XCTAssertEqual(
+            document.documentAttributes?[
+                PDFDocumentAttribute.authorAttribute
+            ] as? String,
+            nil
+        )
+        XCTAssertTrue(
+            (0..<document.pageCount).allSatisfy {
+                document.page(at: $0)?.string?.isEmpty != false
+            }
+        )
+        XCTAssertLessThan(elapsed, .seconds(45))
+        XCTAssertLessThan(
+            peakDelta,
+            UInt64(256 * Self.mebibyte),
+            "40-page safe share exceeded 256 MiB peak RSS growth"
+        )
+    }
+
+    func testVisionOCR_thousandPageResumeUsesBoundedMemory_BitsUT()
+        async throws {
+#if targetEnvironment(simulator)
+        let recognitionPageCount = 8
+        let maximumDuration: Duration = .seconds(30)
+        let maximumPeakRSS = UInt64(512 * Self.mebibyte)
+#else
+        let recognitionPageCount = 20
+        let maximumDuration: Duration = .seconds(30)
+        let maximumPeakRSS = UInt64(256 * Self.mebibyte)
+#endif
+        let source = temporaryDirectory
+            .appendingPathComponent("ocr-resume-1000.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1_000
+        )
+        let identity = OCRCheckpointIdentity(
+            recordID: UUID(),
+            revisionID: UUID(),
+            pageCount: 1_000,
+            configuration: .automatic
+        )
+        let checkpoint = OCRCheckpoint(
+            identity: identity,
+            pages: (0..<(1_000 - recognitionPageCount)).map {
+                OCRPageResult(
+                    pageIndex: $0,
+                    text: "Recovered fixture page \($0 + 1)",
+                    confidence: 0.99,
+                    blocks: []
+                )
+            }
+        )
+        let service = VisionOCRService()
+        service.releaseCachedResources()
+        let baseline = testResidentMemory()
+        let sampler = TestProcessMemorySampler()
+        sampler.start()
+        let startedAt = ContinuousClock.now
+
+        let result = try await service.recognize(
+            url: source,
+            checkpoint: checkpoint
+        )
+
+        let elapsed = startedAt.duration(to: .now)
+        let peakRSS = sampler.stop()
+        let peakDelta = peakRSS
+            .saturatingSubtracting(baseline)
+        service.releaseCachedResources()
+        let baselineMiB = baseline / 1_024 / 1_024
+        let peakMiB = peakRSS / 1_024 / 1_024
+        let growthMiB = peakDelta / 1_024 / 1_024
+        await XCTContext.runActivity(
+            named: """
+            OCR stress: \(recognitionPageCount) pages in \(elapsed), \
+            RSS \(baselineMiB) -> \(peakMiB) MiB (+\(growthMiB) MiB)
+            """
+        ) { _ in }
+        XCTAssertEqual(result.pages.count, 1_000)
+        XCTAssertEqual(
+            result.pages.map(\.pageIndex),
+            Array(0..<1_000)
+        )
+        XCTAssertTrue(
+            result.pages.suffix(recognitionPageCount).allSatisfy {
+                !$0.text.isEmpty
+            }
+        )
+        XCTAssertLessThan(elapsed, maximumDuration)
+        XCTAssertLessThan(
+            peakDelta,
+            maximumPeakRSS,
+            "\(recognitionPageCount)-page resumed OCR exceeded its peak RSS budget"
+        )
+    }
+
     func testCompareVersions_twoHundredPagesUsesBoundedMemory_BitsUT()
         throws {
         let source = temporaryDirectory
@@ -1737,6 +2224,31 @@ private extension UInt64 {
 final class PDFStabilityContractTests: XCTestCase {
     private var temporaryDirectory: URL!
 
+    @MainActor
+    func testPDFViewDeferredUpdatesOnlyAcceptLatestObservedGeneration_BitsUT() {
+        let coordinator = PDFDocumentView.Coordinator(
+            onPageChange: { _ in }
+        )
+        let view = PDFView()
+        coordinator.observePageChanges(in: view)
+
+        let first = coordinator.beginDeferredUpdate(in: view)
+        let second = coordinator.beginDeferredUpdate(in: view)
+
+        XCTAssertFalse(
+            coordinator.isCurrentDeferredUpdate(first, in: view)
+        )
+        XCTAssertTrue(
+            coordinator.isCurrentDeferredUpdate(second, in: view)
+        )
+
+        coordinator.stopObservingPageChanges()
+
+        XCTAssertFalse(
+            coordinator.isCurrentDeferredUpdate(second, in: view)
+        )
+    }
+
     override func setUpWithError() throws {
         temporaryDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(
@@ -2375,7 +2887,10 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let indices = try await store.loadTextIndices()
         let results = try await store.loadOCRResults()
         let records = try await store.load()
-        XCTAssertEqual(indices[record.id], originalIndex)
+        XCTAssertEqual(
+            indices[record.id],
+            originalIndex.bound(to: savedRecord.contentRevisionID)
+        )
         XCTAssertEqual(results[record.id], originalOCR)
         XCTAssertEqual(records.first?.brief, originalBrief)
     }
@@ -2384,7 +2899,19 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         async throws {
         let root = temporaryDirectory
             .appendingPathComponent("MetadataFirstSearchStore")
-        let recordID = UUID()
+        let source = temporaryDirectory
+            .appendingPathComponent("metadata-search-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(
+            at: source,
+            pageCount: 1
+        )
+        let store = DocumentStore(rootURL: root)
+        let record = try await store.importPDF(
+            from: source,
+            preferredName: "Quarterly Review",
+            preserveSourceLocation: false
+        )
+        let recordID = record.id
         let sidecarURL = root
             .appendingPathComponent("TextIndex", isDirectory: true)
             .appendingPathComponent(
@@ -2395,14 +2922,14 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             at: sidecarURL,
             withIntermediateDirectories: true
         )
-        let store = DocumentStore(rootURL: root)
         let candidate = DocumentStoreTextSearchCandidate(
             recordID: recordID,
             metadataCorpus: DocumentSearchNormalization.text(
                 "Quarterly Review"
             ),
             pageCount: 1,
-            hasAnalysis: true
+            hasAnalysis: false,
+            contentRevisionID: record.contentRevisionID
         )
 
         let metadataMatch = try await store.searchTextIndices(
@@ -3573,8 +4100,9 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         async throws {
         let source = temporaryDirectory
             .appendingPathComponent("concurrent-output-source.pdf")
-        try PDFTestFixtureFactory.makeTextPDF(
+        try PDFTestFixtureFactory.makeTrailingPaddedPDF(
             at: source,
+            paddingBytes: 1_024 * 1_024,
             pageCount: 6
         )
         let store = DocumentStore(
@@ -3632,6 +4160,74 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             1
         )
         XCTAssertFalse(model.isProcessing(imported.id))
+    }
+
+    @MainActor
+    func testModel_concurrentImageImportsKeepOperationOwnership_BitsUT()
+        async throws {
+        let store = DocumentStore(
+            rootURL: temporaryDirectory
+                .appendingPathComponent("ConcurrentImageImportStore")
+        )
+        let previousSync = UserDefaults.standard.object(
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        UserDefaults.standard.set(
+            false,
+            forKey: AppPreferences.metadataSyncEnabledKey
+        )
+        defer {
+            if let previousSync {
+                UserDefaults.standard.set(
+                    previousSync,
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                )
+            } else {
+                UserDefaults.standard.removeObject(
+                    forKey: AppPreferences.metadataSyncEnabledKey
+                )
+            }
+        }
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let image = makeTestImage(
+            size: CGSize(width: 640, height: 480)
+        )
+        let pages = (0..<8).map { _ in
+            ScanPageImage(image: image)
+        }
+        let scanProgressID = UUID()
+        let imageProgressID = UUID()
+
+        let scanTask = Task { @MainActor in
+            await model.importScan(
+                pages: pages,
+                progressID: scanProgressID
+            )
+        }
+        for _ in 0..<100
+        where model.scanImportFraction(for: scanProgressID) == nil {
+            await Task.yield()
+        }
+        XCTAssertNotNil(
+            model.scanImportFraction(for: scanProgressID)
+        )
+
+        let imageTask = Task { @MainActor in
+            await model.importImages(
+                pages: pages,
+                progressID: imageProgressID
+            )
+        }
+        let records = await (scanTask.value, imageTask.value)
+
+        XCTAssertNotNil(records.0)
+        XCTAssertNotNil(records.1)
+        XCTAssertNotEqual(records.0?.id, records.1?.id)
+        XCTAssertEqual(model.documents.count, 2)
+        XCTAssertNil(model.scanImportFraction(for: scanProgressID))
+        XCTAssertNil(model.scanImportFraction(for: imageProgressID))
+        XCTAssertFalse(model.hasActiveLocalDataOperations)
     }
 
     @MainActor
@@ -4300,8 +4896,117 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let indicesAfterFailure = try await store.loadTextIndices()
         XCTAssertEqual(
             indicesAfterFailure[original.id],
-            modifiedIndex
+            modifiedIndex.bound(to: modified.contentRevisionID)
         )
+    }
+
+    func testRestoreVersion_checkpointCleanupFailurePreservesPages_BitsUT()
+        async throws {
+        for mode in CheckpointRemovalFailingFileManager.Mode.allCases {
+            let source = temporaryDirectory
+                .appendingPathComponent("checkpoint-\(mode).pdf")
+            try PDFTestFixtureFactory.makeTextPDF(at: source, pageCount: 2)
+            let root = temporaryDirectory
+                .appendingPathComponent("CheckpointStore-\(mode)")
+            let fileManager = CheckpointRemovalFailingFileManager(mode: mode)
+            let store = DocumentStore(rootURL: root, fileManager: fileManager)
+            let original = try await store.importPDF(
+                from: source,
+                preserveSourceLocation: false
+            )
+            let snapshot = try await store.createVersionSnapshot(
+                for: original, label: "Before edit"
+            )
+            let privateURL = await store.url(for: original)
+            try PDFMutationService().addStamp(.draft, toPageAt: 0, in: privateURL)
+            let modified = try await store.refresh(original)
+            let identity = OCRCheckpointIdentity(
+                recordID: modified.id,
+                revisionID: modified.contentRevisionID,
+                pageCount: 2,
+                configuration: .automatic
+            )
+            _ = try await store.prepareOCRCheckpoint(identity)
+            for index in 0..<2 {
+                try await store.saveOCRCheckpointPage(
+                    OCRPageResult(
+                        pageIndex: index,
+                        text: "Saved recognition page \(index + 1)",
+                        confidence: 0.99,
+                        blocks: []
+                    ),
+                    identity: identity
+                )
+            }
+            let checkpointURL = root.appendingPathComponent(
+                "OCR/\(modified.id.uuidString).resume"
+            )
+            let names = ["identity.json", "page-0.json", "page-1.json"]
+            let savedBytes = try names.map {
+                try Data(contentsOf: checkpointURL.appendingPathComponent($0))
+            }
+            let savedPDF = try Data(contentsOf: privateURL)
+            let journal = root.appendingPathComponent(
+                "active-working-copy-transaction.json"
+            )
+            fileManager.checkpointURL = checkpointURL
+
+            do {
+                _ = try await store.restoreVersion(
+                    snapshotID: snapshot.id, for: modified
+                )
+                XCTFail("Cleanup failure must reject version restore: \(mode)")
+            } catch {
+                XCTAssertTrue(fileManager.didInjectFailure, "\(mode)")
+            }
+            XCTAssertEqual(try Data(contentsOf: privateURL), savedPDF, "\(mode)")
+            if mode == .restoreCopyFailure || mode == .restoreProtectionFailure {
+                XCTAssertTrue(
+                    FileManager.default.fileExists(atPath: journal.path),
+                    "A failed rollback must retain its journal"
+                )
+                let backups = try FileManager.default.contentsOfDirectory(
+                    at: root, includingPropertiesForKeys: nil
+                ).filter { $0.lastPathComponent.hasPrefix(".batch-sidecar-rollback-") }
+                XCTAssertEqual(backups.count, 1)
+                if let backup = backups.first {
+                    for (name, data) in zip(names, savedBytes) {
+                        XCTAssertEqual(
+                            try Data(contentsOf: backup.appendingPathComponent(name)),
+                            data
+                        )
+                    }
+                }
+            } else {
+                for (name, data) in zip(names, savedBytes) {
+                    XCTAssertEqual(
+                        try? Data(contentsOf: checkpointURL.appendingPathComponent(name)),
+                        data,
+                        "\(mode): \(name)"
+                    )
+                }
+            }
+
+            let reopened = DocumentStore(rootURL: root)
+            let records = try await reopened.load()
+            XCTAssertEqual(
+                records.first?.contentRevisionID,
+                modified.contentRevisionID,
+                "\(mode)"
+            )
+            let checkpoint = try await reopened.loadOCRCheckpoint(identity)
+            XCTAssertEqual(checkpoint?.pages.map(\.pageIndex), [0, 1], "\(mode)")
+            for (name, data) in zip(names, savedBytes) {
+                XCTAssertEqual(
+                    try? Data(contentsOf: checkpointURL.appendingPathComponent(name)),
+                    data,
+                    "\(mode): \(name) after reopening"
+                )
+            }
+            XCTAssertFalse(FileManager.default.fileExists(atPath: journal.path))
+            let remaining = try FileManager.default.contentsOfDirectory(atPath: root.path)
+            XCTAssertFalse(remaining.contains { $0.hasPrefix(".batch-sidecar-") })
+        }
     }
 
     @MainActor
@@ -4634,9 +5339,16 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
             options: .atomic
         )
 
-        let pending = try ExternalPDFInbox.pendingItems(
+        let snapshot = try ExternalPDFInbox.pendingSnapshot(
             sharedContainerURL: sharedContainer
         )
+        XCTAssertTrue(
+            snapshot.deferredItems.isEmpty,
+            snapshot.deferredItems.map {
+                "\($0.containerURL.lastPathComponent): \($0.reason)"
+            }.joined(separator: "\n")
+        )
+        let pending = snapshot.items
         let sourceData = try Data(contentsOf: source)
         let expectedFingerprint = SHA256.hash(data: sourceData)
             .map { String(format: "%02x", $0) }
@@ -7409,6 +8121,39 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
     }
 
+    func testDocumentRoute_repeatedQuickTaskHasFreshInvocationIdentity_BitsUT() {
+        let recordID = UUID()
+        let revisionID = UUID()
+        let firstRead = DocumentRoute(
+            recordID: recordID,
+            pageIndex: 4
+        )
+        let secondRead = DocumentRoute(
+            recordID: recordID,
+            pageIndex: 4
+        )
+        let firstTask = DocumentRoute(
+            recordID: recordID,
+            pageIndex: 4,
+            quickTask: .protectPDF
+        )
+        let secondTask = DocumentRoute(
+            recordID: recordID,
+            pageIndex: 4,
+            quickTask: .protectPDF
+        )
+
+        XCTAssertEqual(firstRead, secondRead)
+        XCTAssertNotEqual(firstTask, secondTask)
+
+        let reboundTask = firstTask.bindingExpectedRevision(revisionID)
+        XCTAssertEqual(
+            reboundTask.bindingExpectedRevision(revisionID),
+            reboundTask
+        )
+        XCTAssertNotEqual(reboundTask, secondTask)
+    }
+
     func testDocumentBriefProfileAndNoticeContracts_BitsUT() {
         let recordID = UUID()
         XCTAssertEqual(
@@ -7418,18 +8163,6 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(
             AppNoticeAction.undoPageChange(recordID: recordID).title,
             "Undo"
-        )
-        XCTAssertEqual(
-            DocumentRoute(
-                recordID: recordID,
-                pageIndex: 4,
-                quickTask: .signPDF
-            ),
-            DocumentRoute(
-                recordID: recordID,
-                pageIndex: 4,
-                quickTask: .signPDF
-            )
         )
         XCTAssertEqual(PDFQuickTaskGroup.finish.title, "Finish & protect")
         XCTAssertFalse(PDFQuickTask.mergePDFs.requiresDocument)
@@ -7571,7 +8304,15 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         XCTAssertEqual(runtimeEvidence.pageYieldPercent, 100)
         XCTAssertEqual(runtimeEvidence.searchableCoveragePercent, 80)
         XCTAssertEqual(runtimeEvidence.assetBudgetUsePercent, 100)
-        XCTAssertEqual(runtimeEvidence.yieldSummary, "5/2 页 · 产出率 100%")
+        XCTAssertEqual(
+            runtimeEvidence.yieldSummary,
+            AppLocalization.format(
+                "%lld/%lld pages · %lld%% yield",
+                5,
+                2,
+                100
+            )
+        )
         XCTAssertEqual(
             PDFOfficeRuntimeEvidence(
                 sourcePageCount: 0,
@@ -11843,6 +12584,349 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
     }
 }
 
+final class PageReplacementOwnershipTests: XCTestCase {
+    @MainActor
+    func testReplacePage_preservesSourceOwnershipAndReleasesOperations_BitsUT()
+        async throws {
+        let syncKey = AppPreferences.metadataSyncEnabledKey
+        let previousSync = UserDefaults.standard.object(forKey: syncKey)
+        UserDefaults.standard.set(false, forKey: syncKey)
+        defer {
+            if let previousSync {
+                UserDefaults.standard.set(previousSync, forKey: syncKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: syncKey)
+            }
+        }
+        for scenario in [
+            "replacing", "source-busy", "cancelled", "invalid-page",
+            "stale-source", "stale-destination", "same-document"
+        ] {
+            try await exerciseReplacement(scenario: scenario)
+        }
+    }
+
+    @MainActor
+    private func exerciseReplacement(scenario: String) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ReplacementOwnership-\(UUID())")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = root.appendingPathComponent("source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(at: input, pageCount: 2)
+        let gate = ReplacementCapacityGate()
+        defer { gate.release() }
+        let store = DocumentStore(
+            rootURL: root.appendingPathComponent("Store"),
+            availableCapacity: { _ in gate.capacity() }
+        )
+        let source = try await store.importPDF(
+            from: input, preserveSourceLocation: false
+        )
+        let destination = try await store.importPDF(
+            from: input, preserveSourceLocation: false
+        )
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let sourceURL = try XCTUnwrap(model.url(for: source.id))
+        let destinationURL = try XCTUnwrap(model.url(for: destination.id))
+        let sourceBytes = try Data(contentsOf: sourceURL)
+        let destinationBytes = try Data(contentsOf: destinationURL)
+        let replace: @MainActor () async -> Bool = {
+            await model.replacePage(
+                recordID: destination.id,
+                index: 0,
+                from: scenario == "same-document"
+                    ? destination.id : source.id,
+                sourceIndex: scenario == "invalid-page" ? 10 : 1,
+                expectedDestinationContentRevisionID:
+                    scenario == "stale-destination"
+                        ? UUID() : destination.contentRevisionID,
+                expectedSourceContentRevisionID:
+                    scenario == "stale-source"
+                        ? UUID() : source.contentRevisionID
+            )
+        }
+
+        var replaced = false
+        if ["replacing", "source-busy", "cancelled"].contains(scenario) {
+            let entered = expectation(description: "\(scenario) storage paused")
+            gate.arm { entered.fulfill() }
+            let first = Task { @MainActor in
+                if scenario == "source-busy" {
+                    return await model.rotatePages(
+                        recordID: source.id, indices: [0]
+                    )
+                }
+                return await replace()
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            if scenario == "source-busy" {
+                XCTAssertTrue(model.isProcessing(source.id), scenario)
+            } else {
+                XCTAssertTrue(model.isProcessing(destination.id), scenario)
+                XCTAssertTrue(model.isProcessing(source.id), scenario)
+            }
+            if scenario == "cancelled" {
+                first.cancel()
+                gate.release()
+                replaced = await first.value
+                XCTAssertFalse(replaced, scenario)
+            } else {
+                let contenderStarted = expectation(
+                    description: "\(scenario) competing operation started"
+                )
+                let contender = Task { @MainActor in
+                    contenderStarted.fulfill()
+                    if scenario == "source-busy" {
+                        return await replace()
+                    }
+                    return await model.rotatePages(
+                        recordID: source.id, indices: [0]
+                    )
+                }
+                await fulfillment(of: [contenderStarted], timeout: 5)
+                gate.release()
+                let firstSucceeded = await first.value
+                let competingSucceeded = await contender.value
+                XCTAssertTrue(firstSucceeded, scenario)
+                XCTAssertFalse(competingSucceeded, scenario)
+                replaced = scenario == "source-busy"
+                    ? competingSucceeded : firstSucceeded
+            }
+        } else {
+            replaced = await replace()
+            XCTAssertFalse(replaced, scenario)
+        }
+        XCTAssertFalse(model.isProcessing(source.id), scenario)
+        XCTAssertFalse(model.isProcessing(destination.id), scenario)
+        XCTAssertFalse(model.hasActiveLocalDataOperations, scenario)
+        XCTAssertFalse(gate.didTimeOut, scenario)
+        if scenario != "source-busy" {
+            XCTAssertEqual(try Data(contentsOf: sourceURL), sourceBytes, scenario)
+            XCTAssertEqual(
+                model.record(id: source.id)?.contentRevisionID,
+                source.contentRevisionID,
+                scenario
+            )
+        }
+        if replaced {
+            let output = try XCTUnwrap(PDFDocument(url: destinationURL))
+            XCTAssertEqual(output.pageCount, 2, scenario)
+            XCTAssertEqual(
+                output.page(at: 0)?.string,
+                PDFDocument(url: input)?.page(at: 1)?.string,
+                scenario
+            )
+            XCTAssertNotEqual(
+                model.record(id: destination.id)?.contentRevisionID,
+                destination.contentRevisionID,
+                scenario
+            )
+        } else {
+            XCTAssertEqual(
+                try Data(contentsOf: destinationURL), destinationBytes, scenario
+            )
+            XCTAssertEqual(
+                model.record(id: destination.id)?.contentRevisionID,
+                destination.contentRevisionID,
+                scenario
+            )
+        }
+    }
+}
+
+final class PageCopyOwnershipTests: XCTestCase {
+    @MainActor
+    func testCopyPages_preservesSourceOwnershipAndReleasesOperations_BitsUT()
+        async throws {
+        let syncKey = AppPreferences.metadataSyncEnabledKey
+        let previousSync = UserDefaults.standard.object(forKey: syncKey)
+        UserDefaults.standard.set(false, forKey: syncKey)
+        defer {
+            if let previousSync {
+                UserDefaults.standard.set(previousSync, forKey: syncKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: syncKey)
+            }
+        }
+        for scenario in [
+            "copying", "source-busy", "cancelled", "invalid-page",
+            "same-document", "empty-selection", "missing-source",
+            "missing-destination"
+        ] {
+            try await exerciseCopy(scenario: scenario)
+        }
+    }
+
+    @MainActor
+    private func exerciseCopy(scenario: String) async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PageCopyOwnership-\(UUID())")
+        try FileManager.default.createDirectory(
+            at: root, withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = root.appendingPathComponent("source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(at: input, pageCount: 2)
+        let gate = ReplacementCapacityGate()
+        defer { gate.release() }
+        let store = DocumentStore(
+            rootURL: root.appendingPathComponent("Store"),
+            availableCapacity: { _ in gate.capacity() }
+        )
+        let source = try await store.importPDF(
+            from: input, preserveSourceLocation: false
+        )
+        let destination = try await store.importPDF(
+            from: input, preserveSourceLocation: false
+        )
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let sourceURL = try XCTUnwrap(model.url(for: source.id))
+        let destinationURL = try XCTUnwrap(model.url(for: destination.id))
+        let sourceBytes = try Data(contentsOf: sourceURL)
+        let destinationBytes = try Data(contentsOf: destinationURL)
+        let copy: @MainActor () async -> Bool = {
+            await model.copyPages(
+                from: scenario == "missing-source" ? UUID() : source.id,
+                indices: scenario == "empty-selection"
+                    ? [] : (scenario == "invalid-page" ? [10] : [0, 1]),
+                to: scenario == "same-document" ? source.id
+                    : (scenario == "missing-destination" ? UUID() : destination.id)
+            )
+        }
+        var copied = false
+        if ["copying", "source-busy", "cancelled"].contains(scenario) {
+            let entered = expectation(description: "\(scenario) storage paused")
+            gate.arm { entered.fulfill() }
+            let first = Task { @MainActor in
+                if scenario == "source-busy" {
+                    return await model.rotatePages(
+                        recordID: source.id, indices: [0]
+                    )
+                }
+                return await copy()
+            }
+            await fulfillment(of: [entered], timeout: 5)
+            XCTAssertTrue(model.isProcessing(source.id), scenario)
+            if scenario != "source-busy" {
+                XCTAssertTrue(model.isProcessing(destination.id), scenario)
+            }
+            if scenario == "cancelled" {
+                first.cancel()
+                gate.release()
+                copied = await first.value
+                XCTAssertFalse(copied, scenario)
+            } else {
+                let started = expectation(
+                    description: "\(scenario) competing operation started"
+                )
+                let contender = Task { @MainActor in
+                    started.fulfill()
+                    if scenario == "source-busy" {
+                        return await copy()
+                    }
+                    return await model.rotatePages(
+                        recordID: source.id, indices: [0]
+                    )
+                }
+                await fulfillment(of: [started], timeout: 5)
+                gate.release()
+                let firstSucceeded = await first.value
+                let competingSucceeded = await contender.value
+                XCTAssertTrue(firstSucceeded, scenario)
+                XCTAssertFalse(competingSucceeded, scenario)
+                copied = scenario == "source-busy"
+                    ? competingSucceeded : firstSucceeded
+            }
+        } else {
+            copied = await copy()
+            XCTAssertFalse(copied, scenario)
+        }
+        XCTAssertFalse(model.isProcessing(source.id), scenario)
+        XCTAssertFalse(model.isProcessing(destination.id), scenario)
+        XCTAssertFalse(model.hasActiveLocalDataOperations, scenario)
+        XCTAssertFalse(gate.didTimeOut, scenario)
+        if scenario != "source-busy" {
+            XCTAssertEqual(try Data(contentsOf: sourceURL), sourceBytes, scenario)
+            XCTAssertEqual(
+                model.record(id: source.id)?.contentRevisionID,
+                source.contentRevisionID, scenario
+            )
+        }
+        if copied {
+            let output = try XCTUnwrap(PDFDocument(url: destinationURL))
+            XCTAssertEqual(output.pageCount, 4, scenario)
+            for index in 0..<2 {
+                XCTAssertEqual(
+                    output.page(at: index + 2)?.string,
+                    PDFDocument(url: input)?.page(at: index)?.string,
+                    scenario
+                )
+            }
+            XCTAssertNotEqual(
+                model.record(id: destination.id)?.contentRevisionID,
+                destination.contentRevisionID, scenario
+            )
+        } else {
+            XCTAssertEqual(
+                try Data(contentsOf: destinationURL), destinationBytes, scenario
+            )
+            XCTAssertEqual(
+                model.record(id: destination.id)?.contentRevisionID,
+                destination.contentRevisionID, scenario
+            )
+        }
+    }
+}
+
+private final class ReplacementCapacityGate: @unchecked Sendable {
+    private let condition = NSCondition()
+    private var onEntry: (() -> Void)?
+    private var released = false
+    private var timedOut = false
+
+    var didTimeOut: Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        return timedOut
+    }
+
+    func arm(onEntry: @escaping () -> Void) {
+        condition.lock()
+        defer { condition.unlock() }
+        self.onEntry = onEntry
+        released = false
+    }
+
+    func capacity() -> Int64 {
+        condition.lock()
+        defer { condition.unlock() }
+        guard let onEntry else { return .max }
+        self.onEntry = nil
+        onEntry()
+        let deadline = Date().addingTimeInterval(10)
+        while !released {
+            if !condition.wait(until: deadline) {
+                timedOut = true
+                break
+            }
+        }
+        return .max
+    }
+
+    func release() {
+        condition.lock()
+        released = true
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
 private final class TestProgressRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [Double] = []
@@ -11894,6 +12978,62 @@ private final class RemovalFailingFileManager:
             throw ProtectionTestError.denied
         }
         try super.removeItem(at: URL)
+    }
+}
+
+private final class CheckpointRemovalFailingFileManager:
+    FileManager,
+    @unchecked Sendable {
+    enum Mode: CaseIterable {
+        case partialRemoval
+        case completeRemoval
+        case restoreCopyFailure
+        case restoreProtectionFailure
+    }
+
+    let mode: Mode
+    var checkpointURL: URL?
+    private(set) var didInjectFailure = false
+
+    init(mode: Mode) {
+        self.mode = mode
+        super.init()
+    }
+
+    override func removeItem(at URL: URL) throws {
+        if URL == checkpointURL, !didInjectFailure {
+            didInjectFailure = true
+            if mode == .completeRemoval {
+                try super.removeItem(at: URL)
+            } else {
+                try super.removeItem(at: URL.appendingPathComponent("page-0.json"))
+            }
+            throw ProtectionTestError.denied
+        }
+        try super.removeItem(at: URL)
+    }
+
+    override func copyItem(at srcURL: URL, to dstURL: URL) throws {
+        if mode == .restoreCopyFailure,
+           didInjectFailure,
+           srcURL.path.contains(".batch-sidecar-rollback-") {
+            try Data("partial checkpoint copy".utf8).write(to: dstURL)
+            throw ProtectionTestError.denied
+        }
+        try super.copyItem(at: srcURL, to: dstURL)
+    }
+
+    override func setAttributes(
+        _ attributes: [FileAttributeKey: Any],
+        ofItemAtPath path: String
+    ) throws {
+        if mode == .restoreProtectionFailure,
+           didInjectFailure,
+           attributes[.protectionKey] != nil,
+           path == checkpointURL?.appendingPathComponent("page-0.json").path {
+            throw ProtectionTestError.denied
+        }
+        try super.setAttributes(attributes, ofItemAtPath: path)
     }
 }
 

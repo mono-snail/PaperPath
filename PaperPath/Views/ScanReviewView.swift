@@ -13,8 +13,8 @@ enum ScanReviewPurpose: Hashable, Sendable {
 
     var title: String {
         switch self {
-        case .createPDF: return "Review captured pages"
-        case .replacePage: return "Review replacement scan"
+        case .createPDF: return "Review Scan"
+        case .replacePage: return "Replacement Scan"
         }
     }
 
@@ -110,6 +110,7 @@ struct ScanReviewView: View {
     @State private var completionFeedback = 0
     @State private var isCompletingReview = false
     @State private var didSuspendForProtection = false
+    @State private var showsFineAdjustments = false
 
     init(
         images: [UIImage],
@@ -243,7 +244,7 @@ struct ScanReviewView: View {
                         .protectedDataWillBecomeUnavailableNotification
                 )
             ) { _ in
-                closeForUnavailableProtectedData()
+                suspendReviewForProtection()
             }
             .onReceive(
                 NotificationCenter.default.publisher(
@@ -257,6 +258,7 @@ struct ScanReviewView: View {
                 previewFailed = false
                 detectedDocument = false
                 detectedCropQuad = nil
+                undoSnapshot = nil
                 ScanPDFRenderer().releaseCachedResources()
                 pageRevision &+= 1
             }
@@ -472,6 +474,16 @@ struct ScanReviewView: View {
 
     private var scanCompletionBar: some View {
         VStack(spacing: PPSpacing.small) {
+            if purpose == .createPDF {
+                Label(
+                    "Image-based PDF · recognize text after saving".localizedUI,
+                    systemImage: "doc.viewfinder"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+
             let statusLayout = dynamicTypeSize.ppPrefersExpandedLayout
                 ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
                 : AnyLayout(HStackLayout(spacing: PPSpacing.small))
@@ -525,8 +537,13 @@ struct ScanReviewView: View {
     private var canFinishReview: Bool {
         let baseReady = !isCompletingReview
             && !workingImages.isEmpty
+            && workingImages.count == pageOptions.count
+            && workingImages.count
+                == automaticCropResolutions.count
             && !isEditingManualCrop
             && !isPreparingPreview
+            && scenePhase == .active
+            && UIApplication.shared.isProtectedDataAvailable
             && (
                 previewMode != .processed
                     || preview != nil && !previewFailed
@@ -655,12 +672,8 @@ struct ScanReviewView: View {
             currentOptions.autoCrop ? "crop" : "full",
             currentOptions.removeShadows ? "light" : "natural",
             currentOptions.cleanEdges ? "clean" : "edges",
-            String(
-                Int((currentOptions.brightness * 100).rounded())
-            ),
-            String(
-                Int((currentOptions.contrast * 100).rounded())
-            ),
+            String(currentOptions.brightness.bitPattern),
+            String(currentOptions.contrast.bitPattern),
             currentOptions.manualCrop?.cacheKey ?? "automatic",
             isEditingManualCrop ? "editing-crop" : "reviewing",
             previewMode.rawValue,
@@ -939,13 +952,9 @@ struct ScanReviewView: View {
                             Text("\(index + 1)")
                                 .font(.caption2.weight(.bold))
                                 .monospacedDigit()
-                                .foregroundStyle(.white)
+                                .foregroundStyle(PPColor.onInk)
                                 .padding(.horizontal, 4)
-                                .background(
-                                    index == pageIndex
-                                        ? PPColor.accent
-                                        : Color.black.opacity(0.58)
-                                )
+                                .background(PPColor.ink, in: RoundedRectangle(cornerRadius: 3))
                         }
                         .overlay(alignment: .topTrailing) {
                             if isSelectingPages,
@@ -974,7 +983,7 @@ struct ScanReviewView: View {
                                adjustmentSourcePageIndex == index {
                                 Image(systemName: "slider.horizontal.3")
                                     .font(.caption2.weight(.bold))
-                                    .foregroundStyle(Color.white)
+                                    .foregroundStyle(PPColor.onAccent)
                                     .frame(width: 22, height: 22)
                                     .background(PPColor.cyan, in: Circle())
                                     .padding(3)
@@ -996,8 +1005,11 @@ struct ScanReviewView: View {
                                 )
                         }
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PPPressButtonStyle())
                     .id(index)
+                    .accessibilityAddTraits(
+                        (isSelectingPages ? selectedPageIndices.contains(index) : index == pageIndex) ? .isSelected : []
+                    )
                     .accessibilityLabel(
                         AppLocalization.format(
                             "Scanned page %lld",
@@ -1038,6 +1050,16 @@ struct ScanReviewView: View {
             else { return }
             focusPage(newValue)
         }
+        .frame(
+            minWidth: min(
+                CGFloat(workingImages.count) * 50,
+                150
+            ),
+            maxWidth: .infinity,
+            alignment: .leading
+        )
+        .frame(height: 54)
+        .layoutPriority(1)
     }
 
     private func pageAccessibilityValue(
@@ -1172,16 +1194,11 @@ struct ScanReviewView: View {
         .accessibilityIdentifier("scanPageAction-\(label)")
     }
 
-    @ViewBuilder
     private var controls: some View {
-        if dynamicTypeSize.ppPrefersExpandedLayout {
-            ScrollView(.vertical, showsIndicators: false) {
-                controlPanel
-            }
-            .frame(maxHeight: 300)
-        } else {
+        ScrollView(.vertical) {
             controlPanel
         }
+        .frame(maxHeight: 250)
     }
 
     private var controlPanel: some View {
@@ -1202,29 +1219,26 @@ struct ScanReviewView: View {
 
             pageAdjustmentScope
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: PPSpacing.small) {
-                    ForEach(ScanEnhancement.allCases) { option in
-                        enhancementButton(option)
-                    }
+            LazyVGrid(
+                columns: enhancementColumns,
+                spacing: PPSpacing.small
+            ) {
+                ForEach(ScanEnhancement.allCases) { option in
+                    enhancementButton(option)
                 }
-                .padding(.horizontal, PPSpacing.regular)
-                .padding(.vertical, PPSpacing.small)
             }
+            .padding(.horizontal, PPSpacing.regular)
+            .padding(.vertical, PPSpacing.small)
             .accessibilityIdentifier("scanEnhancementPicker")
 
             Rectangle()
                 .fill(PPColor.border.opacity(0.65))
                 .frame(height: 0.6)
 
-            toneControls
-
-            Rectangle()
-                .fill(PPColor.border.opacity(0.65))
-                .frame(height: 0.6)
-
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: PPSpacing.regular) {
+            DisclosureGroup(isExpanded: $showsFineAdjustments) {
+                VStack(spacing: PPSpacing.small) {
+                    toneControls
+                        .padding(.horizontal, -PPSpacing.regular)
                     scanToggle(
                         "Auto crop",
                         symbol: "viewfinder",
@@ -1243,30 +1257,40 @@ struct ScanReviewView: View {
                             && currentOptions.manualCrop == nil
                     )
                 }
-                .fixedSize(horizontal: true, vertical: false)
-
-                VStack(alignment: .leading, spacing: PPSpacing.small) {
-                    scanToggle(
-                        "Auto crop",
-                        symbol: "viewfinder",
-                        isOn: optionBinding(\.autoCrop)
-                    )
-                    scanToggle(
-                        "Reduce shadows",
-                        symbol: "circle.lefthalf.striped.horizontal",
-                        isOn: optionBinding(\.removeShadows)
-                    )
-                    scanToggle(
-                        "Clean edges",
-                        symbol: "crop",
-                        isOn: optionBinding(\.cleanEdges),
-                        disabled: !currentOptions.autoCrop
-                            && currentOptions.manualCrop == nil
-                    )
-                }
+                .padding(.bottom, PPSpacing.small)
+            } label: {
+                Label(
+                    "Fine adjustments".localizedUI,
+                    systemImage: "slider.horizontal.3"
+                )
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(PPColor.textPrimary)
+                .frame(minHeight: 44)
             }
             .padding(.horizontal, PPSpacing.regular)
-            .padding(.bottom, PPSpacing.small)
+            .accessibilityIdentifier("scanFineAdjustments")
+
+            if purpose == .createPDF {
+                DisclosureGroup {
+                    Text(
+                        "Pages are fitted to standard Letter-sized sheets and may be downsampled. Run Recognize Text afterward to search or copy."
+                            .localizedUI
+                    )
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .padding(.bottom, PPSpacing.small)
+                } label: {
+                    Label(
+                        "Image-based Letter pages".localizedUI,
+                        systemImage: "doc.viewfinder"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(minHeight: 44)
+                }
+                .padding(.horizontal, PPSpacing.regular)
+                .accessibilityIdentifier("scanOutputBoundary")
+            }
         }
         .background(.bar)
         .overlay(alignment: .top) {
@@ -1569,6 +1593,8 @@ struct ScanReviewView: View {
                     .font(.caption.weight(.semibold))
                 Text(option.title.localizedUI)
                     .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
             }
             .foregroundStyle(
                 currentOptions.enhancement == option
@@ -1576,7 +1602,7 @@ struct ScanReviewView: View {
                     : PPColor.textPrimary
             )
             .padding(.horizontal, PPSpacing.small)
-            .frame(minHeight: 44)
+            .frame(maxWidth: .infinity, minHeight: 44)
             .background(
                 currentOptions.enhancement == option
                     ? PPColor.accent
@@ -1597,6 +1623,16 @@ struct ScanReviewView: View {
         )
         .accessibilityIdentifier(
             "scanEnhancement-\(option.rawValue)"
+        )
+    }
+
+    private var enhancementColumns: [GridItem] {
+        Array(
+            repeating: GridItem(
+                .flexible(minimum: 0),
+                spacing: PPSpacing.small
+            ),
+            count: dynamicTypeSize.ppPrefersExpandedLayout ? 1 : 3
         )
     }
 
@@ -1706,7 +1742,7 @@ struct ScanReviewView: View {
             .accessibilityLabel(title.localizedUI)
             .accessibilityValue(displayValue)
         }
-        .frame(minWidth: 120, maxWidth: .infinity)
+        .frame(minWidth: 150, maxWidth: .infinity)
     }
 
     private var resetToneButton: some View {
@@ -1973,10 +2009,13 @@ struct ScanReviewView: View {
         _ update: (inout ScanProcessingOptions) -> Void
     ) {
         guard pageOptions.indices.contains(pageIndex) else { return }
+        var updatedOptions = pageOptions[pageIndex]
+        update(&updatedOptions)
+        guard updatedOptions != pageOptions[pageIndex] else { return }
         if clearsUndo {
             undoSnapshot = nil
         }
-        update(&pageOptions[pageIndex])
+        pageOptions[pageIndex] = updatedOptions
         previewMode = .processed
         previewGeneration = UUID()
         validatedProcessedPreviewKey = nil
@@ -1993,31 +2032,32 @@ struct ScanReviewView: View {
         guard let sourceIndex,
               pageOptions.indices.contains(sourceIndex)
         else { return }
-        captureUndoSnapshot()
         let options = pageOptions[sourceIndex]
+        var updatedOptions = pageOptions
+        let targetIndices = isSelectingPages
+            ? selectedPageIndices
+            : Set(pageOptions.indices)
+        for index in targetIndices
+        where pageOptions.indices.contains(index) {
+            updatedOptions[index] = transferableOptions(
+                options,
+                sourceIndex: sourceIndex,
+                to: index
+            )
+        }
+        let hasChanges = updatedOptions != pageOptions
+        if hasChanges {
+            captureUndoSnapshot()
+            pageOptions = updatedOptions
+        }
         if isSelectingPages {
-            for index in selectedPageIndices
-            where pageOptions.indices.contains(index) {
-                pageOptions[index] = transferableOptions(
-                    options,
-                    sourceIndex: sourceIndex,
-                    to: index
-                )
-            }
             isSelectingPages = false
             selectedPageIndices.removeAll()
             adjustmentSourcePageIndex = nil
             focusPage(sourceIndex)
-        } else {
-            for index in pageOptions.indices {
-                pageOptions[index] = transferableOptions(
-                    options,
-                    sourceIndex: sourceIndex,
-                    to: index
-                )
-            }
         }
         previewMode = .processed
+        guard hasChanges else { return }
         pageRevision &+= 1
         previewGeneration = UUID()
         preview = nil
@@ -2083,12 +2123,22 @@ struct ScanReviewView: View {
 
     private func rotateSelectedPages() {
         guard !selectedPageIndices.isEmpty else { return }
-        captureUndoSnapshot()
+        let snapshot = EditSnapshot(
+            images: workingImages,
+            options: pageOptions,
+            automaticCropResolutions: automaticCropResolutions,
+            pageIndex: pageIndex,
+            isSelectingPages: isSelectingPages,
+            selectedPageIndices: selectedPageIndices,
+            adjustmentSourcePageIndex: adjustmentSourcePageIndex
+        )
+        var changed = false
         for index in selectedPageIndices.sorted()
         where workingImages.indices.contains(index)
             && pageOptions.indices.contains(index)
             && automaticCropResolutions.indices.contains(index) {
             if let rotated = rotatedImage(workingImages[index]) {
+                changed = true
                 workingImages[index] = rotated
                 pageOptions[index].manualCrop =
                     pageOptions[index]
@@ -2099,6 +2149,8 @@ struct ScanReviewView: View {
                         .rotatedClockwise
             }
         }
+        guard changed else { return }
+        undoSnapshot = snapshot
         pageRevision += 1
         preview = nil
         detectedDocument = false
@@ -2129,16 +2181,21 @@ struct ScanReviewView: View {
     }
 
     private func applyManualCrop() {
-        guard manualCropDraft.isValid else { return }
-        captureUndoSnapshot()
-        updateCurrentOptions(clearsUndo: false) {
-            $0.manualCrop =
-                manualCropDraft.isEffectivelyFullFrame
-                    ? nil
-                    : manualCropDraft
-            $0.autoCrop = false
-            if $0.manualCrop == nil {
-                $0.cleanEdges = false
+        guard manualCropDraft.isValid,
+              pageOptions.indices.contains(pageIndex)
+        else { return }
+        var updatedOptions = currentOptions
+        updatedOptions.manualCrop = manualCropDraft.isEffectivelyFullFrame
+            ? nil
+            : manualCropDraft
+        updatedOptions.autoCrop = false
+        if updatedOptions.manualCrop == nil {
+            updatedOptions.cleanEdges = false
+        }
+        if updatedOptions != currentOptions {
+            captureUndoSnapshot()
+            updateCurrentOptions(clearsUndo: false) {
+                $0 = updatedOptions
             }
         }
         isEditingManualCrop = false
@@ -2198,6 +2255,7 @@ struct ScanReviewView: View {
             isSelectingPages = false
             adjustmentSourcePageIndex = nil
         }
+        editFeedback &+= 1
     }
 
     private func captureUndoSnapshot() {
@@ -2348,10 +2406,21 @@ struct ScanReviewView: View {
         dismiss()
     }
 
-    private func closeForUnavailableProtectedData() {
+    private func suspendReviewForProtection() {
         guard !didSuspendForProtection else { return }
         didSuspendForProtection = true
+        guard !isCompletingReview else {
+            clearTransientPreviewState()
+            dismiss()
+            return
+        }
+        let pages = reviewedPages(
+            at: Array(workingImages.indices)
+        )
         clearTransientPreviewState()
+        if let pages {
+            onSuspend?(pages, pageIndex)
+        }
         dismiss()
     }
 
@@ -2517,22 +2586,22 @@ private struct ScanManualCropOverlay: View {
             .accessibilityLabel(cornerTitle(corner).localizedUI)
             .accessibilityValue(cornerPosition(corner))
             .accessibilityAction(
-                named: Text("Move Left")
+                named: Text("Move Left".localizedUI)
             ) {
                 nudge(corner, dx: -0.02, dy: 0)
             }
             .accessibilityAction(
-                named: Text("Move Right")
+                named: Text("Move Right".localizedUI)
             ) {
                 nudge(corner, dx: 0.02, dy: 0)
             }
             .accessibilityAction(
-                named: Text("Move Up")
+                named: Text("Move Up".localizedUI)
             ) {
                 nudge(corner, dx: 0, dy: -0.02)
             }
             .accessibilityAction(
-                named: Text("Move Down")
+                named: Text("Move Down".localizedUI)
             ) {
                 nudge(corner, dx: 0, dy: 0.02)
             }

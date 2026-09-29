@@ -84,6 +84,64 @@ enum DemoPDFBuilder {
     }
 
 #if DEBUG
+    static func createOfficeCorpusResultFixture(
+        at url: URL
+    ) throws {
+        let page = CGRect(x: 0, y: 0, width: 612, height: 792)
+        let emptyPageIndices: Set<Int> = [
+            6, 8, 16, 18, 20, 22, 24, 29, 32, 35
+        ]
+        let renderer = UIGraphicsPDFRenderer(bounds: page)
+        try renderer.writePDF(to: url) { context in
+            for pageIndex in 0..<36 {
+                context.beginPage()
+                guard !emptyPageIndices.contains(pageIndex) else {
+                    continue
+                }
+
+                drawTitle(
+                    "ConditionalFormattingSamples",
+                    in: page
+                )
+                let header =
+                    "Region     Quarter     Revenue     Orders"
+                header.draw(
+                    at: CGPoint(x: 56, y: 132),
+                    withAttributes: [
+                        .font: UIFont.monospacedSystemFont(
+                            ofSize: 11,
+                            weight: .bold
+                        ),
+                        .foregroundColor: UIColor.black
+                    ]
+                )
+                let rowCount = pageIndex == 0 ? 28 : 12
+                for row in 0..<rowCount {
+                    let line = String(
+                        format: "%-10@ Q%-10d $%-10d %-6d",
+                        "Region \(row % 7 + 1)" as NSString,
+                        row % 4 + 1,
+                        18_000 + pageIndex * 2_000 + row * 1_375,
+                        120 + row * 9
+                    )
+                    line.draw(
+                        at: CGPoint(
+                            x: 56,
+                            y: 158 + CGFloat(row) * 19
+                        ),
+                        withAttributes: [
+                            .font: UIFont.monospacedSystemFont(
+                                ofSize: 10,
+                                weight: .regular
+                            ),
+                            .foregroundColor: UIColor.darkText
+                        ]
+                    )
+                }
+            }
+        }
+    }
+
     static func createOfficeSoak(at url: URL) throws {
         let page = CGRect(x: 0, y: 0, width: 612, height: 792)
         let visual = UIGraphicsImageRenderer(
@@ -208,7 +266,8 @@ enum DemoPDFBuilder {
             in: CGRect(x: x, y: y + 42, width: 150, height: 40),
             withAttributes: [
                 .font: UIFont.systemFont(ofSize: 12, weight: .medium),
-                .foregroundColor: UIColor.secondaryLabel
+                // PDF paper stays white regardless of the app's appearance.
+                .foregroundColor: UIColor(white: 0.35, alpha: 1)
             ]
         )
     }

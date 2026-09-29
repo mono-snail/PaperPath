@@ -1,6 +1,5 @@
 import Foundation
 import LocalAuthentication
-import OSLog
 import StoreKit
 import SwiftUI
 import UIKit
@@ -15,31 +14,6 @@ extension EnvironmentValues {
         set { self[PaperPathSceneIDKey.self] = newValue }
     }
 }
-
-#if DEBUG
-private let paperPathDebugLogger = Logger(
-    subsystem: Bundle.main.bundleIdentifier ?? "PaperPath",
-    category: "diagnostics"
-)
-
-func reportFrequentUIFreezeDebugEvent(
-    hypothesisID: String,
-    location: String,
-    message: String,
-    data: [String: String] = [:]
-) {
-    guard ProcessInfo.processInfo.arguments.contains(
-        "UITEST_FREEZE_TRACE"
-    ) else { return }
-    let metadata = data
-        .sorted { $0.key < $1.key }
-        .map { "\($0.key)=\($0.value)" }
-        .joined(separator: " ")
-    paperPathDebugLogger.debug(
-        "[\(hypothesisID, privacy: .public)] \(location, privacy: .public): \(message, privacy: .public) \(metadata, privacy: .private(mask: .hash))"
-    )
-}
-#endif
 
 enum AppLockDelay: Int, CaseIterable, Identifiable {
     case immediately = 0
@@ -460,6 +434,8 @@ struct RootView: View {
     private var isInspectorPresented = false
     @State private var noticeDismissTask: Task<Void, Never>?
     @State private var pendingExternalOpenTask: Task<Void, Never>?
+    @State private var externalURLTasks:
+        [UUID: Task<Void, Never>] = [:]
     @State private var ratingRequestTask: Task<Void, Never>?
     @State private var activeLifecycleTask: Task<Void, Never>?
     @State private var layoutTransitionTask: Task<Void, Never>?
@@ -470,6 +446,8 @@ struct RootView: View {
     @State private var activeLifecycleGeneration = UUID()
     @State private var navigationGeneration = UUID()
     @State private var pendingExternalOpenGeneration = UUID()
+    @State private var noticeDismissGeneration = UUID()
+    @State private var ratingRequestGeneration = UUID()
     @State private var pendingGlobalActivation = false
     @State private var protectedDataAvailable =
         UIApplication.shared.isProtectedDataAvailable
@@ -493,8 +471,17 @@ struct RootView: View {
 
     private var navigationWithFeedback: some View {
         ZStack {
-            workspaceNavigation
+            if !appLock.isLocked {
+                workspaceNavigation
+                    .accessibilityHidden(
+                        scenePhase != .active || !protectedDataAvailable
+                    )
+                    .allowsHitTesting(
+                        scenePhase == .active && protectedDataAvailable
+                    )
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .environment(\.paperPathSceneID, sceneID)
         .id(appLock.lockGeneration)
         .privacySensitive()
@@ -505,14 +492,10 @@ struct RootView: View {
                 isTargeted && canAcceptDroppedPDFs
         }
         .onOpenURL { url in
-            Task {
-                await model.receiveExternalURL(
-                    url,
-                    targetSceneID: sceneID
-                )
-            }
+            receiveExternalURL(url)
         }
         .overlay(alignment: .top) {
+            if !appLock.isLocked && scenePhase == .active && protectedDataAvailable {
             VStack(spacing: PPSpacing.small) {
                 if model.isExternalPDFImportActive {
                     ExternalImportBanner(
@@ -614,6 +597,7 @@ struct RootView: View {
             .padding(.horizontal, PPSpacing.regular)
             .frame(maxWidth: .infinity)
             .zIndex(10)
+            }
         }
         .overlay {
             if isPDFDropTargeted && canAcceptDroppedPDFs {
@@ -667,8 +651,7 @@ struct RootView: View {
         }
         .onChange(of: sceneActionNotice, initial: true) {
             _, newValue in
-            noticeDismissTask?.cancel()
-            noticeDismissTask = nil
+            suspendNoticePresentation()
             if let newValue {
                 guard canPresentTransientFeedback else { return }
                 if voiceOverEnabled {
@@ -696,8 +679,7 @@ struct RootView: View {
             }
         }
         .onChange(of: voiceOverEnabled) { _, isEnabled in
-            noticeDismissTask?.cancel()
-            noticeDismissTask = nil
+            suspendNoticePresentation()
             guard !isEnabled,
                   canPresentTransientFeedback
             else { return }
@@ -761,7 +743,6 @@ struct RootView: View {
                 let becameGloballyActive =
                     appLock.sceneDidBecomeActive(sceneID)
                 if becameGloballyActive {
-                    model.resumeDeferredBackgroundWork()
                     scheduleRatingRequestIfAppropriate()
                 }
                 scheduleActiveLifecycle(
@@ -779,7 +760,6 @@ struct RootView: View {
                 let becameGloballyActive =
                     appLock.sceneDidBecomeActive(sceneID)
                 if becameGloballyActive {
-                    model.resumeDeferredBackgroundWork()
                     scheduleRatingRequestIfAppropriate()
                 }
                 scheduleActiveLifecycle(
@@ -803,6 +783,7 @@ struct RootView: View {
                 isPDFDropTargeted = false
                 model.feedbackSceneDidResignActive(sceneID)
                 suspendNoticePresentation()
+                suspendActiveLifecycle()
                 model.checkpointTrustedTime()
             @unknown default:
                 break
@@ -818,7 +799,7 @@ struct RootView: View {
             protectedDataAvailable = false
             model.feedbackSceneDidResignActive(sceneID)
             suspendNoticePresentation()
-            cancelActiveLifecycle()
+            suspendActiveLifecycle()
             cancelPendingExternalOpen()
             ratingRequestTask?.cancel()
             ratingRequestTask = nil
@@ -838,7 +819,7 @@ struct RootView: View {
             let becameGloballyActive =
                 appLock.sceneDidBecomeActive(sceneID)
             if becameGloballyActive {
-                model.resumeDeferredBackgroundWork()
+                scheduleRatingRequestIfAppropriate()
             } else {
                 appLock.didBecomeActive()
             }
@@ -856,10 +837,13 @@ struct RootView: View {
             navigationGeneration = UUID()
             navigationTask?.cancel()
             navigationTask = nil
+            for task in externalURLTasks.values {
+                task.cancel()
+            }
+            externalURLTasks.removeAll(keepingCapacity: false)
             cancelPendingExternalOpen()
             pendingFirstRunDocumentID = nil
-            noticeDismissTask?.cancel()
-            noticeDismissTask = nil
+            suspendNoticePresentation()
             ratingRequestTask?.cancel()
             ratingRequestTask = nil
             model.feedbackSceneDidDisconnect(sceneID)
@@ -873,18 +857,28 @@ struct RootView: View {
             }
         }
         .onChange(
-            of: model.pendingExternalDocumentHandoff,
+            of: model.externalDocumentHandoffs,
             initial: true
-        ) { _, handoff in
-            guard handoff != nil else { return }
+        ) { _, handoffs in
+            guard !handoffs.entries.isEmpty else { return }
             resumePendingRootNavigationIfPossible()
         }
         .onChange(of: appLock.isLocked) { _, isLocked in
             if isLocked {
                 isPDFDropTargeted = false
                 suspendNoticePresentation()
+                suspendActiveLifecycle()
+                ratingRequestTask?.cancel()
+                ratingRequestTask = nil
+                return
             }
-            guard !isLocked else { return }
+            guard scenePhase == .active,
+                  protectedDataAvailable
+            else { return }
+            scheduleActiveLifecycle(
+                becameGloballyActive: model.isLoading
+            )
+            scheduleRatingRequestIfAppropriate()
             resumePendingRootNavigationIfPossible()
             resumeNoticePresentationIfNeeded()
         }
@@ -892,13 +886,6 @@ struct RootView: View {
 
     var body: some View {
         navigationWithLifecycle
-#if DEBUG
-        // #region debug-point A:desk-launch-navigation
-        .onAppear {
-            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "desk-launch-navigation", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "A", "msg": "[DEBUG] Root appeared", "location": "RootView.body", "data": ["regular": horizontalSizeClass == .regular, "desk": isDeskVisible]]); URLSession.shared.dataTask(with: request).resume() }
-        }
-        // #endregion
-#endif
         .fullScreenCover(
             isPresented: firstRunPresentation,
             onDismiss: completeFirstRunPresentation
@@ -1265,7 +1252,8 @@ struct RootView: View {
                     pageIndex: checkpoint.pageIndex,
                     quickTask: checkpoint.stage.quickTask,
                     expectedContentRevisionID:
-                        record.contentRevisionID
+                        record.contentRevisionID,
+                    invocationID: route.invocationID
                 )
             }
             return DocumentRoute(
@@ -1281,7 +1269,8 @@ struct RootView: View {
             pageIndex: resolvedPageIndex,
             quickTask: route.quickTask,
             expectedContentRevisionID:
-                route.expectedContentRevisionID
+                route.expectedContentRevisionID,
+            invocationID: route.invocationID
         )
     }
 
@@ -1776,7 +1765,6 @@ struct RootView: View {
             && protectedDataAvailable
             && !appLock.isLocked
             && !model.isLoading
-            && !model.isImporting
             && !isFirstRunPresentationActive
             && !isFullUnlockPresentationActive
     }
@@ -1805,10 +1793,16 @@ struct RootView: View {
             seenPaths.insert($0.standardizedFileURL.path).inserted
         }
         guard !uniqueURLs.isEmpty else { return false }
-        Task {
+        let taskID = UUID()
+        let targetSceneID = sceneID
+        externalURLTasks[taskID] = Task { @MainActor in
+            defer {
+                externalURLTasks[taskID] = nil
+            }
+            guard !Task.isCancelled else { return }
             await model.receiveExternalURLs(
                 uniqueURLs,
-                targetSceneID: sceneID
+                targetSceneID: targetSceneID
             )
         }
         return true
@@ -1911,6 +1905,21 @@ struct RootView: View {
         lastComparisonPeerID = ""
     }
 
+    private func receiveExternalURL(_ url: URL) {
+        let taskID = UUID()
+        let targetSceneID = sceneID
+        externalURLTasks[taskID] = Task { @MainActor in
+            defer {
+                externalURLTasks[taskID] = nil
+            }
+            guard !Task.isCancelled else { return }
+            await model.receiveExternalURL(
+                url,
+                targetSceneID: targetSceneID
+            )
+        }
+    }
+
     private func scheduleActiveLifecycle(
         becameGloballyActive: Bool,
         resumesInterruptedWork: Bool = false
@@ -1932,27 +1941,23 @@ struct RootView: View {
             }
             guard !Task.isCancelled,
                   activeLifecycleGeneration == generation,
-                  appLock.hasActiveScenes,
-                  protectedDataAvailable
+                  canRunActiveLifecycle
             else { return }
             if resumesInterruptedWork {
                 await model.restoreCommittedImportsForForeground()
                 guard !Task.isCancelled,
                       activeLifecycleGeneration == generation,
-                      appLock.hasActiveScenes,
-                      protectedDataAvailable
+                      canRunActiveLifecycle
                 else { return }
                 await model.processPendingExternalPDFs()
                 guard !Task.isCancelled,
                       activeLifecycleGeneration == generation,
-                      appLock.hasActiveScenes,
-                      protectedDataAvailable
+                      canRunActiveLifecycle
                 else { return }
                 await model.restoreCommittedImportsForForeground()
                 guard !Task.isCancelled,
                       activeLifecycleGeneration == generation,
-                      appLock.hasActiveScenes,
-                      protectedDataAvailable
+                      canRunActiveLifecycle
                 else { return }
                 model.resumeDeferredBackgroundWork()
                 resumePendingRootNavigationIfPossible()
@@ -1965,8 +1970,7 @@ struct RootView: View {
             await model.bootstrap()
             guard !Task.isCancelled,
                   activeLifecycleGeneration == generation,
-                  appLock.hasActiveScenes,
-                  protectedDataAvailable
+                  canRunActiveLifecycle
             else { return }
             pendingGlobalActivation = false
 #if DEBUG
@@ -1974,6 +1978,21 @@ struct RootView: View {
 #endif
             _ = await purchaseRefresh
         }
+    }
+
+    private var canRunActiveLifecycle: Bool {
+        scenePhase == .active
+            && protectedDataAvailable
+            && !appLock.isLocked
+            && appLock.hasActiveScenes
+    }
+
+    private func suspendActiveLifecycle() {
+        pendingGlobalActivation =
+            pendingGlobalActivation || model.isLoading
+        activeLifecycleGeneration = UUID()
+        activeLifecycleTask?.cancel()
+        activeLifecycleTask = nil
     }
 
     private func cancelActiveLifecycle() {
@@ -2093,6 +2112,7 @@ struct RootView: View {
     }
 
     private func suspendNoticePresentation() {
+        noticeDismissGeneration = UUID()
         noticeDismissTask?.cancel()
         noticeDismissTask = nil
     }
@@ -2127,11 +2147,18 @@ struct RootView: View {
     private func scheduleMessageDismiss(
         _ notice: AppTransientNotice
     ) {
-        noticeDismissTask?.cancel()
+        suspendNoticePresentation()
         guard !voiceOverEnabled,
               canPresentTransientFeedback
         else { return }
-        noticeDismissTask = Task {
+        let generation = UUID()
+        noticeDismissGeneration = generation
+        noticeDismissTask = Task { @MainActor in
+            defer {
+                if noticeDismissGeneration == generation {
+                    noticeDismissTask = nil
+                }
+            }
             let visibleSeconds = min(
                 6,
                 max(2.8, Double(notice.message.count) * 0.055)
@@ -2140,6 +2167,7 @@ struct RootView: View {
                 for: .seconds(visibleSeconds)
             )
             if !Task.isCancelled,
+               noticeDismissGeneration == generation,
                canPresentTransientFeedback,
                sceneTransientNotice?.id == notice.id,
                sceneActionNotice == nil {
@@ -2154,12 +2182,19 @@ struct RootView: View {
     private func scheduleActionNoticeDismiss(
         _ notice: AppActionNotice
     ) {
-        noticeDismissTask?.cancel()
+        suspendNoticePresentation()
         guard !voiceOverEnabled,
               canPresentTransientFeedback,
               sceneActionNotice?.id == notice.id
         else { return }
-        noticeDismissTask = Task {
+        let generation = UUID()
+        noticeDismissGeneration = generation
+        noticeDismissTask = Task { @MainActor in
+            defer {
+                if noticeDismissGeneration == generation {
+                    noticeDismissTask = nil
+                }
+            }
             let readingLength = notice.message.count
                 + (notice.detail?.count ?? 0)
                 + notice.action.title.count
@@ -2171,6 +2206,7 @@ struct RootView: View {
                 for: .seconds(visibleSeconds)
             )
             if !Task.isCancelled,
+               noticeDismissGeneration == generation,
                canPresentTransientFeedback,
                sceneActionNotice?.id == notice.id {
                 model.dismissActionNotice(
@@ -2187,9 +2223,17 @@ struct RootView: View {
         guard !isRunningAutomatedTests,
               AppEntitlement.shouldRequestRating
         else { return }
+        let generation = UUID()
+        ratingRequestGeneration = generation
         ratingRequestTask = Task { @MainActor in
+            defer {
+                if ratingRequestGeneration == generation {
+                    ratingRequestTask = nil
+                }
+            }
             try? await Task.sleep(for: .seconds(7))
             guard !Task.isCancelled,
+                  ratingRequestGeneration == generation,
                   scenePhase == .active,
                   !appLock.isLocked,
                   model.fullUnlockContext(for: sceneID) == nil,
@@ -2200,7 +2244,6 @@ struct RootView: View {
             else { return }
             requestReview()
             AppEntitlement.markRatingRequested()
-            ratingRequestTask = nil
         }
     }
 }
@@ -5291,6 +5334,7 @@ private struct ExternalImportHandoffBanner: View {
 
 private struct NoticeBanner: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.colorScheme) private var colorScheme
 
     let message: String
     let detail: String?
@@ -5330,32 +5374,20 @@ private struct NoticeBanner: View {
         .frame(minHeight: detail == nil ? 46 : 54)
         .frame(maxWidth: 560)
         .background {
-            UnevenRoundedRectangle(
-                topLeadingRadius: 2,
-                bottomLeadingRadius: 9,
-                bottomTrailingRadius: 9,
-                topTrailingRadius: 2,
+            RoundedRectangle(
+                cornerRadius: PPRadius.surface,
                 style: .continuous
             )
-            .fill(.ultraThinMaterial)
+            .fill(PPColor.elevated)
         }
         .overlay {
-            UnevenRoundedRectangle(
-                topLeadingRadius: 2,
-                bottomLeadingRadius: 9,
-                bottomTrailingRadius: 9,
-                topTrailingRadius: 2,
+            RoundedRectangle(
+                cornerRadius: PPRadius.surface,
                 style: .continuous
             )
                 .stroke(PPColor.border.opacity(0.6), lineWidth: 0.7)
         }
-        .overlay(alignment: .leading) {
-            Rectangle()
-                .fill(noticeTint)
-                .frame(width: 2)
-                .padding(.vertical, 7)
-        }
-        .shadow(color: .black.opacity(0.16), radius: 12, y: 6)
+        .shadow(color: colorScheme == .light ? .black.opacity(0.1) : .clear, radius: 12, y: 6)
         .accessibilityElement(children: .contain)
     }
 
@@ -5407,13 +5439,9 @@ private struct NoticeBanner: View {
                             : nil,
                         minHeight: 44
                     )
-                    .overlay(alignment: .bottom) {
-                        Rectangle()
-                            .fill(noticeTint.opacity(0.72))
-                            .frame(height: 1.5)
-                    }
+                    .background(PPColor.surfaceMuted, in: RoundedRectangle(cornerRadius: PPRadius.control))
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PPPressButtonStyle())
             .accessibilityHint(
                 actionAccessibilityHint.localizedUI
             )

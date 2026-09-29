@@ -63,6 +63,13 @@ struct PDFCompressionEstimate: Equatable, Sendable {
     let estimatedByteCount: Int64
     let sampledPageCount: Int
 
+    var formattedSourceSize: String {
+        ByteCountFormatter.string(
+            fromByteCount: sourceByteCount,
+            countStyle: .file
+        )
+    }
+
     var formattedSize: String {
         ByteCountFormatter.string(
             fromByteCount: estimatedByteCount,
@@ -70,10 +77,12 @@ struct PDFCompressionEstimate: Equatable, Sendable {
         )
     }
 
+    var isBeneficial: Bool {
+        sourceByteCount > 0 && estimatedByteCount < sourceByteCount
+    }
+
     var savingsPercent: Int? {
-        guard sourceByteCount > 0,
-              estimatedByteCount < sourceByteCount
-        else { return nil }
+        guard isBeneficial else { return nil }
         return Int(
             (
                 1
@@ -93,9 +102,9 @@ struct PDFCompressionEstimate: Equatable, Sendable {
             )
         }
         return AppLocalization.format(
-            "May not reduce this PDF · sampled %lld page%@",
-            sampledPageCount,
-            sampledPageCount == 1 ? "" : "s"
+            "Original is already smaller · %@ now · about %@ if rebuilt",
+            formattedSourceSize,
+            formattedSize
         )
     }
 }
@@ -1053,16 +1062,36 @@ struct PDFOutputService: @unchecked Sendable {
         sourceURL: URL,
         quality: PDFCompressionQuality
     ) throws -> PDFCompressionEstimate {
+        let sourceValues = try sourceURL.resourceValues(
+            forKeys: [
+                .fileSizeKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard sourceValues.isRegularFile == true,
+              sourceValues.isSymbolicLink != true,
+              let rawSourceByteCount = sourceValues.fileSize,
+              rawSourceByteCount > 0,
+              rawSourceByteCount
+                <= Self.maximumImageExportSourceBytes
+        else {
+            throw PaperPathError.fileTooLarge
+        }
         guard let document = PDFDocument(url: sourceURL),
               !document.isLocked,
               document.pageCount > 0
         else {
             throw PaperPathError.unreadablePDF
         }
-        let sourceByteCount = Int64(
-            try sourceURL.resourceValues(forKeys: [.fileSizeKey])
-                .fileSize ?? 0
-        )
+        guard document.pageCount
+                <= Self.maximumPageImageExportCount
+        else {
+            throw PaperPathError.insufficientSelection(
+                "Compression supports PDFs up to 1,000 pages."
+            )
+        }
+        let sourceByteCount = Int64(rawSourceByteCount)
         let lastIndex = document.pageCount - 1
         let sampleIndices = Array(
             Set([0, lastIndex / 2, lastIndex])
@@ -1694,6 +1723,7 @@ struct PDFOutputService: @unchecked Sendable {
             destination: destination,
             longestEdge: quality.longestEdge,
             jpegQuality: quality.jpegQuality,
+            requiresSmallerOutput: true,
             redactions: [],
             progress: progress
         )
@@ -1843,13 +1873,19 @@ struct PDFOutputService: @unchecked Sendable {
             options: .mappedIfSafe
         )
         try Task.checkCancellation()
-        let protectedData = try PDFCatalogStructureAppender(
-            data: encryptedData
-        ).appending(
-            attachmentPayloads: attachmentPayloads,
-            pageLabels: pageLabels,
-            encryptionPassword: password
-        )
+        let protectedData: Data
+        if attachmentPayloads.isEmpty,
+           !pageLabels.contains(where: \.isExplicit) {
+            protectedData = encryptedData
+        } else {
+            protectedData = try PDFCatalogStructureAppender(
+                data: encryptedData
+            ).appending(
+                attachmentPayloads: attachmentPayloads,
+                pageLabels: pageLabels,
+                encryptionPassword: password
+            )
+        }
         try Task.checkCancellation()
         try protectedData.write(to: destination, options: .atomic)
         didWriteDestination = true
@@ -4684,6 +4720,7 @@ struct PDFOutputService: @unchecked Sendable {
         destination: URL,
         longestEdge: CGFloat,
         jpegQuality: CGFloat,
+        requiresSmallerOutput: Bool = false,
         redactions: [PDFRedactionMark],
         progress: @escaping PDFProgressHandler
     ) throws {
@@ -4715,6 +4752,10 @@ struct PDFOutputService: @unchecked Sendable {
                 "Rasterized output supports PDFs up to 1,000 pages."
             )
         }
+        try requireTemporaryWriteCapacity(
+            at: destination,
+            byteCount: sourceByteCount
+        )
         guard redactions.count <= 10_000,
               redactions.allSatisfy({
                   $0.pageIndex >= 0
@@ -4809,11 +4850,16 @@ struct PDFOutputService: @unchecked Sendable {
                             sanitized = bitmap.image { bitmapContext in
                                 let pixelBounds = CGRect(origin: .zero, size: imageSize)
                                 rendered.draw(in: pixelBounds)
-                                bitmapContext.cgContext.setFillColor(UIColor.black.cgColor)
                                 for (markIndex, mark) in pageMarks.enumerated() {
                                     if markIndex.isMultiple(of: 64), Task.isCancelled {
                                         return
                                     }
+                                    let fillColor: UIColor = mark.appearance == .white
+                                        ? .white
+                                        : .black
+                                    bitmapContext.cgContext.setFillColor(
+                                        fillColor.cgColor
+                                    )
                                     let rect = CGRect(
                                         x: mark.normalizedX * imageSize.width,
                                         y: (1 - mark.normalizedY - mark.normalizedHeight) * imageSize.height,
@@ -4866,6 +4912,23 @@ struct PDFOutputService: @unchecked Sendable {
                 expectedPageCount: document.pageCount
             )
             try Task.checkCancellation()
+            if requiresSmallerOutput {
+                guard let candidateByteCount = try stagingURL
+                    .resourceValues(forKeys: [.fileSizeKey])
+                    .fileSize,
+                      candidateByteCount > 0
+                else {
+                    throw PaperPathError.outputVerificationFailed(
+                        "the compressed PDF size could not be verified"
+                    )
+                }
+                guard candidateByteCount < sourceByteCount else {
+                    throw PaperPathError.compressionNotBeneficial(
+                        sourceByteCount: Int64(sourceByteCount),
+                        candidateByteCount: Int64(candidateByteCount)
+                    )
+                }
+            }
             try Self.requireUnchangedSource(
                 at: sourceURL,
                 initialValues: sourceValues

@@ -1016,6 +1016,7 @@ struct DeliveryReceiptView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.paperPathSceneID) private var paperPathSceneID
 
@@ -1096,7 +1097,7 @@ struct DeliveryReceiptView: View {
                         ScrollView {
                             VStack(
                                 alignment: .leading,
-                                spacing: PPSpacing.xLarge
+                                spacing: PPSpacing.large
                             ) {
                                 certificate(
                                     record: record,
@@ -1117,6 +1118,10 @@ struct DeliveryReceiptView: View {
                                 ) {
                                     primaryShareAction(receipt)
                                 }
+                                deliverySummary(
+                                    record: record,
+                                    receipt: receipt
+                                )
                                 verificationDetails(
                                     record: record,
                                     receipt: receipt
@@ -1383,6 +1388,14 @@ struct DeliveryReceiptView: View {
                 spacing: PPSpacing.xLarge
             ) {
                 OfficeClockContinuitySection()
+                if !isCurrent(receipt: receipt, for: record) {
+                    deliveryDecisionActionMatrix(
+                        record: record,
+                        receipt: receipt,
+                        isCurrent: false,
+                        tint: PPColor.amber
+                    )
+                }
                 if let source = model.sourceRecord(for: record) {
                     lineage(source)
                 }
@@ -1458,6 +1471,225 @@ struct DeliveryReceiptView: View {
         }
     }
 
+    private func deliverySummary(
+        record: DocumentRecord,
+        receipt: PDFDeliveryReceipt
+    ) -> some View {
+        let source = model.sourceRecord(for: record)
+        let receiptIsCurrent = isCurrent(
+            receipt: receipt,
+            for: record
+        )
+        let visibleChangeCount =
+            receipt.changeReview?.visibleChanges.count ?? 0
+        let columns = dynamicTypeSize.ppPrefersExpandedLayout
+            ? [GridItem(.flexible())]
+            : [
+                GridItem(.flexible(), spacing: PPSpacing.medium),
+                GridItem(.flexible(), spacing: PPSpacing.medium)
+            ]
+
+        return VStack(
+            alignment: .leading,
+            spacing: PPSpacing.small
+        ) {
+            StudioSectionRule(
+                title: "DELIVERY SUMMARY",
+                detail: "Source, output, issues, and send status",
+                symbol: "list.clipboard",
+                tint: receiptIsCurrent
+                    ? (
+                        receipt.hasWarnings
+                            ? PPColor.amber
+                            : PPColor.mint
+                    )
+                    : PPColor.amber
+            )
+
+            LazyVGrid(
+                columns: columns,
+                alignment: .leading,
+                spacing: 0
+            ) {
+                deliverySummaryFact(
+                    id: "source",
+                    title: "Source",
+                    value:
+                        source?.displayName
+                            ?? "Source PDF",
+                    detail: source.map {
+                        "\($0.profile.pageCount) pages · \($0.profile.formattedSize)"
+                    } ?? AppLocalization.format(
+                        "%lld pages · %@",
+                        receipt.sourcePageCount,
+                        ByteCountFormatter.string(
+                            fromByteCount: receipt.sourceByteCount,
+                            countStyle: .file
+                        )
+                    ),
+                    symbol: "doc",
+                    tint: PPColor.cyan
+                )
+                deliverySummaryFact(
+                    id: "output",
+                    title: "Output",
+                    value: record.displayName,
+                    detail: AppLocalization.format(
+                        "%lld pages · %@",
+                        receipt.outputPageCount,
+                        receipt.formattedOutputSize
+                    ),
+                    symbol: receipt.operation.symbol,
+                    tint: PPColor.accent
+                )
+                deliverySummaryFact(
+                    id: "issues",
+                    title: "Issues",
+                    value: receipt.warningCount == 0
+                        ? "No unresolved checks"
+                        : receipt.warningCount == 1
+                            ? AppLocalization.format(
+                                "%lld warning",
+                                receipt.warningCount
+                            )
+                            : AppLocalization.format(
+                                "%lld warnings",
+                                receipt.warningCount
+                            ),
+                    detail: visibleChangeCount == 0
+                        ? "No visible drift recorded"
+                        : visibleChangeCount == 1
+                            ? AppLocalization.format(
+                                "%lld visible change recorded",
+                                visibleChangeCount
+                            )
+                            : AppLocalization.format(
+                                "%lld visible changes recorded",
+                                visibleChangeCount
+                            ),
+                    symbol: receipt.warningCount == 0
+                        ? "checkmark.circle"
+                        : "exclamationmark.triangle",
+                    tint: receipt.warningCount == 0
+                        ? PPColor.mint
+                        : PPColor.amber
+                )
+                deliverySummaryFact(
+                    id: "send-status",
+                    title: "Send status",
+                    value: deliverySendStatus(
+                        receiptIsCurrent: receiptIsCurrent,
+                        receipt: receipt
+                    ),
+                    detail: deliverySendStatusDetail(
+                        receiptIsCurrent: receiptIsCurrent,
+                        receipt: receipt
+                    ),
+                    symbol:
+                        receiptIsCurrent && receipt.isVerified
+                            ? (
+                                receipt.hasWarnings
+                                    ? "exclamationmark.shield"
+                                    : "checkmark.seal"
+                            )
+                            : "arrow.triangle.2.circlepath",
+                    tint:
+                        receiptIsCurrent
+                            && receipt.isVerified
+                            && !receipt.hasWarnings
+                            ? PPColor.mint
+                            : PPColor.amber
+                )
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("deliverySummary")
+    }
+
+    private func deliverySummaryFact(
+        id: String,
+        title: String,
+        value: String,
+        detail: String,
+        symbol: String,
+        tint: Color
+    ) -> some View {
+        HStack(alignment: .top, spacing: PPSpacing.small) {
+            Image(systemName: symbol)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(tint)
+                .frame(width: 24, height: 24)
+                .background(tint.opacity(0.09), in: Circle())
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title.localizedUI.uppercased())
+                    .font(.caption2.smallCaps().weight(.bold))
+                    .foregroundStyle(PPColor.textSecondary)
+                Text(value.localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? nil
+                            : 2
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(detail.localizedUI)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? nil
+                            : 2
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, PPSpacing.small)
+        .frame(
+            maxWidth: .infinity,
+            minHeight:
+                dynamicTypeSize.ppPrefersExpandedLayout
+                    ? nil
+                    : 76,
+            alignment: .topLeading
+        )
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(PPColor.border.opacity(0.58))
+                .frame(height: 0.6)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("deliverySummary-\(id)")
+    }
+
+    private func deliverySendStatus(
+        receiptIsCurrent: Bool,
+        receipt: PDFDeliveryReceipt
+    ) -> String {
+        guard receiptIsCurrent, receipt.isVerified else {
+            return "Recheck required"
+        }
+        return receipt.hasWarnings
+            ? "Review before sharing"
+            : "Ready to share"
+    }
+
+    private func deliverySendStatusDetail(
+        receiptIsCurrent: Bool,
+        receipt: PDFDeliveryReceipt
+    ) -> String {
+        guard receiptIsCurrent, receipt.isVerified else {
+            return "Current file no longer matches this receipt"
+        }
+        if receipt.hasWarnings {
+            return "Review the recorded warnings first"
+        }
+        return "Current revision and SHA-256 match"
+    }
+
     private func certificate(
         record: DocumentRecord,
         receipt: PDFDeliveryReceipt
@@ -1469,35 +1701,48 @@ struct DeliveryReceiptView: View {
         let replacement = isCurrent
             ? nil
             : model.verifiedShareTarget(for: record.id)
+        let compactIllustration = horizontalSizeClass != .regular
 
         return layout {
-            ZStack(alignment: .bottomTrailing) {
-                if let url = model.url(for: recordID),
-                   !record.profile.isLocked {
-                    PDFPageThumbnailView(
-                        url: url,
-                        pageIndex: 0,
-                        refreshToken: model.refreshToken(for: recordID),
-                        width: 92
-                    )
-                    .rotationEffect(.degrees(-2))
-                    .shadow(color: .black.opacity(0.16), radius: 8, y: 5)
-                } else {
-                    sealedDocument
-                }
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                ZStack(alignment: .bottomTrailing) {
+                    if let url = model.url(for: recordID),
+                       !record.profile.isLocked {
+                        PDFPageThumbnailView(
+                            url: url,
+                            pageIndex: 0,
+                            refreshToken: model.refreshToken(for: recordID),
+                            width: compactIllustration ? 58 : 92
+                        )
+                        .rotationEffect(.degrees(-2))
+                        .shadow(color: .black.opacity(0.16), radius: 8, y: 5)
+                    } else {
+                        sealedDocument
+                            .scaleEffect(compactIllustration ? 0.63 : 1)
+                            .frame(
+                                width: compactIllustration ? 58 : 92,
+                                height: compactIllustration ? 75 : 118
+                            )
+                    }
 
-                DeliverySealIllustration(
-                    warning: receipt.hasWarnings
+                    DeliverySealIllustration(
+                        warning: !isCurrent || receipt.hasWarnings
+                    )
+                    .frame(
+                        width: compactIllustration ? 40 : 70,
+                        height: compactIllustration ? 40 : 70
+                    )
+                    .offset(
+                        x: compactIllustration ? 10 : 22,
+                        y: compactIllustration ? 8 : 17
+                    )
+                }
+                .frame(
+                    width: compactIllustration ? 72 : 122,
+                    height: compactIllustration ? 92 : 132
                 )
-                .frame(width: 70, height: 70)
-                .offset(x: 22, y: 17)
+                .accessibilityHidden(true)
             }
-            .frame(
-                width: dynamicTypeSize.ppPrefersExpandedLayout
-                    ? 132
-                    : 122,
-                height: 132
-            )
 
             VStack(alignment: .leading, spacing: PPSpacing.small) {
                 SectionEyebrow(
@@ -1518,7 +1763,11 @@ struct DeliveryReceiptView: View {
                                     : "New verified copy ready"
                     ).localizedUI
                 )
-                    .font(.title.bold())
+                    .font(
+                        compactIllustration
+                            ? .title2.bold()
+                            : .title.bold()
+                    )
                     .fontDesign(.serif)
                     .foregroundStyle(PPColor.textPrimary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -1539,7 +1788,7 @@ struct DeliveryReceiptView: View {
                 )
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(2)
+                    .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2)
                 DeliveryReceiptBadge(
                     receipt: receipt,
                     isCurrent: isCurrent
@@ -1547,12 +1796,7 @@ struct DeliveryReceiptView: View {
                     .padding(.top, 3)
             }
         }
-        .padding(.vertical, PPSpacing.medium)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.68))
-                .frame(height: 0.7)
-        }
+        .ppCard(padding: PPSpacing.large, emphasized: isCurrent && !receipt.hasWarnings)
     }
 
     private func primaryShareAction(
@@ -1598,23 +1842,12 @@ struct DeliveryReceiptView: View {
                             .font(.subheadline.weight(.semibold))
                             .foregroundStyle(PPColor.textPrimary)
                         Text(
-                            "One ZIP with the exact PDF and a signed verification manifest."
+                            "The PDF and its receipt together in one ZIP."
                                 .localizedUI
                         )
                         .font(.caption)
                         .foregroundStyle(PPColor.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
-                        if let keyID =
-                            model.officeDeliverySigningKeyID {
-                            Text(
-                                AppLocalization.format(
-                                    "Device signature · %@",
-                                    String(keyID.prefix(8)).uppercased()
-                                )
-                            )
-                            .font(.caption2.monospacedDigit())
-                            .foregroundStyle(PPColor.textSecondary)
-                        }
                     }
                     Spacer(minLength: PPSpacing.small)
                     if preparingShareArtifactKind == .deliveryPackage {
@@ -1688,8 +1921,6 @@ struct DeliveryReceiptView: View {
         receipt: PDFDeliveryReceipt
     ) -> some View {
         let isCurrent = isCurrent(receipt: receipt, for: record)
-        let visibleChanges = receipt.changeReview?.majorVisibleChanges.count
-            ?? 0
         let replacement = isCurrent
             ? nil
             : model.verifiedShareTarget(for: record.id)
@@ -1725,7 +1956,7 @@ struct DeliveryReceiptView: View {
                     Text(
                         (
                             isCurrent
-                                ? receipt.outcomeDetail
+                                ? "Review the recorded warnings first"
                                 : replacement == nil
                                     ? "The PDF changed after this receipt was issued."
                                     : "Open the newer verified copy to share it."
@@ -1745,83 +1976,38 @@ struct DeliveryReceiptView: View {
 
             }
 
-            ViewThatFits(in: .horizontal) {
-                HStack(spacing: PPSpacing.medium) {
-                    deliveryDecisionFact(
-                        isCurrent ? "Current" : "Expired",
-                        label: "STATUS",
-                        symbol: isCurrent
-                            ? "checkmark.seal"
-                            : "exclamationmark.triangle",
-                        tint: tint
+            Button {
+                if isCurrent {
+                    showsVerificationDetails = true
+                    hasReviewedWarnings = true
+                    verificationScrollRequest &+= 1
+                } else if let replacement {
+                    requestOpenPage(
+                        recordID: replacement.id,
+                        pageIndex: 0,
+                        contentRevisionID: replacement.contentRevisionID
                     )
-                    deliveryDecisionFact(
-                        "\(receipt.warningCount)",
-                        label: "WARN",
-                        symbol: "exclamationmark.triangle",
-                        tint: receipt.warningCount == 0
-                            ? PPColor.mint
-                            : PPColor.amber
-                    )
-                    deliveryDecisionFact(
-                        "\(visibleChanges)",
-                        label: "CHANGES",
-                        symbol: "eye",
-                        tint: visibleChanges == 0
-                            ? PPColor.mint
-                            : PPColor.cyan
-                    )
-                    deliveryDecisionFact(
-                        receipt.shortFingerprint.uppercased(),
-                        label: "SHA",
-                        symbol: "number",
-                        tint: PPColor.accent
-                    )
+                } else {
+                    recheck(record)
                 }
-                VStack(alignment: .leading, spacing: PPSpacing.small) {
-                    HStack(spacing: PPSpacing.medium) {
-                        deliveryDecisionFact(
-                            isCurrent ? "Current" : "Expired",
-                            label: "STATUS",
-                            symbol: isCurrent
-                                ? "checkmark.seal"
-                                : "exclamationmark.triangle",
-                            tint: tint
-                        )
-                        deliveryDecisionFact(
-                            "\(receipt.warningCount)",
-                            label: "WARN",
-                            symbol: "exclamationmark.triangle",
-                            tint: receipt.warningCount == 0
-                                ? PPColor.mint
-                                : PPColor.amber
-                        )
-                    }
-                    HStack(spacing: PPSpacing.medium) {
-                        deliveryDecisionFact(
-                            "\(visibleChanges)",
-                            label: "CHANGES",
-                            symbol: "eye",
-                            tint: visibleChanges == 0
-                                ? PPColor.mint
-                                : PPColor.cyan
-                        )
-                        deliveryDecisionFact(
-                            receipt.shortFingerprint.uppercased(),
-                            label: "SHA",
-                            symbol: "number",
-                            tint: PPColor.accent
-                        )
-                    }
-                }
+            } label: {
+                Label(
+                    (
+                        isCurrent
+                            ? "Review Details"
+                            : replacement != nil
+                                ? "Open latest"
+                                : recheckTask == nil ? "Recheck" : "Rechecking"
+                    ).localizedUI,
+                    systemImage: isCurrent
+                        ? "checklist"
+                        : "arrow.triangle.2.circlepath"
+                )
+                .frame(maxWidth: .infinity, minHeight: 44)
             }
-
-            deliveryDecisionActionMatrix(
-                record: record,
-                receipt: receipt,
-                isCurrent: isCurrent,
-                tint: tint
-            )
+            .buttonStyle(PPQuietButtonStyle(tint: tint))
+            .disabled(hasActiveTask)
+            .accessibilityIdentifier("deliveryReviewDecision")
             if recheckTask != nil {
                 if let progress = model.progress(for: record.id) {
                     LocalOperationProgressView(progress: progress)

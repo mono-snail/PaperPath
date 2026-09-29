@@ -106,6 +106,7 @@ final class ShareViewController: UIViewController {
         )
         openConfiguration.imagePadding = 8
         openConfiguration.cornerStyle = .medium
+        openConfiguration.titleLineBreakMode = .byWordWrapping
         openButton.configuration = openConfiguration
         openButton.isHidden = true
         openButton.addTarget(
@@ -124,6 +125,7 @@ final class ShareViewController: UIViewController {
         )
         retryConfiguration.imagePadding = 8
         retryConfiguration.cornerStyle = .medium
+        retryConfiguration.titleLineBreakMode = .byWordWrapping
         retryButton.configuration = retryConfiguration
         retryButton.isHidden = true
         retryButton.addTarget(
@@ -137,6 +139,7 @@ final class ShareViewController: UIViewController {
 
         var doneConfiguration = UIButton.Configuration.plain()
         doneConfiguration.title = localized("Cancel")
+        doneConfiguration.titleLineBreakMode = .byWordWrapping
         doneButton.configuration = doneConfiguration
         doneButton.accessibilityHint = localized(
             "Stops copying and removes staged private copies."
@@ -627,7 +630,7 @@ final class ShareViewController: UIViewController {
         symbolView.tintColor = brandColor
         beginReception(
             with: retryProviders,
-            skippedCount: 0,
+            skippedCount: skippedCount,
             preservesImportedCount: true
         )
         UIAccessibility.post(

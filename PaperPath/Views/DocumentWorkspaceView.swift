@@ -9,6 +9,10 @@ private enum ProtectedPDFPasswordValidationResult: Sendable {
 }
 
 struct DocumentWorkspaceView: View {
+    @State private var isPrivacyScanPresented = false
+    @StateObject private var privacyScanReviewModel =
+        PrivacyScanReviewModel()
+
     private enum ToolMode: String, CaseIterable, Identifiable {
         case read
         case annotate
@@ -32,6 +36,15 @@ struct DocumentWorkspaceView: View {
             case .annotate: return PPColor.cyan
             case .pages: return PPColor.textPrimary
             case .deliver: return PPColor.mint
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .read: return "book"
+            case .annotate: return "pencil.tip"
+            case .pages: return "square.grid.2x2"
+            case .deliver: return "square.and.arrow.up"
             }
         }
 
@@ -190,6 +203,7 @@ struct DocumentWorkspaceView: View {
     @State private var isRenaming = false
     @State private var proposedName = ""
     @State private var originalName = ""
+    @State private var isSelectingToolMode = false
     @State private var isJumpingToPage = false
     @State private var pageJumpInput = ""
     @FocusState private var renameFieldFocused: Bool
@@ -204,6 +218,8 @@ struct DocumentWorkspaceView: View {
     @State private var searchableCopyGeneration = UUID()
     @State private var searchableCopyStopRequested = false
     @State private var readingPositionTask: Task<Void, Never>?
+    @State private var readingPositionGeneration = UUID()
+    @State private var readingPositionOwnerID = UUID()
     @State private var workspaceTransitionTask: Task<Void, Never>?
     @State private var workspaceTransitionGeneration = UUID()
     @State private var activeWorkspaceHandoff:
@@ -230,6 +246,7 @@ struct DocumentWorkspaceView: View {
     @State private var pageBackHistory: [Int] = []
     @State private var pageForwardHistory: [Int] = []
     @State private var pdfSearchHighlight: PDFTextSearchHighlight?
+    @State private var privacyEvidenceOverlay: PDFEvidenceOverlay?
     @State private var documentFindQuery = ""
     @State private var documentFindHistory: [String] = []
     @State private var isImmersiveReading = false
@@ -393,6 +410,9 @@ struct DocumentWorkspaceView: View {
                     0,
                     record.contentRevisionID
                 )
+                guard scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
+                else { return }
                 await model.updateReadingPosition(
                     recordID: recordID,
                     pageIndex: 0,
@@ -408,8 +428,12 @@ struct DocumentWorkspaceView: View {
             clearProtectedDocumentSession()
             stopRecognition()
             stopSearchableCopyCreation()
+            readingPositionGeneration = UUID()
             readingPositionTask?.cancel()
             readingPositionTask = nil
+            model.cancelReadingPositionUpdate(
+                ownerID: readingPositionOwnerID
+            )
             stopSharePreparation()
             cleanupShareCopy()
             invalidateWorkspaceMetadataPresentation()
@@ -417,19 +441,18 @@ struct DocumentWorkspaceView: View {
             let viewedAt = Date()
             let contentRevisionID = model.record(id: recordID)?
                 .contentRevisionID
-            if let contentRevisionID,
+            let canPersistReadingPosition =
+                scenePhase == .active
+                && UIApplication.shared.isProtectedDataAvailable
+            if canPersistReadingPosition,
+               let contentRevisionID,
                pageStateContentRevisionID == contentRevisionID {
                 onReadingPositionChange(
                     pageIndex,
                     contentRevisionID
                 )
-            }
-            Task {
-                guard let contentRevisionID,
-                      pageStateContentRevisionID
-                        == contentRevisionID
-                else { return }
-                await model.updateReadingPosition(
+                model.enqueueReadingPositionUpdate(
+                    ownerID: readingPositionOwnerID,
                     recordID: recordID,
                     pageIndex: pageIndex,
                     expectedContentRevisionID:
@@ -519,6 +542,7 @@ struct DocumentWorkspaceView: View {
                     navigationToken: pageNavigationToken,
                     readingPreferences: readingPreferences,
                     command: pdfCommand,
+                    evidenceOverlay: privacyEvidenceOverlay,
                     searchHighlight:
                         pdfSearchHighlight?.contentRevisionID
                             == record.contentRevisionID
@@ -559,6 +583,9 @@ struct DocumentWorkspaceView: View {
                         else { return }
                         if pdfSearchHighlight?.pageIndex != pageIndex {
                             pdfSearchHighlight = nil
+                        }
+                        if privacyEvidenceOverlay?.pageIndex != pageIndex {
+                            privacyEvidenceOverlay = nil
                         }
                         currentPageIndex = pageIndex
                         if !isScrubbingPage {
@@ -652,9 +679,12 @@ struct DocumentWorkspaceView: View {
                         alignment: .bottomTrailing
                     )
                     .transition(.opacity)
-                    .accessibilityLabel("Exit immersive reading")
+                    .accessibilityLabel(
+                        "Exit immersive reading".localizedUI
+                    )
                     .accessibilityHint(
                         "Returns the document controls without changing your page."
+                            .localizedUI
                     )
                     .accessibilityIdentifier("exitImmersiveReading")
                 }
@@ -674,6 +704,46 @@ struct DocumentWorkspaceView: View {
                 handleWorkspaceEscape()
             }
             .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    isPrivacyScanPresented = true
+                } label: {
+                    Label(
+                        "Privacy Scan".localizedUI,
+                        systemImage: "checkmark.shield"
+                    )
+                }
+                .help("Privacy Scan".localizedUI)
+                .accessibilityLabel("Privacy Scan".localizedUI)
+                .accessibilityHint(
+                    privacyScanAvailabilityHint(for: record)
+                )
+                .accessibilityIdentifier("privacyScanButton")
+                .sheet(isPresented: $isPrivacyScanPresented) {
+                    PrivacyScanWorkspaceSheet(
+                        reviewModel: privacyScanReviewModel,
+                        recordID: recordID,
+                        contentRevisionID: record.contentRevisionID,
+                        sourceURL: url,
+                        estimatedPageCount: record.profile.pageCount,
+                        documentName: record.displayName,
+                        textIndex: model.textIndices[recordID],
+                        onLocate: { finding in
+                            locatePrivacyFinding(
+                                finding,
+                                contentRevisionID:
+                                    record.contentRevisionID
+                            )
+                        }
+                    )
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                }
+                .disabled(
+                    record.profile.isLocked
+                        || model.isProcessing(recordID)
+                )
+            }
                 ToolbarItem(placement: .principal) {
                     VStack(spacing: 1) {
                         Text(record.displayName)
@@ -891,7 +961,9 @@ struct DocumentWorkspaceView: View {
                     } label: {
                         Image(systemName: "book.pages")
                     }
-                    .accessibilityLabel("Reading and navigation")
+                    .accessibilityLabel(
+                        "Reading and navigation".localizedUI
+                    )
                     .disabled(hasBlockingWorkspaceControlTask)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -1047,7 +1119,7 @@ struct DocumentWorkspaceView: View {
                         Image(systemName: "ellipsis.circle")
                             .symbolRenderingMode(.hierarchical)
                     }
-                    .accessibilityLabel("Document menu")
+                    .accessibilityLabel("Document menu".localizedUI)
                     .disabled(hasBlockingWorkspaceControlTask)
                 }
             }
@@ -1135,25 +1207,6 @@ struct DocumentWorkspaceView: View {
                                         queueWorkspaceHandoff(.tool(tool))
                                     }
                                 )
-                                .onAppear {
-#if DEBUG
-                                    // #region debug-point B:tools-sheet-appeared
-                                    reportFrequentUIFreezeDebugEvent(
-                                        hypothesisID: "B",
-                                        location:
-                                            "DocumentWorkspaceView.toolsSheet.onAppear",
-                                        message: "Tools sheet appeared",
-                                        data: [
-                                            "recordID":
-                                                recordID.uuidString,
-                                            "presentedSheet":
-                                                presentedSheet?.rawValue
-                                                ?? "nil"
-                                        ]
-                                    )
-                                    // #endregion
-#endif
-                                }
                                 .presentationDetents([.large])
                             case .stamp:
                                 StampPickerView(pageIndex: currentPageIndex) { kind in
@@ -1550,6 +1603,10 @@ struct DocumentWorkspaceView: View {
                 .alert("Rename working copy", isPresented: $isRenaming) {
                     TextField("Document name", text: $proposedName)
                         .focused($renameFieldFocused)
+                        .submitLabel(.done)
+                        .onSubmit {
+                            renameWorkingCopy()
+                        }
                     Button("Cancel", role: .cancel) {}
                     Button("Save") {
                         renameWorkingCopy()
@@ -1569,6 +1626,10 @@ struct DocumentWorkspaceView: View {
                     TextField("Page number", text: $pageJumpInput)
                         .keyboardType(.numberPad)
                         .focused($pageJumpFieldFocused)
+                        .submitLabel(.go)
+                        .onSubmit {
+                            jumpToEnteredPage()
+                        }
                     Button("Cancel", role: .cancel) {
                         pageJumpInput = ""
                     }
@@ -1726,16 +1787,32 @@ struct DocumentWorkspaceView: View {
                     }
                 }
                 .onChange(of: isRenaming) { _, isPresented in
-                    guard isPresented else { return }
+                    guard isPresented else {
+                        renameFieldFocused = false
+                        return
+                    }
                     Task { @MainActor in
                         await Task.yield()
+                        guard isRenaming,
+                              scenePhase == .active,
+                              UIApplication.shared
+                                .isProtectedDataAvailable
+                        else { return }
                         renameFieldFocused = true
                     }
                 }
                 .onChange(of: isJumpingToPage) { _, isPresented in
-                    guard isPresented else { return }
+                    guard isPresented else {
+                        pageJumpFieldFocused = false
+                        return
+                    }
                     Task { @MainActor in
                         await Task.yield()
+                        guard isJumpingToPage,
+                              scenePhase == .active,
+                              UIApplication.shared
+                                .isProtectedDataAvailable
+                        else { return }
                         pageJumpFieldFocused = true
                     }
                 }
@@ -1761,6 +1838,7 @@ struct DocumentWorkspaceView: View {
                 .onChange(of: record.contentRevisionID) {
                     oldRevisionID,
                     newRevisionID in
+                    privacyScanReviewModel.reset()
                     rebuildPageStateForUpdatedPDF(
                         from: oldRevisionID,
                         to: newRevisionID
@@ -1778,6 +1856,60 @@ struct DocumentWorkspaceView: View {
                 .sensoryFeedback(.success, trigger: metadataSuccessFeedback)
                 .sensoryFeedback(.error, trigger: metadataErrorFeedback)
         )
+    }
+
+    private func locatePrivacyFinding(
+        _ finding: PrivacyFinding,
+        contentRevisionID: UUID
+    ) {
+        guard model.record(id: recordID)?.contentRevisionID
+            == contentRevisionID
+        else {
+            model[noticeFor: paperPathSceneID] =
+                "Document changed. Run the privacy scan again."
+                    .localizedUI
+            return
+        }
+        requestedPageIndex = finding.pageIndex
+        pageNavigationToken += 1
+        privacyEvidenceOverlay = PDFEvidenceOverlay(
+            pageIndex: finding.pageIndex,
+            regions: finding.normalizedBounds.map { bounds in
+                PDFDifferenceRegion(
+                    x: bounds.x,
+                    y: 1 - bounds.y - bounds.height,
+                    width: bounds.width,
+                    height: bounds.height,
+                    intensity: 1
+                )
+            },
+            tone: .source,
+            generation: pageNavigationToken
+        )
+        pdfSearchHighlight = PDFTextSearchHighlight(
+            query: finding.rawValue,
+            pageIndex: finding.pageIndex,
+            contentRevisionID: contentRevisionID
+        )
+        model[noticeFor: paperPathSceneID] =
+            AppLocalization.format(
+                "Privacy candidate on page %lld · review preserved",
+                finding.pageIndex + 1
+            )
+    }
+
+    private func privacyScanAvailabilityHint(
+        for record: DocumentRecord
+    ) -> String {
+        if record.profile.isLocked {
+            return "Unlock this PDF before scanning for private information."
+                .localizedUI
+        }
+        if model.isProcessing(recordID) {
+            return "Wait for the current document operation to finish."
+                .localizedUI
+        }
+        return "Scans this PDF on device before sharing.".localizedUI
     }
 
     private var lockedDocumentOverlay: some View {
@@ -1811,7 +1943,9 @@ struct DocumentWorkspaceView: View {
             if isApplyingSessionUnlock {
                 ProgressView()
                     .controlSize(.regular)
-                    .accessibilityLabel("Opening protected PDF")
+                    .accessibilityLabel(
+                        "Opening protected PDF".localizedUI
+                    )
                 Button("Cancel", role: .cancel) {
                     clearProtectedDocumentSession()
                 }
@@ -1909,6 +2043,7 @@ struct DocumentWorkspaceView: View {
                     )
                     .accessibilityHint(
                         "Retries with the password already verified for this session."
+                            .localizedUI
                     )
                 }
                 Button {
@@ -1919,7 +2054,9 @@ struct DocumentWorkspaceView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(PPColor.textSecondary)
-                .accessibilityLabel("Dismiss editable copy error")
+                .accessibilityLabel(
+                    "Dismiss editable copy error".localizedUI
+                )
             }
         }
         .padding(.horizontal, PPSpacing.regular)
@@ -2301,12 +2438,9 @@ struct DocumentWorkspaceView: View {
             workspacePrimaryAction(record: record, recommendation: recommendation)
                 .disabled(hasBlockingWorkspaceControlTask || isRedactionMode)
         }
-        .padding(.vertical, 4)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.62))
-                .frame(height: 0.6)
-        }
+        .padding(.horizontal, PPSpacing.medium)
+        .padding(.vertical, PPSpacing.small)
+        .background(PPColor.surface, in: RoundedRectangle(cornerRadius: PPRadius.control))
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("documentContext")
     }
@@ -2695,9 +2829,14 @@ struct DocumentWorkspaceView: View {
         isConfiguringRecognition = false
         stopRecognition()
         stopSearchableCopyCreation()
+        readingPositionGeneration = UUID()
         readingPositionTask?.cancel()
         readingPositionTask = nil
+        model.cancelReadingPositionUpdate(
+            ownerID: readingPositionOwnerID
+        )
         pdfSearchHighlight = nil
+        privacyEvidenceOverlay = nil
         pdfCommand = nil
         originalName = ""
         proposedName = ""
@@ -2736,7 +2875,9 @@ struct DocumentWorkspaceView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityHint("Opens the delivery verification details")
+            .accessibilityHint(
+                "Opens the delivery verification details".localizedUI
+            )
             .accessibilityIdentifier("deliveryReceiptBadge")
         } else if !model.deliveryHistoryOutputs(for: record.id).isEmpty {
             Button {
@@ -2755,7 +2896,9 @@ struct DocumentWorkspaceView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityHint("Opens verified output history")
+            .accessibilityHint(
+                "Opens verified output history".localizedUI
+            )
         } else if let provenance =
                     record.receivedPackageProvenance {
             Button {
@@ -3052,9 +3195,13 @@ struct DocumentWorkspaceView: View {
                     }
                     .environment(\.deskToolNamesVisible, false)
                     .padding(.vertical, PPSpacing.xSmall)
-                } else if verticalSizeClass == .compact, !isRedactionMode {
+                } else if !isRedactionMode,
+                          verticalSizeClass == .compact
+                            || (horizontalSizeClass == .compact
+                                && !dynamicTypeSize.ppPrefersExpandedLayout) {
                     HStack(spacing: PPSpacing.medium) {
                         toolModeMenu
+                            .fixedSize(horizontal: true, vertical: false)
                         workspaceToolRow(record)
                     }
                     .padding(.vertical, PPSpacing.small)
@@ -3074,7 +3221,7 @@ struct DocumentWorkspaceView: View {
                 hasBlockingWorkspaceControlTask ? 0.46 : 1
             )
         }
-        .background(.bar)
+        .background(PPColor.surface)
         .dynamicTypeSize(.xSmall ... .accessibility1)
         .overlay(alignment: .top) {
             Rectangle()
@@ -3084,21 +3231,14 @@ struct DocumentWorkspaceView: View {
     }
 
     private func workspaceToolRow(_ record: DocumentRecord) -> some View {
-        ViewThatFits(in: .horizontal) {
+        ScrollView(.horizontal) {
             HStack(alignment: .top, spacing: PPSpacing.medium) {
                 actionBarCommands(record)
             }
-            HStack(alignment: .top, spacing: PPSpacing.xSmall) {
-                actionBarCommands(record)
-            }
-            ScrollView(.horizontal) {
-                HStack(alignment: .top, spacing: PPSpacing.medium) {
-                    actionBarCommands(record)
-                }
-            }
-            .scrollIndicators(.hidden)
-            .fixedSize(horizontal: false, vertical: true)
         }
+        .scrollIndicators(.hidden)
+        .accessibilityIdentifier("workspaceToolRow")
+        .fixedSize(horizontal: false, vertical: true)
         .environment(\.deskToolNamesVisible, showToolNames && verticalSizeClass != .compact)
         .frame(minHeight: PPDeskLayout.touchTarget)
     }
@@ -3346,82 +3486,127 @@ struct DocumentWorkspaceView: View {
         }
     }
 
-    @ViewBuilder
     private func actionBarCommands(
         _ record: DocumentRecord
-    ) -> some View {
+    ) -> AnyView {
         if isRedactionMode {
-            DeskIconButton(title: "Cancel redaction", symbol: "xmark", tint: PPColor.textSecondary) {
-                cancelRedactionMode()
+            return AnyView(redactionActionBarCommands)
+        }
+        switch toolMode {
+        case .read:
+            return AnyView(readActionBarCommands(record))
+        case .annotate:
+            return AnyView(annotationActionBarCommands(record))
+        case .pages:
+            return AnyView(pageActionBarCommands(record))
+        case .deliver:
+            return AnyView(deliveryActionBarCommands(record))
+        }
+    }
+
+    @ViewBuilder
+    private var redactionActionBarCommands: some View {
+        DeskIconButton(title: "Cancel redaction", symbol: "xmark", tint: PPColor.textSecondary) {
+            cancelRedactionMode()
+        }
+        .keyboardShortcut(.cancelAction)
+        .accessibilityIdentifier("cancelRedactionMode")
+        DeskIconButton(
+            title: "Redact", symbol: "eye.slash", tint: PPColor.amber,
+            isProminent: true
+        ) {
+            runCommand(.markRedaction)
+        }
+        .accessibilityHint(
+            "Marks the currently selected text for permanent redaction"
+        )
+        .accessibilityIdentifier("applyRedactionSelection")
+    }
+
+    @ViewBuilder
+    private func readActionBarCommands(
+        _ record: DocumentRecord
+    ) -> some View {
+        workspaceToolButton(.find, record: record)
+            .accessibilityIdentifier("workspaceFindAction")
+        workspaceToolButton(.bookmarks, record: record)
+        DeskIconButton(title: "Reader", symbol: "book", tint: toolMode.tint) {
+            presentedSheet = .reader
+        }
+        DeskIconButton(title: "Reading", symbol: "textformat.size", tint: toolMode.tint) {
+            presentedSheet = .reading
+        }
+        DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right", tint: toolMode.tint) {
+            toggleImmersiveReading()
+        }
+        recentToolButton(record: record)
+    }
+
+    @ViewBuilder
+    private func annotationActionBarCommands(
+        _ record: DocumentRecord
+    ) -> some View {
+        workspaceToolButton(.highlight, record: record)
+        workspaceToolButton(.underline, record: record)
+        workspaceToolButton(.ink, record: record)
+        workspaceToolButton(.note, record: record)
+        workspaceToolButton(.sign, record: record)
+        markUpMenu
+            .disabled(record.profile.isLocked)
+    }
+
+    @ViewBuilder
+    private func pageActionBarCommands(
+        _ record: DocumentRecord
+    ) -> some View {
+        workspaceToolButton(.organize, record: record)
+            .keyboardShortcut("p", modifiers: [.command, .shift])
+        workspaceToolButton(.compare, record: record)
+        workspaceToolButton(.bates, record: record)
+        workspaceToolButton(.watermark, record: record)
+        DeskIconButton(title: "Version History", symbol: "clock.arrow.circlepath", tint: toolMode.tint) {
+            presentedSheet = .versionHistory
+        }
+        recentToolButton(record: record)
+    }
+
+    @ViewBuilder
+    private func deliveryActionBarCommands(
+        _ record: DocumentRecord
+    ) -> some View {
+        DeskIconButton(
+            title: record.profile.isLocked ? "Unlock to continue" : "Verify & Share",
+            symbol: record.profile.isLocked ? "lock.open" : "checkmark.shield",
+            tint: PPColor.mint, isProminent: true
+        ) {
+            if record.profile.isLocked {
+                performStatusAction(record: record, recommendation: model.recommendation(for: record))
+            } else {
+                shareVerifiedOrCreate()
             }
-            .keyboardShortcut(.cancelAction)
-            .accessibilityIdentifier("cancelRedactionMode")
-            DeskIconButton(
-                title: "Redact", symbol: "eye.slash", tint: PPColor.amber,
-                isProminent: true
-            ) {
-                runCommand(.markRedaction)
-            }
-            .accessibilityHint(
-                "Marks the currently selected text for permanent redaction"
-            )
-            .accessibilityIdentifier("applyRedactionSelection")
-        } else {
-            switch toolMode {
-            case .read:
-                workspaceToolButton(.find, record: record)
-                    .accessibilityIdentifier("workspaceFindAction")
-                workspaceToolButton(.bookmarks, record: record)
-                DeskIconButton(title: "Reader", symbol: "book", tint: toolMode.tint) {
-                    presentedSheet = .reader
-                }
-                DeskIconButton(title: "Reading", symbol: "textformat.size", tint: toolMode.tint) {
-                    presentedSheet = .reading
-                }
-                DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right", tint: toolMode.tint) {
-                    toggleImmersiveReading()
-                }
-            case .annotate:
-                workspaceToolButton(.highlight, record: record)
-                workspaceToolButton(.underline, record: record)
-                workspaceToolButton(.ink, record: record)
-                workspaceToolButton(.note, record: record)
-                workspaceToolButton(.sign, record: record)
-                markUpMenu
-                    .disabled(record.profile.isLocked)
-            case .pages:
-                workspaceToolButton(.organize, record: record)
-                    .keyboardShortcut("p", modifiers: [.command, .shift])
-                workspaceToolButton(.compare, record: record)
-                workspaceToolButton(.bates, record: record)
-                workspaceToolButton(.watermark, record: record)
-                DeskIconButton(title: "Version History", symbol: "clock.arrow.circlepath", tint: toolMode.tint) {
-                    presentedSheet = .versionHistory
-                }
-            case .deliver:
-                DeskIconButton(
-                    title: record.profile.isLocked ? "Unlock to continue" : "Verify & Share",
-                    symbol: record.profile.isLocked ? "lock.open" : "checkmark.shield",
-                    tint: PPColor.mint, isProminent: true
-                ) {
-                    if record.profile.isLocked {
-                        performStatusAction(record: record, recommendation: model.recommendation(for: record))
-                    } else {
-                        shareVerifiedOrCreate()
-                    }
-                }
-                .disabled(isApplyingSessionUnlock || unlockCopyIssue?.isRetryable == false)
-                workspaceToolButton(.fillForm, record: record)
-                workspaceToolButton(.compress, record: record)
-                workspaceToolButton(.protect, record: record)
-                workspaceToolButton(.export, record: record)
-                DeskIconButton(title: "Delivery history", symbol: "clock.badge.checkmark", tint: PPColor.mint) {
-                    presentedSheet = .deliveryHistory
-                }
-            }
-            if toolMode == .read || toolMode == .pages {
-                recentToolButton(record: record)
-            }
+        }
+        .disabled(isApplyingSessionUnlock || unlockCopyIssue?.isRetryable == false)
+        DeskIconButton(
+            title: "Privacy Scan",
+            symbol: "checkmark.shield",
+            tint: PPColor.mint
+        ) {
+            isPrivacyScanPresented = true
+        }
+        .disabled(
+            record.profile.isLocked
+                || model.isProcessing(recordID)
+        )
+        .accessibilityHint(
+            privacyScanAvailabilityHint(for: record)
+        )
+        .accessibilityIdentifier("privacyScanDeliveryAction")
+        workspaceToolButton(.fillForm, record: record)
+        workspaceToolButton(.compress, record: record)
+        workspaceToolButton(.protect, record: record)
+        workspaceToolButton(.export, record: record)
+        DeskIconButton(title: "Delivery history", symbol: "clock.badge.checkmark", tint: PPColor.mint) {
+            presentedSheet = .deliveryHistory
         }
     }
 
@@ -3460,31 +3645,54 @@ struct DocumentWorkspaceView: View {
     }
 
     private var toolModeMenu: some View {
-        Menu {
-            ForEach(ToolMode.allCases) { mode in
-                Button {
-                    savedToolMode = mode.rawValue
-                } label: {
-                    Label(mode.title.localizedUI, systemImage: mode == toolMode ? "checkmark" : "circle")
-                }
-                .accessibilityIdentifier("workspaceMode-\(mode.rawValue)")
-            }
-            Divider()
-            Toggle("Show tool names".localizedUI, isOn: $showToolNames)
+        Button {
+            isSelectingToolMode = true
         } label: {
-            HStack {
+            HStack(spacing: 6) {
+                Image(systemName: toolMode.symbol)
+                    .font(.caption.weight(.semibold))
                 Text(toolMode.title.localizedUI)
                     .font(PPType.document)
                     .lineLimit(1)
                 Image(systemName: "chevron.up.chevron.down")
-                    .font(.caption)
+                    .font(.caption2.weight(.semibold))
             }
+            .foregroundStyle(toolMode.tint)
+            .padding(.horizontal, PPSpacing.medium)
             .frame(minHeight: PPDeskLayout.touchTarget)
+            .background(PPColor.surfaceMuted, in: RoundedRectangle(cornerRadius: PPRadius.control))
         }
+        .buttonStyle(PPPressButtonStyle())
         .tint(toolMode.tint)
         .accessibilityLabel("Workspace tools".localizedUI)
         .accessibilityValue(toolMode.title.localizedUI)
         .accessibilityIdentifier("workspaceModeMenu")
+        .confirmationDialog(
+            "Workspace tools".localizedUI,
+            isPresented: $isSelectingToolMode,
+            titleVisibility: .visible
+        ) {
+            ForEach(ToolMode.allCases) { mode in
+                Button {
+                    savedToolMode = mode.rawValue
+                } label: {
+                    Text(mode.title.localizedUI)
+                }
+                .accessibilityIdentifier(
+                    "workspaceMode-\(mode.rawValue)"
+                )
+            }
+            Button(
+                (
+                    showToolNames
+                        ? "Hide tool names"
+                        : "Show tool names"
+                ).localizedUI
+            ) {
+                showToolNames.toggle()
+            }
+            Button("Cancel", role: .cancel) {}
+        }
     }
 
     private func workspaceToolButton(_ tool: DocumentTool, record: DocumentRecord) -> some View {
@@ -3710,24 +3918,6 @@ struct DocumentWorkspaceView: View {
             symbol: "ellipsis",
             tint: PPColor.textSecondary
         ) {
-#if DEBUG
-            // #region debug-point B:tools-sheet-requested
-            reportFrequentUIFreezeDebugEvent(
-                hypothesisID: "B",
-                location:
-                    "DocumentWorkspaceView.recentToolButton",
-                message: "Tools sheet requested",
-                data: [
-                    "recordID": recordID.uuidString,
-                    "presentedSheet":
-                        presentedSheet?.rawValue ?? "nil",
-                    "hasBlockingTask": String(
-                        hasBlockingWorkspaceControlTask
-                    )
-                ]
-            )
-            // #endregion
-#endif
             presentedSheet = .tools
         }
         .accessibilityHint(
@@ -3793,12 +3983,14 @@ struct DocumentWorkspaceView: View {
                     )
                 } label: {
                     Image(systemName: "chevron.left")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(currentPageIndex <= 0 ? PPColor.border : PPColor.accent)
                         .frame(width: 44, height: 44)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PPPressButtonStyle())
                 .disabled(currentPageIndex <= 0)
                 .keyboardShortcut("[", modifiers: .command)
-                .accessibilityLabel("Previous page")
+                .accessibilityLabel("Previous page".localizedUI)
 
                 VStack(spacing: pageCount > 5 ? 0 : 2) {
                     Button {
@@ -3821,10 +4013,16 @@ struct DocumentWorkspaceView: View {
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                         .monospacedDigit()
-                        .contentTransition(.numericText())
+                        .contentTransition(
+                            reduceMotion
+                                ? .identity
+                                : .numericText()
+                        )
                         .lineLimit(1)
                         .minimumScaleFactor(0.8)
+                        .padding(.horizontal, PPSpacing.medium)
                         .frame(minHeight: 44)
+                        .background(PPColor.surfaceMuted, in: Capsule())
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -3892,7 +4090,9 @@ struct DocumentWorkspaceView: View {
                         }
                         .tint(PPColor.accent)
                         .frame(minWidth: 112)
-                        .accessibilityLabel("Page position")
+                        .accessibilityLabel(
+                            "Page position".localizedUI
+                        )
                         .accessibilityValue(
                             AppLocalization.format(
                                 "Page %lld of %lld",
@@ -3912,14 +4112,16 @@ struct DocumentWorkspaceView: View {
                     )
                 } label: {
                     Image(systemName: "chevron.right")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(currentPageIndex >= pageCount - 1 ? PPColor.border : PPColor.accent)
                         .frame(width: 44, height: 44)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(PPPressButtonStyle())
                 .disabled(
                     currentPageIndex >= record.profile.pageCount - 1
                 )
                 .keyboardShortcut("]", modifiers: .command)
-                .accessibilityLabel("Next page")
+                .accessibilityLabel("Next page".localizedUI)
 
                 Button {
                     toggleCurrentPageBookmark()
@@ -3947,6 +4149,7 @@ struct DocumentWorkspaceView: View {
                     )
                 )
                 .accessibilityIdentifier("bookmarkCurrentPage")
+                .accessibilityAddTraits(record.bookmarkedPages.contains(currentPageIndex) ? .isSelected : [])
                 .keyboardShortcut("b", modifiers: .command)
                 .disabled(workspaceMetadataTask != nil)
             }
@@ -4235,6 +4438,7 @@ struct DocumentWorkspaceView: View {
         guard pageJumpIsValid,
               let page = Int(pageJumpInput)
         else { return }
+        isJumpingToPage = false
         pageJumpInput = ""
         showPage(
             page - 1,
@@ -4532,63 +4736,13 @@ struct DocumentWorkspaceView: View {
         activeWorkspaceHandoff = handoff
         workspaceHandoffFeedback += 1
         workspaceTransitionTask = Task { @MainActor in
-#if DEBUG
-            // #region debug-point D:workspace-transition-started
-            reportFrequentUIFreezeDebugEvent(
-                hypothesisID: "D",
-                location:
-                    "DocumentWorkspaceView.scheduleWorkspaceTransition",
-                message: "Workspace transition task started",
-                data: [
-                    "recordID": recordID.uuidString,
-                    "isCurrent": String(
-                        workspaceTransitionGeneration == generation
-                    )
-                ]
-            )
-            // #endregion
-#endif
             defer {
-#if DEBUG
-                // #region debug-point D:workspace-transition-finished
-                reportFrequentUIFreezeDebugEvent(
-                    hypothesisID: "D",
-                    location:
-                        "DocumentWorkspaceView.scheduleWorkspaceTransition",
-                    message: "Workspace transition task finished",
-                    data: [
-                        "recordID": recordID.uuidString,
-                        "cancelled": String(Task.isCancelled),
-                        "isCurrent": String(
-                            workspaceTransitionGeneration == generation
-                        )
-                    ]
-                )
-                // #endregion
-#endif
                 if workspaceTransitionGeneration == generation {
                     workspaceTransitionTask = nil
                     activeWorkspaceHandoff = nil
                 }
             }
             await Task.yield()
-#if DEBUG
-            // #region debug-point D:workspace-transition-resumed
-            reportFrequentUIFreezeDebugEvent(
-                hypothesisID: "D",
-                location:
-                    "DocumentWorkspaceView.scheduleWorkspaceTransition",
-                message: "Workspace transition resumed after yield",
-                data: [
-                    "recordID": recordID.uuidString,
-                    "cancelled": String(Task.isCancelled),
-                    "isCurrent": String(
-                        workspaceTransitionGeneration == generation
-                    )
-                ]
-            )
-            // #endregion
-#endif
             guard !Task.isCancelled,
                   workspaceTransitionGeneration == generation,
                   scenePhase == .active,
@@ -4721,11 +4875,27 @@ struct DocumentWorkspaceView: View {
         guard let contentRevisionID =
             expectedContentRevisionID
                 ?? model.record(id: recordID)?.contentRevisionID,
-              pageStateContentRevisionID == contentRevisionID
+              pageStateContentRevisionID == contentRevisionID,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
         else { return }
-        readingPositionTask = Task {
-            try? await Task.sleep(for: .milliseconds(450))
+        let generation = UUID()
+        readingPositionGeneration = generation
+        readingPositionTask = Task { @MainActor in
+            defer {
+                if readingPositionGeneration == generation {
+                    readingPositionTask = nil
+                }
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(450))
+            } catch {
+                return
+            }
             guard !Task.isCancelled,
+                  readingPositionGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
                   model.record(id: recordID)?.contentRevisionID
                     == contentRevisionID,
                   pageStateContentRevisionID
@@ -4816,8 +4986,15 @@ struct DocumentWorkspaceView: View {
     }
 
     private func renameWorkingCopy() {
+        guard workspaceMetadataTask == nil,
+              !model.isProcessing(recordID),
+              !proposedName.trimmingCharacters(
+                in: .whitespacesAndNewlines
+              ).isEmpty
+        else { return }
         let requestedName = proposedName
         let expectedName = originalName
+        isRenaming = false
         performWorkspaceMetadataOperation(.rename) {
             await model.rename(
                 recordID: recordID,
@@ -5307,28 +5484,6 @@ struct DocumentWorkspaceView: View {
     }
 
     private func handleWorkspacePresentationDismissal() {
-#if DEBUG
-        // #region debug-point C:workspace-presentation-dismissed
-        reportFrequentUIFreezeDebugEvent(
-            hypothesisID: "C",
-            location:
-                "DocumentWorkspaceView.handleWorkspacePresentationDismissal",
-            message: "Workspace presentation dismissed",
-            data: [
-                "recordID": recordID.uuidString,
-                "hasActivePresentation": String(
-                    hasActiveWorkspacePresentation
-                ),
-                "hasPendingHandoff": String(
-                    pendingWorkspaceHandoff != nil
-                ),
-                "hasTransitionTask": String(
-                    workspaceTransitionTask != nil
-                )
-            ]
-        )
-        // #endregion
-#endif
         cleanupShareCopy()
         guard !hasActiveWorkspacePresentation,
               let handoff = pendingWorkspaceHandoff
@@ -5362,28 +5517,6 @@ struct DocumentWorkspaceView: View {
     private func queueWorkspaceHandoff(
         _ handoff: PendingWorkspaceHandoff
     ) {
-#if DEBUG
-        // #region debug-point C:workspace-handoff-queued
-        reportFrequentUIFreezeDebugEvent(
-            hypothesisID: "C",
-            location: "DocumentWorkspaceView.queueWorkspaceHandoff",
-            message: "Workspace handoff queued",
-            data: [
-                "recordID": recordID.uuidString,
-                "handoff": String(describing: handoff),
-                "hasActivePresentation": String(
-                    hasActiveWorkspacePresentation
-                ),
-                "hadPendingHandoff": String(
-                    pendingWorkspaceHandoff != nil
-                ),
-                "hadTransitionTask": String(
-                    workspaceTransitionTask != nil
-                )
-            ]
-        )
-        // #endregion
-#endif
         cancelWorkspaceTransition()
         let revisionBoundHandoff: PendingWorkspaceHandoff
         switch handoff {
@@ -5803,6 +5936,9 @@ struct DocumentWorkspaceView: View {
         if pdfSearchHighlight?.pageIndex != resolvedPageIndex {
             pdfSearchHighlight = nil
         }
+        if privacyEvidenceOverlay?.pageIndex != resolvedPageIndex {
+            privacyEvidenceOverlay = nil
+        }
         if recordsHistory,
            resolvedPageIndex != currentPageIndex {
             if pageBackHistory.last != currentPageIndex {
@@ -5913,6 +6049,7 @@ struct DocumentWorkspaceView: View {
         signaturePageIndex = nil
         signatureInitialBounds = nil
         pdfSearchHighlight = nil
+        privacyEvidenceOverlay = nil
         pdfCommand = nil
         textSelectionForReplacement = nil
         redactionMarks.removeAll(keepingCapacity: false)

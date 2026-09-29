@@ -16,6 +16,21 @@ struct PaperPathApp: App {
                 rootURL: documents.appendingPathComponent("PolishOCRFixture")
             ))
         }
+        if ProcessInfo.processInfo.arguments.contains(
+            "UITEST_OFFICE_CORPUS_FIXTURE"
+        ),
+        let documents = FileManager.default.urls(
+            for: .documentDirectory,
+            in: .userDomainMask
+        ).first {
+            return PaperPathModel(
+                store: DocumentStore(
+                    rootURL: documents.appendingPathComponent(
+                        "OfficeCorpusUITestFixture-v1"
+                    )
+                )
+            )
+        }
         if ProcessInfo.processInfo.arguments.contains("UITEST_OFFICE_CORPUS_RESULT"),
            let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
            let data = try? Data(contentsOf: documents.appendingPathComponent("OfficeCorpus/report.json")),
@@ -42,11 +57,6 @@ struct PaperPathApp: App {
     }
 
     init() {
-#if DEBUG
-        // #region debug-point C:desk-launch-navigation
-        if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "desk-launch-navigation", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "C", "msg": "[DEBUG] App init", "location": "PaperPathApp.init"]); URLSession.shared.dataTask(with: request).resume() }
-        // #endregion
-#endif
         AppPreferences.registerDefaults()
 #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
@@ -65,7 +75,7 @@ struct PaperPathApp: App {
 
     var body: some Scene {
         WindowGroup(for: UUID.self) { $initialRecordID in
-            RootView(initialRecordID: initialRecordID)
+            appContent(initialRecordID: initialRecordID)
                 .environmentObject(model)
                 .environmentObject(appLock)
                 .environmentObject(purchase)
@@ -85,5 +95,20 @@ struct PaperPathApp: App {
                     )
                 }
         }
+    }
+
+    @ViewBuilder
+    private func appContent(initialRecordID: UUID?) -> some View {
+#if DEBUG
+        if ProcessInfo.processInfo.arguments.contains(where: {
+            $0.hasPrefix("UITEST_PRIVACY_GALLERY_")
+        }) {
+            PrivacyScanDebugGalleryView()
+        } else {
+            RootView(initialRecordID: initialRecordID)
+        }
+#else
+        RootView(initialRecordID: initialRecordID)
+#endif
     }
 }

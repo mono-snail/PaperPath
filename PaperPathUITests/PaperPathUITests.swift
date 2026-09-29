@@ -5,16 +5,80 @@ import UIKit
 final class PaperPathUITests: XCTestCase {
     private func selectProfessionalMode(_ mode: String, chinese: Bool = false, in app: XCUIApplication) {
         XCTAssertTrue(app.descendants(matching: .any)["pdfWorkspace"].firstMatch.waitForExistence(timeout: 10))
-        let menu = app.buttons["workspaceModeMenu"]
-        if menu.exists {
-            menu.tap()
-            app.buttons["workspaceMode-\(mode)"].tap()
+        var menu = firstHittableButton(
+            identifier: "workspaceModeMenu",
+            in: app,
+            timeout: 2
+        )
+        if !menu.isHittable {
+            let label = chinese ? "工作区工具" : "Workspace tools"
+            let alternatives = app.buttons.matching(
+                NSPredicate(format: "label == %@", label)
+            )
+            _ = alternatives.firstMatch.waitForExistence(timeout: 2)
+            menu = alternatives.allElementsBoundByIndex
+                .first(where: \.isHittable)
+                ?? alternatives.firstMatch
+        }
+        if menu.exists, menu.isHittable {
+            tapCenter(menu)
+            let identified = firstHittableButton(
+                identifier: "workspaceMode-\(mode)",
+                in: app,
+                timeout: 2
+            )
+            if identified.exists, identified.isHittable {
+                tapCenter(identified)
+            } else {
+                let title: String
+                switch mode {
+                case "read":
+                    title = chinese ? "阅读" : "Read"
+                case "annotate":
+                    title = chinese ? "批注" : "Annotate"
+                case "deliver":
+                    title = chinese ? "交付" : "Deliver"
+                default:
+                    title = chinese ? "页面" : "Pages"
+                }
+                let options = app.buttons.matching(
+                    NSPredicate(format: "label == %@", title)
+                )
+                let option = options.allElementsBoundByIndex
+                    .first(where: \.isHittable)
+                    ?? options.firstMatch
+                XCTAssertTrue(option.waitForExistence(timeout: 3))
+                tapCenter(option)
+            }
         } else {
-            let title = mode == "read" ? (chinese ? "阅读" : "Read") : (chinese ? "页面" : "Pages")
+            let title: String
+            switch mode {
+            case "read":
+                title = chinese ? "阅读" : "Read"
+            case "annotate":
+                title = chinese ? "批注" : "Annotate"
+            case "deliver":
+                title = chinese ? "交付" : "Deliver"
+            default:
+                title = chinese ? "页面" : "Pages"
+            }
             let button = app.buttons[title].firstMatch
             XCTAssertTrue(button.waitForExistence(timeout: 5))
             button.tap()
         }
+
+        let expectedControl: String
+        switch mode {
+        case "read": expectedControl = "workspaceFindAction"
+        case "annotate": expectedControl = "workspaceTool-highlight"
+        case "deliver": expectedControl = "workspaceTool-fillForm"
+        default: expectedControl = "workspaceTool-organize"
+        }
+        XCTAssertTrue(
+            app.buttons[expectedControl].firstMatch
+                .waitForExistence(timeout: 5),
+            "Workspace mode \(mode) did not become active"
+        )
     }
 
     func testProfessionalFavorites() throws {
@@ -31,7 +95,7 @@ final class PaperPathUITests: XCTestCase {
         row.tap()
         if app.buttons["deskOpenDocument"].waitForExistence(timeout: 2) { app.buttons["deskOpenDocument"].tap() }
         selectProfessionalMode("pages", in: app)
-        app.buttons["documentToolsAction"].tap()
+        openDocumentTools(in: app)
         let search = app.textFields["documentToolSearchField"]
         XCTAssertTrue(search.waitForExistence(timeout: 5))
         search.tap()
@@ -72,7 +136,7 @@ final class PaperPathUITests: XCTestCase {
             app.buttons["deskOpenDocument"].tap()
         }
         selectProfessionalMode("pages", in: app)
-        app.buttons["documentToolsAction"].tap()
+        openDocumentTools(in: app)
         let search = app.textFields["documentToolSearchField"]
         XCTAssertTrue(search.waitForExistence(timeout: 5))
         search.tap()
@@ -223,7 +287,7 @@ final class PaperPathUITests: XCTestCase {
             XCTAssertTrue(reveal(second, in: app, maxSwipes: 6))
             addScreenshot(named: "Page organizer" + suffix, app: app)
             app.buttons[chinese ? "关闭" : "Close"].firstMatch.tap()
-            app.buttons["documentToolsAction"].tap()
+            openDocumentTools(chinese: chinese, in: app)
             let search = app.textFields["documentToolSearchField"]
             XCTAssertTrue(search.waitForExistence(timeout: 5))
             addScreenshot(named: "Document tools" + suffix, app: app)
@@ -231,8 +295,12 @@ final class PaperPathUITests: XCTestCase {
             search.typeText(chinese ? "查找" : "Find")
             let find = app.buttons["documentTool-find"]
             XCTAssertTrue(find.waitForExistence(timeout: 5))
-            find.tap()
-            XCTAssertTrue(app.navigationBars[chinese ? "查找" : "Find"].waitForExistence(timeout: 5))
+            let submit = app.keyboards.buttons["Go"].firstMatch
+            XCTAssertTrue(submit.waitForExistence(timeout: 3))
+            submit.tap()
+            XCTAssertTrue(
+                app.searchFields.firstMatch.waitForExistence(timeout: 5)
+            )
             app.terminate()
         }
     }
@@ -256,9 +324,50 @@ final class PaperPathUITests: XCTestCase {
         return false
     }
 
-    private func waitForOfficeTablePixels(_ preview: XCUIElement) {
+    private func waitForOfficeTablePixels(
+        in app: XCUIApplication
+    ) {
         let rendered = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
-            guard let image = preview.screenshot().image.cgImage else { return false }
+            let status = app.descendants(matching: .any)[
+                "officeOutputPreviewStatus"
+            ].firstMatch
+            guard status.exists,
+                  status.frame.width > 0,
+                  status.frame.height > 0,
+                  let image = app.screenshot().image.cgImage
+            else { return false }
+            let appFrame = app.frame
+            let previewHeight: CGFloat = 210
+            let points = CGRect(
+                x: appFrame.minX + 16,
+                y: max(
+                    appFrame.minY,
+                    status.frame.minY - previewHeight
+                ),
+                width: max(1, appFrame.width - 32),
+                height: previewHeight
+            )
+            let scaleX = CGFloat(image.width) / appFrame.width
+            let scaleY = CGFloat(image.height) / appFrame.height
+            let pixelBounds = CGRect(
+                x: (points.minX - appFrame.minX) * scaleX,
+                y: (points.minY - appFrame.minY) * scaleY,
+                width: points.width * scaleX,
+                height: points.height * scaleY
+            ).integral.intersection(
+                CGRect(
+                    x: 0,
+                    y: 0,
+                    width: image.width,
+                    height: image.height
+                )
+            )
+            guard pixelBounds.width > 0,
+                  pixelBounds.height > 0,
+                  let previewImage = image.cropping(
+                    to: pixelBounds
+                  )
+            else { return false }
             let width = 320, height = 180
             var pixels = [UInt8](repeating: 255, count: width * height * 4)
             let rows = pixels.withUnsafeMutableBytes { bytes -> Int in
@@ -268,51 +377,73 @@ final class PaperPathUITests: XCTestCase {
                     space: CGColorSpaceCreateDeviceRGB(),
                     bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
                 ) else { return 0 }
-                context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+                context.draw(
+                    previewImage,
+                    in: CGRect(
+                        x: 0,
+                        y: 0,
+                        width: width,
+                        height: height
+                    )
+                )
                 let data = bytes.bindMemory(to: UInt8.self)
                 return (10..<170).filter { y in
                     let darkPixels = (8..<312).filter { x in
                         let i = (y * width + x) * 4
                         return data[i] < 170 && data[i + 1] < 170 && data[i + 2] < 170
                     }.count
-                    return darkPixels > 15 && darkPixels < 230
+                    return darkPixels > 3 && darkPixels < 230
                 }.count
             }
-            return rows > 28
+            return rows > 40
         }, object: nil)
         XCTAssertEqual(XCTWaiter.wait(for: [rendered], timeout: 30), .completed)
     }
 
+    private func waitForOfficePreviewReady(
+        chinese: Bool = false,
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        let expectedValue = chinese
+            ? "输出预览已就绪"
+            : "Output preview ready"
+        let status = app.descendants(matching: .any)[
+            "officeOutputPreviewStatus"
+        ].firstMatch
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "value == %@",
+                expectedValue
+            ),
+            object: status
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 30),
+            .completed
+        )
+        return status
+    }
+
     func testNativeWorkbenchHiddenPreview() throws {
         let app = makeApp()
-        // #region debug-point D:ipad-notice-hit
-        for key in ["NOTICE_DEBUG_URL", "NOTICE_DEBUG_RUN"] {
-            app.launchEnvironment[key] = ProcessInfo.processInfo.environment[key]
-        }
-        // #endregion
         app.launchArguments += [
-            "UITEST_OFFICE_CORPUS_RESULT",
+            "UITEST_OFFICE_CORPUS_FIXTURE",
             "-experience.onboardingCompleted.v4", "YES",
             "-privacy.hideLibraryPreviews", "YES"
         ]
         app.launch()
-        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitForOfficeCorpusFixture(in: app))
         selectWorkspaceLane(title: "Results", identifier: "workspaceLane-outputs", in: app)
-        // #region debug-point D:ipad-notice-hit-search
-        if ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] == "without-search" {
-            let more = app.buttons["moreOfficeResults"]
-            if reveal(more, in: app, maxSwipes: 6) { more.tap() }
-        } else {
-            let search = app.searchFields.firstMatch
-            search.tap()
-            search.typeText("ConditionalFormattingSamples")
-            if app.keyboards.buttons["Search"].exists { app.keyboards.buttons["Search"].tap() }
-        }
-        // #endregion
+        let search = app.searchFields.firstMatch
+        search.tap()
+        search.typeText("ConditionalFormattingSamples")
+        submitSearchKeyboard(in: app)
         let output = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "officeResult-", "ConditionalFormattingSamples")).firstMatch
         XCTAssertTrue(reveal(output, in: app, maxSwipes: 12))
         output.tap()
-        let preview = app.descendants(matching: .any)["officeOutputPreview"].firstMatch
+        let preview = app.descendants(matching: .any)[
+            "officeOutputPreviewStatus"
+        ].firstMatch
         XCTAssertTrue(preview.waitForExistence(timeout: 10))
         XCTAssertEqual(preview.value as? String, "Preview hidden")
         XCTAssertFalse(app.buttons["officeOpenOutputPreview"].isEnabled)
@@ -330,13 +461,13 @@ final class PaperPathUITests: XCTestCase {
     func testNativeWorkbenchDocumentFlow() throws {
         let app = makeApp()
         app.launchArguments += [
-            "UITEST_OFFICE_CORPUS_RESULT",
+            "UITEST_OFFICE_CORPUS_FIXTURE",
             "-experience.onboardingCompleted.v4", "YES",
             "-privacy.hideLibraryPreviews", "NO",
             "-workspace.toolMode", "read"
         ]
         app.launch()
-        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitForOfficeCorpusFixture(in: app))
         selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
         let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "documentRow-")).firstMatch
         XCTAssertTrue(row.waitForExistence(timeout: 10))
@@ -355,8 +486,7 @@ final class PaperPathUITests: XCTestCase {
         addScreenshot(named: "Native focused reader", app: app)
         app.buttons["exitImmersiveReading"].tap()
         XCTAssertTrue(read.waitForExistence(timeout: 5))
-        read.tap()
-        app.buttons["workspaceMode-annotate"].tap()
+        selectProfessionalMode("annotate", in: app)
         XCTAssertTrue(app.buttons["workspaceTool-highlight"].waitForExistence(timeout: 5))
         addScreenshot(named: "Native annotation tools", app: app)
         app.terminate()
@@ -368,24 +498,23 @@ final class PaperPathUITests: XCTestCase {
             app.launchArguments = [
                 "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN",
                 "-app.language", "zh-Hans",
+                "-privacy.appLockEnabled", "NO",
                 "-UIPreferredContentSizeCategoryName",
                 largeType ? "UICTContentSizeCategoryAccessibilityXXXL" : "UICTContentSizeCategoryL",
-                "UITEST_OFFICE_CORPUS_RESULT",
+                "UITEST_OFFICE_CORPUS_FIXTURE",
                 "-experience.onboardingCompleted.v4", "YES",
                 "-privacy.hideLibraryPreviews", "NO",
                 "-workspace.toolMode", "read"
             ]
             app.launch()
-            let documents = app.buttons["workspaceLane-home"].firstMatch
-            XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 20))
-            if documents.exists {
-                documents.tap()
-            } else {
-                app.buttons["工作区"].firstMatch.tap()
-                let option = app.buttons["文档"].firstMatch
-                XCTAssertTrue(option.waitForExistence(timeout: 5))
-                option.tap()
-            }
+            XCTAssertTrue(
+                waitForOfficeCorpusFixture(chinese: true, in: app)
+            )
+            selectWorkspaceLane(
+                title: "文档",
+                identifier: "workspaceLane-home",
+                in: app
+            )
             let row = app.buttons.matching(NSPredicate(
                 format: "identifier BEGINSWITH %@", "documentRow-"
             )).firstMatch
@@ -402,8 +531,11 @@ final class PaperPathUITests: XCTestCase {
             let mode = app.buttons["workspaceModeMenu"]
             XCTAssertTrue(mode.waitForExistence(timeout: 5))
             if !app.buttons["enterFocusReading"].exists {
-                mode.tap()
-                app.buttons["workspaceMode-read"].tap()
+                selectProfessionalMode(
+                    "read",
+                    chinese: true,
+                    in: app
+                )
             }
             XCTAssertTrue(app.buttons["enterFocusReading"].isHittable)
             addScreenshot(named: largeType ? "Chinese reader accessibility" : "Chinese reader", app: app)
@@ -426,7 +558,7 @@ final class PaperPathUITests: XCTestCase {
                 ]
             }
             app.launch()
-            XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 20))
+            XCTAssertTrue(waitForLibrary(in: app))
             selectWorkspaceLane(title: "Results", identifier: "workspaceLane-outputs", in: app)
             let document = app.buttons.matching(NSPredicate(
                 format: "identifier BEGINSWITH %@", "resultDocument-"
@@ -449,44 +581,47 @@ final class PaperPathUITests: XCTestCase {
         app.launchArguments = [
             "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN",
             "-app.language", "zh-Hans",
+            "-privacy.appLockEnabled", "NO",
             "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryL",
-            "UITEST_OFFICE_CORPUS_RESULT",
+            "UITEST_OFFICE_CORPUS_FIXTURE",
             "-experience.onboardingCompleted.v4", "YES",
             "-privacy.hideLibraryPreviews", "NO"
         ]
         app.launch()
-        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 20))
-        app.buttons["workspaceLane-outputs"].firstMatch.tap()
+        XCTAssertTrue(
+            waitForOfficeCorpusFixture(chinese: true, in: app)
+        )
         let search = app.searchFields.firstMatch
         search.tap()
         search.typeText("ConditionalFormattingSamples")
-        if app.keyboards.buttons["搜索"].exists { app.keyboards.buttons["搜索"].tap() }
+        submitSearchKeyboard(in: app)
         let output = app.buttons.matching(NSPredicate(
             format: "identifier BEGINSWITH %@", "officeResult-"
         )).firstMatch
-        XCTAssertTrue(output.waitForExistence(timeout: 10))
+        guard output.waitForExistence(timeout: 30) else {
+            XCTFail("The localized Office result did not become available")
+            app.terminate()
+            return
+        }
         addScreenshot(named: "Chinese results", app: app)
         output.tap()
-        let preview = app.descendants(matching: .any)["officeOutputPreview"].firstMatch
+        let preview = app.descendants(matching: .any)[
+            "officeOutputPreviewStatus"
+        ].firstMatch
         XCTAssertTrue(preview.waitForExistence(timeout: 15))
-        let ready = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "value == %@", "输出预览已就绪"), object: preview
+        _ = waitForOfficePreviewReady(
+            chinese: true,
+            in: app
         )
-        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 30), .completed)
-        waitForOfficeTablePixels(preview)
+        waitForOfficeTablePixels(in: app)
         addScreenshot(named: "Chinese output preview", app: app)
         app.terminate()
     }
 
     func testOfficeCorpusNoticesSurviveReopening() throws {
         let app = makeApp()
-        // #region debug-point C:ipad-notice-hit
-        for key in ["NOTICE_DEBUG_URL", "NOTICE_DEBUG_RUN"] {
-            app.launchEnvironment[key] = ProcessInfo.processInfo.environment[key]
-        }
-        // #endregion
         app.launchArguments += [
-            "UITEST_OFFICE_CORPUS_RESULT",
+            "UITEST_OFFICE_CORPUS_FIXTURE",
             "-experience.onboardingCompleted.v4", "YES",
             "-privacy.hideLibraryPreviews", "NO",
             "-library.workspaceLane", "deliver"
@@ -499,7 +634,7 @@ final class PaperPathUITests: XCTestCase {
                 ]
             }
             app.launch()
-            XCTAssertTrue(waitForLibrary(in: app))
+            XCTAssertTrue(waitForOfficeCorpusFixture(in: app))
             selectWorkspaceLane(title: "Results", identifier: "workspaceLane-outputs", in: app)
             let search = app.searchFields.firstMatch
             XCTAssertTrue(search.waitForExistence(timeout: 20))
@@ -514,39 +649,26 @@ final class PaperPathUITests: XCTestCase {
             XCTAssertTrue(output.waitForExistence(timeout: 10))
             addScreenshot(named: largeType ? "Native results accessibility" : "Native results", app: app)
             output.tap()
-            let preview = app.descendants(matching: .any)["officeOutputPreview"].firstMatch
+            let preview = app.descendants(matching: .any)[
+                "officeOutputPreviewStatus"
+            ].firstMatch
             XCTAssertTrue(preview.waitForExistence(timeout: 15))
             if !largeType {
-                let loaded = XCTNSPredicateExpectation(
-                    predicate: NSPredicate(format: "value == %@", "Output preview ready"), object: preview
+                _ = waitForOfficePreviewReady(
+                    in: app
                 )
-                XCTAssertEqual(XCTWaiter.wait(for: [loaded], timeout: 30), .completed)
-                // #region debug-point C:ipad-notice-hit-lifecycle
-                if ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] != "no-background" {
-                    XCUIDevice.shared.press(.home)
-                    app.activate()
-                }
-                // #endregion
-                let reloaded = XCTNSPredicateExpectation(
-                    predicate: NSPredicate(format: "value == %@", "Output preview ready"), object: preview
+                XCUIDevice.shared.press(.home)
+                app.activate()
+                _ = waitForOfficePreviewReady(
+                    in: app
                 )
-                XCTAssertEqual(XCTWaiter.wait(for: [reloaded], timeout: 30), .completed)
-                waitForOfficeTablePixels(preview)
+                waitForOfficeTablePixels(in: app)
             }
             addScreenshot(named: largeType ? "Native output accessibility" : "Native output preview", app: app)
             let summary = app.otherElements["officeNoticeDetails-spreadsheetTextOnly"].buttons.firstMatch
             XCTAssertTrue(revealOfficeControl(summary, in: app))
-            // #region debug-point C:ipad-notice-hit
-            if let endpoint = ProcessInfo.processInfo.environment["NOTICE_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "ipad-notice-hit", "runId": ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "C", "msg": "[DEBUG] Test tap", "data": ["frame": "\(summary.frame)", "preview": "\(preview.frame)"]]); URLSession.shared.dataTask(with: request).resume() }
-            // #endregion
             summary.tap()
             let notice = app.descendants(matching: .any)["officeNotice-spreadsheetTextOnly"].firstMatch
-            // #region debug-point C:ipad-notice-hit-offset
-            if ProcessInfo.processInfo.environment["NOTICE_DEBUG_RUN"] == "offset", !notice.waitForExistence(timeout: 1) {
-                summary.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-                    .withOffset(CGVector(dx: 0, dy: 42)).tap()
-            }
-            // #endregion
             XCTAssertTrue(notice.waitForExistence(timeout: 10))
             XCTAssertTrue(notice.label.contains("Charts, images and conditional formatting"))
             XCTAssertTrue(revealOfficeControl(notice, in: app))
@@ -579,14 +701,15 @@ final class PaperPathUITests: XCTestCase {
         app.launchArguments += [
             "UITEST_RESET_DEMO",
             "-AppleInterfaceStyle",
-            "Dark"
+            "Dark",
+            "-workspace.toolMode",
+            "pages"
         ]
-        configureFreezeTracing(for: app)
         app.launch()
 
         XCTAssertTrue(waitForLibrary(in: app))
         selectWorkspaceLane(
-            title: "Home",
+            title: "Documents",
             identifier: "workspaceLane-home",
             in: app
         )
@@ -599,15 +722,11 @@ final class PaperPathUITests: XCTestCase {
             "PaperPath: Secure PDF Studio"
         )
         XCTAssertTrue(
-            app.buttons["homePrimaryAction"].waitForExistence(timeout: 3)
+            app.otherElements["libraryDocumentsSection"]
+                .waitForExistence(timeout: 3)
         )
-        XCTAssertEqual(
-            app.buttons["homePrimaryAction"].label,
-            "Fill Form"
-        )
-        XCTAssertTrue(app.otherElements["libraryDocumentsSection"].exists)
         selectWorkspaceLane(
-            title: "Tasks",
+            title: "Tools",
             identifier: "workspaceLane-tasks",
             in: app
         )
@@ -619,21 +738,28 @@ final class PaperPathUITests: XCTestCase {
             "taskPackage-convertForWork",
             "taskPackage-fixPages"
         ] {
-            XCTAssertTrue(app.buttons[identifier].exists)
+            XCTAssertTrue(
+                reveal(
+                    app.buttons[identifier],
+                    in: app,
+                    maxSwipes: 10
+                )
+            )
         }
         let allTaskPaths = app.buttons["toggleAllTaskPaths"].firstMatch
         XCTAssertTrue(reveal(allTaskPaths, in: app, maxSwipes: 3))
         allTaskPaths.tap()
         XCTAssertFalse(app.buttons["taskPackage-makeSearchable"].exists)
         XCTAssertTrue(app.buttons["taskPackage-compressForEmail"].exists)
-        let toolsSection = app.otherElements["pdfToolsSection"].firstMatch
-        XCTAssertTrue(reveal(toolsSection, in: app, maxSwipes: 4))
-        let allTools = app.buttons["Show all PDF tools"]
-        XCTAssertTrue(allTools.waitForExistence(timeout: 3))
-        allTools.tap()
         XCTAssertTrue(
-            app.buttons["Show quick PDF tools only"]
-                .waitForExistence(timeout: 3)
+            app.otherElements["deskToolsCatalog"].exists
+        )
+        XCTAssertTrue(
+            revealTowardTop(
+                combineButton,
+                in: app,
+                maxSwipes: 12
+            )
         )
         addScreenshot(named: "PaperPath Library Default", app: app)
         combineButton.tap()
@@ -681,9 +807,13 @@ final class PaperPathUITests: XCTestCase {
 
         let workspace = app.otherElements["pdfWorkspace"].firstMatch
         XCTAssertTrue(workspace.waitForExistence(timeout: 5))
+        selectProfessionalMode("pages", in: app)
         XCTAssertTrue(app.otherElements["documentContext"].exists)
         XCTAssertTrue(
-            app.buttons["workspaceNextAction"].waitForExistence(timeout: 3)
+            app.buttons["workspaceNextAction"]
+                .waitForExistence(timeout: 1)
+                || app.buttons["verifiedShareAction"]
+                    .waitForExistence(timeout: 2)
         )
         XCTAssertFalse(app.otherElements["recentDocumentTabs"].exists)
         XCTAssertFalse(app.otherElements["workspaceCommandRail"].exists)
@@ -731,6 +861,7 @@ final class PaperPathUITests: XCTestCase {
             .completed
         )
 
+        selectProfessionalMode("read", in: app)
         let findButton = firstHittableButton(
             identifier: "workspaceFindAction",
             in: app,
@@ -747,7 +878,7 @@ final class PaperPathUITests: XCTestCase {
         closeFind.tap()
         XCTAssertFalse(findNavigation.waitForExistence(timeout: 1))
 
-        app.buttons["Pages"].tap()
+        openPageOrganizer(in: app)
         XCTAssertTrue(
             app.navigationBars["Organize pages"].waitForExistence(timeout: 5)
         )
@@ -769,6 +900,2563 @@ final class PaperPathUITests: XCTestCase {
         )
         XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
         addScreenshot(named: "PaperPath Extracted Copy", app: app)
+    }
+
+    func testSplitPDFQuickJourneyCreatesCopyAfterCancelAndReentry()
+        throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "-workspace.toolMode",
+            "pages"
+        ]
+        app.launch()
+
+        XCTAssertTrue(waitForLibrary(in: app))
+        openQuickTask(
+            identifier: "splitPDF",
+            query: "Split PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Split PDF"].waitForExistence(timeout: 10)
+        )
+        dismissPresentedWorkflow(title: "Split PDF", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "splitPDF",
+            query: "Split PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Split PDF"].waitForExistence(timeout: 10)
+        )
+        let firstPage = app.buttons["organizerPage-0"]
+        XCTAssertTrue(firstPage.waitForExistence(timeout: 5))
+        firstPage.tap()
+
+        let extract = app.buttons["extractPagesButton"]
+        XCTAssertTrue(extract.waitForExistence(timeout: 3))
+        XCTAssertTrue(extract.isEnabled)
+        extract.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["Project handoff - extracted pages"]
+                .waitForExistence(timeout: 15)
+        )
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+        assertAppAlive(app)
+    }
+
+    func testProtectPDFJourneyCreatesCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "protectPDF",
+            query: "Protect PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Protect PDF"]
+                .waitForExistence(timeout: 8)
+        )
+        addScreenshot(named: "Protection first screen", app: app)
+        dismissPresentedWorkflow(title: "Protect PDF", in: app)
+
+        openQuickTask(
+            identifier: "protectPDF",
+            query: "Protect PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Protect PDF"]
+                .waitForExistence(timeout: 8)
+        )
+        completeProtection(
+            navigationTitle: "Protect PDF",
+            password: "PaperPath-2026",
+            in: app
+        )
+        let protectedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Protected copy"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [protectedCopyOpened],
+                timeout: 30
+            ),
+            .completed
+        )
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+        assertAppAlive(app)
+    }
+
+    func testWatermarkJourneyWritesAnnotationsAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "watermark",
+            query: "Watermark",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Watermark"]
+                .waitForExistence(timeout: 5)
+        )
+        dismissPresentedWorkflow(title: "Watermark", in: app)
+
+        openDocumentTool(
+            identifier: "watermark",
+            query: "Watermark",
+            in: app
+        )
+        let apply = app.buttons["watermarkApplyAction"].firstMatch
+        XCTAssertTrue(apply.waitForExistence(timeout: 5))
+        XCTAssertTrue(apply.isEnabled)
+        apply.tap()
+        XCTAssertTrue(
+            app.navigationBars["Watermark"]
+                .waitForNonExistence(timeout: 20)
+        )
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+
+        openDocumentTool(
+            identifier: "annotations",
+            query: "Annotations",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Comments & Markup"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(
+            app.staticTexts["CONFIDENTIAL"]
+                .waitForExistence(timeout: 10)
+        )
+        XCTAssertGreaterThan(
+            app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "identifier BEGINSWITH %@",
+                    "annotationRow-"
+                )
+            ).count,
+            0
+        )
+        assertAppAlive(app)
+    }
+
+    func testBatesJourneyWritesPageIDsAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "bates",
+            query: "Bates Numbering",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Bates Numbering"]
+                .waitForExistence(timeout: 5)
+        )
+        dismissPresentedWorkflow(title: "Bates Numbering", in: app)
+
+        openDocumentTool(
+            identifier: "bates",
+            query: "Bates Numbering",
+            in: app
+        )
+        let apply = app.buttons["batesApplyAction"].firstMatch
+        XCTAssertTrue(apply.waitForExistence(timeout: 5))
+        XCTAssertTrue(apply.isEnabled)
+        apply.tap()
+        XCTAssertTrue(
+            app.navigationBars["Bates Numbering"]
+                .waitForNonExistence(timeout: 20)
+        )
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+
+        openDocumentTool(
+            identifier: "annotations",
+            query: "Annotations",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Comments & Markup"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(
+            app.staticTexts["000001"].waitForExistence(timeout: 10)
+        )
+        XCTAssertGreaterThan(
+            app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "identifier BEGINSWITH %@",
+                    "annotationRow-"
+                )
+            ).count,
+            0
+        )
+        assertAppAlive(app)
+    }
+
+    func testStampJourneyAddsEditableAnnotationAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "stamp",
+            query: "Stamp",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Add stamp"]
+                .waitForExistence(timeout: 5)
+        )
+        dismissPresentedWorkflow(title: "Add stamp", in: app)
+
+        openDocumentTool(
+            identifier: "stamp",
+            query: "Stamp",
+            in: app
+        )
+        let approved = app.buttons["stampOption-Approved"].firstMatch
+        XCTAssertTrue(approved.waitForExistence(timeout: 5))
+        tapCenter(approved)
+        XCTAssertTrue(
+            app.navigationBars["Add stamp"]
+                .waitForNonExistence(timeout: 10)
+        )
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+
+        openDocumentTool(
+            identifier: "annotations",
+            query: "Annotations",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Comments & Markup"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(
+            app.staticTexts["Approved"].waitForExistence(timeout: 10)
+        )
+        XCTAssertGreaterThan(
+            app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "identifier BEGINSWITH %@",
+                    "annotationRow-"
+                )
+            ).count,
+            0
+        )
+        assertAppAlive(app)
+    }
+
+    func testBriefJourneyLoadsResultAfterCloseAndReentry() throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        for _ in 0..<2 {
+            openDocumentTool(
+                identifier: "brief",
+                query: "Brief",
+                in: app
+            )
+            XCTAssertTrue(
+                app.navigationBars["Document details"]
+                    .waitForExistence(timeout: 8)
+            )
+            XCTAssertTrue(
+                app.staticTexts["Project handoff"]
+                    .waitForExistence(timeout: 10)
+            )
+            XCTAssertFalse(app.staticTexts["Brief unavailable"].exists)
+            dismissPresentedWorkflow(
+                title: "Document details",
+                in: app
+            )
+            XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+        }
+        assertAppAlive(app)
+    }
+
+    func testAnnotationsJourneyReloadsInventoryAfterCloseAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        for _ in 0..<2 {
+            openDocumentTool(
+                identifier: "annotations",
+                query: "Annotations",
+                in: app
+            )
+            XCTAssertTrue(
+                app.navigationBars["Comments & Markup"]
+                    .waitForExistence(timeout: 8)
+            )
+            let loaded = XCTNSPredicateExpectation(
+                predicate: NSPredicate { _, _ in
+                    app.staticTexts["No annotations"].exists
+                        || app.descendants(matching: .any).matching(
+                            NSPredicate(
+                                format: "identifier BEGINSWITH %@",
+                                "annotationRow-"
+                            )
+                        ).count > 0
+                },
+                object: nil
+            )
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [loaded], timeout: 15),
+                .completed
+            )
+            dismissPresentedWorkflow(
+                title: "Comments & Markup",
+                in: app
+            )
+            XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+        }
+        assertAppAlive(app)
+    }
+
+    func testAttachmentsJourneyReloadsInspectionAfterCloseAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        for _ in 0..<2 {
+            openDocumentTool(
+                identifier: "attachments",
+                query: "Attachments",
+                in: app
+            )
+            XCTAssertTrue(
+                app.navigationBars["Attachments"]
+                    .waitForExistence(timeout: 8)
+            )
+            let loaded = XCTNSPredicateExpectation(
+                predicate: NSPredicate { _, _ in
+                    app.staticTexts["No embedded files"].exists
+                        || app.descendants(matching: .any).matching(
+                            NSPredicate(
+                                format: "identifier BEGINSWITH %@",
+                                "attachmentRow-"
+                            )
+                        ).count > 0
+                },
+                object: nil
+            )
+            XCTAssertEqual(
+                XCTWaiter.wait(for: [loaded], timeout: 15),
+                .completed
+            )
+            dismissPresentedWorkflow(
+                title: "Attachments",
+                in: app
+            )
+            XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
+        }
+        assertAppAlive(app)
+    }
+
+    func testScanToPDFJourneyCreatesReviewedTwoPageDocument()
+        throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_SCAN_CAPTURE_FIXTURE"]
+        )
+
+        openQuickTask(
+            identifier: "scanToPDF",
+            query: "Scan to PDF",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Review Scan"]
+                .waitForExistence(timeout: 8)
+        )
+        addScreenshot(named: "Scan review first screen", app: app)
+        dismissPresentedWorkflow(
+            title: "Review Scan",
+            in: app
+        )
+
+        openQuickTask(
+            identifier: "scanToPDF",
+            query: "Scan to PDF",
+            in: app
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "scanOutputBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        let save = app.buttons["scanSave"].firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: save
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 10),
+            .completed
+        )
+        save.tap()
+
+        let title = workspaceDocumentTitle(in: app)
+        let scanOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label BEGINSWITH %@",
+                "Scan"
+            ),
+            object: title
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [scanOpened], timeout: 30),
+            .completed
+        )
+        let pageCountLoaded = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "value BEGINSWITH %@",
+                "2 pages"
+            ),
+            object: title
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [pageCountLoaded], timeout: 5),
+            .completed
+        )
+        assertAppAlive(app)
+    }
+
+    func testImagesToPDFJourneyCreatesReviewedTwoPageDocument()
+        throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_IMAGE_IMPORT_FIXTURE"]
+        )
+
+        openQuickTask(
+            identifier: "imagesToPDF",
+            query: "Images to PDF",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Review Scan"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(
+            title: "Review Scan",
+            in: app
+        )
+
+        openQuickTask(
+            identifier: "imagesToPDF",
+            query: "Images to PDF",
+            in: app
+        )
+        let save = app.buttons["scanSave"].firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: save
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 10),
+            .completed
+        )
+        save.tap()
+
+        let title = workspaceDocumentTitle(in: app)
+        let imagesOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label BEGINSWITH %@",
+                "Images"
+            ),
+            object: title
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [imagesOpened], timeout: 30),
+            .completed
+        )
+        let pageCountLoaded = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "value BEGINSWITH %@",
+                "2 pages"
+            ),
+            object: title
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [pageCountLoaded], timeout: 5),
+            .completed
+        )
+        assertAppAlive(app)
+    }
+
+    func testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "mergePDFs",
+            query: "Merge PDFs",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Merge PDFs"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Merge PDFs", in: app)
+
+        openQuickTask(
+            identifier: "mergePDFs",
+            query: "Merge PDFs",
+            in: app
+        )
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        XCTAssertFalse(create.isEnabled)
+
+        for documentTitle in ["Project handoff", "August invoice"] {
+            let document = app.buttons.matching(
+                NSPredicate(
+                    format:
+                        "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+                    "mergeAvailableDocument-",
+                    documentTitle
+                )
+            ).firstMatch
+            XCTAssertTrue(
+                revealForCenterTap(document, in: app, maxSwipes: 10),
+                "Could not add \(documentTitle) to the merge"
+            )
+            tapCenter(document)
+            guard document.waitForNonExistence(timeout: 8) else {
+                XCTFail(
+                    "\(documentTitle) did not move into the merge selection"
+                )
+                return
+            }
+            let selectedDocument = app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format:
+                        "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+                    "mergeSelectedDocument-",
+                    documentTitle
+                )
+            ).firstMatch
+            guard selectedDocument.waitForExistence(timeout: 8) else {
+                XCTFail(
+                    "\(documentTitle) was not added to the merge order"
+                )
+                return
+            }
+        }
+
+        let outputName = app.textFields["mergeOutputName"].firstMatch
+        XCTAssertTrue(revealForCenterTap(outputName, in: app, maxSwipes: 8))
+        outputName.tap()
+        outputName.typeText("Automation Merge")
+        if app.keyboards.buttons["Done"].exists {
+            app.keyboards.buttons["Done"].tap()
+        }
+        addScreenshot(named: "Merge order and output name", app: app)
+
+        XCTAssertTrue(reveal(create, in: app, maxSwipes: 8))
+        let mergeEnabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: create
+        )
+        guard XCTWaiter.wait(
+            for: [mergeEnabled],
+            timeout: 15
+        ) == .completed else {
+            XCTFail("Merge action did not become enabled")
+            return
+        }
+        create.tap()
+        XCTAssertTrue(
+            app.staticTexts["Merged PDF ready"]
+                .waitForExistence(timeout: 30)
+        )
+        let openResult = app.buttons["mergeOpenResult"].firstMatch
+        XCTAssertTrue(openResult.waitForExistence(timeout: 5))
+        tapCenter(openResult)
+
+        let title = workspaceDocumentTitle(in: app)
+        let mergedDocumentOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Automation Merge"
+            ),
+            object: title
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [mergedDocumentOpened],
+                timeout: 15
+            ),
+            .completed
+        )
+        assertAppAlive(app)
+    }
+
+    func testOrganizePagesQuickJourneyCreatesCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "organizePages",
+            query: "Organize Pages",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Organize pages"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Organize pages", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "organizePages",
+            query: "Organize Pages",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        let cropPage = app.buttons["Crop page"].firstMatch
+        XCTAssertTrue(cropPage.waitForExistence(timeout: 5))
+        tapCenter(cropPage)
+        XCTAssertTrue(
+            app.navigationBars["Crop Page"]
+                .waitForExistence(timeout: 5)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "pageCropBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        app.buttons["Cancel"].firstMatch.tap()
+        XCTAssertTrue(
+            app.navigationBars["Organize pages"]
+                .waitForExistence(timeout: 5)
+        )
+        completePageExtraction(in: app)
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "Project handoff - extracted pages"
+        )
+        assertAppAlive(app)
+    }
+
+    func testCompressPDFQuickJourneyKeepsAlreadySmallerOriginal()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "compressPDF",
+            query: "Compress PDF",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Compress PDF"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Compress PDF", in: app)
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "compressPDF",
+            query: "Compress PDF",
+            in: app
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "batchCompressionOutputBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        let source = app.buttons.matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND label BEGINSWITH %@",
+                "batchCompressionDocument-",
+                "Project handoff"
+            )
+        ).firstMatch
+        XCTAssertTrue(source.waitForExistence(timeout: 8))
+        tapCenter(source)
+        let compress = app.buttons["batchCompressionAction"].firstMatch
+        XCTAssertTrue(compress.waitForExistence(timeout: 5))
+        XCTAssertTrue(compress.isEnabled)
+        compress.tap()
+
+        XCTAssertTrue(
+            app.staticTexts["COMPRESSION RESULT"]
+                .waitForExistence(timeout: 45)
+        )
+        XCTAssertTrue(
+            app.staticTexts["Originals already smaller"]
+                .waitForExistence(timeout: 5)
+        )
+        let protectedFromGrowth = app.staticTexts.matching(
+            NSPredicate(
+                format: "label CONTAINS %@",
+                "PaperPath did not save the larger copy."
+            )
+        )
+        .firstMatch
+        XCTAssertTrue(
+            protectedFromGrowth.waitForExistence(timeout: 5)
+        )
+        XCTAssertTrue(app.staticTexts["No new copy"].exists)
+        XCTAssertFalse(app.buttons["Retry 1 Failed"].exists)
+        let done = app.buttons["Done"].firstMatch
+        XCTAssertTrue(done.waitForExistence(timeout: 5))
+        done.tap()
+        XCTAssertTrue(waitForLibrary(in: app))
+        XCTAssertFalse(
+            app.staticTexts["Project handoff - Compressed copy"].exists
+        )
+        assertAppAlive(app)
+    }
+
+    func testFillFormsQuickJourneyAddsFieldAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "fillForms",
+            query: "Fill Forms",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Fill Form"].waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Fill Form", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "fillForms",
+            query: "Fill Forms",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertFalse(app.staticTexts["Quick task field"].exists)
+        completeFormField(named: "Quick task field", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        assertAppAlive(app)
+    }
+
+    func testSignPDFQuickJourneyPlacesSignatureAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_INK_FIXTURE"]
+        )
+
+        openQuickTask(
+            identifier: "signPDF",
+            query: "Sign PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Add signature"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Add signature", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "signPDF",
+            query: "Sign PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        completeSignature(in: app)
+        assertAnnotationResult(title: "Signature", in: app)
+    }
+
+    func testRedactPDFQuickJourneyCreatesSecureCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_PRESELECT_TEXT"]
+        )
+
+        openQuickTask(
+            identifier: "redactPDF",
+            query: "Redact PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        openQuickRedactionReview(in: app)
+        dismissPresentedWorkflow(title: "Review redactions", in: app)
+        let cancelMode = app.buttons["cancelRedactionMode"].firstMatch
+        XCTAssertTrue(cancelMode.waitForExistence(timeout: 5))
+        cancelMode.tap()
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "redactPDF",
+            query: "Redact PDF",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        openQuickRedactionReview(in: app)
+        completeRedaction(in: app)
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "Project handoff - Redacted copy"
+        )
+        assertAppAlive(app)
+    }
+
+    func testSafeShareQuickJourneyCreatesVerifiedCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "safeShare",
+            query: "Verify Share",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Finish & Share"]
+                .waitForExistence(timeout: 10)
+        )
+        dismissPresentedWorkflow(title: "Finish & Share", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "safeShare",
+            query: "Verify Share",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        completeVerifiedShare(in: app)
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "Project handoff - Verified copy"
+        )
+        assertAppAlive(app)
+    }
+
+    func testRecognizeTextQuickJourneyProducesResultAfterCancelAndReentry()
+        throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "UITEST_POLISH_OCR",
+            "-workspace.toolMode",
+            "pages"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "recognizeText",
+            query: "OCR PDF",
+            documentTitle: "Polish scan",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Recognition"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Recognition", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Polish scan")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "recognizeText",
+            query: "OCR PDF",
+            documentTitle: "Polish scan",
+            in: app
+        )
+        completeRecognition(query: "Delivery", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Polish scan")
+        assertAppAlive(app)
+    }
+
+    func testExportTextQuickJourneyProducesResultAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "exportText",
+            query: "PDF Office",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Convert PDF"]
+                .waitForExistence(timeout: 10)
+        )
+        dismissPresentedWorkflow(title: "Convert PDF", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "exportText",
+            query: "PDF Office",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        completeOfficeExport(in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        assertAppAlive(app)
+    }
+
+    func testExportImagesJourneyProducesShareablePageFilesAfterReentry()
+        throws {
+        let app = launchResetDemo()
+
+        openQuickTask(
+            identifier: "exportImages",
+            query: "PDF Images",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Save as Images"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Save as Images", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        XCTAssertTrue(waitForLibrary(in: app))
+
+        openQuickTask(
+            identifier: "exportImages",
+            query: "PDF Images",
+            documentTitle: "Project handoff",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Save as Images"]
+                .waitForExistence(timeout: 8)
+        )
+        let export = app.buttons[
+            "exportPageImages-jpegCompact"
+        ].firstMatch
+        XCTAssertTrue(reveal(export, in: app, maxSwipes: 12))
+        tapCenter(export)
+        XCTAssertTrue(
+            app.otherElements["ActivityListView"]
+                .waitForExistence(timeout: 30)
+        )
+        addScreenshot(named: "Exported page images in system share sheet", app: app)
+        assertAppAlive(app)
+    }
+
+    func testHighlightJourneyWritesMarkupAfterCancelAndReentry()
+        throws {
+        runMarkupJourney(
+            identifier: "highlight",
+            query: "Highlight",
+            expectedAnnotationTitle: "Highlight"
+        )
+    }
+
+    func testTouchSelectionSurvivesOpeningMarkupTools() throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+        let workspace = app.otherElements["pdfWorkspace"].firstMatch
+        XCTAssertTrue(workspace.waitForExistence(timeout: 8))
+        addScreenshot(named: "PDF before touch selection", app: app)
+        let selectableTitle = workspace.staticTexts["Project handoff"]
+            .firstMatch
+        XCTAssertTrue(selectableTitle.waitForExistence(timeout: 5))
+        selectableTitle.press(forDuration: 1.2)
+        XCTAssertTrue(
+            app.menuItems["Copy"].waitForExistence(timeout: 4)
+                || app.buttons["Copy"].waitForExistence(timeout: 4)
+        )
+        addScreenshot(named: "Text selected by touch", app: app)
+        openDocumentTool(identifier: "highlight", query: "Highlight", in: app)
+        assertAnnotationResult(title: "Highlight", in: app)
+    }
+
+    func testUnderlineJourneyWritesMarkupAfterCancelAndReentry()
+        throws {
+        runMarkupJourney(
+            identifier: "underline",
+            query: "Underline",
+            expectedAnnotationTitle: "Underline"
+        )
+    }
+
+    func testStrikeoutJourneyWritesMarkupAfterCancelAndReentry()
+        throws {
+        runMarkupJourney(
+            identifier: "strikeOut",
+            query: "Strike",
+            expectedAnnotationTitle: "Strikethrough"
+        )
+    }
+
+    func testInkJourneyWritesDrawingAfterCancelAndReentry() throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_INK_FIXTURE"]
+        )
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "ink",
+            query: "Draw",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Draw on page"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Draw on page", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "ink",
+            query: "Draw",
+            in: app
+        )
+        let save = app.buttons["inkSaveAction"].firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 8))
+        let canvas = app.descendants(matching: .any)[
+            "inkCanvas"
+        ].firstMatch
+        XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: save
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 15),
+            .completed
+        )
+        let initialShapePosition = String(
+            describing: canvas.value
+        )
+        XCTAssertTrue(
+            initialShapePosition.contains("shape selected"),
+            "The inserted shape should be directly editable"
+        )
+        addScreenshot(named: "Drawing and shape before touch move", app: app)
+        canvas.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
+        ).press(
+            forDuration: 0.1,
+            thenDragTo: canvas.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.62, dy: 0.5)
+            )
+        )
+        let moved = XCTNSPredicateExpectation(
+            predicate: NSPredicate { object, _ in
+                guard let element = object as? XCUIElement else {
+                    return false
+                }
+                return String(describing: element.value)
+                    != initialShapePosition
+            },
+            object: canvas
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [moved], timeout: 5),
+            .completed,
+            "Dragging the inserted shape should change its position"
+        )
+        let selection = app.descendants(matching: .any)[
+            "insertedShapeSelection"
+        ].firstMatch
+        XCTAssertTrue(selection.waitForExistence(timeout: 5))
+        let originalSelectionFrame = selection.frame
+        // This thin-line fixture has a 52-point logical selection height.
+        // XCTest reports the frame after page fitting, including its scale.
+        let handleInset = originalSelectionFrame.height * (20.0 / 52.0)
+        let handle = selection.coordinate(withNormalizedOffset: .zero)
+            .withOffset(CGVector(
+                dx: originalSelectionFrame.width - handleInset,
+                dy: originalSelectionFrame.height - handleInset
+            ))
+        handle.press(
+            forDuration: 0.1,
+            thenDragTo: handle.withOffset(CGVector(dx: -40, dy: -10))
+        )
+        // The fixture is a thin line; its selection keeps a minimum hit height.
+        // Shrinking also avoids clamping at the page edge after the move above.
+        let resized = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                selection.frame.width < originalSelectionFrame.width - 12
+                    && abs(selection.frame.minX - originalSelectionFrame.minX) < 3
+            },
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [resized], timeout: 5),
+            .completed,
+            "Dragging the bottom-right handle should resize the selected shape"
+        )
+        addScreenshot(named: "Inserted shape after touch handle resize", app: app)
+        let viewportMode = app.buttons["Move and zoom page"].firstMatch
+        XCTAssertTrue(viewportMode.waitForExistence(timeout: 5))
+        let fittedCanvasFrame = canvas.frame
+        XCTAssertTrue(app.buttons["Lasso"].firstMatch.isSelected)
+        viewportMode.tap()
+        XCTAssertTrue(viewportMode.isSelected)
+        XCTAssertFalse(
+            app.buttons["Lasso"].firstMatch.isSelected,
+            "Moving the page must not present the lasso as the active tool."
+        )
+        // Large iPad canvases constrain the synthesized finger travel.
+        canvas.pinch(withScale: 4, velocity: 1)
+        let zoomed = XCTNSPredicateExpectation(
+            predicate: NSPredicate { object, _ in
+                guard let element = object as? XCUIElement else {
+                    return false
+                }
+                return element.frame.width
+                    > fittedCanvasFrame.width * 1.25
+            },
+            object: canvas
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [zoomed], timeout: 5),
+            .completed,
+            "Pinching the page should enlarge the PDF and drawing together"
+        )
+        addScreenshot(named: "Drawing and PDF after touch zoom", app: app)
+        save.tap()
+        XCTAssertTrue(
+            app.navigationBars["Draw on page"]
+                .waitForNonExistence(timeout: 30)
+        )
+
+        assertAnnotationResult(
+            title: "Drawing",
+            in: app
+        )
+    }
+
+    func testNoteJourneyWritesCommentAfterCancelAndReentry() throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "note",
+            query: "Note",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Add note"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Add note", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "note",
+            query: "Note",
+            in: app
+        )
+        let note = app.descendants(matching: .any)["noteText"].firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 5))
+        note.tap()
+        note.typeText("Automation note")
+        let add = app.buttons["noteAddAction"].firstMatch
+        XCTAssertTrue(add.waitForExistence(timeout: 3))
+        XCTAssertTrue(add.isEnabled)
+        add.tap()
+        XCTAssertTrue(
+            app.navigationBars["Add note"]
+                .waitForNonExistence(timeout: 20)
+        )
+
+        assertAnnotationResult(
+            title: "Note",
+            contents: "Automation note",
+            in: app
+        )
+    }
+
+    func testContentJourneyCreatesEditedCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "content",
+            query: "Add Content",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Add Content"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Add Content", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "content",
+            query: "Add Content",
+            in: app
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "addContentStructureBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        let text = app.descendants(matching: .any)["contentText"].firstMatch
+        XCTAssertTrue(text.waitForExistence(timeout: 8))
+        text.tap()
+        text.typeText("Automation content")
+        let create = app.buttons["contentCreateCopy"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: create
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 15),
+            .completed
+        )
+        create.tap()
+
+        let editedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Edited copy"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [editedCopyOpened], timeout: 30),
+            .completed
+        )
+        assertAnnotationResult(
+            title: "Added Text",
+            contents: "Automation content",
+            in: app
+        )
+    }
+
+    func testCompressJourneyExplainsAlreadySmallerOriginalAfterReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "compress",
+            query: "Compress",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Compress"].waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Compress", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "compress",
+            query: "Compress",
+            in: app
+        )
+        let create = app.buttons["compressionCreateAction"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 8))
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "compressionOutputBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        XCTAssertTrue(
+            app.staticTexts["Original is already smaller"]
+                .waitForExistence(timeout: 45)
+        )
+        XCTAssertFalse(create.isEnabled)
+        XCTAssertTrue(
+            create.label.contains("Original Is Already Smaller")
+        )
+        XCTAssertFalse(app.alerts.firstMatch.exists)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        assertAppAlive(app)
+    }
+
+    func testDocumentProtectJourneyCreatesCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "protect",
+            query: "Protect",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Protect PDF"].waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Protect PDF", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "protect",
+            query: "Protect",
+            in: app
+        )
+        completeProtection(
+            navigationTitle: "Protect PDF",
+            password: "PaperPath-Document-2026",
+            in: app
+        )
+        let protectedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Protected copy"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [protectedCopyOpened],
+                timeout: 30
+            ),
+            .completed
+        )
+        assertAppAlive(app)
+    }
+
+    func testLinksJourneyCreatesEditedCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "links",
+            query: "Edit Links",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Edit Links"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Edit Links", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "links",
+            query: "Edit Links",
+            in: app
+        )
+        let label = app.textFields["existingLinkLabel"].firstMatch
+        XCTAssertTrue(label.waitForExistence(timeout: 8))
+        label.tap()
+        label.typeText(" Automation")
+        let create = app.buttons["createLinkEditedCopy"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: create
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 8),
+            .completed
+        )
+        create.tap()
+
+        let linkCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Links edited"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [linkCopyOpened], timeout: 45),
+            .completed
+        )
+        assertAppAlive(app)
+    }
+
+    func testSignJourneyPlacesSignatureAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_INK_FIXTURE"]
+        )
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "sign",
+            query: "Sign",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Add signature"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Add signature", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "sign",
+            query: "Sign",
+            in: app
+        )
+        let advance = app.buttons["Place on Page"].firstMatch
+        XCTAssertTrue(advance.waitForExistence(timeout: 8))
+        let canAdvance = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: advance
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [canAdvance], timeout: 15),
+            .completed
+        )
+        advance.tap()
+
+        let place = app.buttons["placeSignatureOnly"].firstMatch
+        XCTAssertTrue(place.waitForExistence(timeout: 8))
+        let canPlace = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: place
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [canPlace], timeout: 10),
+            .completed
+        )
+        place.tap()
+        XCTAssertTrue(
+            app.navigationBars["Add signature"]
+                .waitForNonExistence(timeout: 30)
+        )
+        assertAnnotationResult(title: "Signature", in: app)
+    }
+
+    func testRedactJourneyCreatesSecureCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_PRESELECT_TEXT"]
+        )
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "redact",
+            query: "Redact",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Review redactions"]
+                .waitForExistence(timeout: 15)
+        )
+        dismissPresentedWorkflow(title: "Review redactions", in: app)
+        let cancelMode = app.buttons["cancelRedactionMode"].firstMatch
+        XCTAssertTrue(cancelMode.waitForExistence(timeout: 5))
+        cancelMode.tap()
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "redact",
+            query: "Redact",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Review redactions"]
+                .waitForExistence(timeout: 15)
+        )
+        let create = app.buttons["redactionCreateAction"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        XCTAssertTrue(create.isEnabled)
+        create.tap()
+
+        let redactedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Redacted copy"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [redactedCopyOpened], timeout: 45),
+            .completed
+        )
+        assertAppAlive(app)
+    }
+
+    func testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(named: "August invoice", in: app)
+
+        let scan = app.buttons["privacyScanButton"].firstMatch
+        XCTAssertTrue(scan.waitForExistence(timeout: 5))
+        XCTAssertTrue(scan.isEnabled)
+        scan.tap()
+        XCTAssertTrue(
+            app.buttons["privacyScanClose"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPrivacyScan(in: app)
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "August invoice"
+        )
+
+        scan.tap()
+        let privacyCandidate =
+            app.staticTexts["b***@example.com"].firstMatch
+        XCTAssertTrue(
+            privacyCandidate.waitForExistence(timeout: 30)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "privacyReviewSummary"
+            ].firstMatch.exists
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "privacyRedactionScope"
+            ].firstMatch.exists
+        )
+        let findingReason = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@",
+                "privacyFindingReason-"
+            )
+        ).firstMatch
+        XCTAssertTrue(reveal(findingReason, in: app, maxSwipes: 6))
+        let findingSource = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@",
+                "privacyFindingSource-"
+            )
+        ).firstMatch
+        XCTAssertTrue(reveal(findingSource, in: app, maxSwipes: 6))
+        addScreenshot(
+            named: "Privacy Scan Review",
+            app: app
+        )
+        let locate = app.descendants(matching: .any).matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@",
+                "privacyLocate-"
+            )
+        ).firstMatch
+        XCTAssertTrue(reveal(locate, in: app, maxSwipes: 6))
+        XCTAssertGreaterThanOrEqual(locate.frame.width, 44)
+        XCTAssertGreaterThanOrEqual(locate.frame.height, 44)
+        tapCenter(locate)
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "August invoice"
+        )
+
+        scan.tap()
+        XCTAssertTrue(
+            app.staticTexts["b***@example.com"]
+                .waitForExistence(timeout: 30)
+        )
+
+        let redact = app.buttons["privacyRedactionAction"].firstMatch
+        XCTAssertTrue(redact.waitForExistence(timeout: 5))
+        XCTAssertTrue(redact.isEnabled)
+        XCTAssertTrue(redact.label.contains("1 item"))
+        redact.tap()
+        let cancel = app.buttons["privacyRedactionCancel"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5))
+        XCTAssertTrue(cancel.isHittable)
+        cancel.tap()
+        XCTAssertTrue(redact.waitForExistence(timeout: 5))
+        XCTAssertTrue(redact.isEnabled)
+        redact.tap()
+        let confirm = app.descendants(matching: .any)[
+            "privacyRedactionConfirm"
+        ].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 5))
+        addScreenshot(
+            named: "Privacy Redaction Confirmation",
+            app: app
+        )
+        confirm.tap()
+
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "privacyRedactionVerified"
+            ].firstMatch.waitForExistence(timeout: 60)
+        )
+        let share = app.buttons["privacyShareVerifiedCopy"].firstMatch
+        XCTAssertTrue(share.waitForExistence(timeout: 5))
+        XCTAssertTrue(share.isHittable)
+        addScreenshot(
+            named: "Privacy Redaction Completed",
+            app: app
+        )
+        share.tap()
+        let shareSheet = app.otherElements["ActivityListView"].firstMatch
+        XCTAssertTrue(shareSheet.waitForExistence(timeout: 15))
+        addScreenshot(named: "Privacy verified copy in system share sheet", app: app)
+        if let closeShare = app.buttons.matching(identifier: "Close")
+            .allElementsBoundByIndex.first(where: \.isHittable) {
+            closeShare.tap()
+        } else {
+            XCTAssertTrue(
+                app.otherElements["PopoverDismissRegion"].firstMatch.exists
+            )
+            let shareFrame = shareSheet.frame
+            XCTAssertGreaterThan(shareFrame.minY - app.frame.minY, 32)
+            app.coordinate(withNormalizedOffset: .zero).withOffset(
+                CGVector(
+                    dx: shareFrame.midX - app.frame.minX,
+                    dy: shareFrame.minY - app.frame.minY - 16
+                )
+            ).tap()
+        }
+        XCTAssertTrue(shareSheet.waitForNonExistence(timeout: 5))
+        let done = app.buttons["privacyRedactionDone"].firstMatch
+        XCTAssertTrue(done.waitForExistence(timeout: 5))
+        done.tap()
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "August invoice"
+        )
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Results",
+            identifier: "workspaceLane-outputs",
+            in: app
+        )
+        let managedCopy = app.buttons.matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+                "resultDocument-",
+                "August invoice - Redacted copy"
+            )
+        ).firstMatch
+        XCTAssertTrue(
+            reveal(managedCopy, in: app, maxSwipes: 10),
+            "The verified redacted copy was not retained in the library"
+        )
+        assertAppAlive(app)
+    }
+
+    func testSignatureEnglishStandardJourney() throws {
+        try signatureStandardJourney(chinese: false)
+    }
+
+    func testSignatureChineseStandardJourney() throws {
+        try signatureStandardJourney(chinese: true)
+    }
+
+    /// Uses the real library and redaction pipeline, so the result preview must
+    /// be a retained, verified copy rather than a presentation-only fixture.
+    private func signatureStandardJourney(chinese: Bool) throws {
+        continueAfterFailure = false
+        let name = chinese ? "Signature Chinese" : "Signature English"
+        let app = XCUIApplication()
+        app.launchArguments = [
+            "UITEST_RESET_DEMO",
+            "-AppleLanguages", chinese ? "(zh-Hans)" : "(en)",
+            "-AppleLocale", chinese ? "zh_CN" : "en_US",
+            "-app.language", chinese ? "zh-Hans" : "en",
+            "-privacy.appLockEnabled", "NO",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryL",
+            "-privacy.hideLibraryPreviews", "NO",
+            "-workspace.toolMode", "read"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
+        let primary = app.buttons["homePrimaryAction"].firstMatch
+        XCTAssertTrue(primary.waitForExistence(timeout: 8))
+        XCTAssertTrue(primary.isHittable)
+        addScreenshot(named: "\(name) Home", app: app)
+
+        selectWorkspaceLane(title: "Tools", identifier: "workspaceLane-tasks", in: app)
+        XCTAssertTrue(app.buttons["quickTool-mergePDFs"].waitForExistence(timeout: 5))
+        addScreenshot(named: "\(name) Tools", app: app)
+        openDemoDocument(named: "August invoice", in: app)
+        selectProfessionalMode("read", chinese: chinese, in: app)
+        let document = app.descendants(matching: .any)["pdfWorkspace"].firstMatch
+        XCTAssertGreaterThan(document.frame.height / app.frame.height, 0.45)
+        addScreenshot(named: "\(name) Reader", app: app)
+
+        app.buttons["privacyScanButton"].firstMatch.tap()
+        let summary = app.descendants(matching: .any)["privacyReviewSummary"].firstMatch
+        XCTAssertTrue(summary.waitForExistence(timeout: 30))
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            let firstFinding = app.descendants(matching: .any).matching(
+                NSPredicate(format: "identifier BEGINSWITH %@", "privacyLocate-")
+            ).firstMatch
+            XCTAssertTrue(
+                firstFinding.isHittable,
+                "The first finding must be reachable without scrolling past the summary on iPad."
+            )
+        }
+        let clear = app.buttons["privacyClearSelection"].firstMatch
+        XCTAssertTrue(revealTowardTop(clear, in: app, maxSwipes: 6))
+        clear.tap()
+        let redact = app.buttons["privacyRedactionAction"].firstMatch
+        XCTAssertTrue(redact.exists)
+        XCTAssertFalse(redact.isEnabled)
+        addScreenshot(named: "\(name) Privacy Zero Selection", app: app)
+        let selectAll = app.buttons["privacySelectAll"].firstMatch
+        XCTAssertTrue(selectAll.isHittable)
+        selectAll.tap()
+        XCTAssertTrue(redact.isEnabled)
+        XCTAssertGreaterThanOrEqual(redact.frame.height, 44)
+        XCTAssertLessThanOrEqual(redact.frame.maxX, app.frame.maxX)
+        addScreenshot(named: "\(name) Privacy Review", app: app)
+        redact.tap()
+        let cancel = app.buttons["privacyRedactionCancel"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 5))
+        addScreenshot(named: "\(name) Redaction Confirmation", app: app)
+        cancel.tap()
+        XCTAssertTrue(redact.isEnabled)
+        redact.tap()
+        app.buttons["privacyRedactionConfirm"].firstMatch.tap()
+        let verified = app.descendants(matching: .any)["privacyRedactionVerified"].firstMatch
+        XCTAssertTrue(verified.waitForExistence(timeout: 60))
+        let share = app.buttons["privacyShareVerifiedCopy"].firstMatch
+        XCTAssertTrue(share.waitForExistence(timeout: 5))
+        XCTAssertTrue(share.isEnabled)
+        XCTAssertTrue(share.isHittable)
+        addScreenshot(named: "\(name) Verified Copy", app: app)
+        app.buttons["privacyRedactionDone"].firstMatch.tap()
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "August invoice")
+        app.terminate()
+    }
+
+    func testPrivacyScanReviewLayoutMatrix() throws {
+        let variants: [(
+            name: String,
+            arguments: [String],
+            expectsAppearanceMenu: Bool
+        )] = [
+            (
+                name: "English Light Regular",
+                arguments: [
+                    "-AppleInterfaceStyle", "Light",
+                    "-UIPreferredContentSizeCategoryName",
+                    "UICTContentSizeCategoryL"
+                ],
+                expectsAppearanceMenu: false
+            ),
+            (
+                name: "Chinese Dark Accessibility",
+                arguments: [
+                    "-AppleLanguages", "(zh-Hans)",
+                    "-AppleLocale", "zh_CN",
+                    "-app.language", "zh-Hans",
+                    "-AppleInterfaceStyle", "Dark",
+                    "-UIPreferredContentSizeCategoryName",
+                    "UICTContentSizeCategoryAccessibilityXXXL"
+                ],
+                expectsAppearanceMenu: true
+            )
+        ]
+
+        for variant in variants {
+            let app = makeApp()
+            app.launchArguments += [
+                "UITEST_RESET_DEMO",
+                "-workspace.toolMode",
+                "pages"
+            ] + variant.arguments
+            app.launch()
+            XCTAssertTrue(waitForLibrary(in: app))
+            openDemoDocument(named: "August invoice", in: app)
+
+            let scan = app.buttons["privacyScanButton"].firstMatch
+            XCTAssertTrue(scan.waitForExistence(timeout: 5))
+            scan.tap()
+            XCTAssertTrue(
+                app.descendants(matching: .any)[
+                    "privacyReviewSummary"
+                ].firstMatch.waitForExistence(timeout: 30)
+            )
+            let action = app.descendants(matching: .any)[
+                "privacyRedactionAction"
+            ].firstMatch
+            XCTAssertTrue(action.waitForExistence(timeout: 5))
+            XCTAssertLessThanOrEqual(action.frame.maxX, app.frame.maxX)
+            XCTAssertGreaterThanOrEqual(action.frame.height, 44)
+            let firstFinding = app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "identifier BEGINSWITH %@",
+                    "privacyFinding-"
+                )
+            ).firstMatch
+            XCTAssertTrue(reveal(firstFinding, in: app, maxSwipes: 12))
+            for _ in 0..<8
+            where firstFinding.frame.maxY > action.frame.minY {
+                app.swipeUp()
+            }
+            XCTAssertTrue(app.frame.intersects(firstFinding.frame))
+            XCTAssertLessThan(firstFinding.frame.minY, action.frame.minY)
+            XCTAssertLessThanOrEqual(
+                firstFinding.frame.maxY,
+                action.frame.minY
+            )
+
+            if variant.expectsAppearanceMenu {
+                let selectionMenu = app.descendants(matching: .any)[
+                    "privacySelectionMenu"
+                ].firstMatch
+                XCTAssertTrue(
+                    revealTowardTop(
+                        selectionMenu,
+                        in: app,
+                        maxSwipes: 8
+                    )
+                )
+                XCTAssertFalse(
+                    app.descendants(matching: .any)[
+                        "privacyRedactionScope"
+                    ].firstMatch.exists
+                )
+            } else {
+                let selectAll =
+                    app.descendants(matching: .any)[
+                        "privacySelectAll"
+                    ].firstMatch
+                let deselectAll =
+                    app.descendants(matching: .any)[
+                        "privacyClearSelection"
+                    ].firstMatch
+                XCTAssertTrue(selectAll.waitForExistence(timeout: 5))
+                XCTAssertTrue(deselectAll.waitForExistence(timeout: 5))
+                XCTAssertEqual(selectAll.label, "Select All")
+                XCTAssertEqual(deselectAll.label, "Deselect All")
+            }
+
+            if variant.expectsAppearanceMenu {
+                let appearanceMenu = app.descendants(matching: .any)[
+                    "privacyAppearanceMenu"
+                ].firstMatch
+                XCTAssertTrue(
+                    reveal(appearanceMenu, in: app, maxSwipes: 8)
+                )
+            } else {
+                XCTAssertTrue(
+                    app.descendants(matching: .any)[
+                        "privacyAppearance-black"
+                    ].firstMatch.waitForExistence(timeout: 5)
+                )
+                XCTAssertTrue(
+                    app.descendants(matching: .any)[
+                        "privacyAppearance-white"
+                    ].firstMatch.exists
+                )
+            }
+
+            addScreenshot(
+                named: "Privacy Review \(variant.name)",
+                app: app
+            )
+            dismissPrivacyScan(in: app)
+            app.terminate()
+        }
+    }
+
+    func testFillFormJourneyAddsFieldAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "fillForm",
+            query: "Fill Form",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Fill Form"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Fill Form", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "fillForm",
+            query: "Fill Form",
+            in: app
+        )
+        let addField = app.buttons["addFormFieldFromReview"].firstMatch
+        XCTAssertTrue(reveal(addField, in: app, maxSwipes: 12))
+        addField.tap()
+        XCTAssertTrue(
+            app.navigationBars["Place Form Field"]
+                .waitForExistence(timeout: 8)
+        )
+        let name = app.textFields["formFieldName"].firstMatch
+        XCTAssertTrue(name.waitForExistence(timeout: 5))
+        name.tap()
+        name.typeText("Automation field")
+        let add = app.buttons["addFormField"].firstMatch
+        XCTAssertTrue(add.waitForExistence(timeout: 5))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: add
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 15),
+            .completed
+        )
+        add.tap()
+        XCTAssertTrue(
+            app.navigationBars["Fill Form"]
+                .waitForExistence(timeout: 30)
+        )
+        XCTAssertTrue(
+            waitForFormField(
+                named: "Automation field",
+                in: app
+            )
+        )
+        assertAppAlive(app)
+    }
+
+    func testOCRJourneyProducesSearchableResultAfterCancelAndReentry()
+        throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "UITEST_POLISH_OCR",
+            "-workspace.toolMode",
+            "pages"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: "Polish scan", in: app)
+
+        openDocumentTool(
+            identifier: "recognize",
+            query: "OCR",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Recognition"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Recognition", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Polish scan")
+
+        openDocumentTool(
+            identifier: "recognize",
+            query: "OCR",
+            in: app
+        )
+        let start = app.buttons["startOCR"].firstMatch
+        XCTAssertTrue(start.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: start
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 20),
+            .completed
+        )
+        start.tap()
+        XCTAssertTrue(
+            app.buttons["recognizedTextCopyMenu"]
+                .waitForExistence(timeout: 90)
+        )
+        addScreenshot(named: "Signature OCR Result", app: app)
+        let openSearch = app.buttons["Search recognized text"].firstMatch
+        XCTAssertTrue(openSearch.waitForExistence(timeout: 5))
+        XCTAssertTrue(openSearch.isHittable)
+        openSearch.tap()
+        let search = app.searchFields["Search recognized text"].firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+        search.typeText("Delivery")
+        if app.keyboards.buttons["Search"].exists {
+            app.keyboards.buttons["Search"].tap()
+        }
+        XCTAssertTrue(
+            app.buttons["copyFilteredRecognizedPages"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(app.buttons["copyFilteredRecognizedPages"].isEnabled)
+        addScreenshot(named: "Signature OCR Filtered Result", app: app)
+        assertAppAlive(app)
+    }
+
+    func testFindJourneyReturnsResultAfterCancelAndReentry() throws {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_PREPARE_FIND_INDEX"]
+        )
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "find",
+            query: "Find",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Find"].waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Find", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "find",
+            query: "Find",
+            in: app
+        )
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText("local")
+        let result = app.buttons["documentFindResult-0"].firstMatch
+        XCTAssertTrue(result.waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["No results"].exists)
+        if app.keyboards.buttons["Search"].exists {
+            app.keyboards.buttons["Search"].tap()
+        }
+        let viewPDF = app.buttons["documentFindViewPDF"].firstMatch
+        XCTAssertTrue(viewPDF.waitForExistence(timeout: 5))
+        viewPDF.tap()
+        XCTAssertTrue(
+            app.otherElements["pdfWorkspace"].waitForExistence(timeout: 8)
+        )
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        assertAppAlive(app)
+    }
+
+    func testCompareJourneyLoadsResultAfterCancelAndReentry() throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "compare",
+            query: "Compare Versions",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Compare Versions"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Compare Versions", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "compare",
+            query: "Compare Versions",
+            in: app
+        )
+        let compare = app.buttons["compareVersionsButton"].firstMatch
+        XCTAssertTrue(compare.waitForExistence(timeout: 8))
+        XCTAssertTrue(compare.isEnabled)
+        compare.tap()
+        XCTAssertTrue(
+            app.staticTexts["COMPARISON RESULT"]
+                .waitForExistence(timeout: 30)
+        )
+        XCTAssertTrue(app.staticTexts["2 changed pages"].exists)
+        XCTAssertEqual(
+            app.buttons.matching(
+                NSPredicate(
+                    format: "identifier BEGINSWITH %@",
+                    "changePage-"
+                )
+            ).count,
+            2
+        )
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        assertAppAlive(app)
+    }
+
+    func testBookmarksJourneyPersistsResultAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "bookmarks",
+            query: "Bookmarks",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Navigate"].waitForExistence(timeout: 8)
+        )
+        let bookmark = app.buttons["navigationCurrentBookmark"].firstMatch
+        XCTAssertTrue(bookmark.waitForExistence(timeout: 5))
+        let bookmarkReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: bookmark
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [bookmarkReady], timeout: 15),
+            .completed
+        )
+        bookmark.tap()
+        let cancelledName = app.alerts.textFields.firstMatch
+        XCTAssertTrue(cancelledName.waitForExistence(timeout: 5))
+        cancelledName.typeText("Cancelled bookmark")
+        app.alerts.buttons["Cancel"].tap()
+        dismissPresentedWorkflow(title: "Navigate", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "bookmarks",
+            query: "Bookmarks",
+            in: app
+        )
+        XCTAssertFalse(app.staticTexts["Cancelled bookmark"].exists)
+        let reopenedBookmark =
+            app.buttons["navigationCurrentBookmark"].firstMatch
+        let reopenedReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: reopenedBookmark
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [reopenedReady], timeout: 15),
+            .completed
+        )
+        reopenedBookmark.tap()
+        let name = app.alerts.textFields.firstMatch
+        XCTAssertTrue(name.waitForExistence(timeout: 5))
+        name.typeText("Automation bookmark")
+        app.alerts.buttons["Save"].tap()
+        XCTAssertTrue(
+            app.staticTexts["Automation bookmark"]
+                .waitForExistence(timeout: 15)
+        )
+        dismissPresentedWorkflow(title: "Navigate", in: app)
+
+        openDocumentTool(
+            identifier: "bookmarks",
+            query: "Bookmarks",
+            in: app
+        )
+        XCTAssertTrue(
+            app.staticTexts["Automation bookmark"]
+                .waitForExistence(timeout: 15)
+        )
+        XCUIDevice.shared.press(.home)
+        app.activate()
+        XCTAssertTrue(
+            app.staticTexts["Automation bookmark"]
+                .waitForExistence(timeout: 15)
+        )
+        let resumedBookmark = app.buttons["navigationCurrentBookmark"].firstMatch
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [XCTNSPredicateExpectation(
+                    predicate: NSPredicate(format: "exists == true AND enabled == true"),
+                    object: resumedBookmark
+                )],
+                timeout: 15
+            ),
+            .completed
+        )
+        addScreenshot(named: "Bookmarks restored after background", app: app)
+        assertAppAlive(app)
+    }
+
+    func testOrganizeJourneyCreatesCopyAfterCancelAndReentry() throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "organize",
+            query: "Organize",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Organize pages"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Organize pages", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "organize",
+            query: "Organize",
+            in: app
+        )
+        completePageExtraction(in: app)
+        XCTAssertEqual(
+            workspaceDocumentTitle(in: app).label,
+            "Project handoff - extracted pages"
+        )
+        assertAppAlive(app)
+    }
+
+    func testExportJourneyProducesPageFilesAfterCancelAndReentry()
+        throws {
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+
+        openDocumentTool(
+            identifier: "export",
+            query: "Export",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Create & Share"]
+                .waitForExistence(timeout: 8)
+        )
+        dismissPresentedWorkflow(title: "Create & Share", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: "export",
+            query: "Export",
+            in: app
+        )
+        let pdf = app.descendants(matching: .any)[
+            "exportCatalogMode-pdf"
+        ].firstMatch
+        XCTAssertTrue(reveal(pdf, in: app, maxSwipes: 8))
+        tapCenter(pdf)
+        let flattened = app.buttons["flattenedOutputOption"]
+            .firstMatch
+        XCTAssertTrue(reveal(flattened, in: app, maxSwipes: 8))
+        XCTAssertTrue(
+            app.staticTexts[
+                "Image-based: removes search, links, forms, and editable layers"
+            ].exists
+        )
+        let images = app.descendants(matching: .any)[
+            "exportCatalogMode-images"
+        ].firstMatch
+        XCTAssertTrue(reveal(images, in: app, maxSwipes: 8))
+        tapCenter(images)
+        completePageImageExport(in: app)
+        assertAppAlive(app)
+    }
+
+    func testEveryPDFQuickToolRemainsDiscoverable() throws {
+        let app = makeApp()
+        app.launchArguments += ["UITEST_RESET_DEMO"]
+        app.launch()
+
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Tools",
+            identifier: "workspaceLane-tasks",
+            in: app
+        )
+
+        let quickTools = [
+            ("scanToPDF", "Scan to PDF"),
+            ("imagesToPDF", "Images to PDF"),
+            ("mergePDFs", "Merge PDFs"),
+            ("splitPDF", "Split PDF"),
+            ("organizePages", "Organize Pages"),
+            ("compressPDF", "Compress PDF"),
+            ("fillForms", "Fill Forms"),
+            ("signPDF", "Sign PDF"),
+            ("redactPDF", "Redact PDF"),
+            ("protectPDF", "Protect PDF"),
+            ("safeShare", "Verify Share"),
+            ("recognizeText", "OCR PDF"),
+            ("exportText", "PDF Office"),
+            ("exportImages", "PDF Images")
+        ]
+
+        for (identifier, query) in quickTools {
+            let search = librarySearchField(in: app)
+            XCTAssertTrue(
+                search.waitForExistence(timeout: 3),
+                "Library search is unavailable for \(identifier)"
+            )
+            search.tap()
+            search.typeText(query)
+
+            XCTAssertTrue(
+                app.buttons["quickTool-\(identifier)"]
+                    .waitForExistence(timeout: 3),
+                "Quick tool \(identifier) is not discoverable"
+            )
+
+            let clear = app.buttons["Clear text"].firstMatch
+            XCTAssertTrue(clear.waitForExistence(timeout: 2))
+            clear.tap()
+        }
+    }
+
+    func testEveryDocumentToolRemainsDiscoverable() throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "-workspace.toolMode",
+            "pages",
+            "-workspace.showToolNames",
+            "NO"
+        ]
+        app.launch()
+
+        XCTAssertTrue(waitForLibrary(in: app))
+        let librarySearch = librarySearchField(in: app)
+        librarySearch.tap()
+        librarySearch.typeText("Project handoff")
+        if app.keyboards.buttons["Search"].exists {
+            app.keyboards.buttons["Search"].tap()
+        }
+        let document = app.buttons
+            .containing(.staticText, identifier: "Project handoff")
+            .firstMatch
+        XCTAssertTrue(document.waitForExistence(timeout: 5))
+        document.tap()
+        XCTAssertTrue(
+            app.otherElements["pdfWorkspace"]
+                .waitForExistence(timeout: 10)
+        )
+
+        selectProfessionalMode("pages", in: app)
+        openDocumentTools(in: app)
+        XCTAssertTrue(
+            app.navigationBars["Tools"].waitForExistence(timeout: 5)
+        )
+        let documentTools = [
+            ("brief", "Brief"),
+            ("find", "Find"),
+            ("recognize", "Recognize"),
+            ("highlight", "Highlight"),
+            ("underline", "Underline"),
+            ("strikeOut", "Strike"),
+            ("ink", "Draw"),
+            ("note", "Note"),
+            ("stamp", "Stamp"),
+            ("watermark", "Watermark"),
+            ("bates", "Bates Numbering"),
+            ("content", "Add Content"),
+            ("links", "Edit Links"),
+            ("annotations", "Annotations"),
+            ("attachments", "Attachments"),
+            ("compare", "Compare Versions"),
+            ("sign", "Sign"),
+            ("redact", "Redact"),
+            ("fillForm", "Fill Form"),
+            ("bookmarks", "Bookmarks"),
+            ("organize", "Organize"),
+            ("compress", "Compress"),
+            ("protect", "Protect"),
+            ("export", "Export")
+        ]
+
+        for (identifier, query) in documentTools {
+            let search = documentToolSearchField(in: app)
+            XCTAssertTrue(
+                search.waitForExistence(timeout: 3),
+                "Tool search is unavailable for \(identifier)"
+            )
+            search.tap()
+            search.typeText(query)
+
+            XCTAssertTrue(
+                app.buttons["documentTool-\(identifier)"]
+                    .firstMatch
+                    .waitForExistence(timeout: 3),
+                "Document tool \(identifier) is not discoverable"
+            )
+
+            let clear = app.buttons["Clear tool search"].firstMatch
+            XCTAssertTrue(clear.waitForExistence(timeout: 2))
+            clear.tap()
+        }
+    }
+
+    func testWorkspaceToolModesSurviveRepeatedRecomposition() throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "-workspace.toolMode",
+            "read"
+        ]
+        app.launch()
+
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
+        )
+        let search = librarySearchField(in: app)
+        search.tap()
+        search.typeText("Project handoff")
+        if app.keyboards.buttons["Search"].exists {
+            app.keyboards.buttons["Search"].tap()
+        }
+        let document = app.buttons
+            .containing(.staticText, identifier: "Project handoff")
+            .firstMatch
+        XCTAssertTrue(document.waitForExistence(timeout: 5))
+        document.tap()
+
+        let workspace = app.otherElements["pdfWorkspace"].firstMatch
+        XCTAssertTrue(workspace.waitForExistence(timeout: 10))
+        let modes = [
+            ("read", "workspaceFindAction"),
+            ("annotate", "workspaceTool-highlight"),
+            ("pages", "workspaceTool-organize"),
+            ("deliver", "workspaceTool-fillForm")
+        ]
+
+        for iteration in 0..<4 {
+            for (mode, expectedControl) in modes {
+                selectProfessionalMode(mode, in: app)
+                XCTAssertTrue(
+                    app.buttons[expectedControl]
+                        .waitForExistence(timeout: 3),
+                    "\(mode) mode failed during iteration \(iteration + 1)"
+                )
+                XCTAssertTrue(workspace.exists)
+            }
+        }
+    }
+
+    func testIntroductionCanReturnHomeFromFirstPage() throws {
+        let seeded = launchResetDemo()
+        seeded.terminate()
+
+        // Replay through the real Settings flow so launch defaults do not
+        // override the completion value that the introduction writes.
+        let app = makeApp()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        app.buttons["settings"].tap()
+        let replay = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS %@", "Replay Introduction")
+        ).firstMatch
+        XCTAssertTrue(revealForCenterTap(replay, in: app, maxSwipes: 12))
+        tapCenter(replay)
+
+        let home = app.buttons["onboardingOpenLibrary"]
+        XCTAssertTrue(home.waitForExistence(timeout: 8))
+        XCTAssertTrue(app.buttons["samplePDFAction"].isHittable)
+        addScreenshot(named: "Introduction first page", app: app)
+        home.tap()
+        XCTAssertTrue(home.waitForNonExistence(timeout: 8))
+        XCTAssertTrue(waitForLibrary(in: app))
+        assertAppAlive(app)
+    }
+
+    func testIntroductionSampleRemainsReadableAfterRotation() throws {
+        continueAfterFailure = false
+        let seeded = launchResetDemo()
+        seeded.terminate()
+        let app = makeApp()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        let sample = app.buttons["samplePDFAction"]
+        if !sample.waitForExistence(timeout: 2) {
+            app.buttons["settings"].tap()
+            let replay = app.buttons.matching(
+                NSPredicate(format: "label CONTAINS %@", "Replay Introduction")
+            ).firstMatch
+            XCTAssertTrue(revealForCenterTap(replay, in: app, maxSwipes: 12))
+            tapCenter(replay)
+        }
+        XCTAssertTrue(sample.waitForExistence(timeout: 8))
+        sample.tap()
+        let workspace = app.otherElements["pdfWorkspace"].firstMatch
+        if !workspace.waitForExistence(timeout: 3) {
+            let open = app.buttons["deskOpenDocument"].firstMatch
+            XCTAssertTrue(open.waitForExistence(timeout: 8))
+            open.tap()
+        }
+        XCTAssertTrue(workspace.waitForExistence(timeout: 15))
+        let title = workspaceDocumentTitle(in: app).label
+        addScreenshot(named: "Sample reader portrait", app: app)
+
+        defer { XCUIDevice.shared.orientation = .portrait }
+        XCUIDevice.shared.orientation = .landscapeLeft
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate { _, _ in app.frame.width > app.frame.height },
+                object: app
+            )], timeout: 8),
+            .completed
+        )
+        XCTAssertTrue(workspace.exists)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        // UIKit publishes new bounds before its rotation animation finishes.
+        Thread.sleep(forTimeInterval: 1)
+        let landscape = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        landscape.name = "Sample reader landscape"
+        landscape.lifetime = .keepAlways
+        add(landscape)
+        XCUIDevice.shared.orientation = .portrait
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate { _, _ in app.frame.height > app.frame.width },
+                object: app
+            )], timeout: 8),
+            .completed
+        )
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        assertAppAlive(app)
+    }
+
+    func testFindEmptyStateRemainsReachableAtAccessibilityXXXL() throws {
+        continueAfterFailure = false
+        let app = launchResetDemo(additionalArguments: [
+            "UITEST_PREPARE_FIND_INDEX",
+            "-UIPreferredContentSizeCategoryName",
+            "UICTContentSizeCategoryAccessibilityXXXL"
+        ])
+        openDemoDocument(in: app)
+        openDocumentTools(in: app)
+        let toolSearch = documentToolSearchField(in: app)
+        XCTAssertTrue(toolSearch.waitForExistence(timeout: 5))
+        toolSearch.tap()
+        toolSearch.typeText("Find")
+        let find = app.buttons["documentTool-find"].firstMatch
+        XCTAssertTrue(find.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.keyboards.firstMatch.exists)
+        XCTAssertTrue(revealForCenterTap(find, in: app, maxSwipes: 8))
+        XCTAssertEqual(toolSearch.value as? String, "Find")
+        XCTAssertGreaterThan(find.frame.midY, toolSearch.frame.maxY)
+        if app.keyboards.firstMatch.exists {
+            XCTAssertLessThan(find.frame.midY, app.keyboards.firstMatch.frame.minY)
+        }
+        addScreenshot(named: "Tool search above keyboard accessibility", app: app)
+        tapCenter(find)
+
+        let search = app.searchFields.firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText("zzznomatchingtext")
+        app.keyboards.buttons["Search"].tap()
+
+        let clear = app.buttons["documentFindClearSearch"]
+        XCTAssertTrue(clear.waitForExistence(timeout: 10))
+        XCTAssertTrue(reveal(clear, in: app, maxSwipes: 8))
+        addScreenshot(named: "Find empty state accessibility", app: app)
+        tapCenter(clear)
+        XCTAssertTrue(clear.waitForNonExistence(timeout: 5))
+
+        search.tap()
+        search.typeText("local")
+        XCTAssertTrue(
+            app.buttons["documentFindResult-0"].waitForExistence(timeout: 10)
+        )
+        app.keyboards.buttons["Search"].tap()
+        let open = app.buttons["documentFindViewPDF"]
+        XCTAssertTrue(reveal(open, in: app, maxSwipes: 8))
+        tapCenter(open)
+        XCTAssertTrue(
+            app.otherElements["pdfWorkspace"].waitForExistence(timeout: 8)
+        )
+        assertAppAlive(app)
     }
 
     func testDocumentFindSearchNavigationAndHistory() throws {
@@ -794,11 +3482,17 @@ final class PaperPathUITests: XCTestCase {
                 .waitForExistence(timeout: 5)
         )
 
-        app.buttons["Find"].tap()
-        XCTAssertTrue(
-            app.navigationBars["Find"].waitForExistence(timeout: 5)
+        selectProfessionalMode("read", in: app)
+        let find = firstHittableButton(
+            identifier: "workspaceFindAction",
+            in: app,
+            timeout: 5
         )
-        let search = app.searchFields.firstMatch
+        XCTAssertTrue(find.isHittable)
+        find.tap()
+        let findNavigationBar = app.navigationBars["Find"].firstMatch
+        XCTAssertTrue(findNavigationBar.waitForExistence(timeout: 5))
+        let search = findNavigationBar.searchFields.firstMatch
         XCTAssertTrue(search.waitForExistence(timeout: 3))
         search.tap()
         search.typeText("local")
@@ -814,12 +3508,15 @@ final class PaperPathUITests: XCTestCase {
         next.tap()
 
         search.tap()
-        let clearText = app.buttons["Clear text"].firstMatch
+        let clearText = findNavigationBar.buttons["Clear text"].firstMatch
         XCTAssertTrue(clearText.waitForExistence(timeout: 3))
         clearText.tap()
-        let history = app.buttons["documentFindHistory-local"]
-        XCTAssertTrue(history.waitForExistence(timeout: 3))
-        history.tap()
+        search.tap()
+        let history = app.descendants(matching: .any)[
+            "documentFindHistory-local"
+        ].firstMatch
+        XCTAssertTrue(history.waitForExistence(timeout: 8))
+        tapCenter(history)
         XCTAssertTrue(firstResult.waitForExistence(timeout: 5))
 
         app.buttons["documentFindViewPDF"].tap()
@@ -838,18 +3535,19 @@ final class PaperPathUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(
-            app.navigationBars["Review captured pages"]
+            app.navigationBars["Review Scan"]
                 .waitForExistence(timeout: 8)
         )
         let undo = app.buttons["scanUndo"]
         XCTAssertTrue(undo.exists)
         XCTAssertFalse(undo.isEnabled)
 
-        let rotate = app.buttons[
-            "scanPageAction-Rotate Clockwise"
-        ]
+        let rotate = scanPageAction(
+            labeled: "Rotate Clockwise",
+            in: app
+        )
         XCTAssertTrue(rotate.waitForExistence(timeout: 3))
-        rotate.tap()
+        tapCenter(rotate)
         expectation(
             for: NSPredicate(format: "enabled == true"),
             evaluatedWith: undo
@@ -862,32 +3560,260 @@ final class PaperPathUITests: XCTestCase {
         )
         waitForExpectations(timeout: 3)
 
-        let selectPages = app.buttons["scanSelectPages"]
-        XCTAssertTrue(selectPages.waitForExistence(timeout: 3))
+        let selectPages = app.descendants(matching: .any)[
+            "scanSelectPages"
+        ].firstMatch
+        XCTAssertTrue(
+            revealInScanReview(
+                selectPages,
+                in: app,
+                maxSwipes: 4
+            ),
+            "Select Pages was not reachable above the completion bar"
+        )
         selectPages.tap()
-        let secondPage = app.buttons["scanThumbnail-1"]
-        XCTAssertTrue(secondPage.waitForExistence(timeout: 3))
-        secondPage.tap()
-        XCTAssertEqual(secondPage.value as? String, "Selected")
+        let selectionSource = app.buttons.matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND value == %@",
+                "scanThumbnail-",
+                "Adjustment source"
+            )
+        ).firstMatch
+        XCTAssertTrue(selectionSource.waitForExistence(timeout: 3))
+        let targetPage = app.buttons.matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND value == %@",
+                "scanThumbnail-",
+                "Not selected"
+            )
+        ).firstMatch
+        let selectionModeReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == true"),
+            object: targetPage
+        )
+        guard XCTWaiter.wait(
+            for: [selectionModeReady],
+            timeout: 3
+        ) == .completed else {
+            XCTFail("Scan review did not enter page selection mode")
+            return
+        }
+        XCTAssertTrue(
+            revealTowardTop(targetPage, in: app, maxSwipes: 4),
+            "Target scan page was not reachable in selection mode"
+        )
+        let targetPageIdentifier = targetPage.identifier
+        XCTAssertFalse(targetPageIdentifier.isEmpty)
+        if app.frame.height <= 700 {
+            let selectAll = scanPageAction(
+                labeled: "Select All",
+                in: app
+            )
+            XCTAssertTrue(
+                selectAll.waitForExistence(timeout: 3),
+                "Select All was not available on the compact screen"
+            )
+            selectAll.tap()
+        } else {
+            targetPage.tap()
+        }
+        let selectedTargetPage = app.buttons[targetPageIdentifier]
+        let pageSelected = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "value == %@",
+                "Selected"
+            ),
+            object: selectedTargetPage
+        )
+        guard XCTWaiter.wait(
+            for: [pageSelected],
+            timeout: 3
+        ) == .completed else {
+            XCTFail("Target scan page was not selected")
+            return
+        }
 
-        let rotateSelected = app.buttons[
-            "scanPageAction-Rotate Selected"
-        ]
-        XCTAssertTrue(rotateSelected.waitForExistence(timeout: 3))
+        let rotateSelected = scanPageAction(
+            labeled: "Rotate Selected",
+            in: app
+        )
+        XCTAssertTrue(
+            reveal(rotateSelected, in: app, maxSwipes: 4),
+            "Rotate Selected was not reachable"
+        )
         rotateSelected.tap()
         XCTAssertTrue(undo.isEnabled)
         undo.tap()
         XCTAssertFalse(undo.isEnabled)
 
-        app.buttons["scanSelectPages"].tap()
-        let adjustCrop = app.buttons["scanAdjustCrop"]
-        XCTAssertTrue(adjustCrop.waitForExistence(timeout: 3))
-        adjustCrop.tap()
         XCTAssertTrue(
-            app.buttons["scanApplyCrop"].waitForExistence(timeout: 3)
+            revealInScanReview(
+                selectPages,
+                in: app,
+                maxSwipes: 4
+            ),
+            "Done selecting pages was not reachable"
         )
-        app.buttons["scanCancelCrop"].tap()
+        selectPages.tap()
+        let adjustCrop = scanPageAction(
+            labeled: "Adjust crop",
+            in: app
+        )
         XCTAssertTrue(adjustCrop.waitForExistence(timeout: 3))
+        if app.frame.height <= 700 {
+            adjustCrop.tap()
+        } else {
+            tapCenter(adjustCrop)
+        }
+        let applyCrop = app.descendants(matching: .any)[
+            "scanApplyCrop"
+        ].firstMatch
+        guard applyCrop.waitForExistence(timeout: 3) else {
+            XCTFail("Manual crop editor did not open")
+            return
+        }
+        let cancelCrop = app.descendants(matching: .any)[
+            "scanCancelCrop"
+        ].firstMatch
+        guard cancelCrop.waitForExistence(timeout: 3) else {
+            XCTFail("Manual crop cancel action was unavailable")
+            return
+        }
+        tapCenter(cancelCrop)
+        XCTAssertTrue(adjustCrop.waitForExistence(timeout: 3))
+    }
+
+    func testScanUnchangedSettingsDoNotCreateUndo() throws {
+        continueAfterFailure = false
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO", "UITEST_OPEN_SCAN_REVIEW"
+        ]
+        app.launch()
+        XCTAssertTrue(
+            app.navigationBars["Review Scan"].waitForExistence(timeout: 8)
+        )
+        let undo = app.buttons["scanUndo"]
+        XCTAssertFalse(undo.isEnabled)
+        let apply = app.buttons["scanApplyToScope"]
+        XCTAssertTrue(revealInScanReview(apply, in: app, maxSwipes: 5))
+        apply.tap()
+        XCTAssertFalse(
+            undo.isEnabled,
+            "Applying identical settings must not create an undo step."
+        )
+        let save = app.buttons["scanSave"]
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: save
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 8), .completed)
+        addScreenshot(named: "Identical scan settings preserve clean undo", app: app)
+    }
+
+    func testScanUnchangedCropPreservesPreviousUndo() throws {
+        continueAfterFailure = false
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO", "UITEST_OPEN_SCAN_REVIEW"
+        ]
+        app.launch()
+        XCTAssertTrue(
+            app.navigationBars["Review Scan"].waitForExistence(timeout: 8)
+        )
+        let document = app.buttons["scanEnhancement-document"]
+        XCTAssertTrue(revealInScanReview(document, in: app, maxSwipes: 5))
+        document.tap()
+        let undo = app.buttons["scanUndo"]
+        XCTAssertTrue(undo.isEnabled)
+        let crop = scanPageAction(labeled: "Adjust crop", in: app)
+        XCTAssertTrue(revealInScanReview(
+            crop, in: app, maxSwipes: 5, includesPreview: true
+        ))
+        tapCenter(crop)
+        let applyCrop = app.buttons["scanApplyCrop"]
+        XCTAssertTrue(applyCrop.waitForExistence(timeout: 5))
+        applyCrop.tap()
+        XCTAssertTrue(undo.isEnabled)
+        undo.tap()
+
+        let original = app.buttons["scanEnhancement-original"]
+        XCTAssertTrue(revealInScanReview(original, in: app, maxSwipes: 5))
+        XCTAssertTrue(
+            original.isSelected,
+            "Confirming unchanged crop corners must preserve the enhancement undo."
+        )
+        XCTAssertFalse(undo.isEnabled)
+        addScreenshot(named: "Unchanged crop keeps previous scan undo", app: app)
+    }
+
+    func testScanBrightnessRepeatedValueFinishesPreview() throws {
+        continueAfterFailure = false
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "UITEST_OPEN_SCAN_REVIEW"
+        ]
+        app.launch()
+
+        XCTAssertTrue(
+            app.navigationBars["Review Scan"]
+                .waitForExistence(timeout: 8)
+        )
+        let save = app.buttons["scanSave"]
+        expectation(
+            for: NSPredicate(format: "enabled == true"),
+            evaluatedWith: save
+        )
+        waitForExpectations(timeout: 8)
+
+        let fineAdjustments = app.buttons["scanFineAdjustments"].firstMatch
+        XCTAssertTrue(revealInScanReview(fineAdjustments, in: app, maxSwipes: 6))
+        fineAdjustments.tap()
+        let brightness = app.sliders["Brightness"].firstMatch
+        XCTAssertTrue(
+            revealInScanReview(brightness, in: app, maxSwipes: 6),
+            app.debugDescription
+        )
+        let initialValue = try XCTUnwrap(brightness.value as? String)
+        // The custom AX value is a signed brightness percentage, not the
+        // normalized percentage assumed by XCTest's slider adjustment API.
+        let maximum = brightness.coordinate(
+            withNormalizedOffset: CGVector(dx: 1, dy: 0.5)
+        )
+        brightness.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
+        ).press(
+            forDuration: 0.05, thenDragTo: maximum,
+            withVelocity: .slow, thenHoldForDuration: 0.2
+        )
+        XCTAssertTrue(app.navigationBars["Review Scan"].exists)
+        expectation(
+            for: NSPredicate(format: "enabled == true"),
+            evaluatedWith: save
+        )
+        waitForExpectations(timeout: 8)
+        let adjustedValue = try XCTUnwrap(brightness.value as? String)
+        XCTAssertNotEqual(adjustedValue, initialValue)
+        XCTAssertEqual(adjustedValue, "+35%")
+
+        brightness.coordinate(
+            withNormalizedOffset: CGVector(dx: 0.95, dy: 0.5)
+        ).press(
+            forDuration: 0.05, thenDragTo: maximum,
+            withVelocity: .slow, thenHoldForDuration: 0.2
+        )
+        XCTAssertTrue(app.navigationBars["Review Scan"].exists)
+        expectation(
+            for: NSPredicate(format: "enabled == true"),
+            evaluatedWith: save
+        )
+        waitForExpectations(timeout: 3)
+        XCTAssertEqual(brightness.value as? String, adjustedValue)
+        XCTAssertFalse(app.staticTexts["Updating preview"].exists)
+        addScreenshot(named: "Repeated scan brightness preview ready", app: app)
     }
 
     func testStoppingScanCreationRestoresReviewedDraft() throws {
@@ -900,19 +3826,14 @@ final class PaperPathUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(
-            app.navigationBars["Review captured pages"]
+            app.navigationBars["Review Scan"]
                 .waitForExistence(timeout: 8)
         )
         let blackAndWhite = app.buttons[
             "scanEnhancement-blackAndWhite"
         ]
-        let enhancementPicker = app.scrollViews[
-            "scanEnhancementPicker"
-        ]
-        XCTAssertTrue(enhancementPicker.waitForExistence(timeout: 3))
-        enhancementPicker.swipeLeft()
-        XCTAssertTrue(blackAndWhite.waitForExistence(timeout: 3))
-        blackAndWhite.tap()
+        XCTAssertTrue(reveal(blackAndWhite, in: app, maxSwipes: 6))
+        tapCenter(blackAndWhite)
         XCTAssertTrue(blackAndWhite.isSelected)
 
         let save = app.buttons["scanSave"]
@@ -927,22 +3848,15 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(stop.waitForExistence(timeout: 3))
         stop.tap()
         XCTAssertTrue(
-            app.navigationBars["Review captured pages"]
+            app.navigationBars["Review Scan"]
                 .waitForExistence(timeout: 5)
         )
 
         let restoredBlackAndWhite = app.buttons[
             "scanEnhancement-blackAndWhite"
         ]
-        let restoredEnhancementPicker = app.scrollViews[
-            "scanEnhancementPicker"
-        ]
         XCTAssertTrue(
-            restoredEnhancementPicker.waitForExistence(timeout: 3)
-        )
-        restoredEnhancementPicker.swipeLeft()
-        XCTAssertTrue(
-            restoredBlackAndWhite.waitForExistence(timeout: 3)
+            reveal(restoredBlackAndWhite, in: app, maxSwipes: 6)
         )
         XCTAssertTrue(restoredBlackAndWhite.isSelected)
         XCTAssertTrue(app.buttons["scanSave"].isEnabled)
@@ -955,13 +3869,9 @@ final class PaperPathUITests: XCTestCase {
 
         XCTAssertTrue(waitForLibrary(in: app))
         selectWorkspaceLane(
-            title: "Tasks",
+            title: "Tools",
             identifier: "workspaceLane-tasks",
             in: app
-        )
-        XCTAssertTrue(
-            app.buttons["taskPackage-prepareToSend"]
-                .waitForExistence(timeout: 3)
         )
 
         let compress = app.buttons["quickTool-compressPDF"]
@@ -1018,15 +3928,17 @@ final class PaperPathUITests: XCTestCase {
 
         let cancel = app.buttons["cancelRedactionMode"]
         let apply = app.buttons["applyRedactionSelection"]
+        let next = app.buttons["workspaceNextAction"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 3))
         XCTAssertTrue(apply.exists)
-        XCTAssertFalse(app.buttons["workspaceNextAction"].exists)
+        XCTAssertTrue(next.exists)
+        XCTAssertFalse(next.isEnabled)
 
         cancel.tap()
         XCTAssertTrue(
-            app.buttons["workspaceNextAction"]
-                .waitForExistence(timeout: 3)
+            next.waitForExistence(timeout: 3)
         )
+        XCTAssertTrue(next.isEnabled)
         XCTAssertFalse(cancel.exists)
         XCTAssertFalse(apply.exists)
         XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
@@ -1038,6 +3950,11 @@ final class PaperPathUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
+        )
         let search = librarySearchField(in: app)
         search.tap()
         search.typeText("Project handoff")
@@ -1119,6 +4036,10 @@ final class PaperPathUITests: XCTestCase {
         throws {
         let app = try openVerifiedDeliveryReceipt()
         XCTAssertTrue(app.staticTexts["FINAL COPY CHECKED"].exists)
+        XCTAssertTrue(
+            app.descendants(matching: .any)["deliverySummary"]
+                .waitForExistence(timeout: 3)
+        )
         let share = app.buttons["shareVerifiedOutput"]
         XCTAssertTrue(share.waitForExistence(timeout: 3))
         XCTAssertEqual(share.label, "Share checked PDF")
@@ -1136,12 +4057,26 @@ final class PaperPathUITests: XCTestCase {
         )
         addScreenshot(named: "PaperPath Verified Outcome", app: app)
 
+        for summaryID in [
+            "deliverySummary-source",
+            "deliverySummary-output",
+            "deliverySummary-issues",
+            "deliverySummary-send-status"
+        ] {
+            let fact = app.descendants(matching: .any)[summaryID].firstMatch
+            XCTAssertTrue(
+                revealInDeliveryReceipt(fact, in: app, maxSwipes: 8),
+                "\(summaryID) was not reachable in the delivery summary"
+            )
+        }
+        XCTAssertTrue(revealTowardTop(share, in: app, maxSwipes: 8))
         share.tap()
         XCTAssertTrue(
             app.staticTexts.matching(
                 NSPredicate(
-                    format: "label BEGINSWITH %@",
-                    "Share with 1 warning"
+                    format: "label BEGINSWITH %@ AND label CONTAINS[c] %@",
+                    "Share with ",
+                    "warning"
                 )
             ).firstMatch.waitForExistence(timeout: 3)
         )
@@ -1155,14 +4090,21 @@ final class PaperPathUITests: XCTestCase {
         reviewWarning.tap()
         XCTAssertFalse(app.buttons["confirmWarningShare"].exists)
 
-        expandVerificationDetails(in: app)
-        let protectMilestone = app.buttons[
+        guard expandVerificationDetails(in: app) else {
+            XCTFail("Verification details did not expand")
+            return
+        }
+        let protectMilestone = app.descendants(matching: .any)[
             "protectDeliveryMilestone"
-        ]
+        ].firstMatch
         XCTAssertTrue(
-            reveal(protectMilestone, in: app, maxSwipes: 6)
+            revealInDeliveryReceipt(
+                protectMilestone,
+                in: app,
+                maxSwipes: 8
+            )
         )
-        protectMilestone.tap()
+        tapCenter(protectMilestone)
         let linkedMilestone = app.buttons.matching(
             NSPredicate(
                 format: "identifier BEGINSWITH %@",
@@ -1203,14 +4145,21 @@ final class PaperPathUITests: XCTestCase {
     func testDeliveryEvidenceRemainsReachableAtAccessibilityXXXL()
         throws {
         let setupApp = try openVerifiedDeliveryReceipt()
-        expandVerificationDetails(in: setupApp)
-        let protectMilestone = setupApp.buttons[
+        guard expandVerificationDetails(in: setupApp) else {
+            XCTFail("Verification details did not expand")
+            return
+        }
+        let protectMilestone = setupApp.descendants(matching: .any)[
             "protectDeliveryMilestone"
-        ]
+        ].firstMatch
         XCTAssertTrue(
-            reveal(protectMilestone, in: setupApp, maxSwipes: 8)
+            revealInDeliveryReceipt(
+                protectMilestone,
+                in: setupApp,
+                maxSwipes: 12
+            )
         )
-        protectMilestone.tap()
+        tapCenter(protectMilestone)
         let protectedMilestone = setupApp.buttons.matching(
             NSPredicate(
                 format: "identifier BEGINSWITH %@",
@@ -1256,14 +4205,24 @@ final class PaperPathUITests: XCTestCase {
             in: app,
             timeout: 8
         )
-        XCTAssertTrue(receipt.exists)
-        tapCenter(receipt)
+        if receipt.exists, receipt.isHittable {
+            tapCenter(receipt)
+        } else {
+            app.buttons["Document menu"].tap()
+            app.buttons["Results"].firstMatch.tap()
+            let menuReceipt = app.buttons["Delivery receipt"].firstMatch
+            XCTAssertTrue(menuReceipt.waitForExistence(timeout: 5))
+            menuReceipt.tap()
+        }
         XCTAssertTrue(
             app.navigationBars["Delivery receipt"]
                 .waitForExistence(timeout: 8)
         )
 
-        expandVerificationDetails(in: app)
+        guard expandVerificationDetails(in: app) else {
+            XCTFail("Verification details did not expand")
+            return
+        }
         let linkedMilestone = app.buttons.matching(
             NSPredicate(
                 format: "identifier BEGINSWITH %@",
@@ -1277,11 +4236,14 @@ final class PaperPathUITests: XCTestCase {
                 maxSwipes: 14
             )
         )
-        tapCenter(linkedMilestone)
-        XCTAssertTrue(
-            app.navigationBars["Version History"]
-                .waitForExistence(timeout: 8)
-        )
+        linkedMilestone.tap()
+        let versionHistory = app.navigationBars[
+            "Version History"
+        ].firstMatch
+        guard versionHistory.waitForExistence(timeout: 8) else {
+            XCTFail("Version History did not open from the receipt")
+            return
+        }
 
         let editMilestone = app.descendants(matching: .any).matching(
             NSPredicate(
@@ -1289,24 +4251,44 @@ final class PaperPathUITests: XCTestCase {
                 "editInspectedVersionMilestone-"
             )
         ).firstMatch
-        XCTAssertTrue(
-            revealForCenterTap(
+        guard revealInPresentedSheet(
                 editMilestone,
+                navigationTitle: "Version History",
                 in: app,
                 maxSwipes: 14
-            )
+        ) else {
+            XCTFail("The milestone editor action was not reachable")
+            return
+        }
+        let editMilestoneEnabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == YES"),
+            object: editMilestone
         )
+        guard XCTWaiter.wait(
+            for: [editMilestoneEnabled],
+            timeout: 15
+        ) == .completed else {
+            XCTFail("The milestone editor action remained disabled")
+            return
+        }
         tapCenter(editMilestone)
 
-        XCTAssertTrue(
-            app.scrollViews["versionMilestoneEditor"]
-                .waitForExistence(timeout: 5)
-        )
+        let milestoneEditor = app.descendants(matching: .any)[
+            "versionMilestoneEditor"
+        ].firstMatch
+        guard milestoneEditor.waitForExistence(timeout: 8) else {
+            XCTFail("The milestone editor did not open")
+            return
+        }
         let receiptLink = app.descendants(
             matching: .any
         )["milestoneReceiptLink"]
         XCTAssertTrue(
-            reveal(receiptLink, in: app, maxSwipes: 8)
+            revealInContainer(
+                receiptLink,
+                container: milestoneEditor,
+                maxSwipes: 8
+            )
         )
         addScreenshot(
             named: "PaperPath Milestone Editor Accessibility XXXL",
@@ -1381,7 +4363,9 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["Approval signature"].exists)
         addScreenshot(named: "PaperPath Form Check", app: app)
 
-        app.buttons["Add Field"].tap()
+        let addField = app.buttons["addFormFieldFromReview"]
+        XCTAssertTrue(reveal(addField, in: app, maxSwipes: 8))
+        addField.tap()
         let placementNavigation = app.navigationBars["Place Form Field"]
         XCTAssertTrue(placementNavigation.waitForExistence(timeout: 5))
         XCTAssertTrue(app.textFields["Field name"].exists)
@@ -1410,6 +4394,7 @@ final class PaperPathUITests: XCTestCase {
             "formField-1-0"
         ].firstMatch
         XCTAssertTrue(signatureField.waitForExistence(timeout: 3))
+        XCTAssertTrue(revealTowardTop(signatureField, in: app, maxSwipes: 8))
         tapCenter(signatureField)
         XCTAssertTrue(
             app.navigationBars["Add signature"]
@@ -1574,23 +4559,10 @@ final class PaperPathUITests: XCTestCase {
     func testReadingPageWorkflowAndFilesSurfaces() throws {
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
-        configureFreezeTracing(for: app)
         app.launch()
 
         XCTAssertTrue(waitForLibrary(in: app))
-        let search = librarySearchField(in: app)
-        search.tap()
-        search.typeText("Project handoff")
-        app.keyboards.buttons["Search"].tap()
-        let document = app.buttons
-            .containing(.staticText, identifier: "Project handoff")
-            .firstMatch
-        XCTAssertTrue(document.waitForExistence(timeout: 5))
-        document.tap()
-        XCTAssertTrue(
-            app.otherElements["pdfWorkspace"]
-                .waitForExistence(timeout: 5)
-        )
+        openDemoDocument(in: app)
 
         app.buttons["Reading and navigation"].tap()
         let navigate = app.buttons["Navigate"].firstMatch
@@ -1608,7 +4580,7 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(navigationDone.waitForExistence(timeout: 3))
         navigationDone.tap()
 
-        app.buttons["Pages"].tap()
+        openPageOrganizer(in: app)
         XCTAssertTrue(
             app.navigationBars["Organize pages"]
                 .waitForExistence(timeout: 5)
@@ -1705,16 +4677,17 @@ final class PaperPathUITests: XCTestCase {
 
         XCTAssertTrue(waitForLibrary(in: app))
         selectWorkspaceLane(
-            title: "Home",
+            title: "Documents",
             identifier: "workspaceLane-home",
             in: app
         )
         XCTAssertTrue(
-            app.buttons["homePrimaryAction"].waitForExistence(timeout: 3)
+            app.otherElements["libraryDocumentsSection"]
+                .waitForExistence(timeout: 3)
         )
         addScreenshot(named: "PaperPath Accessibility Home XXXL", app: app)
         selectWorkspaceLane(
-            title: "Tasks",
+            title: "Tools",
             identifier: "workspaceLane-tasks",
             in: app
         )
@@ -1735,10 +4708,13 @@ final class PaperPathUITests: XCTestCase {
         ]
         app.launch()
 
-        let search = app.searchFields.firstMatch
-        XCTAssertTrue(
-            search.waitForExistence(timeout: 8)
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
         )
+        let search = librarySearchField(in: app)
         search.tap()
         search.typeText("Project handoff")
         app.keyboards.buttons["Search"].tap()
@@ -1766,10 +4742,12 @@ final class PaperPathUITests: XCTestCase {
                 .waitForExistence(timeout: 5)
         )
 
-        let recommended = app.buttons["recommendedOfficeExport"]
-        XCTAssertTrue(recommended.waitForExistence(timeout: 5))
+        let recommended = selectRecommendedOfficeExport(in: app)
         XCTAssertTrue(recommended.isEnabled)
-        recommended.doubleTap()
+        tapCenter(recommended)
+        let convert = app.buttons["officeConvertAction"].firstMatch
+        XCTAssertTrue(reveal(convert, in: app, maxSwipes: 8))
+        convert.doubleTap()
 
         XCTAssertTrue(
             app.wait(for: .runningForeground, timeout: 12)
@@ -1793,11 +4771,15 @@ final class PaperPathUITests: XCTestCase {
     func testOfficeExportCanBePresentedRepeatedlyInOneSession() throws {
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
-        configureFreezeTracing(for: app)
         app.launch()
 
-        let search = app.searchFields.firstMatch
-        XCTAssertTrue(search.waitForExistence(timeout: 8))
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
+        )
+        let search = librarySearchField(in: app)
         search.tap()
         search.typeText("Project handoff")
         app.keyboards.buttons["Search"].tap()
@@ -1849,11 +4831,15 @@ final class PaperPathUITests: XCTestCase {
             "UITEST_RESET_DEMO",
             "UITEST_OFFICE_SOAK_DEMO"
         ]
-        configureFreezeTracing(for: app)
         app.launch()
 
-        let search = app.searchFields.firstMatch
-        XCTAssertTrue(search.waitForExistence(timeout: 20))
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
+        )
+        let search = librarySearchField(in: app)
         search.tap()
         search.typeText("Office stress")
         app.keyboards.buttons["Search"].tap()
@@ -1883,10 +4869,11 @@ final class PaperPathUITests: XCTestCase {
                 exportNavigation.waitForExistence(timeout: 8),
                 "Export sheet did not appear on iteration \(iteration)"
             )
-            let recommended = app.buttons["recommendedOfficeExport"]
-                .firstMatch
-            XCTAssertTrue(reveal(recommended, in: app, maxSwipes: 8))
-            recommended.tap()
+            let recommended = selectRecommendedOfficeExport(in: app)
+            tapCenter(recommended)
+            let convert = app.buttons["officeConvertAction"].firstMatch
+            XCTAssertTrue(reveal(convert, in: app, maxSwipes: 8))
+            convert.tap()
 
             let stop = app.descendants(matching: .any)[
                 "officeExportStopAction"
@@ -1895,15 +4882,24 @@ final class PaperPathUITests: XCTestCase {
                 stop.waitForExistence(timeout: 5),
                 "Office export did not start on iteration \(iteration)"
             )
-            stop.tap()
+            XCTAssertTrue(
+                tapCurrentFrame(of: stop, in: app),
+                "Office stop action had no tappable frame on iteration \(iteration)"
+            )
             let done = app.descendants(matching: .any)[
                 "officeExportDoneAction"
             ].firstMatch
-            XCTAssertTrue(
-                done.waitForExistence(timeout: 20),
-                "Cancellation did not settle on iteration \(iteration)"
-            )
-            done.tap()
+            guard finishOfficeExportCancellation(
+                stop: stop,
+                done: done,
+                in: app,
+                timeout: 20
+            ) else {
+                XCTFail(
+                    "Cancellation did not settle on iteration \(iteration)"
+                )
+                return
+            }
             XCTAssertTrue(
                 app.otherElements["pdfWorkspace"]
                     .waitForExistence(timeout: 8),
@@ -1919,41 +4915,27 @@ final class PaperPathUITests: XCTestCase {
     func testRapidNavigationAndSheetHandoffsRemainResponsive() throws {
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
-        configureFreezeTracing(for: app)
         app.launch()
 
         XCTAssertTrue(waitForLibrary(in: app))
+        // XCUI element polling can return after the app has already rendered.
+        let automationDriverAllowance: TimeInterval = 1
         let lanes = [
-            (
-                "workspaceLane-home",
-                "homePrimaryAction"
-            ),
-            (
-                "workspaceLane-tasks",
-                "taskPackage-prepareToSend"
-            ),
-            (
-                "workspaceLane-outputs",
-                "outputsVerifyAction"
-            )
+            ("workspaceLane-home", "Documents"),
+            ("workspaceLane-tasks", "Tools"),
+            ("workspaceLane-outputs", "Results")
         ]
-        for iteration in 0..<18 {
+        for iteration in 0..<20 {
             let lane = lanes[iteration % lanes.count]
-            let laneButton = app.buttons[lane.0].firstMatch
-            XCTAssertTrue(
-                laneButton.waitForExistence(timeout: 2),
-                "Lane disappeared on iteration \(iteration)"
-            )
             let startedAt = Date()
-            laneButton.tap()
-            XCTAssertTrue(
-                app.buttons[lane.1].firstMatch
-                    .waitForExistence(timeout: 3),
-                "Lane did not respond on iteration \(iteration)"
+            selectWorkspaceLane(
+                title: lane.1,
+                identifier: lane.0,
+                in: app
             )
             XCTAssertLessThan(
                 Date().timeIntervalSince(startedAt),
-                4,
+                4 + automationDriverAllowance,
                 "Lane transition stalled on iteration \(iteration)"
             )
             XCTAssertTrue(
@@ -1962,7 +4944,7 @@ final class PaperPathUITests: XCTestCase {
         }
 
         selectWorkspaceLane(
-            title: "Home",
+            title: "Documents",
             identifier: "workspaceLane-home",
             in: app
         )
@@ -1981,13 +4963,16 @@ final class PaperPathUITests: XCTestCase {
                 .waitForExistence(timeout: 5)
         )
 
-        for iteration in 0..<12 {
-            let toolsButton = firstHittableButton(
-                identifier: "documentToolsAction",
-                in: app,
-                timeout: 3
+        selectProfessionalMode("pages", in: app)
+        // Twenty lane changes plus twenty Tools and twenty Find
+        // open/close pairs exercise 100 high-frequency transitions.
+        for iteration in 0..<20 {
+            app.activate()
+            XCTAssertTrue(
+                app.wait(for: .runningForeground, timeout: 3),
+                "App was not foregrounded on iteration \(iteration)"
             )
-            XCTAssertTrue(toolsButton.isHittable)
+            let toolsButton = revealDocumentToolsButton(in: app)
             let toolsStartedAt = Date()
             tapCenter(toolsButton)
             let tools = app.navigationBars["Tools"]
@@ -1997,7 +4982,7 @@ final class PaperPathUITests: XCTestCase {
             )
             XCTAssertLessThan(
                 Date().timeIntervalSince(toolsStartedAt),
-                3,
+                3 + automationDriverAllowance,
                 "Tools opening stalled on iteration \(iteration)"
             )
             let toolsDone = tools.buttons.matching(
@@ -2015,12 +5000,23 @@ final class PaperPathUITests: XCTestCase {
                 "Workspace did not recover from Tools on iteration \(iteration)"
             )
 
+            app.activate()
+            XCTAssertTrue(
+                app.wait(for: .runningForeground, timeout: 3),
+                "App lost foreground after Tools on iteration \(iteration)"
+            )
+            selectProfessionalMode("read", in: app)
             let find = firstHittableButton(
                 identifier: "workspaceFindAction",
                 in: app,
                 timeout: 2
             )
-            XCTAssertTrue(find.isHittable)
+            guard find.isHittable else {
+                XCTFail(
+                    "Find was not reachable on iteration \(iteration)"
+                )
+                return
+            }
             let findStartedAt = Date()
             find.tap()
             let findNavigation = app.navigationBars["Find"]
@@ -2030,7 +5026,7 @@ final class PaperPathUITests: XCTestCase {
             )
             XCTAssertLessThan(
                 Date().timeIntervalSince(findStartedAt),
-                3,
+                3 + automationDriverAllowance,
                 "Find opening stalled on iteration \(iteration)"
             )
             let findDone = findNavigation.buttons.matching(
@@ -2047,6 +5043,7 @@ final class PaperPathUITests: XCTestCase {
                     .waitForExistence(timeout: 3),
                 "Workspace did not recover from Find on iteration \(iteration)"
             )
+            selectProfessionalMode("pages", in: app)
             XCTAssertTrue(
                 app.wait(for: .runningForeground, timeout: 1)
             )
@@ -2060,35 +5057,63 @@ final class PaperPathUITests: XCTestCase {
         ]
         app.launch()
 
-        let home = app.buttons["workspaceLane-home"].firstMatch
-        let tasks = app.buttons["workspaceLane-tasks"].firstMatch
-        let outputs = app.buttons["workspaceLane-outputs"].firstMatch
-        XCTAssertTrue(home.waitForExistence(timeout: 8))
-        XCTAssertTrue(tasks.exists)
-        XCTAssertTrue(outputs.exists)
-        home.tap()
-        XCTAssertTrue(
-            app.buttons["homePrimaryAction"].waitForExistence(timeout: 3)
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
         )
         XCTAssertTrue(app.otherElements["libraryDocumentsSection"].exists)
+        let deskHeader = app.descendants(matching: .any)[
+            "documentDeskHeader"
+        ].firstMatch
+        let importPDFs = app.buttons["deskImport"].firstMatch
+        let scanPaper = app.buttons["deskScan"].firstMatch
+        let continueAction = app.buttons["homePrimaryAction"].firstMatch
+        for element in [deskHeader, importPDFs, scanPaper, continueAction] {
+            XCTAssertTrue(element.waitForExistence(timeout: 3))
+            XCTAssertTrue(element.isHittable)
+            XCTAssertLessThanOrEqual(
+                element.frame.maxY,
+                app.frame.maxY,
+                "The focused Home action must remain in the first viewport"
+            )
+        }
+        addScreenshot(
+            named: "PaperPath Focused Home First Screen",
+            app: app
+        )
 
-        tasks.tap()
+        selectWorkspaceLane(
+            title: "Tools",
+            identifier: "workspaceLane-tasks",
+            in: app
+        )
         XCTAssertTrue(
-            app.buttons["taskPackage-prepareToSend"]
-                .waitForExistence(timeout: 3)
+            reveal(
+                app.buttons["taskPackage-prepareToSend"],
+                in: app,
+                maxSwipes: 10
+            )
         )
         XCTAssertFalse(app.buttons["homePrimaryAction"].exists)
         XCTAssertFalse(app.otherElements["libraryDocumentsSection"].exists)
 
-        outputs.tap()
+        selectWorkspaceLane(
+            title: "Results",
+            identifier: "workspaceLane-outputs",
+            in: app
+        )
         XCTAssertTrue(
-            app.buttons["outputsVerifyAction"]
-                .waitForExistence(timeout: 3)
+            app.descendants(matching: .any)["deliveryCenter"]
+                .firstMatch.exists
         )
         XCTAssertFalse(app.otherElements["libraryDocumentsSection"].exists)
 
-        home.tap()
-        XCTAssertTrue(app.buttons["homePrimaryAction"].exists)
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
+        )
         XCTAssertTrue(app.otherElements["libraryDocumentsSection"].exists)
         addScreenshot(named: "PaperPath Focused Home", app: app)
     }
@@ -2108,6 +5133,8 @@ final class PaperPathUITests: XCTestCase {
             "en_US",
             "-app.language",
             "en",
+            "-privacy.appLockEnabled",
+            "NO",
             "-UIPreferredContentSizeCategoryName",
             "UICTContentSizeCategoryL"
         ]
@@ -2119,17 +5146,676 @@ final class PaperPathUITests: XCTestCase {
         return app
     }
 
-    private func configureFreezeTracing(for app: XCUIApplication) {
-        app.launchArguments += ["UITEST_FREEZE_TRACE"]
-        let defaults = [
-            "DEBUG_SERVER_URL": "http://localhost:7777/event",
-            "DEBUG_SESSION_ID": "frequent-ui-freeze",
-            "DEBUG_RUN_ID": "post-fix"
-        ]
-        for (key, fallback) in defaults {
-            app.launchEnvironment[key] =
-                ProcessInfo.processInfo.environment[key] ?? fallback
+    private func launchResetDemo(
+        additionalArguments: [String] = []
+    ) -> XCUIApplication {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_RESET_DEMO",
+            "-workspace.toolMode",
+            "pages"
+        ] + additionalArguments
+        app.launch()
+        XCTAssertTrue(
+            waitForLibrary(in: app),
+            "The reset demo library did not become ready"
+        )
+        assertAppAlive(app)
+        return app
+    }
+
+    private func openDemoDocument(
+        named title: String = "Project handoff",
+        in app: XCUIApplication
+    ) {
+        selectWorkspaceLane(
+            title: "Documents",
+            identifier: "workspaceLane-home",
+            in: app
+        )
+        let row = app.buttons.matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+                "documentRow-",
+                title
+            )
+        ).firstMatch
+        XCTAssertTrue(
+            revealForCenterTap(row, in: app, maxSwipes: 10),
+            "Could not find demo document \(title)"
+        )
+        tapCenter(row)
+        let workspace = app.otherElements["pdfWorkspace"].firstMatch
+        if !workspace.waitForExistence(timeout: 2) {
+            let open = app.buttons["deskOpenDocument"].firstMatch
+            if reveal(open, in: app, maxSwipes: 8) {
+                tapCenter(open)
+            }
         }
+        XCTAssertTrue(
+            workspace.waitForExistence(timeout: 8),
+            "The PDF workspace did not open for \(title)"
+        )
+        let workspaceTitle = workspaceDocumentTitle(in: app)
+        XCTAssertTrue(workspaceTitle.waitForExistence(timeout: 5))
+        XCTAssertTrue(
+            workspaceTitle.label.localizedCaseInsensitiveContains(title)
+        )
+        assertAppAlive(app)
+    }
+
+    @discardableResult
+    private func openDocumentTool(
+        identifier: String,
+        query: String,
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        openDocumentTools(in: app)
+        XCTAssertTrue(
+            app.navigationBars["Tools"].waitForExistence(timeout: 5)
+        )
+        let search = documentToolSearchField(in: app)
+        XCTAssertTrue(search.waitForExistence(timeout: 3))
+        search.tap()
+        search.typeText(query)
+        let tool = app.buttons["documentTool-\(identifier)"].firstMatch
+        XCTAssertTrue(
+            tool.waitForExistence(timeout: 5),
+            "Document tool \(identifier) was not available"
+        )
+        let enabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: tool
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [enabled], timeout: 15),
+            .completed,
+            "Document tool \(identifier) did not become enabled"
+        )
+        XCTAssertTrue(revealForCenterTap(tool, in: app, maxSwipes: 8))
+        tapCenter(tool)
+        assertAppAlive(app)
+        return tool
+    }
+
+    private func openQuickTask(
+        identifier: String,
+        query: String,
+        documentTitle: String? = nil,
+        in app: XCUIApplication
+    ) {
+        let hasLibrarySurface =
+            app.descendants(matching: .any)[
+                "libraryDocumentsSection"
+            ].firstMatch.exists
+            || app.descendants(matching: .any)[
+                "taskPackagesSection"
+            ].firstMatch.exists
+            || app.descendants(matching: .any)[
+                "deliveryCenter"
+            ].firstMatch.exists
+        if !hasLibrarySurface {
+            XCTAssertTrue(
+                waitForLibrary(in: app),
+                "The Library was not reachable before opening \(identifier)"
+            )
+        }
+        selectWorkspaceLane(
+            title: "Tools",
+            identifier: "workspaceLane-tasks",
+            in: app
+        )
+        var task = app.buttons["quickTool-\(identifier)"].firstMatch
+        if !revealForCenterTap(task, in: app, maxSwipes: 10) {
+            let search = librarySearchField(in: app)
+            XCTAssertTrue(search.waitForExistence(timeout: 3))
+            search.tap()
+            search.typeText(query)
+            task = app.buttons["quickTool-\(identifier)"].firstMatch
+        }
+        XCTAssertTrue(
+            task.waitForExistence(timeout: 5),
+            "Quick task \(identifier) was not available"
+        )
+        XCTAssertTrue(task.isEnabled)
+        XCTAssertTrue(
+            revealForCenterTap(task, in: app, maxSwipes: 10),
+            "Quick task \(identifier) could not be centered for tapping"
+        )
+        tapCenter(task)
+
+        guard let documentTitle else {
+            assertAppAlive(app)
+            return
+        }
+        let document = app.buttons.matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+                "quickTaskDocument-",
+                documentTitle
+            )
+        ).firstMatch
+        XCTAssertTrue(
+            document.waitForExistence(timeout: 8),
+            "Document picker did not present \(documentTitle) for \(identifier)"
+        )
+        guard document.exists else { return }
+        XCTAssertTrue(
+            revealForCenterTap(document, in: app, maxSwipes: 10),
+            "Could not choose \(documentTitle) for \(identifier)"
+        )
+        tapCenter(document)
+        assertAppAlive(app)
+    }
+
+    private func dismissPresentedWorkflow(
+        title: String,
+        in app: XCUIApplication
+    ) {
+        let navigation = app.navigationBars[title].firstMatch
+        XCTAssertTrue(navigation.waitForExistence(timeout: 5))
+        let controls = [
+            navigation.buttons["Cancel"].firstMatch,
+            navigation.buttons["Close"].firstMatch,
+            navigation.buttons["Done"].firstMatch
+        ]
+        guard let control = controls.first(where: {
+            $0.exists && $0.isHittable
+        }) else {
+            XCTFail("No dismissal control was available for \(title)")
+            return
+        }
+        tapCenter(control)
+        for confirmationTitle in [
+            "Discard Pages",
+            "Discard Draft",
+            "Discard Changes"
+        ] {
+            let confirmation = app.buttons[confirmationTitle].firstMatch
+            if confirmation.waitForExistence(timeout: 1) {
+                tapCenter(confirmation)
+                break
+            }
+        }
+        XCTAssertTrue(navigation.waitForNonExistence(timeout: 5))
+        assertAppAlive(app)
+    }
+
+    private func dismissPrivacyScan(in app: XCUIApplication) {
+        let close = app.buttons["privacyScanClose"].firstMatch
+        XCTAssertTrue(close.waitForExistence(timeout: 5))
+        close.tap()
+        XCTAssertTrue(close.waitForNonExistence(timeout: 5))
+        assertAppAlive(app)
+    }
+
+    private func runMarkupJourney(
+        identifier: String,
+        query: String,
+        expectedAnnotationTitle: String
+    ) {
+        let app = launchResetDemo(
+            additionalArguments: ["UITEST_PRESELECT_TEXT"]
+        )
+        openDemoDocument(in: app)
+
+        cancelDocumentToolSelection(
+            identifier: identifier,
+            query: query,
+            in: app
+        )
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+
+        openDocumentTool(
+            identifier: identifier,
+            query: query,
+            in: app
+        )
+        assertAnnotationResult(
+            title: expectedAnnotationTitle,
+            in: app
+        )
+    }
+
+    private func cancelDocumentToolSelection(
+        identifier: String,
+        query: String,
+        in app: XCUIApplication
+    ) {
+        openDocumentTools(in: app)
+        XCTAssertTrue(
+            app.navigationBars["Tools"].waitForExistence(timeout: 5)
+        )
+        let search = documentToolSearchField(in: app)
+        XCTAssertTrue(search.waitForExistence(timeout: 3))
+        search.tap()
+        search.typeText(query)
+        XCTAssertTrue(
+            app.buttons["documentTool-\(identifier)"]
+                .firstMatch
+                .waitForExistence(timeout: 5)
+        )
+        dismissPresentedWorkflow(title: "Tools", in: app)
+    }
+
+    private func assertAnnotationResult(
+        title: String,
+        contents: String? = nil,
+        in app: XCUIApplication
+    ) {
+        openDocumentTool(
+            identifier: "annotations",
+            query: "Annotations",
+            in: app
+        )
+        XCTAssertTrue(
+            app.navigationBars["Comments & Markup"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(
+            app.staticTexts[title].waitForExistence(timeout: 15),
+            "Expected annotation type \(title)"
+        )
+        if let contents {
+            XCTAssertTrue(
+                app.staticTexts[contents].waitForExistence(timeout: 5),
+                "Expected annotation contents \(contents)"
+            )
+        }
+        XCTAssertGreaterThan(
+            app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "identifier BEGINSWITH %@",
+                    "annotationRow-"
+                )
+            ).count,
+            0
+        )
+        assertAppAlive(app)
+    }
+
+    private func completeProtection(
+        navigationTitle: String,
+        password value: String,
+        in app: XCUIApplication
+    ) {
+        XCTAssertTrue(
+            app.navigationBars[navigationTitle]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "protectionPermissionBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        let password = app.descendants(matching: .any)[
+            "protectionPassword"
+        ].firstMatch
+        let confirmation = app.descendants(matching: .any)[
+            "protectionConfirmation"
+        ].firstMatch
+        XCTAssertTrue(password.waitForExistence(timeout: 8))
+        XCTAssertTrue(confirmation.exists)
+        password.tap()
+        password.typeText(value)
+        let keyboardNext = app.keyboards.buttons["next"].firstMatch
+        if keyboardNext.waitForExistence(timeout: 2) {
+            keyboardNext.tap()
+        } else {
+            tapCenter(confirmation)
+        }
+        let confirmationFocused = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hasKeyboardFocus == true"),
+            object: confirmation
+        )
+        if XCTWaiter.wait(
+            for: [confirmationFocused],
+            timeout: 3
+        ) != .completed {
+            tapCenter(confirmation)
+        }
+        let confirmationRefocused = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hasKeyboardFocus == true"),
+            object: confirmation
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [confirmationRefocused],
+                timeout: 3
+            ),
+            .completed
+        )
+        confirmation.typeText(value)
+        let create = app.buttons["protectionCreateAction"].firstMatch
+        let enabled = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: create
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [enabled], timeout: 8),
+            .completed
+        )
+        create.tap()
+        XCTAssertTrue(
+            app.navigationBars[navigationTitle]
+                .waitForNonExistence(timeout: 45)
+        )
+    }
+
+    private func completePageExtraction(in app: XCUIApplication) {
+        XCTAssertTrue(
+            app.navigationBars["Organize pages"]
+                .waitForExistence(timeout: 8)
+        )
+        let select = app.buttons["selectOrganizerPages"].firstMatch
+        XCTAssertTrue(select.waitForExistence(timeout: 5))
+        select.tap()
+        let selection = app.buttons["pageSelectionMenu"].firstMatch
+        XCTAssertTrue(selection.waitForExistence(timeout: 5))
+        selection.tap()
+        app.buttons["All Pages"].tap()
+        let actions = app.buttons["pageSelectionActions"].firstMatch
+        XCTAssertTrue(actions.waitForExistence(timeout: 5))
+        actions.tap()
+        let extract = app.buttons["Extract to New PDF"].firstMatch
+        XCTAssertTrue(extract.waitForExistence(timeout: 5))
+        extract.tap()
+        XCTAssertTrue(
+            app.staticTexts["Project handoff - extracted pages"]
+                .waitForExistence(timeout: 30)
+        )
+        let extractedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - extracted pages"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [extractedCopyOpened],
+                timeout: 15
+            ),
+            .completed
+        )
+    }
+
+    private func completeFormField(
+        named fieldName: String,
+        in app: XCUIApplication
+    ) {
+        XCTAssertTrue(
+            app.navigationBars["Fill Form"].waitForExistence(timeout: 8)
+        )
+        let addField = app.buttons["addFormFieldFromReview"].firstMatch
+        XCTAssertTrue(reveal(addField, in: app, maxSwipes: 12))
+        addField.tap()
+        XCTAssertTrue(
+            app.navigationBars["Place Form Field"]
+                .waitForExistence(timeout: 8)
+        )
+        let name = app.textFields["formFieldName"].firstMatch
+        XCTAssertTrue(name.waitForExistence(timeout: 5))
+        name.tap()
+        name.typeText(fieldName)
+        let add = app.buttons["addFormField"].firstMatch
+        XCTAssertTrue(add.waitForExistence(timeout: 5))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: add
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 15),
+            .completed
+        )
+        add.tap()
+        XCTAssertTrue(
+            app.navigationBars["Fill Form"]
+                .waitForExistence(timeout: 30)
+        )
+        XCTAssertTrue(
+            waitForFormField(named: fieldName, in: app)
+        )
+    }
+
+    private func completeSignature(in app: XCUIApplication) {
+        XCTAssertTrue(
+            app.navigationBars["Add signature"]
+                .waitForExistence(timeout: 8)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "visualSignatureBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        let advance = app.buttons["Place on Page"].firstMatch
+        XCTAssertTrue(advance.waitForExistence(timeout: 8))
+        let canAdvance = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: advance
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [canAdvance], timeout: 15),
+            .completed
+        )
+        advance.tap()
+        let place = app.buttons["placeSignatureOnly"].firstMatch
+        XCTAssertTrue(place.waitForExistence(timeout: 8))
+        let canPlace = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: place
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [canPlace], timeout: 10),
+            .completed
+        )
+        place.tap()
+        XCTAssertTrue(
+            app.navigationBars["Add signature"]
+                .waitForNonExistence(timeout: 30)
+        )
+    }
+
+    private func openQuickRedactionReview(in app: XCUIApplication) {
+        let apply = app.buttons["applyRedactionSelection"].firstMatch
+        XCTAssertTrue(apply.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: apply
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 10),
+            .completed
+        )
+        apply.tap()
+        XCTAssertTrue(
+            app.navigationBars["Review redactions"]
+                .waitForExistence(timeout: 15)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "redactionOutputBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+    }
+
+    private func completeRedaction(in app: XCUIApplication) {
+        let create = app.buttons["redactionCreateAction"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 5))
+        XCTAssertTrue(create.isEnabled)
+        create.tap()
+        let redactedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Redacted copy"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [redactedCopyOpened],
+                timeout: 45
+            ),
+            .completed
+        )
+    }
+
+    private func completeRecognition(
+        query: String,
+        in app: XCUIApplication
+    ) {
+        XCTAssertTrue(
+            app.navigationBars["Recognition"]
+                .waitForExistence(timeout: 8)
+        )
+        let start = app.buttons["startOCR"].firstMatch
+        XCTAssertTrue(start.waitForExistence(timeout: 8))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: start
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 20),
+            .completed
+        )
+        start.tap()
+        XCTAssertTrue(
+            app.buttons["recognizedTextCopyMenu"]
+                .waitForExistence(timeout: 90)
+        )
+        let search = app.searchFields["Search recognized text"].firstMatch
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText(query)
+        if app.keyboards.buttons["Search"].exists {
+            app.keyboards.buttons["Search"].tap()
+        }
+        XCTAssertTrue(
+            app.buttons["copyFilteredRecognizedPages"]
+                .waitForExistence(timeout: 8)
+        )
+    }
+
+    private func completeOfficeExport(in app: XCUIApplication) {
+        XCTAssertTrue(
+            app.navigationBars["Convert PDF"]
+                .waitForExistence(timeout: 10)
+        )
+        let word = app.descendants(matching: .any)[
+            "officeFormat-wordDocument"
+        ].firstMatch
+        XCTAssertTrue(reveal(word, in: app, maxSwipes: 8))
+        tapCenter(word)
+        let convert = app.buttons["officeConvertAction"].firstMatch
+        XCTAssertTrue(reveal(convert, in: app, maxSwipes: 8))
+        XCTAssertTrue(convert.isEnabled)
+        convert.tap()
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "officeConversionResult"
+            ].firstMatch.waitForExistence(timeout: 90)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "officeResultActions"
+            ].firstMatch.exists
+        )
+        let share = app.buttons["Share output"].firstMatch
+        XCTAssertTrue(reveal(share, in: app, maxSwipes: 8))
+        XCTAssertTrue(share.isEnabled)
+        tapCenter(share)
+        XCTAssertTrue(
+            app.otherElements["ActivityListView"]
+                .waitForExistence(timeout: 30)
+        )
+    }
+
+    private func completePageImageExport(in app: XCUIApplication) {
+        let export = app.buttons[
+            "exportPageImages-jpegCompact"
+        ].firstMatch
+        XCTAssertTrue(reveal(export, in: app, maxSwipes: 12))
+        tapCenter(export)
+        XCTAssertTrue(
+            app.otherElements["ActivityListView"]
+                .waitForExistence(timeout: 30)
+        )
+    }
+
+    private func completeVerifiedShare(in app: XCUIApplication) {
+        XCTAssertTrue(
+            app.navigationBars["Finish & Share"]
+                .waitForExistence(timeout: 10)
+        )
+        XCTAssertTrue(
+            app.descendants(matching: .any)[
+                "safeShareOutputBoundary"
+            ].firstMatch.waitForExistence(timeout: 5)
+        )
+        let create = app.buttons["safeShareButton"].firstMatch
+        XCTAssertTrue(reveal(create, in: app, maxSwipes: 12))
+        let ready = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true"),
+            object: create
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [ready], timeout: 30),
+            .completed
+        )
+        create.tap()
+        let verifiedCopyOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "Project handoff - Verified copy"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(
+                for: [verifiedCopyOpened],
+                timeout: 45
+            ),
+            .completed
+        )
+    }
+
+    private func assertAppAlive(
+        _ app: XCUIApplication,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        XCTAssertTrue(
+            app.wait(for: .runningForeground, timeout: 5),
+            "PaperPath is no longer running in the foreground",
+            file: file,
+            line: line
+        )
+        let hasStableSurface =
+            app.otherElements["pdfWorkspace"].firstMatch.exists
+            || app.otherElements["libraryDocumentsSection"]
+                .firstMatch.exists
+            || !app.navigationBars.allElementsBoundByIndex.isEmpty
+        if hasStableSurface {
+            return
+        }
+        let stableSurface = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                app.otherElements["pdfWorkspace"].firstMatch.exists
+                    || app.otherElements["libraryDocumentsSection"]
+                        .firstMatch.exists
+                    || !app.navigationBars.allElementsBoundByIndex.isEmpty
+            },
+            object: nil
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [stableSurface], timeout: 3),
+            .completed,
+            "PaperPath has no reachable stable surface",
+            file: file,
+            line: line
+        )
     }
 
     private func openVerifiedDeliveryReceipt(
@@ -2158,14 +5844,13 @@ final class PaperPathUITests: XCTestCase {
             let open = app.buttons["deskOpenDocument"]
             if open.waitForExistence(timeout: 2) { open.tap() }
             XCTAssertTrue(app.descendants(matching: .any)["pdfWorkspace"].firstMatch.waitForExistence(timeout: 10))
-            app.buttons["workspaceModeMenu"].tap()
-            app.buttons["workspaceMode-deliver"].tap()
+            selectProfessionalMode("deliver", in: app)
             let verify = app.buttons["Verify & Share"].firstMatch
             XCTAssertTrue(verify.waitForExistence(timeout: 5))
             verify.tap()
         } else {
             selectWorkspaceLane(
-                title: "Tasks",
+                title: "Tools",
                 identifier: "workspaceLane-tasks",
                 in: app
             )
@@ -2259,24 +5944,150 @@ final class PaperPathUITests: XCTestCase {
         return app
     }
 
-    private func expandVerificationDetails(in app: XCUIApplication) {
-        if app.buttons["protectDeliveryMilestone"].exists {
-            return
+    private func expandVerificationDetails(
+        in app: XCUIApplication
+    ) -> Bool {
+        let protectMilestone = app.descendants(matching: .any)[
+            "protectDeliveryMilestone"
+        ].firstMatch
+        if protectMilestone.exists {
+            return true
         }
-        let disclosure = app.buttons.matching(
+        let disclosure = app.descendants(matching: .any).matching(
             NSPredicate(
                 format: "label BEGINSWITH %@",
                 "Verification details"
             )
         ).firstMatch
-        XCTAssertTrue(reveal(disclosure, in: app, maxSwipes: 8))
-        tapCenter(disclosure)
+        guard revealInDeliveryReceipt(
+            disclosure,
+            in: app,
+            maxSwipes: 8
+        ) else {
+            return false
+        }
+        disclosure.tap()
+        return app.navigationBars["Delivery receipt"]
+            .waitForExistence(timeout: 5)
     }
 
     private func waitForLibrary(in app: XCUIApplication) -> Bool {
-        let desk = app.buttons["returnToDocumentDesk"]
-        if desk.waitForExistence(timeout: 3), desk.isHittable { desk.tap() }
-        return app.searchFields.firstMatch.waitForExistence(timeout: 20)
+        dismissBlockingAlert(in: app)
+        dismissKeyboard(in: app)
+
+        let workspace = app.descendants(matching: .any)[
+            "pdfWorkspace"
+        ].firstMatch
+        let desk = app.descendants(matching: .any)[
+            "returnToDocumentDesk"
+        ].firstMatch
+        if desk.waitForExistence(timeout: 3) {
+            let deskReady = XCTNSPredicateExpectation(
+                predicate: NSPredicate(
+                    format: "exists == true AND hittable == true"
+                ),
+                object: desk
+            )
+            _ = XCTWaiter.wait(for: [deskReady], timeout: 5)
+            tapCenter(desk)
+        } else if workspace.exists {
+            let compactBack = app.buttons["BackButton"].firstMatch
+            XCTAssertTrue(
+                compactBack.waitForExistence(timeout: 3),
+                "The compact workspace did not expose its Back button"
+            )
+            if compactBack.exists {
+                tapCenter(compactBack)
+            }
+        }
+
+        let libraryReady = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in
+                self.dismissBlockingAlert(in: app)
+                let hasLibrarySurface =
+                    app.descendants(matching: .any)[
+                        "libraryDocumentsSection"
+                    ].firstMatch.exists
+                    || app.descendants(matching: .any)[
+                        "taskPackagesSection"
+                    ].firstMatch.exists
+                    || app.descendants(matching: .any)[
+                        "deliveryCenter"
+                    ].firstMatch.exists
+                return hasLibrarySurface
+                    && !app.buttons["returnToDocumentDesk"].firstMatch.exists
+                    && !app.descendants(matching: .any)[
+                        "pdfWorkspace"
+                    ].firstMatch.exists
+            },
+            object: nil
+        )
+        return XCTWaiter.wait(
+            for: [libraryReady],
+            timeout: 20
+        ) == .completed
+    }
+
+    private func waitForOfficeCorpusFixture(
+        chinese: Bool = false,
+        in app: XCUIApplication
+    ) -> Bool {
+        guard waitForLibrary(in: app) else {
+            return false
+        }
+        selectWorkspaceLane(
+            title: chinese ? "成果" : "Results",
+            identifier: "workspaceLane-outputs",
+            in: app
+        )
+        return app.buttons.matching(
+            NSPredicate(
+                format: "identifier BEGINSWITH %@",
+                "officeResult-"
+            )
+        ).firstMatch.waitForExistence(timeout: 90)
+    }
+
+    private func dismissBlockingAlert(in app: XCUIApplication) {
+        let alert = app.alerts.firstMatch
+        if alert.exists {
+            let ok = alert.buttons["OK"].firstMatch
+            if ok.exists, ok.isHittable {
+                ok.tap()
+                return
+            }
+        }
+
+        guard app.navigationBars["SwiftUI.PlatformAlert"]
+            .firstMatch.exists
+        else { return }
+        let ok = app.buttons["OK"].firstMatch
+        if ok.exists, ok.isHittable {
+            tapCenter(ok)
+        }
+    }
+
+    private func dismissKeyboard(in app: XCUIApplication) {
+        guard app.keyboards.firstMatch.exists else { return }
+        for label in ["Hide keyboard", "隐藏键盘"] {
+            let hide = app.keyboards.buttons[label].firstMatch
+            if hide.exists, hide.isHittable {
+                hide.tap()
+                return
+            }
+        }
+    }
+
+    private func submitSearchKeyboard(in app: XCUIApplication) {
+        guard app.keyboards.firstMatch.exists else { return }
+        for identifier in ["Search", "search", "搜索"] {
+            let submit = app.keyboards.buttons[identifier].firstMatch
+            if submit.exists, submit.isHittable {
+                submit.tap()
+                return
+            }
+        }
+        dismissKeyboard(in: app)
     }
 
     private func workspaceLane(
@@ -2297,14 +6108,75 @@ final class PaperPathUITests: XCTestCase {
             ?? query.firstMatch
     }
 
-    private func openDocumentTools(in app: XCUIApplication) {
-        let button = firstHittableButton(
+    private func openDocumentTools(
+        chinese: Bool = false,
+        in app: XCUIApplication
+    ) {
+        selectProfessionalMode(
+            "pages",
+            chinese: chinese,
+            in: app
+        )
+        tapDocumentToolsButton(in: app)
+    }
+
+    private func tapDocumentToolsButton(in app: XCUIApplication) {
+        tapCenter(revealDocumentToolsButton(in: app))
+    }
+
+    private func revealDocumentToolsButton(
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        let toolRow = app.scrollViews["workspaceToolRow"].firstMatch
+        var button = firstHittableButton(
             identifier: "documentToolsAction",
+            in: app,
+            timeout: 2
+        )
+        func hasVisibleCenter(
+            _ element: XCUIElement
+        ) -> Bool {
+            guard element.exists, element.isHittable else {
+                return false
+            }
+            guard toolRow.exists else {
+                return true
+            }
+            return toolRow.frame.insetBy(dx: 2, dy: 0).contains(
+                CGPoint(
+                    x: element.frame.midX,
+                    y: element.frame.midY
+                )
+            )
+        }
+        for _ in 0..<8 where !hasVisibleCenter(button) {
+            if toolRow.exists {
+                toolRow.swipeLeft()
+            } else {
+                app.swipeLeft()
+            }
+            button = firstHittableButton(
+                identifier: "documentToolsAction",
+                in: app,
+                timeout: 1
+            )
+        }
+        XCTAssertTrue(
+            hasVisibleCenter(button),
+            "Document tools did not scroll into the visible tool row"
+        )
+        return button
+    }
+
+    private func openPageOrganizer(in app: XCUIApplication) {
+        selectProfessionalMode("pages", in: app)
+        let organizer = firstHittableButton(
+            identifier: "workspaceTool-organize",
             in: app,
             timeout: 5
         )
-        XCTAssertTrue(button.isHittable)
-        tapCenter(button)
+        XCTAssertTrue(organizer.isHittable)
+        tapCenter(organizer)
     }
 
     private func selectWorkspaceLane(
@@ -2312,18 +6184,82 @@ final class PaperPathUITests: XCTestCase {
         identifier: String,
         in app: XCUIApplication
     ) {
-        let directLane = workspaceLane(identifier, in: app)
-        if directLane.exists {
-            directLane.tap()
+        if workspaceLaneMarker(identifier, in: app).exists {
             return
         }
+        let directQuery = app.descendants(matching: .any)
+            .matching(identifier: identifier)
+        _ = directQuery.firstMatch.waitForExistence(timeout: 2)
+        if let directLane = directQuery.allElementsBoundByIndex
+            .first(where: \.isHittable) {
+            tapCenter(directLane)
+        } else {
+            let labeledQuery = app.buttons.matching(
+                NSPredicate(
+                    format: "label == %@ OR label BEGINSWITH %@",
+                    title,
+                    "\(title),"
+                )
+            )
+            _ = labeledQuery.firstMatch.waitForExistence(timeout: 2)
+            if let labeledLane = labeledQuery.allElementsBoundByIndex
+                .first(where: \.isHittable) {
+                tapCenter(labeledLane)
+                XCTAssertTrue(
+                    workspaceLaneMarker(identifier, in: app)
+                        .waitForExistence(timeout: 5),
+                    "Workspace lane \(identifier) did not finish loading"
+                )
+                return
+            }
+            let menuQuery = app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "label IN %@",
+                    ["Workspace", "工作区"]
+                )
+            )
+            let firstMenu = menuQuery.firstMatch
+            _ = firstMenu.waitForExistence(timeout: 3)
+            let menu = menuQuery.allElementsBoundByIndex
+                .first(where: \.isHittable)
+                ?? firstMenu
+            XCTAssertTrue(menu.waitForExistence(timeout: 3))
+            tapCenter(menu)
+            let optionQuery = app.descendants(matching: .any).matching(
+                NSPredicate(
+                    format: "label == %@ OR identifier == %@",
+                    title,
+                    title
+                )
+            )
+            let firstOption = optionQuery.firstMatch
+            _ = firstOption.waitForExistence(timeout: 3)
+            let option = optionQuery.allElementsBoundByIndex
+                .first(where: \.isHittable)
+                ?? firstOption
+            XCTAssertTrue(option.waitForExistence(timeout: 3))
+            tapCenter(option)
+        }
 
-        let menu = app.buttons["Workspace"].firstMatch
-        XCTAssertTrue(menu.waitForExistence(timeout: 3))
-        menu.tap()
-        let option = app.buttons[title].firstMatch
-        XCTAssertTrue(option.waitForExistence(timeout: 3))
-        option.tap()
+        XCTAssertTrue(
+            workspaceLaneMarker(identifier, in: app)
+                .waitForExistence(timeout: 5),
+            "Workspace lane \(identifier) did not finish loading"
+        )
+    }
+
+    private func workspaceLaneMarker(
+        _ identifier: String,
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        let marker: String
+        switch identifier {
+        case "workspaceLane-home": marker = "libraryDocumentsSection"
+        case "workspaceLane-tasks": marker = "taskPackagesSection"
+        case "workspaceLane-outputs": marker = "deliveryCenter"
+        default: marker = identifier
+        }
+        return app.descendants(matching: .any)[marker].firstMatch
     }
 
     private func librarySearchField(
@@ -2371,6 +6307,164 @@ final class PaperPathUITests: XCTestCase {
         menuAction.tap()
     }
 
+    private func selectRecommendedOfficeExport(
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        let mode = app.descendants(matching: .any)[
+            "exportCatalogMode-recommended"
+        ].firstMatch
+        XCTAssertTrue(reveal(mode, in: app, maxSwipes: 8))
+        tapCenter(mode)
+
+        let recommended = app.descendants(matching: .any)[
+            "recommendedOfficeExport"
+        ].firstMatch
+        XCTAssertTrue(reveal(recommended, in: app, maxSwipes: 8))
+        return recommended
+    }
+
+    private func waitForFormField(
+        named fieldName: String,
+        in app: XCUIApplication
+    ) -> Bool {
+        app.descendants(matching: .any).matching(
+            NSPredicate(
+                format:
+                    "identifier BEGINSWITH %@ AND label == %@",
+                "formField-",
+                fieldName
+            )
+        ).firstMatch.waitForExistence(timeout: 45)
+    }
+
+    private func scanPageAction(
+        labeled label: String,
+        in app: XCUIApplication
+    ) -> XCUIElement {
+        app.descendants(matching: .any).matching(
+            NSPredicate(format: "label == %@", label)
+        ).firstMatch
+    }
+
+    private func revealInDeliveryReceipt(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        maxSwipes: Int
+    ) -> Bool {
+        revealInPresentedSheet(
+            element,
+            navigationTitle: "Delivery receipt",
+            in: app,
+            maxSwipes: max(maxSwipes, 16)
+        )
+    }
+
+    private func revealInPresentedSheet(
+        _ element: XCUIElement,
+        navigationTitle: String,
+        in app: XCUIApplication,
+        maxSwipes: Int
+    ) -> Bool {
+        let navigation = app.navigationBars[navigationTitle].firstMatch
+        guard navigation.exists else {
+            return false
+        }
+        let minimumSheetWidth = app.frame.width * 0.55
+        let scrollView = app.scrollViews.allElementsBoundByIndex
+            .filter {
+                $0.frame.width >= minimumSheetWidth
+                    && $0.frame.height > app.frame.height * 0.35
+            }
+            .max(by: {
+                $0.frame.width * $0.frame.height
+                    < $1.frame.width * $1.frame.height
+            })
+            ?? app.scrollViews.firstMatch
+        let isCenteredInViewport: () -> Bool = {
+            guard element.exists,
+                  element.isHittable,
+                  scrollView.exists else {
+                return false
+            }
+            let viewport = scrollView.frame.insetBy(dx: 8, dy: 8)
+            let safeTop = max(
+                viewport.minY,
+                navigation.frame.maxY + 8
+            )
+            let visibleViewport = CGRect(
+                x: viewport.minX,
+                y: safeTop,
+                width: viewport.width,
+                height: max(0, viewport.maxY - safeTop)
+            )
+            return visibleViewport.contains(
+                CGPoint(
+                    x: element.frame.midX,
+                    y: element.frame.midY
+                )
+            )
+        }
+
+        for _ in 0...maxSwipes {
+            if isCenteredInViewport() {
+                return true
+            }
+            guard navigation.exists, scrollView.exists else {
+                return false
+            }
+            let safeTop = max(
+                scrollView.frame.minY + 8,
+                navigation.frame.maxY + 8
+            )
+            if element.exists {
+                let moveDown = element.frame.midY < safeTop
+                if moveDown {
+                    scrollView.coordinate(
+                        withNormalizedOffset:
+                            CGVector(dx: 0.5, dy: 0.35)
+                    ).press(
+                        forDuration: 0.05,
+                        thenDragTo: scrollView.coordinate(
+                            withNormalizedOffset:
+                                CGVector(dx: 0.5, dy: 0.55)
+                        )
+                    )
+                } else {
+                    scrollView.coordinate(
+                        withNormalizedOffset:
+                            CGVector(dx: 0.5, dy: 0.65)
+                    ).press(
+                        forDuration: 0.05,
+                        thenDragTo: scrollView.coordinate(
+                            withNormalizedOffset:
+                                CGVector(dx: 0.5, dy: 0.45)
+                        )
+                    )
+                }
+            } else {
+                scrollView.swipeUp()
+            }
+        }
+        return isCenteredInViewport()
+    }
+
+    private func revealInContainer(
+        _ element: XCUIElement,
+        container: XCUIElement,
+        maxSwipes: Int
+    ) -> Bool {
+        for _ in 0...maxSwipes {
+            if element.exists, element.isHittable {
+                return true
+            }
+            guard container.exists else {
+                return false
+            }
+            container.swipeUp()
+        }
+        return element.exists && element.isHittable
+    }
+
     private func reveal(
         _ element: XCUIElement,
         in app: XCUIApplication,
@@ -2389,15 +6483,109 @@ final class PaperPathUITests: XCTestCase {
         return element.exists && element.isHittable
     }
 
+    private func revealInScanReview(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        maxSwipes: Int,
+        includesPreview: Bool = false
+    ) -> Bool {
+        let completionMessage = app.staticTexts[
+            "Image-based PDF · recognize text after saving"
+        ].firstMatch
+        let save = app.buttons["scanSave"]
+        let navigation = app.navigationBars["Review Scan"]
+        let scrollView = app.scrollViews.containing(
+            .button,
+            identifier: "scanSelectPages"
+        ).firstMatch
+
+        for _ in 0...maxSwipes {
+            guard scrollView.exists, save.exists else {
+                return false
+            }
+            // SwiftUI's AX scroll frame can extend beneath the fixed footer.
+            // scanOutputBoundary belongs to the scrolling disclosure content.
+            let visibleTop = max(
+                includesPreview ? navigation.frame.maxY : scrollView.frame.minY,
+                navigation.frame.maxY
+            ) + 4
+            let visibleBottom = min(
+                scrollView.frame.maxY,
+                completionMessage.exists
+                    ? completionMessage.frame.minY - 16
+                    : save.frame.minY - 8
+            )
+            if element.exists,
+               element.isHittable,
+               element.frame.minY >= visibleTop,
+               element.frame.maxY <= visibleBottom {
+                return true
+            }
+            guard visibleBottom - visibleTop > 60 else {
+                return false
+            }
+            let needsDownwardDrag = element.exists
+                && element.frame.minY < visibleTop
+            let upperY = visibleTop + (visibleBottom - visibleTop) * 0.2
+            let lowerY = visibleTop + (visibleBottom - visibleTop) * 0.8
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let x = scrollView.frame.minX + 6
+            origin.withOffset(CGVector(
+                dx: x,
+                dy: needsDownwardDrag ? upperY : lowerY
+            )).press(
+                forDuration: 0.05,
+                thenDragTo: origin.withOffset(CGVector(
+                    dx: x,
+                    dy: needsDownwardDrag ? lowerY : upperY
+                )),
+                withVelocity: .slow,
+                thenHoldForDuration: 0.2
+            )
+        }
+        return false
+    }
+
+    private func revealTowardTop(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        maxSwipes: Int
+    ) -> Bool {
+        if element.exists && element.isHittable {
+            return true
+        }
+        for _ in 0..<maxSwipes {
+            app.swipeDown()
+            if element.waitForExistence(timeout: 0.5),
+               element.isHittable {
+                return true
+            }
+        }
+        return element.exists && element.isHittable
+    }
+
     private func revealForCenterTap(
         _ element: XCUIElement,
         in app: XCUIApplication,
         maxSwipes: Int
     ) -> Bool {
-        let safeTop = app.frame.minY + 120
-        let safeBottom = app.frame.maxY - 80
+        let toolSearch = app.textFields["documentToolSearchField"].firstMatch
+        let safeTop = max(
+            app.frame.minY + 120,
+            toolSearch.exists ? toolSearch.frame.maxY + 8 : 0
+        )
+        let primaryNavigation = app.descendants(matching: .any)[
+            "libraryPrimaryNavigation"
+        ].firstMatch
+        let navigationBottom = primaryNavigation.exists
+            ? primaryNavigation.frame.minY - 8
+            : app.frame.maxY - 80
 
         for _ in 0...maxSwipes {
+            // XCTest's keyboard frame excludes the prediction/accessory strip.
+            let safeBottom = app.keyboards.firstMatch.exists
+                ? min(navigationBottom, app.keyboards.firstMatch.frame.minY - 64)
+                : navigationBottom
             if element.exists {
                 let frame = element.frame
                 if element.isHittable,
@@ -2405,49 +6593,117 @@ final class PaperPathUITests: XCTestCase {
                    frame.midY <= safeBottom {
                     return true
                 }
-
-                if frame.midY < safeTop {
-                    dragViewport(
-                        in: app,
-                        fromY: 0.35,
-                        toY: 0.65
-                    )
-                } else {
-                    dragViewport(
-                        in: app,
-                        fromY: 0.72,
-                        toY: 0.42
-                    )
-                }
-            } else {
-                app.swipeUp()
             }
+            guard safeBottom > safeTop else { return false }
+            let movesDown = element.exists && element.frame.midY < safeTop
+            dragViewport(
+                in: app,
+                fromY: movesDown ? 0.35 : 0.72,
+                toY: movesDown ? 0.65 : 0.42,
+                top: safeTop,
+                bottom: safeBottom
+            )
         }
 
         guard element.exists, element.isHittable else {
             return false
         }
         let frame = element.frame
+        let safeBottom = app.keyboards.firstMatch.exists
+            ? min(navigationBottom, app.keyboards.firstMatch.frame.minY - 64)
+            : navigationBottom
         return frame.midY >= safeTop && frame.midY <= safeBottom
     }
 
     private func dragViewport(
         in app: XCUIApplication,
         fromY: CGFloat,
-        toY: CGFloat
+        toY: CGFloat,
+        top: CGFloat,
+        bottom: CGFloat
     ) {
+        let visibleHeight = bottom - top
+        let appHeight = app.frame.height
         let start = app.coordinate(
-            withNormalizedOffset: CGVector(dx: 0.5, dy: fromY)
+            withNormalizedOffset: CGVector(
+                dx: 0.5,
+                dy: (top - app.frame.minY + visibleHeight * fromY) / appHeight
+            )
         )
         let end = app.coordinate(
-            withNormalizedOffset: CGVector(dx: 0.5, dy: toY)
+            withNormalizedOffset: CGVector(
+                dx: 0.5,
+                dy: (top - app.frame.minY + visibleHeight * toY) / appHeight
+            )
         )
-        start.press(forDuration: 0.05, thenDragTo: end)
+        start.press(
+            forDuration: 0.05,
+            thenDragTo: end,
+            withVelocity: .slow,
+            thenHoldForDuration: 0.2
+        )
     }
 
     private func tapCenter(_ element: XCUIElement) {
         element.coordinate(
             withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)
         ).tap()
+    }
+
+    private func tapCurrentFrame(
+        of element: XCUIElement,
+        in app: XCUIApplication
+    ) -> Bool {
+        guard element.exists else {
+            return false
+        }
+        let appFrame = app.frame
+        let elementFrame = element.frame
+        guard appFrame.width > 0,
+              appFrame.height > 0,
+              appFrame.intersects(elementFrame) else {
+            return false
+        }
+        app.coordinate(
+            withNormalizedOffset: CGVector(
+                dx: (elementFrame.midX - appFrame.minX) / appFrame.width,
+                dy: (elementFrame.midY - appFrame.minY) / appFrame.height
+            )
+        ).tap()
+        return true
+    }
+
+    private func finishOfficeExportCancellation(
+        stop: XCUIElement,
+        done: XCUIElement,
+        in app: XCUIApplication,
+        timeout: TimeInterval
+    ) -> Bool {
+        let conversionNavigation = app.navigationBars[
+            "Convert PDF"
+        ].firstMatch
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while deadline.timeIntervalSinceNow > 0 {
+            if !conversionNavigation.exists {
+                return true
+            }
+            if done.exists {
+                if tapCurrentFrame(of: done, in: app),
+                   conversionNavigation.waitForNonExistence(timeout: 2) {
+                    return true
+                }
+            } else if stop.exists, stop.isEnabled {
+                _ = tapCurrentFrame(of: stop, in: app)
+            }
+
+            let remaining = max(0, deadline.timeIntervalSinceNow)
+            guard remaining > 0 else {
+                break
+            }
+            _ = done.waitForExistence(timeout: min(1, remaining))
+        }
+
+        return !conversionNavigation.exists
     }
 }

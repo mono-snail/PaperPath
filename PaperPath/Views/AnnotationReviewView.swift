@@ -349,41 +349,44 @@ struct AnnotationReviewView: View {
                         annotationFilterRail
 
                         if displayedAnnotations.isEmpty {
-                            VStack(spacing: PPSpacing.medium) {
-                                PPEmptyState(
-                                    kind: .tools,
-                                    title: searchText.isEmpty
-                                        ? AppLocalization.format(
-                                            "No %@",
-                                            filter.title.localizedUI
+                            ScrollView {
+                                VStack(spacing: PPSpacing.medium) {
+                                    PPEmptyState(
+                                        kind: .tools,
+                                        title: searchText.isEmpty
+                                            ? AppLocalization.format(
+                                                "No %@",
+                                                filter.title.localizedUI
+                                            )
+                                            : "No matching annotations",
+                                        message: searchText.isEmpty
+                                            ? "Choose another annotation type."
+                                            : "Try another word, type, or page number."
+                                    )
+                                    Button {
+                                        resetAnnotationScope()
+                                    } label: {
+                                        Label(
+                                            "Show All Annotations",
+                                            systemImage:
+                                                "line.3.horizontal.decrease.circle"
                                         )
-                                        : "No matching annotations",
-                                    message: searchText.isEmpty
-                                        ? "Choose another annotation type."
-                                        : "Try another word, type, or page number."
-                                )
-                                Button {
-                                    resetAnnotationScope()
-                                } label: {
-                                    Label(
-                                        "Show All Annotations",
-                                        systemImage:
-                                            "line.3.horizontal.decrease.circle"
+                                        .frame(maxWidth: .infinity)
+                                    }
+                                    .buttonStyle(
+                                        PPQuietButtonStyle(
+                                            tint: PPColor.amber
+                                        )
                                     )
-                                    .frame(maxWidth: .infinity)
+                                    .accessibilityIdentifier(
+                                        "annotationResetScope"
+                                    )
                                 }
-                                .buttonStyle(
-                                    PPQuietButtonStyle(
-                                        tint: PPColor.amber
-                                    )
-                                )
-                                .accessibilityIdentifier(
-                                    "annotationResetScope"
-                                )
+                                .frame(maxWidth: 520)
+                                .padding(PPSpacing.regular)
+                                .frame(maxWidth: .infinity)
                             }
-                            .frame(maxWidth: 520)
-                            .padding(PPSpacing.regular)
-                            .frame(maxHeight: .infinity)
+                            .scrollBounceBehavior(.basedOnSize)
                         } else {
                             ScrollView {
                                 LazyVStack(spacing: 0) {
@@ -1084,6 +1087,9 @@ struct AnnotationReviewView: View {
                 .padding(.leading, 46)
         }
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(
+            "annotationRow-\(annotation.id)"
+        )
         .disabled(!hasCurrentInventory || isRemoving || isPreparingSummary)
     }
 
@@ -2037,6 +2043,9 @@ struct PDFAttachmentsView: View {
                 .padding(.leading, 50)
         }
         .accessibilityElement(children: .contain)
+        .accessibilityIdentifier(
+            "attachmentRow-\(attachment.id)"
+        )
     }
 
     private func attachmentSymbol(

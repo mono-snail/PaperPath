@@ -80,89 +80,96 @@ struct DocumentFindView: View {
         NavigationStack {
             Group {
                 if normalizedQuery.isEmpty {
-                    PPEmptyState(
-                        kind: .search,
-                        title: "Find in document",
-                        message: "Search the private on-device text index."
-                    )
-                    .padding(PPSpacing.regular)
+                    searchState {
+                        PPEmptyState(
+                            kind: .search,
+                            title: "Find in document",
+                            message: "Search the private on-device text index."
+                        )
+                        .frame(maxWidth: 520)
+                        .padding(PPSpacing.regular)
+                    }
                 } else if isSearching {
                     ProgressView("Searching on device".localizedUI)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(PPSpacing.regular)
                 } else if let searchErrorMessage {
-                    VStack(spacing: PPSpacing.medium) {
-                        PPEmptyState(
-                            kind: .tools,
-                            title: "Search did not finish",
-                            message: searchErrorMessage
-                        )
-                        Button {
-                            self.searchErrorMessage = nil
-                            searchReloadToken = UUID()
-                        } label: {
-                            Label(
-                                "Search Again",
-                                systemImage: "arrow.clockwise"
+                    searchState {
+                        VStack(spacing: PPSpacing.medium) {
+                            PPEmptyState(
+                                kind: .tools,
+                                title: "Search did not finish",
+                                message: searchErrorMessage
                             )
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(
-                            PPQuietButtonStyle(tint: PPColor.cyan)
-                        )
-                        .accessibilityIdentifier(
-                            "documentFindRetrySearch"
-                        )
-                    }
-                    .frame(maxWidth: 520)
-                    .padding(PPSpacing.regular)
-                } else if results.isEmpty {
-                    VStack(spacing: PPSpacing.medium) {
-                        PPEmptyState(
-                            kind: .search,
-                            title: needsSearchableText
-                                ? "Search needs text"
-                                : "No match found",
-                            message: needsSearchableText
-                                ? "Run local recognition to add a searchable text layer to this private copy."
-                                : isIndexTruncated
-                                    ? "No match was found in the indexed portion of this PDF."
-                                    : "Try a shorter phrase or search for a distinctive word in this PDF."
-                        )
-                        if needsSearchableText {
                             Button {
-                                onRecognizeText()
+                                self.searchErrorMessage = nil
+                                searchReloadToken = UUID()
                             } label: {
                                 Label(
-                                    "Recognize Text",
-                                    systemImage: "viewfinder"
+                                    "Search Again",
+                                    systemImage: "arrow.clockwise"
                                 )
                                 .frame(maxWidth: .infinity)
                             }
-                            .buttonStyle(PPPrimaryButtonStyle())
+                            .buttonStyle(
+                                PPQuietButtonStyle(tint: PPColor.cyan)
+                            )
                             .accessibilityIdentifier(
-                                "documentFindRecognizeText"
+                                "documentFindRetrySearch"
                             )
                         }
-                        Button {
-                            query = ""
-                            dismissSearch()
-                        } label: {
-                            Label(
-                                "Clear Search",
-                                systemImage: "xmark.circle"
-                            )
-                            .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(
-                            PPQuietButtonStyle(tint: PPColor.cyan)
-                        )
-                        .accessibilityIdentifier(
-                            "documentFindClearSearch"
-                        )
+                        .frame(maxWidth: 520)
+                        .padding(PPSpacing.regular)
                     }
-                    .frame(maxWidth: 520)
-                    .padding(PPSpacing.regular)
+                } else if results.isEmpty {
+                    searchState {
+                        VStack(spacing: PPSpacing.medium) {
+                            PPEmptyState(
+                                kind: .search,
+                                title: needsSearchableText
+                                    ? "Search needs text"
+                                    : "No match found",
+                                message: needsSearchableText
+                                    ? "Run local recognition to add a searchable text layer to this private copy."
+                                    : isIndexTruncated
+                                        ? "No match was found in the indexed portion of this PDF."
+                                        : "Try a shorter phrase or search for a distinctive word in this PDF."
+                            )
+                            if needsSearchableText {
+                                Button {
+                                    onRecognizeText()
+                                } label: {
+                                    Label(
+                                        "Recognize Text",
+                                        systemImage: "viewfinder"
+                                    )
+                                    .frame(maxWidth: .infinity)
+                                }
+                                .buttonStyle(PPPrimaryButtonStyle())
+                                .accessibilityIdentifier(
+                                    "documentFindRecognizeText"
+                                )
+                            }
+                            Button {
+                                query = ""
+                                dismissSearch()
+                            } label: {
+                                Label(
+                                    "Clear Search",
+                                    systemImage: "xmark.circle"
+                                )
+                                .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(
+                                PPQuietButtonStyle(tint: PPColor.cyan)
+                            )
+                            .accessibilityIdentifier(
+                                "documentFindClearSearch"
+                            )
+                        }
+                        .frame(maxWidth: 520)
+                        .padding(PPSpacing.regular)
+                    }
                 } else {
                     ScrollViewReader { proxy in
                         List {
@@ -426,13 +433,16 @@ struct DocumentFindView: View {
                 selectedResultIndex = nil
                 focusedResultIndex = nil
                 try? await Task.sleep(for: .milliseconds(160))
-                guard !Task.isCancelled else { return }
+                guard isCurrentSearchRequest(
+                    request,
+                    generation: generation
+                ) else { return }
                 await model.ensureAnalysisLoaded(for: recordID)
-                guard !Task.isCancelled else { return }
+                guard isCurrentSearchRequest(
+                    request,
+                    generation: generation
+                ) else { return }
                 guard let index = model.textIndices[recordID] else {
-                    guard searchGeneration == generation,
-                          searchRequest == request
-                    else { return }
                     results = []
                     isSearching = false
                     searchErrorMessage = nil
@@ -480,9 +490,10 @@ struct DocumentFindView: View {
                             worker.cancel()
                         }
                     try Task.checkCancellation()
-                    guard searchGeneration == generation,
-                          searchRequest == request
-                    else { return }
+                    guard isCurrentSearchRequest(
+                        request,
+                        generation: generation
+                    ) else { return }
                     results = searchResult.matches
                     resultsContentRevisionID =
                         request.contentRevisionID
@@ -508,9 +519,10 @@ struct DocumentFindView: View {
                 } catch is CancellationError {
                     return
                 } catch {
-                    guard searchGeneration == generation,
-                          searchRequest == request
-                    else { return }
+                    guard isCurrentSearchRequest(
+                        request,
+                        generation: generation
+                    ) else { return }
                     results = []
                     isResultLimited = false
                     isSearching = false
@@ -524,11 +536,13 @@ struct DocumentFindView: View {
                 }
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .background {
-                    interruptSearch(clearsQuery: true)
-                } else if phase == .active {
+                if phase == .active {
                     isSearchLifecycleSuspended = false
                     searchLifecycleGeneration = UUID()
+                } else {
+                    interruptSearch(
+                        clearsQuery: phase == .background
+                    )
                 }
             }
             .onReceive(
@@ -574,6 +588,16 @@ struct DocumentFindView: View {
                 clearsQuery: false
             )
         }
+    }
+
+    private func searchState<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        ScrollView {
+            content()
+                .frame(maxWidth: .infinity)
+        }
+        .scrollBounceBehavior(.basedOnSize)
     }
 
     private var normalizedQuery: String {
@@ -764,6 +788,21 @@ struct DocumentFindView: View {
             == resultsContentRevisionID
     }
 
+    private func isCurrentSearchRequest(
+        _ request: DocumentFindSearchRequest,
+        generation: UUID
+    ) -> Bool {
+        !Task.isCancelled
+            && searchGeneration == generation
+            && searchRequest == request
+            && !isSearchLifecycleSuspended
+            && scenePhase == .active
+            && UIApplication.shared.isProtectedDataAvailable
+            && request.contentRevisionID != nil
+            && model.record(id: recordID)?.contentRevisionID
+                == request.contentRevisionID
+    }
+
     private func invalidateStaleResults() {
         onSelectResult(nil, normalizedQuery)
         clearSearchResults()
@@ -872,7 +911,6 @@ struct DocumentFindView: View {
         if clearsQuery {
             query = ""
             onQueryChange("")
-            clearFindHistory()
             preferredPageIndex = nil
         }
         dismissSearch()

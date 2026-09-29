@@ -10,47 +10,26 @@ enum AppBrand {
 }
 
 enum PPColor {
-    static let canvas = Color(uiColor: .systemGroupedBackground)
-    static let surface = Color(uiColor: .secondarySystemGroupedBackground)
-    static let elevated = Color(uiColor: .tertiarySystemGroupedBackground)
-    static let surfaceMuted = Color(uiColor: .secondarySystemBackground)
+    // Semantic HCT colors; each asset follows the system appearance.
+    static let canvas = Color("PPCanvas")
+    static let surface = Color("PPSurface")
+    static let elevated = Color("PPElevated")
+    static let surfaceMuted = Color("PPSurfaceMuted")
     static let documentStage = Color("DocumentStage")
-    static let border = Color(
-        light: UIColor(red: 0.7, green: 0.735, blue: 0.76, alpha: 1),
-        dark: UIColor(red: 0.23, green: 0.245, blue: 0.26, alpha: 1)
-    )
-    static let textPrimary = Color(
-        light: UIColor(red: 0.07, green: 0.08, blue: 0.09, alpha: 1),
-        dark: UIColor(red: 0.94, green: 0.948, blue: 0.956, alpha: 1)
-    )
-    static let textSecondary = Color(
-        light: UIColor(red: 0.315, green: 0.34, blue: 0.365, alpha: 1),
-        dark: UIColor(red: 0.66, green: 0.68, blue: 0.7, alpha: 1)
-    )
-    static let onAccent = Color(
-        light: .white,
-        dark: UIColor(red: 0.035, green: 0.045, blue: 0.04, alpha: 1)
-    )
-    static let accent = Color(
-        light: UIColor(red: 0.08, green: 0.28, blue: 0.5, alpha: 1),
-        dark: UIColor(red: 0.31, green: 0.65, blue: 0.93, alpha: 1)
-    )
-    static let cyan = Color(
-        light: UIColor(red: 0.08, green: 0.42, blue: 0.55, alpha: 1),
-        dark: UIColor(red: 0.3, green: 0.72, blue: 0.8, alpha: 1)
-    )
-    static let mint = Color(
-        light: UIColor(red: 0.12, green: 0.42, blue: 0.3, alpha: 1),
-        dark: UIColor(red: 0.38, green: 0.78, blue: 0.58, alpha: 1)
-    )
-    static let amber = Color(
-        light: UIColor(red: 0.68, green: 0.27, blue: 0.13, alpha: 1),
-        dark: UIColor(red: 0.94, green: 0.52, blue: 0.3, alpha: 1)
-    )
-    static let rose = Color(
-        light: UIColor(red: 0.56, green: 0.16, blue: 0.25, alpha: 1),
-        dark: UIColor(red: 0.94, green: 0.43, blue: 0.55, alpha: 1)
-    )
+    static let border = Color("PPBorder")
+    static let textPrimary = Color("PPTextPrimary")
+    static let textSecondary = Color("PPTextSecondary")
+    static let onAccent = Color("PPOnAccent")
+    static let accent = Color("PPAccent")
+    static let cyan = Color("PPCyan")
+    static let mint = Color("PPMint")
+    static let amber = Color("PPAmber")
+    static let rose = Color("PPRose")
+    static let ink = Color("PPInk")
+    static let onInk = Color("PPOnInk")
+    static let onInkSecondary = Color("PPOnInkSecondary")
+    static let inkAccent = Color("PPInkAccent")
+    static let selection = Color("PPSelection")
 }
 
 extension Color {
@@ -73,11 +52,13 @@ enum PPSpacing {
 }
 
 enum PPMotion {
-    static let press = Animation.easeOut(duration: 0.08)
-    static let selection = Animation.timingCurve(0.2, 0, 0, 1, duration: 0.15)
+    static let press = Animation.easeOut(duration: 0.12)
+    static let selection = Animation.timingCurve(0.2, 0, 0, 1, duration: 0.18)
+    static let reveal = Animation.spring(response: 0.38, dampingFraction: 0.9)
 }
 
 enum PPType {
+    static let display = Font.system(.title2, design: .serif).weight(.semibold)
     static let section = Font.headline
     static let document = Font.subheadline.weight(.semibold)
     static let metadata = Font.caption
@@ -85,8 +66,8 @@ enum PPType {
 }
 
 enum PPRadius {
-    static let control: CGFloat = 7
-    static let surface: CGFloat = 8
+    static let control: CGFloat = 12
+    static let surface: CGFloat = 18
     static let document: CGFloat = 8
 }
 
@@ -107,11 +88,75 @@ extension DynamicTypeSize {
 }
 
 enum LocalFileSecurity {
+    struct RegularFileIdentity: Equatable {
+        let deviceID: UInt64
+        let fileID: UInt64
+        let byteCount: Int64
+        let modificationSeconds: Int64
+        let modificationNanoseconds: Int64
+        let changeSeconds: Int64
+        let changeNanoseconds: Int64
+    }
+
+    static func regularFileIdentity(
+        for fileDescriptor: Int32
+    ) throws -> RegularFileIdentity {
+        var status = stat()
+        guard Darwin.fstat(fileDescriptor, &status) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno)
+            )
+        }
+        guard status.st_mode & S_IFMT == S_IFREG else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(EINVAL)
+            )
+        }
+        return RegularFileIdentity(
+            deviceID: UInt64(status.st_dev),
+            fileID: UInt64(status.st_ino),
+            byteCount: Int64(status.st_size),
+            modificationSeconds: Int64(status.st_mtimespec.tv_sec),
+            modificationNanoseconds: Int64(status.st_mtimespec.tv_nsec),
+            changeSeconds: Int64(status.st_ctimespec.tv_sec),
+            changeNanoseconds: Int64(status.st_ctimespec.tv_nsec)
+        )
+    }
+
+    static func regularFileIdentity(
+        at url: URL
+    ) throws -> RegularFileIdentity {
+        let descriptor = Darwin.open(
+            url.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard descriptor >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno)
+            )
+        }
+        defer { _ = Darwin.close(descriptor) }
+        return try regularFileIdentity(for: descriptor)
+    }
+
     static func excludeFromBackup(_ url: URL) {
+        try? requireExcludedFromBackup(url)
+    }
+
+    static func requireExcludedFromBackup(_ url: URL) throws {
         var values = URLResourceValues()
         values.isExcludedFromBackup = true
         var mutableURL = url
-        try? mutableURL.setResourceValues(values)
+        try mutableURL.setResourceValues(values)
+        mutableURL.removeCachedResourceValue(forKey: .isExcludedFromBackupKey)
+        guard try mutableURL.resourceValues(
+            forKeys: [.isExcludedFromBackupKey]
+        ).isExcludedFromBackup == true else {
+            throw CocoaError(.fileWriteUnknown)
+        }
     }
 
     static func requireCompleteProtection(
@@ -128,6 +173,19 @@ enum LocalFileSecurity {
             [.protectionKey: FileProtectionType.complete],
             ofItemAtPath: url.path
         )
+        let attributes = try fileManager.attributesOfItem(
+            atPath: url.path
+        )
+#if targetEnvironment(simulator)
+        // CoreSimulator does not consistently expose NSFileProtectionKey.
+        return
+#else
+        guard attributes[.protectionKey] as? FileProtectionType
+                == .complete
+        else {
+            throw CocoaError(.fileWriteNoPermission)
+        }
+#endif
     }
 
     static func prepareProtectedDirectory(
@@ -145,10 +203,7 @@ enum LocalFileSecurity {
             to: url,
             fileManager: fileManager
         )
-        var values = URLResourceValues()
-        values.isExcludedFromBackup = true
-        var mutableURL = url
-        try mutableURL.setResourceValues(values)
+        try requireExcludedFromBackup(url)
     }
 
     static func isInsufficientStorageError(_ error: Error) -> Bool {
@@ -163,7 +218,8 @@ enum LocalFileSecurity {
                 return true
             }
             if current.domain == NSPOSIXErrorDomain,
-               current.code == Int(ENOSPC) {
+               current.code == Int(ENOSPC)
+                || current.code == Int(EDQUOT) {
                 return true
             }
             if let underlying = current.userInfo[
@@ -222,6 +278,13 @@ final class ProtectedPhotoTransfer: Transferable, @unchecked Sendable {
     ) async throws -> ProtectedPhotoTransfer {
         try Task.checkCancellation()
         let fileManager = FileManager.default
+        let hasScopedAccess =
+            sourceURL.startAccessingSecurityScopedResource()
+        defer {
+            if hasScopedAccess {
+                sourceURL.stopAccessingSecurityScopedResource()
+            }
+        }
         let keys: Set<URLResourceKey> = [
             .fileSizeKey,
             .isRegularFileKey,
@@ -264,6 +327,12 @@ final class ProtectedPhotoTransfer: Transferable, @unchecked Sendable {
 
         let input = try FileHandle(forReadingFrom: sourceURL)
         defer { try? input.close() }
+        let initialSourceIdentity = try LocalFileSecurity
+            .regularFileIdentity(for: input.fileDescriptor)
+        guard initialSourceIdentity.byteCount == Int64(sourceSize)
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
         let output = try FileHandle(forWritingTo: destinationURL)
         defer { try? output.close() }
         var copiedBytes: Int64 = 0
@@ -284,10 +353,13 @@ final class ProtectedPhotoTransfer: Transferable, @unchecked Sendable {
         }
         try Task.checkCancellation()
         try output.synchronize()
+        let finalSourceIdentity = try LocalFileSecurity
+            .regularFileIdentity(for: input.fileDescriptor)
         let copiedValues = try destinationURL.resourceValues(
             forKeys: keys
         )
         guard copiedBytes == Int64(sourceSize),
+              finalSourceIdentity == initialSourceIdentity,
               copiedValues.fileSize == sourceSize,
               copiedValues.isRegularFile == true,
               copiedValues.isSymbolicLink != true
@@ -657,12 +729,14 @@ enum PaperPathTemporaryArtifact {
         allowedPrefixes: [String]? = nil,
         fileManager: FileManager = .default
     ) -> URL? {
-        let temporaryRoot = fileManager.temporaryDirectory
-            .resolvingSymlinksInPath()
-            .standardizedFileURL
-        let standardized = candidate
-            .resolvingSymlinksInPath()
-            .standardizedFileURL
+        let temporaryRoot = canonicalizedFileURL(
+            fileManager.temporaryDirectory,
+            fileManager: fileManager
+        )
+        let standardized = canonicalizedFileURL(
+            candidate,
+            fileManager: fileManager
+        )
         let rootComponents = temporaryRoot.pathComponents
         let candidateComponents = standardized.pathComponents
         guard standardized.isFileURL,
@@ -687,6 +761,29 @@ enum PaperPathTemporaryArtifact {
                 == temporaryRoot
         else { return nil }
         return topLevelURL
+    }
+
+    static func canonicalizedFileURL(
+        _ url: URL,
+        fileManager: FileManager = .default
+    ) -> URL {
+        var existingAncestor = url.standardizedFileURL
+        var missingComponents: [String] = []
+        var status = stat()
+        while Darwin.lstat(existingAncestor.path, &status) != 0 {
+            let parent = existingAncestor.deletingLastPathComponent()
+            guard parent.path != existingAncestor.path else { break }
+            missingComponents.append(existingAncestor.lastPathComponent)
+            existingAncestor = parent
+        }
+
+        var result = existingAncestor
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+        for component in missingComponents.reversed() {
+            result.appendPathComponent(component)
+        }
+        return result.standardizedFileURL
     }
 
     static func beginShareLease(
@@ -918,6 +1015,7 @@ struct PaperGrain: View {
 }
 
 struct PPCardModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
     var padding: CGFloat = PPSpacing.regular
     var emphasized = false
 
@@ -925,21 +1023,15 @@ struct PPCardModifier: ViewModifier {
         content
             .padding(padding)
             .background {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: PPRadius.surface,
-                    bottomTrailingRadius: PPRadius.surface,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: PPRadius.surface,
                     style: .continuous
                 )
                     .fill(emphasized ? PPColor.elevated : PPColor.surface)
             }
             .overlay {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: PPRadius.surface,
-                    bottomTrailingRadius: PPRadius.surface,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: PPRadius.surface,
                     style: .continuous
                 )
                     .stroke(
@@ -950,7 +1042,7 @@ struct PPCardModifier: ViewModifier {
                     )
             }
             .shadow(
-                color: emphasized ? .black.opacity(0.08) : .clear,
+                color: emphasized && colorScheme == .light ? .black.opacity(0.06) : .clear,
                 radius: emphasized ? 6 : 0,
                 y: emphasized ? 2 : 0
             )
@@ -958,33 +1050,28 @@ struct PPCardModifier: ViewModifier {
 }
 
 struct PPPaperSurfaceModifier: ViewModifier {
+    @Environment(\.colorScheme) private var colorScheme
     var cornerRadius: CGFloat = PPRadius.surface
     var shadow = true
 
     func body(content: Content) -> some View {
         content
             .background {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: cornerRadius,
-                    bottomTrailingRadius: cornerRadius,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: cornerRadius,
                     style: .continuous
                 )
                 .fill(PPColor.surface)
             }
             .overlay {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: cornerRadius,
-                    bottomTrailingRadius: cornerRadius,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: cornerRadius,
                     style: .continuous
                 )
                 .stroke(PPColor.border.opacity(0.48), lineWidth: 0.55)
             }
             .shadow(
-                color: shadow ? .black.opacity(0.08) : .clear,
+                color: shadow && colorScheme == .light ? .black.opacity(0.06) : .clear,
                 radius: shadow ? 6 : 0,
                 y: shadow ? 3 : 0
             )
@@ -1006,8 +1093,7 @@ struct PPRevealModifier: ViewModifier {
                     visible = true
                 } else {
                     withAnimation(
-                        .spring(response: 0.5, dampingFraction: 0.88)
-                            .delay(delay)
+                        PPMotion.reveal.delay(delay)
                     ) {
                         visible = true
                     }
@@ -1052,28 +1138,22 @@ struct PPPrimaryButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.headline)
-            .foregroundStyle(PPColor.onAccent)
+            .foregroundStyle(isEnabled ? PPColor.onAccent : PPColor.textSecondary)
             .multilineTextAlignment(.center)
             .padding(.horizontal, PPSpacing.regular)
             .padding(.vertical, PPSpacing.small)
             .frame(maxWidth: .infinity)
             .frame(minHeight: 48)
-            .background(PPColor.accent.opacity(configuration.isPressed ? 0.78 : 1))
+            .background(isEnabled ? PPColor.accent : PPColor.surfaceMuted)
             .clipShape(
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: PPRadius.control,
-                    bottomTrailingRadius: PPRadius.control,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: PPRadius.control,
                     style: .continuous
                 )
             )
             .overlay {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: PPRadius.control,
-                    bottomTrailingRadius: PPRadius.control,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: PPRadius.control,
                     style: .continuous
                 )
                     .stroke(PPColor.onAccent.opacity(0.14), lineWidth: 0.6)
@@ -1081,9 +1161,8 @@ struct PPPrimaryButtonStyle: ButtonStyle {
             .scaleEffect(
                 configuration.isPressed && !reduceMotion ? 0.985 : 1
             )
-            .opacity(isEnabled ? 1 : 0.42)
             .animation(
-                reduceMotion ? nil : .easeOut(duration: 0.14),
+                reduceMotion ? nil : PPMotion.press,
                 value: configuration.isPressed
             )
             .hoverEffect(.highlight)
@@ -1098,27 +1177,19 @@ struct PPQuietButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
             .font(.subheadline.weight(.semibold))
-            .foregroundStyle(tint)
+            .foregroundStyle(isEnabled ? tint : PPColor.textSecondary)
             .padding(.horizontal, PPSpacing.regular)
             .frame(minHeight: 44)
-            .background(
-                PPColor.elevated.opacity(configuration.isPressed ? 0.72 : 1)
-            )
+            .background(configuration.isPressed ? PPColor.surfaceMuted : PPColor.elevated)
             .clipShape(
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: PPRadius.control,
-                    bottomTrailingRadius: PPRadius.control,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: PPRadius.control,
                     style: .continuous
                 )
             )
             .overlay {
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: PPRadius.control,
-                    bottomTrailingRadius: PPRadius.control,
-                    topTrailingRadius: 2,
+                RoundedRectangle(
+                    cornerRadius: PPRadius.control,
                     style: .continuous
                 )
                     .stroke(PPColor.border.opacity(0.68), lineWidth: 0.6)
@@ -1126,9 +1197,8 @@ struct PPQuietButtonStyle: ButtonStyle {
             .scaleEffect(
                 configuration.isPressed && !reduceMotion ? 0.98 : 1
             )
-            .opacity(isEnabled ? 1 : 0.42)
             .animation(
-                reduceMotion ? nil : .easeOut(duration: 0.12),
+                reduceMotion ? nil : PPMotion.press,
                 value: configuration.isPressed
             )
             .hoverEffect(.highlight)

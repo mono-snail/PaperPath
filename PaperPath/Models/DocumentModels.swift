@@ -116,17 +116,21 @@ struct DocumentRoute: Hashable {
     let pageIndex: Int?
     let quickTask: PDFQuickTask?
     let expectedContentRevisionID: UUID?
+    let invocationID: UUID?
 
     init(
         recordID: UUID,
         pageIndex: Int? = nil,
         quickTask: PDFQuickTask? = nil,
-        expectedContentRevisionID: UUID? = nil
+        expectedContentRevisionID: UUID? = nil,
+        invocationID: UUID? = nil
     ) {
         self.recordID = recordID
         self.pageIndex = pageIndex
         self.quickTask = quickTask
         self.expectedContentRevisionID = expectedContentRevisionID
+        self.invocationID =
+            invocationID ?? quickTask.map { _ in UUID() }
     }
 
     func bindingExpectedRevision(
@@ -139,7 +143,8 @@ struct DocumentRoute: Hashable {
             recordID: recordID,
             pageIndex: pageIndex,
             quickTask: quickTask,
-            expectedContentRevisionID: contentRevisionID
+            expectedContentRevisionID: contentRevisionID,
+            invocationID: invocationID
         )
     }
 }
@@ -8416,12 +8421,34 @@ struct PDFImageObjectSnapshot: Identifiable, Hashable, Sendable {
     }
 }
 
+enum PDFRedactionAppearance: String, Hashable, Sendable {
+    case black
+    case white
+}
+
 struct PDFRedactionMark: Hashable, Sendable {
     let pageIndex: Int
     let normalizedX: Double
     let normalizedY: Double
     let normalizedWidth: Double
     let normalizedHeight: Double
+    let appearance: PDFRedactionAppearance
+
+    init(
+        pageIndex: Int,
+        normalizedX: Double,
+        normalizedY: Double,
+        normalizedWidth: Double,
+        normalizedHeight: Double,
+        appearance: PDFRedactionAppearance = .black
+    ) {
+        self.pageIndex = pageIndex
+        self.normalizedX = normalizedX
+        self.normalizedY = normalizedY
+        self.normalizedWidth = normalizedWidth
+        self.normalizedHeight = normalizedHeight
+        self.appearance = appearance
+    }
 }
 
 enum PDFRedactionMarkSanitizer {
@@ -8439,6 +8466,7 @@ enum PDFRedactionMarkSanitizer {
                     Int((mark.normalizedWidth * precision).rounded()),
                     Int((mark.normalizedHeight * precision).rounded())
                 ].map(String.init).joined(separator: ":")
+                    + ":\(mark.appearance.rawValue)"
                 return keys.insert(key).inserted
             }
             .sorted {
@@ -8479,7 +8507,8 @@ enum PDFRedactionMarkSanitizer {
             normalizedX: x,
             normalizedY: y,
             normalizedWidth: width,
-            normalizedHeight: height
+            normalizedHeight: height,
+            appearance: mark.appearance
         )
     }
 }
@@ -10893,6 +10922,17 @@ struct PDFBatchDeliveryIssue: Codable, LocalizedError, Hashable, Sendable {
             message: message,
             recovery: "Free device memory or storage, then retry this PDF.",
             isRetryable: true
+        )
+    }
+
+    static func compressionNotBeneficial(_ message: String) -> Self {
+        Self(
+            phase: .verification,
+            code: "V-102",
+            message: message,
+            recovery:
+                "The original is already smaller. PaperPath kept it unchanged.",
+            isRetryable: false
         )
     }
 
@@ -15067,6 +15107,10 @@ enum PaperPathError: LocalizedError {
     case fileTooLarge
     case invalidPassword
     case missingRecognizedText
+    case compressionNotBeneficial(
+        sourceByteCount: Int64,
+        candidateByteCount: Int64
+    )
     case outputVerificationFailed(String)
     case storageFailure(String)
 
@@ -15102,6 +15146,21 @@ enum PaperPathError: LocalizedError {
         case .missingRecognizedText:
             return "Recognize the document text before creating a searchable copy."
                 .localizedUI
+        case .compressionNotBeneficial(
+            let sourceByteCount,
+            let candidateByteCount
+        ):
+            return AppLocalization.format(
+                "Compression would grow this PDF from %@ to %@. PaperPath did not save the larger copy.",
+                ByteCountFormatter.string(
+                    fromByteCount: sourceByteCount,
+                    countStyle: .file
+                ),
+                ByteCountFormatter.string(
+                    fromByteCount: candidateByteCount,
+                    countStyle: .file
+                )
+            )
         case .outputVerificationFailed(let reason):
             return AppLocalization.format(
                 "The output failed verification: %@",

@@ -33,7 +33,8 @@ struct FormReviewView: View {
         let isAvailable: Bool
     }
 
-    private struct FieldCreationContext {
+    private struct FieldCreationContext: Identifiable {
+        let id = UUID()
         let revisionID: UUID
         let fields: [PDFFormFieldSnapshot]
     }
@@ -55,7 +56,6 @@ struct FormReviewView: View {
     @State private var reportContentRevisionID: UUID?
     @State private var isLoading = true
     @State private var reportErrorMessage: String?
-    @State private var isAddingField = false
     @State private var fieldCreationContext: FieldCreationContext?
     @State private var reloadAfterAddingField = false
     @State private var isSharingForCompatibility = false
@@ -261,22 +261,20 @@ struct FormReviewView: View {
                 if bounded != text { searchText = bounded }
             }
             .fullScreenCover(
-                isPresented: $isAddingField,
+                item: $fieldCreationContext,
                 onDismiss: completeFieldCreation
-            ) {
-                if let fieldCreationContext {
-                    PDFFormFieldEditorView(
-                        recordID: recordID,
-                        contentRevisionID: fieldCreationContext.revisionID,
-                        initialPageIndex: initialPageIndex,
-                        existingFields: fieldCreationContext.fields,
-                        onCommitted: {
-                            reloadAfterAddingField = true
-                        }
-                    ) {
+            ) { context in
+                PDFFormFieldEditorView(
+                    recordID: recordID,
+                    contentRevisionID: context.revisionID,
+                    initialPageIndex: initialPageIndex,
+                    existingFields: context.fields,
+                    onCommitted: {
                         reloadAfterAddingField = true
-                        isAddingField = false
                     }
+                ) {
+                    reloadAfterAddingField = true
+                    fieldCreationContext = nil
                 }
             }
             .sheet(
@@ -325,7 +323,7 @@ struct FormReviewView: View {
                 protectedDataAvailable = true
             }
             .onDisappear {
-                if !isAddingField {
+                if fieldCreationContext == nil {
                     interruptProtectedFormWork()
                 }
             }
@@ -357,6 +355,7 @@ struct FormReviewView: View {
             Section {
                 compatibilitySummary
             }
+            .listRowBackground(PPColor.surface)
 
             if report.requiresCompatibleReader {
                 Section("Continue safely") {
@@ -473,6 +472,9 @@ struct FormReviewView: View {
                             Label("Add Field", systemImage: "plus")
                         }
                         .disabled(isFormActionUnavailable)
+                        .accessibilityIdentifier(
+                            "addFormFieldFromReview"
+                        )
                     }
                 }
             }
@@ -621,9 +623,9 @@ struct FormReviewView: View {
                 eyebrow: "FORM",
                 title: formStatusTitle,
                 detail: summaryDetail,
-                symbol: report.incompleteRequiredFields.isEmpty
+                symbol: report.isReadyForVerifiedOutput
                     ? "checkmark.circle"
-                    : "pencil.and.list.clipboard",
+                    : "list.bullet.clipboard",
                 tint: compatibilityColor,
                 metrics: []
             )
@@ -654,7 +656,8 @@ struct FormReviewView: View {
                 .buttonStyle(PPPrimaryButtonStyle())
                 .disabled(isFormActionUnavailable)
                 .accessibilityIdentifier("addFirstFormField")
-            } else if let next = nextIncompleteField {
+            } else if let next = nextIncompleteField,
+                      !report.isReadyForVerifiedOutput {
                 Button {
                     open(next)
                 } label: {
@@ -1455,7 +1458,6 @@ struct FormReviewView: View {
         displayedFieldRequest = nil
         isFilteringFields = false
         displayedFields.removeAll(keepingCapacity: false)
-        isAddingField = false
         fieldCreationContext = nil
         reloadAfterAddingField = false
         isLoading = true
@@ -1472,7 +1474,6 @@ struct FormReviewView: View {
         guard !isFormActionUnavailable, let revisionID = reportContentRevisionID else { return }
         fieldCreationContext = FieldCreationContext(revisionID: revisionID, fields: fields)
         isSearchPresented = false
-        isAddingField = true
     }
 
     private func stopFieldOpening() {

@@ -55,6 +55,7 @@ struct VisionOCRService: Sendable {
         progress: @escaping PDFProgressHandler = { _ in }
     ) async throws -> OCRResult {
         let task = Task.detached(priority: .userInitiated) {
+            try Task.checkCancellation()
             guard let document = PDFDocument(url: url) else {
                 throw PaperPathError.unreadablePDF
             }
@@ -145,6 +146,7 @@ struct VisionOCRService: Sendable {
                 }
                 if savedPages[index] == nil {
                     try await onPageCompleted(result)
+                    try Task.checkCancellation()
                     completedPageCount += 1
                 }
                 pages.append(result)
@@ -158,16 +160,19 @@ struct VisionOCRService: Sendable {
                     progress(fraction)
                 }
             }
+            try Task.checkCancellation()
             return OCRResult(
                 pages: pages,
                 configuration: appliedConfiguration
             )
         }
-        return try await withTaskCancellationHandler {
+        let result = try await withTaskCancellationHandler {
             try await task.value
         } onCancel: {
             task.cancel()
         }
+        try Task.checkCancellation()
+        return result
     }
 
     private func recognize(
@@ -363,18 +368,52 @@ struct VisionOCRService: Sendable {
         bounds: CGRect,
         longestEdge: CGFloat
     ) -> CGImage? {
+        guard let sourcePage = page.pageRef else { return nil }
+        let rotation = ((page.rotation % 360) + 360) % 360
+        let swapsEdges = rotation == 90 || rotation == 270
+        let sourceSize = CGSize(
+            width: swapsEdges ? bounds.height : bounds.width,
+            height: swapsEdges ? bounds.width : bounds.height
+        )
         let scale = min(
-            longestEdge / max(bounds.width, bounds.height),
+            longestEdge / max(sourceSize.width, sourceSize.height),
             4
         )
         let imageSize = CGSize(
-            width: max(1, bounds.width * scale),
-            height: max(1, bounds.height * scale)
+            width: max(1, sourceSize.width * scale),
+            height: max(1, sourceSize.height * scale)
         )
-        return page.thumbnail(
-            of: imageSize,
-            for: .mediaBox
-        ).cgImage
+        let pixelWidth = Int(imageSize.width.rounded(.up))
+        let pixelHeight = Int(imageSize.height.rounded(.up))
+        guard let context = CGContext(
+            data: nil,
+            width: pixelWidth,
+            height: pixelHeight,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue
+        ) else {
+            return nil
+        }
+        let imageBounds = CGRect(
+            x: 0,
+            y: 0,
+            width: pixelWidth,
+            height: pixelHeight
+        )
+        context.setFillColor(UIColor.white.cgColor)
+        context.fill(imageBounds)
+        context.concatenate(
+            sourcePage.getDrawingTransform(
+                .mediaBox,
+                rect: imageBounds,
+                rotate: 0,
+                preserveAspectRatio: true
+            )
+        )
+        context.drawPDFPage(sourcePage)
+        return context.makeImage()
     }
 
     private func enhancedTextImage(_ image: CGImage) -> CGImage? {
@@ -407,7 +446,10 @@ struct VisionOCRService: Sendable {
             $0.confidence < 0.68
         }.count
         return result.confidence < 0.82
-            || characterCount < 80
+            || (
+                characterCount < 80
+                    && result.confidence < 0.9
+            )
             || (
                 !result.blocks.isEmpty
                     && weakBlocks * 4 >= result.blocks.count

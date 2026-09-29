@@ -205,26 +205,44 @@ struct PDFTextReplacementView: View {
         ScrollView(.horizontal) {
             HStack(spacing: PPSpacing.medium) {
                 Label(
+                    replacementReadinessTitle,
+                    systemImage: replacementReadinessSymbol
+                )
+                .foregroundStyle(replacementReadinessColor)
+                Label(
                     "\(selection.originalText.count)",
                     systemImage: "textformat"
+                )
+                .accessibilityLabel(
+                    AppLocalization.format(
+                        "%lld characters",
+                        selection.originalText.count
+                    )
                 )
                 Label(
                     "\(selection.lineCount)",
                     systemImage: "text.alignleft"
                 )
+                .accessibilityLabel(
+                    AppLocalization.format("%lld lines", selection.lineCount)
+                )
                 Label(
                     "\(selection.flowRegions.count)",
                     systemImage: "square.dashed"
+                )
+                .accessibilityLabel(
+                    AppLocalization.format(
+                        "%lld text boxes",
+                        selection.flowRegions.count
+                    )
                 )
                 Label(
                     "\(pageIndices.count)",
                     systemImage: "doc.on.doc"
                 )
-                Label(
-                    replacementReadinessTitle,
-                    systemImage: replacementReadinessSymbol
+                .accessibilityLabel(
+                    AppLocalization.format("%lld pages", pageIndices.count)
                 )
-                .foregroundStyle(replacementReadinessColor)
             }
             .fixedSize(horizontal: true, vertical: false)
             .padding(.horizontal, PPSpacing.regular)
@@ -529,19 +547,27 @@ struct PDFTextReplacementView: View {
                     .accessibilityAddTraits(.updatesFrequently)
                 }
 
-                HStack(alignment: .top, spacing: PPSpacing.small) {
-                    Text("ORIGINAL")
-                        .font(.caption2.smallCaps().weight(.bold))
-                        .foregroundStyle(PPColor.textSecondary)
+                OperationBoundaryNotice(
+                    title: "Edited pages are rebuilt",
+                    detail: "The selected pages use a rebuilt appearance and searchable text layer. Embedded files, bookmarks, and custom page labels may not be preserved.",
+                    identifier: "textReplacementStructureBoundary"
+                )
+
+                DisclosureGroup {
                     Text(selection.originalText)
-                        .font(.caption)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(
-                            dynamicTypeSize.ppPrefersExpandedLayout
-                                ? 3
-                                : 1
-                        )
+                        .font(.body)
+                        .foregroundStyle(PPColor.textPrimary)
+                        .textSelection(.enabled)
                         .fixedSize(horizontal: false, vertical: true)
+                        .padding(.vertical, PPSpacing.small)
+                } label: {
+                    Label(
+                        "Original selection".localizedUI,
+                        systemImage: "text.quote"
+                    )
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(minHeight: 44)
                 }
 
                 VStack(alignment: .trailing, spacing: PPSpacing.xSmall) {

@@ -1,4 +1,5 @@
 import CryptoKit
+import Darwin
 import Foundation
 import Security
 
@@ -92,9 +93,27 @@ struct PDFWorkingCopyTransactionJournal: Codable {
         let backupFingerprint: String
     }
 
+    struct RemovedSidecar: Codable {
+        let destinationPath: String
+        let backupPath: String
+    }
+
     let id: UUID
     let createdAt: Date
     let entries: [Entry]
+    let removedSidecars: [RemovedSidecar]?
+
+    init(
+        id: UUID,
+        createdAt: Date,
+        entries: [Entry],
+        removedSidecars: [RemovedSidecar]? = nil
+    ) {
+        self.id = id
+        self.createdAt = createdAt
+        self.entries = entries
+        self.removedSidecars = removedSidecars
+    }
 }
 
 struct ProtectedDataTransactionJournal: Codable {
@@ -174,7 +193,7 @@ actor DocumentStore {
     private static let maximumRecoveryJournalBytes: Int64 =
         1 * 1_024 * 1_024
     private static let maximumDeepInspectionBytes: Int64 =
-        128 * 1_024 * 1_024
+        32 * 1_024 * 1_024
     private static let maximumPinnedOfficeExportsPerDocument = 4
     private static let maximumPinnedOfficeExportBytes: Int64 =
         512 * 1_024 * 1_024
@@ -877,9 +896,7 @@ actor DocumentStore {
             let sourceIdentityKeys: Set<URLResourceKey> = [
                 .isRegularFileKey,
                 .isSymbolicLinkKey,
-                .fileSizeKey,
-                .contentModificationDateKey,
-                .fileResourceIdentifierKey
+                .fileSizeKey
             ]
             let sourceValues = try sourceURL.resourceValues(
                 forKeys: sourceIdentityKeys
@@ -976,12 +993,6 @@ actor DocumentStore {
             guard finalSourceValues.isRegularFile == true,
                   finalSourceValues.isSymbolicLink != true,
                   finalSourceValues.fileSize == rawSourceByteCount,
-                  finalSourceValues.contentModificationDate
-                    == sourceValues.contentModificationDate,
-                  fileResourceIdentifiersMatch(
-                    sourceValues.fileResourceIdentifier,
-                    finalSourceValues.fileResourceIdentifier
-                  ),
                   destinationValues.isRegularFile == true,
                   destinationValues.isSymbolicLink != true,
                   destinationValues.fileSize == rawSourceByteCount,
@@ -1296,9 +1307,7 @@ actor DocumentStore {
         let identityKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
             .isSymbolicLinkKey,
-            .fileSizeKey,
-            .contentModificationDateKey,
-            .fileResourceIdentifierKey
+            .fileSizeKey
         ]
         let sourceValues = try sourceURL.resourceValues(
             forKeys: identityKeys
@@ -1397,12 +1406,6 @@ actor DocumentStore {
                   finalSourceValues.isSymbolicLink != true,
                   Int64(finalSourceValues.fileSize ?? -1)
                     == report.artifactByteCount,
-                  finalSourceValues.contentModificationDate
-                    == sourceValues.contentModificationDate,
-                  fileResourceIdentifiersMatch(
-                    sourceValues.fileResourceIdentifier,
-                    finalSourceValues.fileResourceIdentifier
-                  ),
                   destinationValues.isRegularFile == true,
                   destinationValues.isSymbolicLink != true,
                   Int64(destinationValues.fileSize ?? -1)
@@ -1446,15 +1449,18 @@ actor DocumentStore {
                 isDirectory: true
             )
         let destinationURL = parent.appendingPathComponent(fileName)
+        let canonicalParent =
+            PaperPathTemporaryArtifact.canonicalizedFileURL(
+                parent,
+                fileManager: fileManager
+            )
         guard let managed =
                 PaperPathTemporaryArtifact.managedTopLevelItem(
                     containing: destinationURL,
                     allowedPrefixes: ["PaperPath-FilesExport-"],
                     fileManager: fileManager
                 ),
-              managed == parent
-                .resolvingSymlinksInPath()
-                .standardizedFileURL
+              managed == canonicalParent
         else {
             throw PaperPathError.outputVerificationFailed(
                 "the Files export destination is not managed by PaperPath"
@@ -1493,9 +1499,7 @@ actor DocumentStore {
         let identityKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
             .isSymbolicLinkKey,
-            .fileSizeKey,
-            .contentModificationDateKey,
-            .fileResourceIdentifierKey
+            .fileSizeKey
         ]
         let sourceValues = try sourceURL.resourceValues(
             forKeys: identityKeys
@@ -1510,26 +1514,6 @@ actor DocumentStore {
                 "the working PDF no longer matches its library record"
             )
         }
-#if DEBUG
-        // #region debug-point F:files-export-store-capacity
-        reportFrequentUIFreezeDebugEvent(
-            hypothesisID: "F",
-            location: "DocumentStore.prepareFilesExportCopy",
-            message: "Files export source verified",
-            data: [
-                "recordID": recordID.uuidString,
-                "sourceBytes": String(rawSourceByteCount),
-                "recordBytes": String(record.profile.byteCount),
-                "availableCapacity": String(
-                    availableCapacity(rootURL) ?? -1
-                ),
-                "parentExists": String(
-                    fileManager.fileExists(atPath: parent.path)
-                )
-            ]
-        )
-        // #endregion
-#endif
         try ensureCapacity(for: sourceURL)
         let (totalWorkBytes, didOverflow) = Int64(rawSourceByteCount)
             .multipliedReportingOverflow(by: 2)
@@ -1547,21 +1531,6 @@ actor DocumentStore {
             at: parent,
             fileManager: fileManager
         )
-#if DEBUG
-        // #region debug-point F:files-export-directory-ready
-        reportFrequentUIFreezeDebugEvent(
-            hypothesisID: "F",
-            location: "DocumentStore.prepareFilesExportCopy",
-            message: "Files export directory ready",
-            data: [
-                "recordID": recordID.uuidString,
-                "parentExists": String(
-                    fileManager.fileExists(atPath: parent.path)
-                )
-            ]
-        )
-        // #endregion
-#endif
         do {
             let copiedFile = try copyProtectedFile(
                 from: sourceURL,
@@ -1624,12 +1593,6 @@ actor DocumentStore {
             guard finalSourceValues.isRegularFile == true,
                   finalSourceValues.isSymbolicLink != true,
                   finalSourceValues.fileSize == rawSourceByteCount,
-                  finalSourceValues.contentModificationDate
-                    == sourceValues.contentModificationDate,
-                  fileResourceIdentifiersMatch(
-                    sourceValues.fileResourceIdentifier,
-                    finalSourceValues.fileResourceIdentifier
-                  ),
                   destinationValues.isRegularFile == true,
                   destinationValues.isSymbolicLink != true,
                   destinationValues.fileSize == rawSourceByteCount,
@@ -1645,24 +1608,6 @@ actor DocumentStore {
                     "the Files export copy did not match the working PDF"
                 )
             }
-#if DEBUG
-            // #region debug-point F:files-export-store-succeeded
-            reportFrequentUIFreezeDebugEvent(
-                hypothesisID: "F",
-                location: "DocumentStore.prepareFilesExportCopy",
-                message: "Files export copy verified",
-                data: [
-                    "recordID": recordID.uuidString,
-                    "copiedBytes": String(copiedFile.byteCount),
-                    "destinationExists": String(
-                        fileManager.fileExists(
-                            atPath: destinationURL.path
-                        )
-                    )
-                ]
-            )
-            // #endregion
-#endif
             return destinationURL
         } catch {
             _ = PaperPathTemporaryArtifact.removeManagedItem(
@@ -2103,15 +2048,33 @@ actor DocumentStore {
             )
         }
         metadataWrites.append((indexData, indexURL))
+        let invalidatedSidecarURLs = invalidateAnalysis
+            ? preparedCopies.flatMap {
+                sidecarURLs(for: $0.recordID)
+            }.filter {
+                fileManager.fileExists(atPath: $0.path)
+            }
+            : []
+        guard Set(
+            invalidatedSidecarURLs.map {
+                $0.standardizedFileURL.path
+            }
+        ).count == invalidatedSidecarURLs.count else {
+            throw PaperPathError.storageFailure(
+                "The analysis cleanup contains duplicate files."
+            )
+        }
         try ensurePreparedCopyTransactionCapacity(
             sources: Array(sourceByDestination.values),
-            destinations: Array(sourceByDestination.keys),
+            destinations: Array(sourceByDestination.keys)
+                + invalidatedSidecarURLs,
             metadataWrites: metadataWrites
         )
 
         var stagingByDestination: [URL: URL] = [:]
         var backupByDestination: [URL: URL] = [:]
         var backupFingerprintByDestination: [URL: String] = [:]
+        var sidecarBackupByDestination: [URL: URL] = [:]
         let destinations = Array(sourceByDestination.keys)
             + metadataWrites.map(\.destination)
         var didStartPublishing = false
@@ -2176,8 +2139,21 @@ actor DocumentStore {
                 backupFingerprintByDestination[destination] =
                     copiedBackup.sha256
             }
+            for destination in invalidatedSidecarURLs {
+                let backup = rootURL.appendingPathComponent(
+                    ".batch-sidecar-rollback-\(UUID().uuidString)",
+                    isDirectory: false
+                )
+                sidecarBackupByDestination[destination] = backup
+                try copySidecarForRollback(
+                    from: destination,
+                    to: backup
+                )
+            }
 
-            guard backupByDestination.count == destinations.count else {
+            guard backupByDestination.count == destinations.count,
+                  sidecarBackupByDestination.count
+                    == invalidatedSidecarURLs.count else {
                 throw PaperPathError.storageFailure(
                     "The PDF batch recovery set is incomplete."
                 )
@@ -2200,9 +2176,22 @@ actor DocumentStore {
                         stagingPath: staging.standardizedFileURL.path,
                         backupFingerprint: backupFingerprint
                     )
+                },
+                removedSidecars: invalidatedSidecarURLs.compactMap {
+                    destination in
+                    guard let backup =
+                        sidecarBackupByDestination[destination]
+                    else { return nil }
+                    return PDFWorkingCopyTransactionJournal.RemovedSidecar(
+                        destinationPath:
+                            destination.standardizedFileURL.path,
+                        backupPath: backup.standardizedFileURL.path
+                    )
                 }
             )
-            guard journal.entries.count == destinations.count else {
+            guard journal.entries.count == destinations.count,
+                  journal.removedSidecars?.count
+                    == invalidatedSidecarURLs.count else {
                 throw PaperPathError.storageFailure(
                     "The PDF batch recovery journal is incomplete."
                 )
@@ -2232,6 +2221,16 @@ actor DocumentStore {
                     )
                 }
                 try requireFileProtection(to: destination)
+            }
+            for sidecar in invalidatedSidecarURLs {
+                try removeIfPresent(sidecar)
+            }
+            guard invalidatedSidecarURLs.allSatisfy({
+                !fileManager.fileExists(atPath: $0.path)
+            }) else {
+                throw PaperPathError.storageFailure(
+                    "The stale document analysis could not be removed."
+                )
             }
 
             let committedRecords = try loadIndex()
@@ -2296,12 +2295,32 @@ actor DocumentStore {
                         rollbackFailed = true
                     }
                 }
+                for destination in invalidatedSidecarURLs.reversed() {
+                    do {
+                        guard let backup =
+                            sidecarBackupByDestination[destination]
+                        else {
+                            throw PaperPathError.storageFailure(
+                                "The analysis recovery set is incomplete."
+                            )
+                        }
+                        try restoreInvalidatedSidecarBackup(
+                            from: backup,
+                            to: destination
+                        )
+                    } catch {
+                        rollbackFailed = true
+                    }
+                }
             }
             for staging in stagingByDestination.values {
                 try? removeIfPresent(staging)
             }
             if !rollbackFailed {
                 for backup in backupByDestination.values {
+                    try? removeIfPresent(backup)
+                }
+                for backup in sidecarBackupByDestination.values {
                     try? removeIfPresent(backup)
                 }
                 try? removeIfPresent(
@@ -2323,12 +2342,11 @@ actor DocumentStore {
         for backup in backupByDestination.values {
             try? removeIfPresent(backup)
         }
+        for backup in sidecarBackupByDestination.values {
+            try? removeIfPresent(backup)
+        }
         for prepared in preparedCopies {
             removeDeliveryPreflight(recordID: prepared.recordID)
-            if invalidateAnalysis,
-               let updated = updatedByID[prepared.recordID] {
-                try? removeSidecars(for: updated)
-            }
         }
         return PreparedPDFWorkingCopyBatchResult(
             records: preparedCopies.compactMap {
@@ -3260,6 +3278,11 @@ actor DocumentStore {
         }
 
         let parent = destinationURL.deletingLastPathComponent()
+        let canonicalParent =
+            PaperPathTemporaryArtifact.canonicalizedFileURL(
+                parent,
+                fileManager: fileManager
+            )
         let managed = PaperPathTemporaryArtifact.managedTopLevelItem(
             containing: destinationURL,
             allowedPrefixes: [
@@ -3268,9 +3291,7 @@ actor DocumentStore {
             fileManager: fileManager
         )
         guard let managed,
-              managed == parent
-                .resolvingSymlinksInPath()
-                .standardizedFileURL,
+              managed == canonicalParent,
               isSafeOfficeExportFileName(
                 destinationURL.lastPathComponent
               ),
@@ -3287,9 +3308,7 @@ actor DocumentStore {
         let identityKeys: Set<URLResourceKey> = [
             .isRegularFileKey,
             .isSymbolicLinkKey,
-            .fileSizeKey,
-            .contentModificationDateKey,
-            .fileResourceIdentifierKey
+            .fileSizeKey
         ]
         let sourceValues = try sourceURL.resourceValues(
             forKeys: identityKeys
@@ -3364,12 +3383,6 @@ actor DocumentStore {
                   finalSourceValues.isSymbolicLink != true,
                   Int64(finalSourceValues.fileSize ?? -1)
                     == expectedByteCount,
-                  finalSourceValues.contentModificationDate
-                    == sourceValues.contentModificationDate,
-                  fileResourceIdentifiersMatch(
-                    sourceValues.fileResourceIdentifier,
-                    finalSourceValues.fileResourceIdentifier
-                  ),
                   destinationValues.isRegularFile == true,
                   destinationValues.isSymbolicLink != true,
                   Int64(destinationValues.fileSize ?? -1)
@@ -8576,7 +8589,7 @@ actor DocumentStore {
         ] {
             try requireFileProtection(to: directory)
         }
-        excludeFromBackup(rootURL)
+        try LocalFileSecurity.requireExcludedFromBackup(rootURL)
         for url in persistedMetadataURLs
         where fileManager.fileExists(atPath: url.path) {
             try requireProtectedRegularFile(at: url)
@@ -8590,6 +8603,8 @@ actor DocumentStore {
             didRecoverInterruptedProtectedDataTransaction = true
         }
         if !didPruneOrphanedDocumentStagingFiles {
+            try PDFAnnotationTransaction(fileManager: fileManager)
+                .recoverAll(in: filesURL)
             removeOrphanedDocumentStagingFiles()
             didPruneOrphanedDocumentStagingFiles = true
         }
@@ -8631,9 +8646,13 @@ actor DocumentStore {
 
         guard !journal.entries.isEmpty,
               journal.entries.count
-                <= PDFBatesBatchPlan.maximumDocumentCount + 2,
+                + (journal.removedSidecars?.count ?? 0)
+                <= PDFBatesBatchPlan.maximumDocumentCount * 5 + 2,
               isValidRecoveryJournal(journal),
-              journal.entries.allSatisfy(isValidRecoveryJournalEntry)
+              journal.entries.allSatisfy(isValidRecoveryJournalEntry),
+              (journal.removedSidecars ?? []).allSatisfy(
+                  isValidRecoveryJournalSidecar
+              )
         else {
             throw PaperPathError.storageFailure(
                 "An interrupted PDF batch has an invalid recovery journal."
@@ -8658,6 +8677,16 @@ actor DocumentStore {
                 recoveryFailed = true
             }
         }
+        for sidecar in (journal.removedSidecars ?? []).reversed() {
+            do {
+                try restoreInvalidatedSidecarBackup(
+                    from: URL(fileURLWithPath: sidecar.backupPath),
+                    to: URL(fileURLWithPath: sidecar.destinationPath)
+                )
+            } catch {
+                recoveryFailed = true
+            }
+        }
         guard !recoveryFailed else {
             throw PaperPathError.storageFailure(
                 "An interrupted PDF batch could not be fully restored."
@@ -8666,6 +8695,173 @@ actor DocumentStore {
         try fileManager.removeItem(
             at: workingCopyTransactionJournalURL
         )
+        for sidecar in journal.removedSidecars ?? [] {
+            let backup = URL(fileURLWithPath: sidecar.backupPath)
+            if fileManager.fileExists(atPath: backup.path) {
+                try? fileManager.removeItem(at: backup)
+            }
+        }
+    }
+
+    private func copySidecarForRollback(
+        from source: URL,
+        to backup: URL
+    ) throws {
+        let sourceValues = try source.resourceValues(
+            forKeys: [
+                .isDirectoryKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard sourceValues.isSymbolicLink != true,
+              sourceValues.isDirectory == true
+                || sourceValues.isRegularFile == true else {
+            throw PaperPathError.storageFailure(
+                "A document analysis sidecar is invalid."
+            )
+        }
+        try fileManager.copyItem(at: source, to: backup)
+        let backupValues = try backup.resourceValues(
+            forKeys: [
+                .isDirectoryKey,
+                .isRegularFileKey,
+                .isSymbolicLinkKey
+            ]
+        )
+        guard backupValues.isSymbolicLink != true,
+              backupValues.isDirectory == sourceValues.isDirectory,
+              backupValues.isRegularFile == sourceValues.isRegularFile
+        else {
+            throw PaperPathError.storageFailure(
+                "A document analysis rollback copy is invalid."
+            )
+        }
+        if sourceValues.isRegularFile == true {
+            guard try fileFingerprint(at: source)
+                    == fileFingerprint(at: backup) else {
+                throw PaperPathError.storageFailure(
+                    "A document analysis rollback copy did not match."
+                )
+            }
+        }
+        try requireFileProtection(to: backup)
+    }
+
+    private func restoreInvalidatedSidecarBackup(
+        from backup: URL,
+        to destination: URL
+    ) throws {
+        guard fileManager.fileExists(atPath: backup.path) else {
+            guard fileManager.fileExists(atPath: destination.path) else {
+                throw PaperPathError.storageFailure(
+                    "A document analysis rollback copy is missing."
+                )
+            }
+            try requireFileProtection(to: destination)
+            return
+        }
+        let backupValues = try backup.resourceValues(
+            forKeys: [.isDirectoryKey, .isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard backupValues.isSymbolicLink != true else {
+            throw PaperPathError.storageFailure(
+                "A document analysis rollback copy is invalid."
+            )
+        }
+        if backupValues.isDirectory == true {
+            // A failed recursive removal can leave only part of a checkpoint.
+            // Restore missing files, but never overwrite an independent change.
+            let backupFiles = try checkpointSidecarFiles(in: backup)
+            if !fileManager.fileExists(atPath: destination.path) {
+                try LocalFileSecurity.prepareProtectedDirectory(
+                    at: destination,
+                    fileManager: fileManager
+                )
+            }
+            let destinationFiles = try checkpointSidecarFiles(in: destination)
+            guard Set(destinationFiles.keys).isSubset(of: Set(backupFiles.keys)) else {
+                throw PaperPathError.storageFailure(
+                    "A document analysis sidecar changed during rollback."
+                )
+            }
+            for name in backupFiles.keys.sorted() {
+                guard let source = backupFiles[name] else { continue }
+                try restoreSidecarFile(
+                    from: source,
+                    to: destination.appendingPathComponent(name)
+                )
+            }
+            try requireFileProtection(to: destination)
+            return
+        }
+        guard backupValues.isRegularFile == true else {
+            throw PaperPathError.storageFailure(
+                "A document analysis rollback copy is invalid."
+            )
+        }
+        try restoreSidecarFile(from: backup, to: destination)
+    }
+
+    private func checkpointSidecarFiles(in directory: URL) throws -> [String: URL] {
+        let values = try directory.resourceValues(
+            forKeys: [.isDirectoryKey, .isSymbolicLinkKey]
+        )
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            throw PaperPathError.storageFailure(
+                "A document analysis checkpoint directory is invalid."
+            )
+        }
+        let files = try fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+        )
+        guard files.count <= OCRResult.maximumPageCount + 1 else {
+            throw PaperPathError.storageFailure(
+                "A document analysis checkpoint contains too many files."
+            )
+        }
+        for file in files {
+            let values = try file.resourceValues(
+                forKeys: [.isRegularFileKey, .isSymbolicLinkKey]
+            )
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw PaperPathError.storageFailure(
+                    "A document analysis checkpoint file is invalid."
+                )
+            }
+        }
+        return Dictionary(uniqueKeysWithValues: files.map { ($0.lastPathComponent, $0) })
+    }
+
+    private func restoreSidecarFile(from backup: URL, to destination: URL) throws {
+        // Recovery must finish even when the operation that triggered it was cancelled.
+        let expected = try fileFingerprint(at: backup, checksCancellation: false)
+        if fileManager.fileExists(atPath: destination.path) {
+            guard try fileFingerprint(at: destination, checksCancellation: false)
+                    == expected else {
+                throw PaperPathError.storageFailure(
+                    "A document analysis sidecar changed during rollback."
+                )
+            }
+        } else {
+            let staging = rootURL.appendingPathComponent(
+                ".batch-sidecar-restore-\(UUID().uuidString)"
+            )
+            defer { try? fileManager.removeItem(at: staging) }
+            // Keep the complete backup until the entire rollback succeeds.
+            // A partial copy must never become the next recovery's destination.
+            try fileManager.copyItem(at: backup, to: staging)
+            try requireFileProtection(to: staging)
+            guard try fileFingerprint(at: staging, checksCancellation: false)
+                    == expected else {
+                throw PaperPathError.storageFailure(
+                    "A document analysis rollback copy did not match."
+                )
+            }
+            try fileManager.moveItem(at: staging, to: destination)
+        }
+        try requireFileProtection(to: destination)
     }
 
     private func restoreVerifiedWorkingCopyBackup(
@@ -8949,12 +9145,39 @@ actor DocumentStore {
                     .standardizedFileURL.path
             }
         )
+        let sidecarDestinationPaths = Set(
+            (journal.removedSidecars ?? []).map {
+                URL(fileURLWithPath: $0.destinationPath)
+                    .standardizedFileURL.path
+            }
+        )
+        let sidecarBackupPaths = Set(
+            (journal.removedSidecars ?? []).map {
+                URL(fileURLWithPath: $0.backupPath)
+                    .standardizedFileURL.path
+            }
+        )
         return destinationPaths.count == journal.entries.count
             && backupPaths.count == journal.entries.count
             && stagingPaths.count == journal.entries.count
+            && sidecarDestinationPaths.count
+                == (journal.removedSidecars?.count ?? 0)
+            && sidecarBackupPaths.count
+                == (journal.removedSidecars?.count ?? 0)
             && destinationPaths.isDisjoint(with: backupPaths)
             && destinationPaths.isDisjoint(with: stagingPaths)
             && backupPaths.isDisjoint(with: stagingPaths)
+            && destinationPaths.isDisjoint(
+                with: sidecarDestinationPaths
+            )
+            && destinationPaths.isDisjoint(with: sidecarBackupPaths)
+            && backupPaths.isDisjoint(with: sidecarDestinationPaths)
+            && backupPaths.isDisjoint(with: sidecarBackupPaths)
+            && stagingPaths.isDisjoint(with: sidecarDestinationPaths)
+            && stagingPaths.isDisjoint(with: sidecarBackupPaths)
+            && sidecarDestinationPaths.isDisjoint(
+                with: sidecarBackupPaths
+            )
     }
 
     func isValidRecoveryJournalEntry(
@@ -9006,6 +9229,44 @@ actor DocumentStore {
             staging.lastPathComponent,
             prefix: ".batch-metadata-"
         )
+    }
+
+    private func isValidRecoveryJournalSidecar(
+        _ sidecar: PDFWorkingCopyTransactionJournal.RemovedSidecar
+    ) -> Bool {
+        let destination = URL(
+            fileURLWithPath: sidecar.destinationPath
+        ).standardizedFileURL
+        let backup = URL(
+            fileURLWithPath: sidecar.backupPath
+        ).standardizedFileURL
+        let parent = destination.deletingLastPathComponent()
+            .standardizedFileURL
+        let isJSONSidecar =
+            (
+                parent == indicesURL.standardizedFileURL
+                    || parent == ocrURL.standardizedFileURL
+                    || parent == preflightURL.standardizedFileURL
+            )
+            && destination.pathExtension.lowercased() == "json"
+            && UUID(
+                uuidString: destination.deletingPathExtension()
+                    .lastPathComponent
+            ) != nil
+        let isOCRCheckpoint =
+            parent == ocrURL.standardizedFileURL
+            && destination.pathExtension.lowercased() == "resume"
+            && UUID(
+                uuidString: destination.deletingPathExtension()
+                    .lastPathComponent
+            ) != nil
+        return (isJSONSidecar || isOCRCheckpoint)
+            && backup.deletingLastPathComponent().standardizedFileURL
+                == rootURL.standardizedFileURL
+            && isUUIDTemporaryFileName(
+                backup.lastPathComponent,
+                prefix: ".batch-sidecar-rollback-"
+            )
     }
 
     private func isUUIDTemporaryFileName(
@@ -9061,6 +9322,12 @@ actor DocumentStore {
                   let url = enumerator.nextObject() as? URL {
                 inspectedCount += 1
                 let name = url.lastPathComponent
+                // Legacy backups have no destination journal. Preserve them
+                // rather than treating a potentially unique original as trash.
+                guard !name.hasPrefix(".annotation-rollback-"),
+                      !name.hasPrefix(".annotation-recovery-") else {
+                    continue
+                }
                 let isKnownStaging = stagingPrefixes.contains(
                     where: name.hasPrefix
                 )
@@ -11729,77 +11996,170 @@ actor DocumentStore {
         compactInspectionByteCount: Int64?
     ) {
         guard expectedByteCount > 0,
-              expectedByteCount <= 1_073_741_824,
-              fileManager.createFile(
-                  atPath: destinationURL.path,
-                  contents: nil
-              )
-        else {
+              expectedByteCount <= 1_073_741_824 else {
             throw PaperPathError.unreadablePDF
+        }
+        errno = 0
+        guard fileManager.createFile(
+            atPath: destinationURL.path,
+            contents: nil
+        ) else {
+            throw storageWriteFailure(
+                "The private PDF copy could not be created.",
+                posixCode: errno
+            )
         }
         try requireFileProtection(to: destinationURL)
 
-        let input = try FileHandle(forReadingFrom: sourceURL)
-        defer { try? input.close() }
-        let output = try FileHandle(forWritingTo: destinationURL)
-        defer { try? output.close() }
+        let input = Darwin.open(
+            sourceURL.path,
+            O_RDONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard input >= 0 else {
+            throw PaperPathError.unreadablePDF
+        }
+        defer { _ = Darwin.close(input) }
+        let initialSourceIdentity: LocalFileSecurity.RegularFileIdentity
+        do {
+            initialSourceIdentity = try LocalFileSecurity
+                .regularFileIdentity(for: input)
+        } catch {
+            throw PaperPathError.unreadablePDF
+        }
+        guard initialSourceIdentity.byteCount == expectedByteCount else {
+            throw PaperPathError.outputVerificationFailed(
+                "the source PDF changed before its private copy was created"
+            )
+        }
+        let output = Darwin.open(
+            destinationURL.path,
+            O_WRONLY | O_CLOEXEC | O_NOFOLLOW
+        )
+        guard output >= 0 else {
+            throw storageWriteFailure(
+                "The private PDF copy could not be opened.",
+                posixCode: errno
+            )
+        }
+        defer { _ = Darwin.close(output) }
 
         var hasher = SHA256()
         var copiedByteCount: Int64 = 0
         var lastReportedByteCount: Int64 = 0
         var lastNonPaddingOffset: Int64 = -1
         var lastEOFEndOffset: Int64?
-        let eofMarker = Data("%%EOF".utf8)
-        var markerTail = Data()
+        let eofMarker = Array("%%EOF".utf8)
+        let eofPrefixLengths = [0, 1, 0, 0, 0]
+        var eofMatchLength = 0
+        let buffer = UnsafeMutableRawBufferPointer.allocate(
+            byteCount: 1_048_576,
+            alignment: MemoryLayout<UInt64>.alignment
+        )
+        defer { buffer.deallocate() }
+        let zeroBuffer = UnsafeMutableRawBufferPointer.allocate(
+            byteCount: buffer.count,
+            alignment: MemoryLayout<UInt64>.alignment
+        )
+        defer { zeroBuffer.deallocate() }
+        guard let bufferAddress = buffer.baseAddress,
+              let zeroBufferAddress = zeroBuffer.baseAddress else {
+            throw PaperPathError.storageFailure(
+                "The private PDF copy buffer could not be allocated."
+            )
+        }
+        memset(zeroBufferAddress, 0, zeroBuffer.count)
         while true {
             try Task.checkCancellation()
-            let copiedChunk = try autoreleasepool {
-                let data =
-                    try input.read(upToCount: 1_048_576) ?? Data()
-                guard !data.isEmpty else { return false }
-                let chunkStartOffset = copiedByteCount
-                for (index, byte) in data.enumerated()
-                where !Self.isPDFTrailingPaddingByte(byte) {
-                    lastNonPaddingOffset =
-                        chunkStartOffset + Int64(index)
-                }
-                var searchable = markerTail
-                searchable.append(data)
-                let searchableStartOffset =
-                    chunkStartOffset - Int64(markerTail.count)
-                var searchStart = searchable.startIndex
-                while searchStart < searchable.endIndex,
-                      let range = searchable.range(
-                        of: eofMarker,
-                        in: searchStart..<searchable.endIndex
-                      ) {
-                    lastEOFEndOffset =
-                        searchableStartOffset
-                            + Int64(range.upperBound)
-                    searchStart = searchable.index(
-                        after: range.lowerBound
-                    )
-                }
-                markerTail = Data(
-                    searchable.suffix(
-                        max(0, eofMarker.count - 1)
-                    )
+            var readByteCount: Int
+            repeat {
+                readByteCount = Darwin.read(
+                    input,
+                    bufferAddress,
+                    buffer.count
                 )
-                let (nextByteCount, overflow) = copiedByteCount
-                    .addingReportingOverflow(Int64(data.count))
-                guard !overflow,
-                      nextByteCount <= expectedByteCount
-                else {
+            } while readByteCount < 0 && errno == EINTR
+            guard readByteCount >= 0 else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the source PDF could not be read completely"
+                )
+            }
+            guard readByteCount > 0 else { break }
+
+            let chunkStartOffset = copiedByteCount
+            let chunk = UnsafeRawBufferPointer(
+                start: bufferAddress,
+                count: readByteCount
+            )
+            let containsNonZeroByte =
+                memcmp(
+                    bufferAddress,
+                    zeroBufferAddress,
+                    readByteCount
+                ) != 0
+            if containsNonZeroByte {
+                for (index, byte) in chunk.enumerated() {
+                    if !Self.isPDFTrailingPaddingByte(byte) {
+                        lastNonPaddingOffset =
+                            chunkStartOffset + Int64(index)
+                    }
+                    while eofMatchLength > 0,
+                          byte != eofMarker[eofMatchLength] {
+                        eofMatchLength =
+                            eofPrefixLengths[eofMatchLength - 1]
+                    }
+                    if byte == eofMarker[eofMatchLength] {
+                        eofMatchLength += 1
+                    }
+                    if eofMatchLength == eofMarker.count {
+                        lastEOFEndOffset =
+                            chunkStartOffset + Int64(index) + 1
+                        eofMatchLength =
+                            eofPrefixLengths[eofMatchLength - 1]
+                    }
+                }
+            } else {
+                eofMatchLength = 0
+            }
+            let (nextByteCount, overflow) = copiedByteCount
+                .addingReportingOverflow(Int64(readByteCount))
+            guard !overflow,
+                  nextByteCount <= expectedByteCount else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the source PDF changed while its private copy was created"
+                )
+            }
+            if containsNonZeroByte {
+                var writtenByteCount = 0
+                while writtenByteCount < readByteCount {
+                    let result = Darwin.write(
+                        output,
+                        bufferAddress.advanced(by: writtenByteCount),
+                        readByteCount - writtenByteCount
+                    )
+                    if result > 0 {
+                        writtenByteCount += result
+                    } else if result < 0, errno == EINTR {
+                        continue
+                    } else {
+                        throw storageWriteFailure(
+                            "The private PDF copy could not be written completely.",
+                            posixCode: errno
+                        )
+                    }
+                }
+            } else {
+                guard Darwin.lseek(
+                    output,
+                    off_t(nextByteCount),
+                    SEEK_SET
+                ) == off_t(nextByteCount) else {
                     throw PaperPathError.outputVerificationFailed(
-                        "the source PDF changed while its private copy was created"
+                        "the private PDF copy could not preserve its byte layout"
                     )
                 }
-                try output.write(contentsOf: data)
-                hasher.update(data: data)
-                copiedByteCount = nextByteCount
-                return true
             }
-            if !copiedChunk { break }
+            hasher.update(bufferPointer: chunk)
+            copiedByteCount = nextByteCount
             if copiedByteCount - lastReportedByteCount
                 >= 4 * 1_024 * 1_024
                 || copiedByteCount == expectedByteCount {
@@ -11808,8 +12168,34 @@ actor DocumentStore {
             }
         }
         try Task.checkCancellation()
-        try output.synchronize()
-        guard copiedByteCount == expectedByteCount else {
+        guard Darwin.ftruncate(output, off_t(copiedByteCount)) == 0 else {
+            throw storageWriteFailure(
+                "The private PDF copy could not be finalized.",
+                posixCode: errno
+            )
+        }
+        guard Darwin.fsync(output) == 0 else {
+            throw storageWriteFailure(
+                "The private PDF copy could not be synchronized.",
+                posixCode: errno
+            )
+        }
+        let finalSourceIdentity: LocalFileSecurity.RegularFileIdentity
+        let currentPathIdentity: LocalFileSecurity.RegularFileIdentity
+        do {
+            finalSourceIdentity = try LocalFileSecurity
+                .regularFileIdentity(for: input)
+            currentPathIdentity = try LocalFileSecurity
+                .regularFileIdentity(at: sourceURL)
+        } catch {
+            throw PaperPathError.outputVerificationFailed(
+                "the source PDF changed while its private copy was created"
+            )
+        }
+        guard copiedByteCount == expectedByteCount,
+              finalSourceIdentity == initialSourceIdentity,
+              currentPathIdentity == finalSourceIdentity
+        else {
             throw PaperPathError.outputVerificationFailed(
                 "the source PDF changed while its private copy was created"
             )
@@ -11832,6 +12218,19 @@ actor DocumentStore {
             }.joined(),
             compactInspectionByteCount
         )
+    }
+
+    private func storageWriteFailure(
+        _ detail: String,
+        posixCode: Int32
+    ) -> PaperPathError {
+        let error = NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(posixCode)
+        )
+        return LocalFileSecurity.isInsufficientStorageError(error)
+            ? .insufficientStorage
+            : .storageFailure(detail)
     }
 
     private func importedProfile(
@@ -11966,9 +12365,7 @@ actor DocumentStore {
         let identityKeys: Set<URLResourceKey> = [
             .fileSizeKey,
             .isRegularFileKey,
-            .isSymbolicLinkKey,
-            .contentModificationDateKey,
-            .fileResourceIdentifierKey
+            .isSymbolicLinkKey
         ]
         let initialValues = try uncachedResourceValues(
             at: url,
@@ -11984,6 +12381,18 @@ actor DocumentStore {
         let totalBytes = Int64(rawByteCount)
         let input = try FileHandle(forReadingFrom: url)
         defer { try? input.close() }
+        let initialIdentity: LocalFileSecurity.RegularFileIdentity
+        do {
+            initialIdentity = try LocalFileSecurity
+                .regularFileIdentity(for: input.fileDescriptor)
+        } catch {
+            throw PaperPathError.unreadablePDF
+        }
+        guard initialIdentity.byteCount == totalBytes else {
+            throw PaperPathError.outputVerificationFailed(
+                "the file changed before its checksum was calculated"
+            )
+        }
         var hasher = SHA256()
         let bufferSize: Int64 = 4 * 1_024 * 1_024
         var processedBytes: Int64 = 0
@@ -12010,19 +12419,21 @@ actor DocumentStore {
             }
         }
         let trailingByte = try input.read(upToCount: 1) ?? Data()
-        let finalValues = try uncachedResourceValues(
-            at: url,
-            forKeys: identityKeys
-        )
+        let finalIdentity: LocalFileSecurity.RegularFileIdentity
+        let currentPathIdentity: LocalFileSecurity.RegularFileIdentity
+        do {
+            finalIdentity = try LocalFileSecurity
+                .regularFileIdentity(for: input.fileDescriptor)
+            currentPathIdentity = try LocalFileSecurity
+                .regularFileIdentity(at: url)
+        } catch {
+            throw PaperPathError.outputVerificationFailed(
+                "the file changed while its checksum was calculated"
+            )
+        }
         guard trailingByte.isEmpty,
-              finalValues.isRegularFile == true,
-              finalValues.isSymbolicLink != true,
-              finalValues.fileSize == rawByteCount,
-              finalValues.contentModificationDate == initialValues.contentModificationDate,
-              fileResourceIdentifiersMatch(
-                initialValues.fileResourceIdentifier,
-                finalValues.fileResourceIdentifier
-              )
+              finalIdentity == initialIdentity,
+              currentPathIdentity == finalIdentity
         else {
             throw PaperPathError.outputVerificationFailed(
                 "the file changed while its checksum was calculated"

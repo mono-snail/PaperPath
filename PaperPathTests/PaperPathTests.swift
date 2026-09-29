@@ -1,4 +1,5 @@
 import Darwin
+import ImageIO
 import PDFKit
 import UIKit
 import XCTest
@@ -74,7 +75,8 @@ final class PaperPathTests: XCTestCase {
             [
                 "fill-sign-verify",
                 "redact-verify",
-                "scan-ocr-verify"
+                "scan-ocr-verify",
+                "ocr-page-recovery"
             ]
         )
     }
@@ -858,11 +860,14 @@ final class PaperPathTests: XCTestCase {
                 brief: brief,
                 textIndex: index
             )
+            let storedIndex = index.bound(
+                to: record.contentRevisionID
+            )
 
             let sameStoreIndices = try await store.loadTextIndices()
             XCTAssertEqual(
                 sameStoreIndices[record.id],
-                index,
+                storedIndex,
                 "Same-store read failed after replacement \(revision)"
             )
 
@@ -870,7 +875,7 @@ final class PaperPathTests: XCTestCase {
             let reopenedIndices = try await reopenedStore.loadTextIndices()
             XCTAssertEqual(
                 reopenedIndices[record.id],
-                index,
+                storedIndex,
                 "Reopened-store read failed after replacement \(revision)"
             )
         }
@@ -1863,6 +1868,77 @@ final class PaperPathTests: XCTestCase {
         }
     }
 
+    func testLibraryForegroundActivityOnlyBlocksOwningScene_BitsUT() {
+        XCTAssertFalse(
+            LibraryForegroundActivity(
+                isFileImportActive: false,
+                isPhotoPreparationActive: false,
+                isScanCreationActive: false
+            ).blocksInteraction
+        )
+
+        for activity in [
+            LibraryForegroundActivity(
+                isFileImportActive: true,
+                isPhotoPreparationActive: false,
+                isScanCreationActive: false
+            ),
+            LibraryForegroundActivity(
+                isFileImportActive: false,
+                isPhotoPreparationActive: true,
+                isScanCreationActive: false
+            ),
+            LibraryForegroundActivity(
+                isFileImportActive: false,
+                isPhotoPreparationActive: false,
+                isScanCreationActive: true
+            )
+        ] {
+            XCTAssertTrue(activity.blocksInteraction)
+        }
+    }
+
+    func testExternalDocumentHandoffQueuePreservesSceneOwnership_BitsUT() {
+        let firstScene = UUID()
+        let secondScene = UUID()
+        let firstRecord = UUID()
+        let secondRecord = UUID()
+        let unscopedRecord = UUID()
+        var queue = ExternalDocumentHandoffQueue()
+
+        queue.enqueue(
+            recordID: firstRecord,
+            targetSceneID: firstScene
+        )
+        queue.enqueue(
+            recordID: secondRecord,
+            targetSceneID: secondScene
+        )
+        queue.enqueue(
+            recordID: unscopedRecord,
+            targetSceneID: nil
+        )
+        queue.enqueue(
+            recordID: firstRecord,
+            targetSceneID: secondScene
+        )
+
+        XCTAssertEqual(queue.entries.count, 3)
+        XCTAssertEqual(queue.recordID(for: firstScene), firstRecord)
+        XCTAssertEqual(queue.recordID(for: secondScene), secondRecord)
+
+        queue.clear(recordID: firstRecord)
+        XCTAssertEqual(
+            queue.recordID(for: firstScene),
+            unscopedRecord
+        )
+        XCTAssertEqual(queue.recordID(for: secondScene), secondRecord)
+
+        queue.releaseTarget(for: secondScene)
+        XCTAssertEqual(queue.recordID(for: firstScene), secondRecord)
+        XCTAssertEqual(queue.recordID(for: secondScene), secondRecord)
+    }
+
     func testSourceLocationDetectsExternalChange() async throws {
         let source = temporaryDirectory
             .appendingPathComponent("source-location.pdf")
@@ -1941,7 +2017,7 @@ final class PaperPathTests: XCTestCase {
         )
         let exportURL = try XCTUnwrap(
             exportResult,
-            model.errorMessage ?? "Files export returned no URL"
+            "Files export returned no URL"
         )
         let exportDirectory = exportURL.deletingLastPathComponent()
 
@@ -1966,7 +2042,7 @@ final class PaperPathTests: XCTestCase {
         )
         let interruptedURL = try XCTUnwrap(
             interruptedResult,
-            model.errorMessage ?? "Files export returned no URL"
+            "Files export returned no URL"
         )
         let interruptedDirectory = interruptedURL.deletingLastPathComponent()
         XCTAssertTrue(
@@ -2031,6 +2107,69 @@ final class PaperPathTests: XCTestCase {
             let saved = try await store.load()
             XCTAssertNil(saved)
         }
+    }
+
+    func testSignatureStoreRejectsTruncatedImageAndPreservesSelection()
+        async throws {
+        let root = temporaryDirectory.appendingPathComponent(
+            "TruncatedSignature"
+        )
+        let store = SignatureStore(rootURL: root)
+        let valid = PDFTestFixtureFactory.makeSignaturePNG(seed: 7)
+        let original = try await store.add(valid)
+        let idat = try XCTUnwrap(valid.range(of: Data("IDAT".utf8)))
+        let truncated = Data(valid.prefix(idat.upperBound + 4))
+        let source = try XCTUnwrap(
+            CGImageSourceCreateWithData(truncated as CFData, nil)
+        )
+        XCTAssertNotNil(
+            CGImageSourceCopyPropertiesAtIndex(source, 0, nil),
+            "The fixture must preserve readable image dimensions."
+        )
+
+        do {
+            _ = try await store.add(truncated)
+            XCTFail("Incomplete signature pixels must be rejected.")
+        } catch PaperPathError.storageFailure {
+            // 拒绝损坏图片时，之前保存和选中的签名必须完整保留。
+        }
+        let reloaded = try await store.loadLibrary()
+        XCTAssertEqual(reloaded, original)
+        let selected = try await store.load()
+        XCTAssertEqual(selected, valid)
+    }
+
+    func testSignatureStoreRepairsTruncatedEntryAndRetainsValidSignature()
+        async throws {
+        let root = temporaryDirectory.appendingPathComponent(
+            "RepairTruncatedSignature"
+        )
+        let store = SignatureStore(rootURL: root)
+        let valid = PDFTestFixtureFactory.makeSignaturePNG(seed: 8)
+        let saved = try await store.add(valid)
+        let idat = try XCTUnwrap(valid.range(of: Data("IDAT".utf8)))
+        let damaged = SavedSignature(
+            data: Data(valid.prefix(idat.upperBound + 4))
+        )
+        let library = SavedSignatureLibrary(
+            selectedID: damaged.id,
+            entries: [damaged] + saved.entries
+        )
+        let libraryURL = root.appendingPathComponent(
+            "saved-signatures.json"
+        )
+        try JSONEncoder().encode(library).write(
+            to: libraryURL,
+            options: [.atomic, .completeFileProtection]
+        )
+
+        let repaired = try await store.loadLibrary()
+        XCTAssertEqual(repaired, saved)
+        let persisted = try JSONDecoder().decode(
+            SavedSignatureLibrary.self,
+            from: Data(contentsOf: libraryURL)
+        )
+        XCTAssertEqual(persisted, saved)
     }
 
     func testStoreAppliesCompleteFileProtection() async throws {
@@ -2219,10 +2358,62 @@ final class PaperPathTests: XCTestCase {
         }
     }
 
-    func testCompressionCreatesSeparateReadablePDF() throws {
+    func testOCRCancellationAfterLastCheckpointRemainsResumable()
+        async throws {
+        let source = temporaryDirectory.appendingPathComponent(
+            "checkpoint-cancellation.pdf"
+        )
+        let checkpointURL = temporaryDirectory.appendingPathComponent(
+            "last-page-checkpoint.json"
+        )
+        try makePDF(at: source, pages: ["PaperPath invoice total 1280"])
+        let identity = OCRCheckpointIdentity(
+            recordID: UUID(),
+            revisionID: UUID(),
+            pageCount: 1,
+            configuration: .automatic
+        )
+
+        do {
+            _ = try await VisionOCRService().recognize(
+                url: source,
+                onPageCompleted: { page in
+                    try JSONEncoder().encode(page).write(
+                        to: checkpointURL,
+                        options: .atomic
+                    )
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            )
+            XCTFail("Cancelling at the last checkpoint must not return success.")
+        } catch is CancellationError {
+            // 已完成的检查点保留；取消不得伪装为整个识别任务成功。
+        }
+
+        let savedPage = try JSONDecoder().decode(
+            OCRPageResult.self,
+            from: Data(contentsOf: checkpointURL)
+        )
+        XCTAssertEqual(savedPage.pageIndex, 0)
+        XCTAssertTrue(savedPage.text.lowercased().contains("invoice"))
+        let resumed = try await VisionOCRService().recognize(
+            url: source,
+            checkpoint: OCRCheckpoint(identity: identity, pages: [savedPage]),
+            onPageCompleted: { _ in
+                XCTFail("A saved page must not be recognized again.")
+            }
+        )
+        XCTAssertEqual(resumed.pages.count, 1)
+        XCTAssertEqual(resumed.pages.first?.text, savedPage.text)
+    }
+
+    func testCompressionCreatesSeparateSmallerReadablePDF() throws {
         let source = temporaryDirectory.appendingPathComponent("source.pdf")
         let output = temporaryDirectory.appendingPathComponent("compressed.pdf")
-        try makePDF(at: source, pages: ["One", "Two"])
+        try PDFTestFixtureFactory.makeTrailingPaddedPDF(
+            at: source,
+            paddingBytes: 1_024 * 1_024
+        )
 
         try PDFOutputService().compress(
             sourceURL: source,
@@ -2231,8 +2422,62 @@ final class PaperPathTests: XCTestCase {
         )
 
         let compressed = try XCTUnwrap(PDFDocument(url: output))
-        XCTAssertEqual(compressed.pageCount, 2)
+        XCTAssertEqual(compressed.pageCount, 1)
+        XCTAssertLessThan(
+            try XCTUnwrap(
+                output.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            ),
+            try XCTUnwrap(
+                source.resourceValues(forKeys: [.fileSizeKey]).fileSize
+            )
+        )
         XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testCompressionDoesNotPublishCopyLargerThanSource() throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("optimized-source.pdf")
+        let output = temporaryDirectory
+            .appendingPathComponent("larger-compressed.pdf")
+        try makePDF(at: source, pages: ["One", "Two"])
+        let sourceByteCount = try XCTUnwrap(
+            source.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        )
+
+        XCTAssertThrowsError(
+            try PDFOutputService().compress(
+                sourceURL: source,
+                destination: output,
+                quality: .balanced
+            )
+        ) { error in
+            guard case let PaperPathError.compressionNotBeneficial(
+                originalByteCount,
+                candidateByteCount
+            ) = error else {
+                return XCTFail("Unexpected compression error: \(error)")
+            }
+            XCTAssertEqual(originalByteCount, Int64(sourceByteCount))
+            XCTAssertGreaterThanOrEqual(
+                candidateByteCount,
+                originalByteCount
+            )
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testCompressionEstimateIdentifiesAlreadySmallerOriginal() {
+        let estimate = PDFCompressionEstimate(
+            sourceByteCount: 256 * 1_024,
+            estimatedByteCount: 25 * 1_024 * 1_024,
+            sampledPageCount: 3
+        )
+
+        XCTAssertFalse(estimate.isBeneficial)
+        XCTAssertNil(estimate.savingsPercent)
+        XCTAssertFalse(estimate.formattedSourceSize.isEmpty)
+        XCTAssertFalse(estimate.formattedSize.isEmpty)
     }
 
     func testSafeShareAuditVerifiesEveryPageAndFingerprint() throws {
@@ -2736,6 +2981,44 @@ final class PaperPathTests: XCTestCase {
         XCTAssertTrue(protected.isEncrypted)
         XCTAssertTrue(protected.isLocked)
         XCTAssertTrue(protected.unlock(withPassword: "local-only"))
+    }
+
+    func testProtectedCopySupportsStructuredDemoPDF_BitsUT() throws {
+        let source = temporaryDirectory
+            .appendingPathComponent("structured-source.pdf")
+        let output = temporaryDirectory
+            .appendingPathComponent("structured-protected.pdf")
+        try DemoPDFBuilder.create(at: source)
+
+        try PDFOutputService().protect(
+            sourceURL: source,
+            destination: output,
+            password: "PaperPath-2026"
+        )
+
+        let protected = try XCTUnwrap(PDFDocument(url: output))
+        XCTAssertTrue(protected.isEncrypted)
+        XCTAssertTrue(protected.isLocked)
+        XCTAssertTrue(protected.unlock(withPassword: "PaperPath-2026"))
+        XCTAssertEqual(protected.pageCount, 2)
+        XCTAssertEqual(
+            protected.page(at: 0)?.annotations
+                .filter { $0.widgetFieldType == .text }
+                .count,
+            1
+        )
+        XCTAssertEqual(
+            protected.page(at: 1)?.annotations
+                .filter { $0.widgetFieldType == .signature }
+                .count,
+            1
+        )
+        XCTAssertEqual(
+            protected.page(at: 1)?.annotations
+                .filter { $0.type == "Link" }
+                .count,
+            1
+        )
     }
 
     func testProtectedCopyRejectsShortPassword() throws {
@@ -5226,7 +5509,7 @@ private final class ProcessMemorySampler: @unchecked Sendable {
         peak = currentResidentMemory()
         lock.unlock()
         group.enter()
-        DispatchQueue.global(qos: .utility).async { [self] in
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
             defer { group.leave() }
             while running {
                 let current = currentResidentMemory()

@@ -7,6 +7,7 @@ struct FirstRunExperienceView: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     let hasExistingDocuments: Bool
     let onSample: () async -> Bool
@@ -35,22 +36,7 @@ struct FirstRunExperienceView: View {
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(1)
                     Spacer()
-                    if page < 2 {
-                        Button("Skip") {
-                            onComplete()
-                        }
-                        .font(
-                            dynamicTypeSize.ppPrefersExpandedLayout
-                                ? .caption.weight(.semibold)
-                                : .subheadline.weight(.semibold)
-                        )
-                        .foregroundStyle(PPColor.textSecondary)
-                        .keyboardShortcut(.cancelAction)
-                        .accessibilityHint(
-                            "Skips the introduction and opens Home"
-                                .localizedUI
-                        )
-                    }
+                    OnDeviceBadge(compact: true)
                 }
                 .padding(.horizontal, PPSpacing.large)
                 .padding(.top, PPSpacing.medium)
@@ -60,11 +46,15 @@ struct FirstRunExperienceView: View {
                     .padding(.top, PPSpacing.small)
                     .disabled(isCreatingSample)
 
+                if usesWideOnboardingLayout {
+                    Spacer(minLength: 0)
+                }
+
                 TabView(selection: $page) {
                     introPage(
-                        eyebrow: "START WITH A GOAL",
-                        title: "What do you need to do?",
-                        detail: "Sign, fill, combine, compress, or hide information. PaperPath shows only the steps you need.",
+                        eyebrow: "YOUR PDF, YOUR DEVICE",
+                        title: "Finish important PDFs privately.",
+                        detail: "Fill, sign, or remove sensitive information. Keep your original and check the copy before sharing.",
                         illustration: .workspace,
                         tint: PPColor.accent
                     )
@@ -89,77 +79,68 @@ struct FirstRunExperienceView: View {
                     .tag(2)
                 }
                 .tabViewStyle(.page(indexDisplayMode: .never))
+                .frame(maxHeight: usesWideOnboardingLayout ? 420 : .infinity)
                 .disabled(isCreatingSample)
 
                 VStack(spacing: PPSpacing.medium) {
-                    if page < 2 {
-                        Button {
-                            changeOnboardingPage(to: page + 1)
-                        } label: {
-                            Label(
-                                "Continue",
-                                systemImage: "arrow.right"
-                            )
+                    Button {
+                        if sampleTask != nil {
+                            interruptSampleCreation()
+                        } else {
+                            createSample()
                         }
-                        .buttonStyle(PPPrimaryButtonStyle())
-                        .keyboardShortcut(.defaultAction)
-                    } else {
-                        Button {
-                            if sampleTask != nil {
-                                interruptSampleCreation()
-                            } else {
-                                createSample()
-                            }
-                        } label: {
-                            HStack(spacing: PPSpacing.small) {
-                                if isCreatingSample {
-                                    Image(systemName: "stop.fill")
-                                } else if sampleError != nil {
-                                    Image(systemName: "arrow.clockwise")
-                                } else if hasExistingDocuments {
-                                    Image(systemName: "doc.text")
-                                } else {
-                                    Image(systemName: "doc.text.magnifyingglass")
-                                }
-                                Text(sampleActionTitle.localizedUI)
-                            }
-                        }
-                        .buttonStyle(PPPrimaryButtonStyle())
-                        .keyboardShortcut(.defaultAction)
-                        .accessibilityIdentifier("samplePDFAction")
-                        .accessibilityHint(
-                            (
-                                isCreatingSample
-                                    ? "Stops before the sample is added"
-                                    : hasExistingDocuments
-                                        ? "Opens an existing private working copy"
-                                        : "Creates a local sample PDF"
-                            ).localizedUI
-                        )
-
-                        Button("Go to Home") {
-                            onComplete()
-                        }
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(PPColor.textSecondary)
-                        .frame(minHeight: 44)
-                        .disabled(isCreatingSample)
-                        .keyboardShortcut(.cancelAction)
-
-                        if let sampleError {
-                            Label(
-                                sampleError.localizedUI,
-                                systemImage: "exclamationmark.triangle"
-                            )
-                            .font(.caption)
-                            .foregroundStyle(PPColor.rose)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .accessibilityAddTraits(.isStaticText)
+                    } label: {
+                        HStack(spacing: PPSpacing.small) {
+                            Image(systemName: isCreatingSample
+                                ? "stop.fill"
+                                : sampleError != nil
+                                    ? "arrow.clockwise"
+                                    : "doc.text.magnifyingglass")
+                            Text(sampleActionTitle.localizedUI)
                         }
                     }
+                    .buttonStyle(PPPrimaryButtonStyle())
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("samplePDFAction")
+                    .accessibilityHint(
+                        (
+                            isCreatingSample
+                                ? "Stops before the sample is added"
+                                : hasExistingDocuments
+                                    ? "Opens an existing private working copy"
+                                    : "Creates a local sample PDF"
+                        ).localizedUI
+                    )
+
+                    Button("Go to Home") {
+                        onComplete()
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(maxWidth: .infinity, minHeight: 44)
+                    .contentShape(Rectangle())
+                    .disabled(isCreatingSample)
+                    .keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("onboardingOpenLibrary")
+
+                    if let sampleError {
+                        Label(
+                            sampleError.localizedUI,
+                            systemImage: "exclamationmark.triangle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(PPColor.rose)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityAddTraits(.isStaticText)
+                    }
                 }
+                .frame(maxWidth: 520)
                 .padding(.horizontal, PPSpacing.large)
                 .padding(.bottom, PPSpacing.large)
+
+                if usesWideOnboardingLayout {
+                    Spacer(minLength: 0)
+                }
             }
         }
         .interactiveDismissDisabled()
@@ -271,7 +252,7 @@ struct FirstRunExperienceView: View {
             return "Try Sample Again"
         }
         return hasExistingDocuments
-            ? "Open a Working Copy"
+            ? "Open My PDF"
             : "Try a Sample PDF"
     }
 
@@ -310,6 +291,11 @@ struct FirstRunExperienceView: View {
         .accessibilityValue(selected ? "Selected" : "")
     }
 
+    private var usesWideOnboardingLayout: Bool {
+        horizontalSizeClass == .regular
+            && !dynamicTypeSize.ppPrefersExpandedLayout
+    }
+
     private func changeOnboardingPage(to requestedPage: Int) {
         let resolvedPage = min(max(0, requestedPage), 2)
         guard resolvedPage != page else { return }
@@ -337,9 +323,11 @@ struct FirstRunExperienceView: View {
                 )
 
                 Group {
-                    if dynamicTypeSize.ppPrefersExpandedLayout {
-                        VStack(spacing: PPSpacing.small) {
+                    if horizontalSizeClass == .compact
+                        || dynamicTypeSize.ppPrefersExpandedLayout {
+                        VStack(alignment: .leading, spacing: PPSpacing.xLarge) {
                             onboardingIllustration(illustration)
+                                .frame(maxWidth: .infinity)
                             onboardingCopy(
                                 eyebrow: eyebrow,
                                 title: title,
@@ -364,9 +352,11 @@ struct FirstRunExperienceView: View {
                         }
                     }
                 }
+                .frame(maxWidth: 720)
                 .padding(.horizontal, PPSpacing.xLarge)
 
-                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                if horizontalSizeClass == .regular,
+                   !dynamicTypeSize.ppPrefersExpandedLayout {
                     onboardingEvidence
                         .padding(.horizontal, PPSpacing.large)
                 }
@@ -437,33 +427,38 @@ struct FirstRunExperienceView: View {
 
     private var onboardingEvidence: some View {
         LazyVGrid(
-            columns: [
-                GridItem(
-                    .adaptive(minimum: 106, maximum: 190),
+            columns: Array(
+                repeating: GridItem(
+                    .flexible(minimum: 0),
                     spacing: PPSpacing.medium
-                )
-            ],
+                ),
+                count: 3
+            ),
             spacing: PPSpacing.medium
         ) {
             StudioMetricCell(
                 value: "Choose",
                 label: "A clear goal",
                 symbol: "scope",
-                tint: PPColor.accent
+                tint: PPColor.accent,
+                allowsLabelWrapping: true
             )
             StudioMetricCell(
                 value: "Edit",
                 label: "Private copy",
                 symbol: "doc.on.doc",
-                tint: PPColor.cyan
+                tint: PPColor.cyan,
+                allowsLabelWrapping: true
             )
             StudioMetricCell(
                 value: "Check",
                 label: "Before sharing",
                 symbol: "checkmark.seal",
-                tint: PPColor.mint
+                tint: PPColor.mint,
+                allowsLabelWrapping: true
             )
         }
+        .frame(maxWidth: 720)
     }
 
     private func createSample() {
@@ -518,6 +513,7 @@ struct AppSettingsView: View {
     @State private var isShowingPrivacy = false
     @State private var isShowingWhatsNew = false
     @State private var isShowingUnlock = false
+    @State private var isShowingPrivacyInformation = false
     @State private var isShowingDiagnostics = false
     @State private var diagnosticsURL: URL?
     @State private var resetConfirmation = ""
@@ -553,6 +549,11 @@ struct AppSettingsView: View {
                         remindersSection
                         supportSection
                         dataSection
+                        Text("PaperPath PDF · \(AppPreferences.versionDescription)")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(PPColor.textSecondary)
+                            .frame(maxWidth: .infinity)
+                            .accessibilityIdentifier("settingsAppVersion")
                     }
                     .frame(maxWidth: 720)
                     .padding(PPSpacing.regular)
@@ -612,6 +613,9 @@ struct AppSettingsView: View {
         }
         .sheet(isPresented: $isShowingUnlock) {
             FullUnlockView(context: .settings)
+        }
+        .sheet(isPresented: $isShowingPrivacyInformation) {
+            PrivacyInformationView()
         }
         .sheet(
             isPresented: $isShowingDiagnostics,
@@ -711,6 +715,7 @@ struct AppSettingsView: View {
                     )
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("settingsPurchase")
             }
         }
     }
@@ -956,6 +961,22 @@ struct AppSettingsView: View {
             symbol: "questionmark.circle",
             tint: PPColor.cyan
         ) {
+            settingsControl(tint: PPColor.mint) {
+                Button {
+                    isShowingPrivacyInformation = true
+                } label: {
+                    settingsActionLabel(
+                        "Privacy & Data",
+                        detail: "Read how your files and purchases are handled",
+                        symbol: "hand.raised",
+                        tint: PPColor.mint,
+                        disclosure: true
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("settingsPrivacyInformation")
+            }
+
             settingsControl(tint: PPColor.cyan) {
                 Button {
                     createDiagnostics()
@@ -1620,6 +1641,7 @@ struct FullUnlockView: View {
     @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityVoiceOverEnabled)
     private var voiceOverEnabled
@@ -1629,23 +1651,19 @@ struct FullUnlockView: View {
     @State private var purchaseSuccessFeedback = 0
     @State private var purchaseErrorFeedback = 0
     @State private var continuationTask: Task<Void, Never>?
+    @State private var isShowingPrivacyInformation = false
 
     var body: some View {
         NavigationStack {
             ZStack {
                 PPCanvas()
 
-                ViewThatFits(in: .vertical) {
+                ScrollView {
                     unlockContent
-                        .padding(.horizontal, PPSpacing.xLarge)
+                        .padding(.horizontal, PPSpacing.regular)
                         .padding(.vertical, PPSpacing.regular)
-
-                    ScrollView {
-                        unlockContent
-                            .padding(PPSpacing.xLarge)
-                    }
-                    .scrollIndicators(.hidden)
                 }
+                .scrollBounceBehavior(.basedOnSize)
             }
             .navigationTitle("Verified Output Lifetime")
             .navigationBarTitleDisplayMode(.inline)
@@ -1665,6 +1683,9 @@ struct FullUnlockView: View {
             }
         }
         .interactiveDismissDisabled(isCommittingStoreOperation)
+        .sheet(isPresented: $isShowingPrivacyInformation) {
+            PrivacyInformationView()
+        }
         .task {
             await purchase.prepare()
         }
@@ -1743,17 +1764,24 @@ struct FullUnlockView: View {
                 detail: "Create verified copies without a limit",
                 symbol: "checkmark.shield"
             )
-            capability(
-                "Single & Batch Delivery",
-                detail: "Check one final copy or a complete batch",
-                symbol: "square.stack.3d.up"
-            )
-            capability(
-                "No Subscription",
-                detail: ownershipCapabilityDetail,
-                symbol: "infinity"
-            )
             purchaseActions
+            DisclosureGroup {
+                capability(
+                    "Single & Batch Delivery",
+                    detail: "Check one final copy or a complete batch",
+                    symbol: "square.stack.3d.up"
+                )
+                capability(
+                    "No Subscription",
+                    detail: ownershipCapabilityDetail,
+                    symbol: "infinity"
+                )
+            } label: {
+                Text("Included with unlock".localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .frame(minHeight: 44)
+            }
+            purchaseInformation
         }
         .frame(maxWidth: 560)
         .frame(maxWidth: .infinity)
@@ -1769,11 +1797,11 @@ struct FullUnlockView: View {
             )
 
             if dynamicTypeSize.ppPrefersExpandedLayout {
-                VStack(
-                    alignment: .leading,
-                    spacing: PPSpacing.medium
-                ) {
-                    unlockIllustration
+                unlockCopy
+            } else if horizontalSizeClass != .regular {
+                HStack(spacing: PPSpacing.medium) {
+                    PPIllustration(kind: .tools, width: 72)
+                        .accessibilityHidden(true)
                     unlockCopy
                 }
             } else {
@@ -1985,10 +2013,15 @@ struct FullUnlockView: View {
                     }
                     .buttonStyle(PPPrimaryButtonStyle())
                     .disabled(purchase.isBusy)
+                    .accessibilityIdentifier("purchaseCheckStatus")
                 } else {
                     Button {
                         Task {
-                            await purchase.purchase()
+                            if purchase.product == nil {
+                                await purchase.prepare()
+                            } else {
+                                await purchase.purchase()
+                            }
                         }
                     } label: {
                         HStack(spacing: PPSpacing.small) {
@@ -2005,6 +2038,7 @@ struct FullUnlockView: View {
                     }
                     .buttonStyle(PPPrimaryButtonStyle())
                     .disabled(purchase.purchaseControlsDisabled)
+                    .accessibilityIdentifier("purchasePrimaryAction")
 
                     Button {
                         Task {
@@ -2023,6 +2057,7 @@ struct FullUnlockView: View {
                     .disabled(purchase.purchaseControlsDisabled)
                     .font(.subheadline.weight(.semibold))
                     .frame(minHeight: 44)
+                    .accessibilityIdentifier("purchaseRestore")
                 }
             }
 
@@ -2034,13 +2069,29 @@ struct FullUnlockView: View {
                 .accessibilityAddTraits(
                     purchase.isBusy ? .updatesFrequently : []
                 )
+
+            if !purchase.isUnlocked,
+               purchase.status == .pending || purchase.product == nil {
+                Text(
+                    (purchase.status == .pending
+                        ? "Approval may take time. You can close this screen and keep using PaperPath; access updates when the App Store approves the purchase."
+                        : "Connect to the App Store to load the price. Your PDFs, reading, and editing remain available.")
+                    .localizedUI
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .padding(.top, PPSpacing.small)
     }
 
     private var purchaseButtonTitle: String {
         guard let product = purchase.product else {
-            return "Unlock with App Store".localizedUI
+            return (purchase.isBusy
+                ? "Checking App Store"
+                : "Retry App Store").localizedUI
         }
         return AppLocalization.format(
             "Unlock for %@",
@@ -2052,6 +2103,33 @@ struct FullUnlockView: View {
         purchase.product?.isFamilyShareable == true
             ? "One purchase · Family Sharing"
             : "One purchase · no recurring charge"
+    }
+
+    private var purchaseInformation: some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            Text("A one-time purchase is charged to your Apple Account after confirmation. Restore it with the same Apple Account on another device. There is no recurring charge.".localizedUI)
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: PPSpacing.large) { purchaseInformationLinks }
+                VStack(alignment: .leading, spacing: 0) { purchaseInformationLinks }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var purchaseInformationLinks: some View {
+        Button("Privacy & Data".localizedUI) {
+            isShowingPrivacyInformation = true
+        }
+        .accessibilityIdentifier("purchasePrivacyInformation")
+        .frame(minHeight: 44)
+        Link(
+            "Terms of Use".localizedUI,
+            destination: URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
+        )
+        .frame(minHeight: 44)
     }
 
     private var isCommittingStoreOperation: Bool {
@@ -2092,35 +2170,35 @@ struct WhatsNewView: View {
                             .frame(maxWidth: .infinity)
                         VStack(alignment: .leading, spacing: PPSpacing.small) {
                             StudioSectionRule(
-                                title: "PAPERPATH V5",
-                                detail: "Paper studio edition",
+                                title: "PaperPath \(AppPreferences.currentRelease)",
+                                detail: "Ready for your next PDF",
                                 symbol: "doc.text.magnifyingglass",
                                 tint: PPColor.rose
                             )
-                            Text("A calmer path to trusted output")
+                            Text("Finish your PDF with fewer steps")
                                 .font(.title2.bold())
                                 .fontDesign(.serif)
                                 .foregroundStyle(PPColor.textPrimary)
                         }
                         change(
-                            "Start with the outcome",
-                            detail: "The home screen now prioritizes the next document task.",
+                            "Pick up where you left off",
+                            detail: "A clearer home screen keeps your next document and import actions close.",
                             symbol: "arrow.right.circle"
                         )
                         change(
-                            "Local-first controls",
-                            detail: "iCloud metadata is optional and off by default.",
-                            symbol: "lock.shield"
+                            "Review scans and recognized text",
+                            detail: "Keep the page in view, adjust only what you need, and review uncertain words first.",
+                            symbol: "viewfinder"
                         )
                         change(
-                            "Private support bundle",
-                            detail: "Share diagnostics without PDF names, bytes, or extracted text.",
-                            symbol: "wrench.and.screwdriver"
+                            "Review private details",
+                            detail: "Select candidates, check their position in the PDF, and create a redacted copy while keeping the original.",
+                            symbol: "hand.raised"
                         )
                         change(
-                            "One-time ownership",
-                            detail: "Unlimited Verified Output uses one purchase, not a recurring subscription.",
-                            symbol: "seal"
+                            "Check the copy you share",
+                            detail: "See the result and any warnings first, then share the checked PDF with its receipt if needed.",
+                            symbol: "checkmark.shield"
                         )
                     }
                     .frame(maxWidth: 620)

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PaperPath PDF：离线隐私扫描、永久脱敏、签名与 OCR</title>
+  <meta name="description" content="PaperPath 是面向 iPhone 与 iPad 的本机 PDF 工作室。自动扫描敏感信息，逐项复核并永久脱敏；同时支持签名、表单、OCR、扫描、页面整理、格式转换与可信交付。">
+  <meta name="keywords" content="PDF隐私扫描,PDF脱敏,PDF签名,离线OCR,PDF编辑器,iPhone PDF,iPad PDF,永久遮盖,PDF表单,PDF合并">
+  <meta name="author" content="PaperPath">
+  <meta name="robots" content="index,follow,max-image-preview:large">
+  <meta name="theme-color" content="#f5f2ec">
+  <link rel="canonical" href="/">
+  <link rel="alternate" hreflang="zh-CN" href="/">
+  <link rel="alternate" hreflang="en" href="/en/">
+  <link rel="alternate" hreflang="x-default" href="/en/">
+  <link rel="icon" href="assets/app-icon.webp" type="image/webp">
+  <link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+  <link rel="manifest" href="site.webmanifest">
+  <link rel="preload" href="assets/privacy-review.webp" as="image" type="image/webp" fetchpriority="high">
+  <link rel="stylesheet" href="styles.css">
+
+  <meta property="og:type" content="website">
+  <meta property="og:locale" content="zh_CN">
+  <meta property="og:title" content="PaperPath PDF：分享前，先把隐私处理干净">
+  <meta property="og:description" content="在设备端自动发现敏感信息，逐项确认并生成永久脱敏副本。签名、OCR、扫描、整理与交付，也都在一处完成。">
+  <meta property="og:image" content="/assets/og-paperpath.webp">
+  <meta property="og:image:alt" content="PaperPath 文档首页、隐私扫描与完整工具列表界面">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="PaperPath PDF：本机隐私扫描与永久脱敏">
+  <meta name="twitter:description" content="自动发现敏感信息，复核后永久移除。原件保持不变。">
+  <meta name="twitter:image" content="/assets/og-paperpath.webp">
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "PaperPath PDF",
+    "alternateName": "PaperPath: Secure PDF Studio",
+    "applicationCategory": "BusinessApplication",
+    "operatingSystem": "iOS 17 or later, iPadOS 17 or later",
+    "description": "一款在 iPhone 和 iPad 本机完成隐私扫描、永久 PDF 脱敏、签名、表单、OCR、扫描、页面整理与可信交付的 PDF 工作室。",
+    "image": "/assets/app-icon.webp",
+    "featureList": [
+      "本机自动隐私扫描",
+      "永久 PDF 脱敏",
+      "PDF 签名与表单填写",
+      "离线 OCR 与可搜索副本",
+      "扫描、合并、拆分、排序与压缩",
+      "可信输出与交付回执"
+    ],
+    "offers": {
+      "@type": "Offer",
+      "price": "0",
+      "priceCurrency": "USD",
+      "description": "免费下载，包含一次 Verified Output 体验；可通过一次性购买解锁不限次数使用。"
+    }
+  }
+  </script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <header class="site-header" data-header>
+    <a class="brand" href="#top" aria-label="PaperPath 首页">
+      <img src="assets/app-icon.webp" alt="" width="40" height="40">
+      <span>PaperPath</span>
+    </a>
+    <nav class="desktop-nav" aria-label="主导航">
+      <a href="#privacy">隐私脱敏</a>
+      <a href="#capabilities">全部能力</a>
+      <a href="#workflow">工作方式</a>
+      <a href="#faq">常见问题</a>
+    </nav>
+    <div class="header-actions">
+      <a class="language-link" href="en/" lang="en">EN</a>
+      <a class="header-cta" href="#download">获取 App</a>
+      <button class="menu-button" type="button" aria-label="打开导航" aria-expanded="false" data-menu-button>
+        <span></span><span></span>
+      </button>
+    </div>
+    <nav class="mobile-nav" aria-label="移动端导航" data-mobile-nav>
+      <a href="#privacy">隐私脱敏</a>
+      <a href="#capabilities">全部能力</a>
+      <a href="#workflow">工作方式</a>
+      <a href="#faq">常见问题</a>
+      <a href="en/" lang="en">English</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero" id="top" aria-labelledby="hero-title">
+      <div class="hero-lines" aria-hidden="true"></div>
+      <div class="hero-copy reveal">
+        <p class="eyebrow"><span></span> 本机处理 · 无需 PaperPath 账户</p>
+        <h1 id="hero-title">PaperPath</h1>
+        <p class="hero-statement">分享 PDF 之前，<br><strong>先把隐私处理干净。</strong></p>
+        <p class="hero-summary">自动发现敏感信息，回到原页逐项确认，再生成不可恢复的脱敏副本。原件始终保持不变。</p>
+        <div class="hero-actions">
+          <a class="button button-primary" href="#privacy">查看隐私工作流 <span aria-hidden="true">↓</span></a>
+          <a class="text-link" href="#capabilities">浏览全部能力 <span aria-hidden="true">↗</span></a>
+        </div>
+        <p class="platform-note">为 iPhone 与 iPad 打造 · 支持 iOS 17 及以上版本</p>
+      </div>
+
+      <div class="hero-visual" aria-label="PaperPath 文档首页、隐私扫描与完整工具列表真实界面">
+        <div class="hero-word" aria-hidden="true">PRIVATE</div>
+        <figure class="device device-home reveal" data-tilt data-rotation="-7">
+          <img src="assets/home.webp" alt="PaperPath 文档首页，提供导入、扫描、搜索与继续任务入口" width="1206" height="2622" fetchpriority="high">
+        </figure>
+        <figure class="device device-hero reveal" data-tilt data-rotation="2">
+          <img src="assets/privacy-review.webp" alt="PaperPath 自动识别邮箱地址等敏感信息，并允许选择黑块或白块永久脱敏" width="1206" height="2622" fetchpriority="high">
+        </figure>
+        <figure class="device device-tools reveal" data-tilt data-rotation="7">
+          <img src="assets/tools-phone.webp" alt="PaperPath 完整工具列表，展示表单、签名、隐私脱敏、OCR、页面整理与格式转换" width="1206" height="2622" fetchpriority="high">
+        </figure>
+      </div>
+
+      <a class="scroll-cue" href="#privacy">核心亮点 <span aria-hidden="true">↓</span></a>
+    </section>
+
+    <section class="proof-strip" aria-label="产品原则">
+      <p>自动发现</p>
+      <p>人工复核</p>
+      <p>永久移除</p>
+      <p>原件不变</p>
+    </section>
+
+    <section class="privacy-section" id="privacy" aria-labelledby="privacy-title">
+      <div class="section-shell privacy-intro reveal">
+        <p class="section-index">01 / PRIVACY</p>
+        <h2 id="privacy-title">自动发现。逐项确认。<br>永久移除。</h2>
+        <p>PaperPath 在设备端扫描支持类型的敏感信息，把候选项、所在页面与来源清楚列出。你决定移除什么，也能选择黑块遮盖或白块移除。</p>
+      </div>
+
+      <div class="privacy-demo section-shell">
+        <div class="privacy-tabs" role="tablist" aria-label="隐私工作流步骤">
+          <button type="button" role="tab" aria-selected="true" aria-controls="privacy-panel" id="privacy-tab-scan" data-feature-tab="scan">
+            <span>01</span>
+            <strong>自动扫描</strong>
+            <small>在本机发现候选信息</small>
+          </button>
+          <button type="button" role="tab" aria-selected="false" aria-controls="privacy-panel" id="privacy-tab-review" data-feature-tab="review">
+            <span>02</span>
+            <strong>确认范围</strong>
+            <small>看清风险再执行</small>
+          </button>
+          <button type="button" role="tab" aria-selected="false" aria-controls="privacy-panel" id="privacy-tab-output" data-feature-tab="output">
+            <span>03</span>
+            <strong>核验副本</strong>
+            <small>原件不动，副本可分享</small>
+          </button>
+        </div>
+
+        <div class="privacy-panel" id="privacy-panel" role="tabpanel" aria-labelledby="privacy-tab-scan">
+          <div class="privacy-panel-copy" aria-live="polite">
+            <p class="feature-kicker" data-feature-kicker>自动隐私扫描</p>
+            <h3 data-feature-title>敏感信息，不再靠肉眼一页页找。</h3>
+            <p data-feature-copy>支持的邮箱、电话、日期与文本区域会被归类呈现。点击定位即可回到 PDF 原页复核。</p>
+            <ul class="feature-points" data-feature-points>
+              <li>扫描与识别在设备端完成</li>
+              <li>候选项按类型和页面整理</li>
+              <li>支持零选择、全选与逐项选择</li>
+            </ul>
+          </div>
+          <figure class="feature-device">
+            <img data-feature-image src="assets/privacy-review.webp" alt="PaperPath 隐私扫描候选项复核界面" width="1206" height="2622">
+          </figure>
+        </div>
+      </div>
+    </section>
+
+    <section class="capabilities-section" id="capabilities" aria-labelledby="capabilities-title">
+      <div class="section-shell capabilities-heading reveal">
+        <div>
+          <p class="section-index">02 / CAPABILITIES</p>
+          <h2 id="capabilities-title">从打开文件，<br>到放心交付。</h2>
+        </div>
+        <p>PaperPath 不是一排互不相关的小工具。它围绕一份文档的完整生命周期，把下一步放在你需要的位置。</p>
+      </div>
+
+      <div class="capability-ledger section-shell">
+        <article class="capability-row reveal">
+          <p class="capability-number">01</p>
+          <div class="capability-main">
+            <p class="capability-label">完成文档</p>
+            <h3>填写、签名、批注</h3>
+          </div>
+          <ul>
+            <li>交互式表单</li>
+            <li>手写签名</li>
+            <li>高亮与删除线</li>
+            <li>图章与水印</li>
+          </ul>
+        </article>
+        <article class="capability-row reveal">
+          <p class="capability-number">02</p>
+          <div class="capability-main">
+            <p class="capability-label">创建与识别</p>
+            <h3>扫描、OCR、搜索</h3>
+          </div>
+          <ul>
+            <li>多页文档扫描</li>
+            <li>裁切与画面增强</li>
+            <li>离线文字识别</li>
+            <li>可搜索 PDF 副本</li>
+          </ul>
+        </article>
+        <article class="capability-row reveal">
+          <p class="capability-number">03</p>
+          <div class="capability-main">
+            <p class="capability-label">整理与保护</p>
+            <h3>页面、文件、权限</h3>
+          </div>
+          <ul>
+            <li>合并与拆分</li>
+            <li>排序、旋转、裁切</li>
+            <li>压缩与密码保护</li>
+            <li>贝茨编号</li>
+          </ul>
+        </article>
+        <article class="capability-row reveal">
+          <p class="capability-number">04</p>
+          <div class="capability-main">
+            <p class="capability-label">转换与交付</p>
+            <h3>导出、核验、分享</h3>
+          </div>
+          <ul>
+            <li>Office 与图片导出</li>
+            <li>文本、RTF、Markdown</li>
+            <li>元数据清理</li>
+            <li>交付回执与批量核验</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section class="product-stage" aria-labelledby="product-stage-title">
+      <div class="product-stage-copy reveal">
+        <p class="section-index">BUILT FOR FOCUS</p>
+        <h2 id="product-stage-title">功能很多，<br>界面不必很吵。</h2>
+        <p>快速任务、文档工具和上下文建议被分层呈现。iPhone 适合随时处理，iPad 则把文档、页面与工具同时铺开。</p>
+      </div>
+      <figure class="ipad-shot reveal">
+        <img src="assets/tools-ipad.webp" alt="PaperPath iPad 工具页面，分组展示压缩、合并、表单、签名、隐私脱敏、OCR 和格式转换" width="2064" height="2752" loading="lazy">
+      </figure>
+      <div class="product-stage-note" aria-hidden="true">38 个快速任务与文档工具</div>
+    </section>
+
+    <section class="feature-gallery" aria-labelledby="gallery-title">
+      <div class="section-shell gallery-heading reveal">
+        <p class="section-index">03 / REAL WORKFLOWS</p>
+        <h2 id="gallery-title">每一步，都是实际界面。</h2>
+      </div>
+      <div class="gallery-track">
+        <article class="gallery-item gallery-wide reveal">
+          <div>
+            <p>扫描复核</p>
+            <h3>裁切、增强、逐页检查后再生成 PDF。</h3>
+          </div>
+          <img src="assets/scan-ipad.webp" alt="PaperPath iPad 扫描复核界面，显示多页预览、画面增强和精细调节" width="2064" height="2752" loading="lazy">
+        </article>
+        <article class="gallery-item reveal">
+          <div>
+            <p>文字识别</p>
+            <h3>优先核对不确定内容，再创建可搜索副本。</h3>
+          </div>
+          <img src="assets/ocr.webp" alt="PaperPath OCR 结果界面，显示识别文字、置信度和创建可搜索副本入口" width="1206" height="2622" loading="lazy">
+        </article>
+        <article class="gallery-item reveal">
+          <div>
+            <p>继续任务</p>
+            <h3>中断后回到准确的签名与处理位置。</h3>
+          </div>
+          <img src="assets/signing.webp" alt="PaperPath 搜索结果中显示继续签名任务及对应页码" width="1206" height="2622" loading="lazy">
+        </article>
+      </div>
+    </section>
+
+    <section class="workflow-section" id="workflow" aria-labelledby="workflow-title">
+      <div class="section-shell workflow-heading reveal">
+        <p class="section-index">04 / HOW IT WORKS</p>
+        <h2 id="workflow-title">保留原件，是默认动作。</h2>
+      </div>
+      <div class="workflow-grid section-shell">
+        <article class="workflow-step reveal">
+          <p>01</p>
+          <h3>导入原件</h3>
+          <span>从“文件”导入后，PaperPath 建立本地工作副本，不改动来源文件。</span>
+        </article>
+        <article class="workflow-step reveal">
+          <p>02</p>
+          <h3>完成与复核</h3>
+          <span>签名、整理、识别或脱敏；关键操作先确认，长任务可恢复。</span>
+        </article>
+        <article class="workflow-step reveal">
+          <p>03</p>
+          <h3>核验后分享</h3>
+          <span>重新打开输出页、记录文件检查，再把真正核对过的副本交出去。</span>
+        </article>
+      </div>
+    </section>
+
+    <section class="local-section" aria-labelledby="local-title">
+      <div class="section-shell local-grid">
+        <div class="local-copy reveal">
+          <p class="section-index">PRIVACY BY DESIGN</p>
+          <h2 id="local-title">你的文档，<br>留在你的设备上。</h2>
+          <p>PDF 处理、OCR 与隐私检测都在本机运行。无需 PaperPath 账户，也不把 PDF 内容、识别文字或手写签名发送到 PaperPath 处理服务器。</p>
+        </div>
+        <dl class="local-facts reveal">
+          <div>
+            <dt>PDF 内容</dt>
+            <dd>本机处理</dd>
+          </div>
+          <div>
+            <dt>第三方广告 SDK</dt>
+            <dd>无</dd>
+          </div>
+          <div>
+            <dt>第三方分析 SDK</dt>
+            <dd>无</dd>
+          </div>
+          <div>
+            <dt>可选 iCloud 同步</dt>
+            <dd>仅元数据</dd>
+          </div>
+        </dl>
+      </div>
+      <p class="boundary-note section-shell reveal">自动隐私检测可能遗漏信息，分享前仍需人工复核。永久脱敏生成的副本不可恢复；导入前的原件保持不变。</p>
+    </section>
+
+    <section class="faq-section" id="faq" aria-labelledby="faq-title">
+      <div class="section-shell faq-layout">
+        <div class="faq-heading reveal">
+          <p class="section-index">05 / FAQ</p>
+          <h2 id="faq-title">重要问题，<br>直接回答。</h2>
+        </div>
+        <div class="faq-list">
+          <details class="reveal">
+            <summary>隐私屏蔽是自动完成的吗？</summary>
+            <p>PaperPath 会在设备端自动扫描支持类型的敏感信息，但不会替你直接删除。你可以回到原页逐项核对、选择范围和遮盖样式，再确认生成永久脱敏副本。</p>
+          </details>
+          <details class="reveal">
+            <summary>脱敏后还能恢复原内容吗？</summary>
+            <p>不能。永久脱敏副本中的对应内容不可恢复，因此执行前会出现明确确认。PaperPath 同时保留导入前的原件，方便重新处理。</p>
+          </details>
+          <details class="reveal">
+            <summary>PDF 会上传到服务器吗？</summary>
+            <p>核心 PDF 处理、OCR 和隐私检测在本机完成，不上传到 PaperPath 处理服务器。只有你主动使用系统分享，或开启可选 iCloud 元数据同步时，才会进入相应系统服务边界。</p>
+          </details>
+          <details class="reveal">
+            <summary>除了隐私处理，还能做什么？</summary>
+            <p>支持阅读、表单填写、手写签名、批注、扫描、OCR、合并拆分、页面整理、压缩、密码保护、Office/图片/文本导出以及 Verified Output 核验交付。</p>
+          </details>
+          <details class="reveal">
+            <summary>需要订阅吗？</summary>
+            <p>免费下载，并包含一次 Verified Output 体验。一次性购买可解锁不限次数的 Verified Output 与批量交付，不需要持续订阅 PaperPath。</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="download-section" id="download" aria-labelledby="download-title">
+      <div class="download-inner reveal">
+        <img src="assets/app-icon.webp" alt="PaperPath App 图标" width="112" height="112" loading="lazy">
+        <p class="section-index">PAPERPATH FOR IPHONE & IPAD</p>
+        <h2 id="download-title">让每份 PDF，<br>在分享前多一道检查。</h2>
+        <p>免费下载。一次性解锁，不用持续订阅。</p>
+        <span class="store-status">即将登陆 App Store</span>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-brand">
+      <img src="assets/app-icon.webp" alt="" width="32" height="32" loading="lazy">
+      <strong>PaperPath</strong>
+    </div>
+    <p>Private PDFs. Verified output.</p>
+    <nav aria-label="页脚导航">
+      <a href="#privacy">隐私</a>
+      <a href="#capabilities">功能</a>
+      <a href="#faq">FAQ</a>
+      <a href="en/" lang="en">English</a>
+    </nav>
+    <p class="copyright">© 2026 PaperPath. All rights reserved.</p>
+  </footer>
+
+  <script src="script.js" defer></script>
+</body>
+</html>

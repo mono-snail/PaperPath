@@ -2,6 +2,80 @@ import PDFKit
 import PencilKit
 import SwiftUI
 
+private struct SavedSignatureThumbnail: View {
+    private struct RenderRequest: Hashable {
+        let data: Data
+        let canRender: Bool
+    }
+
+    @Environment(\.scenePhase) private var scenePhase
+    let data: Data
+    @State private var image: UIImage?
+    @State private var protectedDataAvailable =
+        UIApplication.shared.isProtectedDataAvailable
+
+    private var request: RenderRequest {
+        RenderRequest(
+            data: data,
+            canRender: scenePhase == .active && protectedDataAvailable
+        )
+    }
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 4)
+                .fill(Color.white)
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(4)
+            } else {
+                Image(systemName: "signature")
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+            }
+        }
+        .frame(width: 58, height: 32)
+        .task(id: request) {
+            image = nil
+            guard request.canRender,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  let drawing = try? PKDrawing(data: data),
+                  !drawing.strokes.isEmpty
+            else { return }
+            let bounds = drawing.bounds.insetBy(dx: -8, dy: -8)
+            guard bounds.width.isFinite, bounds.height.isFinite,
+                  bounds.width > 0, bounds.height > 0
+            else { return }
+            // The rail is 58 × 32 points. Render at most 3× for this
+            // thumbnail; placement and final output retain full quality.
+            let scale = min(2, 174 / bounds.width, 96 / bounds.height)
+            image = drawing.image(from: bounds, scale: scale)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication.protectedDataWillBecomeUnavailableNotification
+            )
+        ) { _ in
+            protectedDataAvailable = false
+            image = nil
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: UIApplication.protectedDataDidBecomeAvailableNotification
+            )
+        ) { _ in
+            protectedDataAvailable = true
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase != .active { image = nil }
+        }
+        .onDisappear { image = nil }
+        .accessibilityHidden(true)
+    }
+}
+
 private enum PencilShape: String, CaseIterable, Identifiable {
     case line
     case rectangle
@@ -333,15 +407,11 @@ struct InkCaptureView: View {
                                 || didCommitInk
                         )
                         .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("inkSaveAction")
                     }
                 }
             }
             .onAppear {
-#if DEBUG
-                // #region debug-point C:experience-presentations
-                if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "C", "location": "InkCaptureView.appeared", "msg": "[DEBUG] Ink view appeared", "data": ["saving": isSaving]]); URLSession.shared.dataTask(with: request).resume() }
-                // #endregion
-#endif
                 initializeSignatureSelectionIfNeeded()
             }
             .onChange(of: savedPencilPreset) { _, _ in
@@ -410,6 +480,15 @@ struct InkCaptureView: View {
                 previewContentRevisionID = requestedRevisionID
                 isPagePreviewVerified = true
                 isLoadingPagePreview = false
+#if DEBUG
+                if drawing.strokes.isEmpty,
+                   ProcessInfo.processInfo.arguments.contains(
+                       "UITEST_INK_FIXTURE"
+                   ) {
+                    await Task.yield()
+                    insert(.line)
+                }
+#endif
             }
             .onChange(
                 of: model.record(id: recordID)?
@@ -766,7 +845,7 @@ struct InkCaptureView: View {
                 HStack(spacing: PPSpacing.small) {
                     Button {
                         withAnimation(
-                            reduceMotion ? nil : .easeInOut(duration: 0.16)
+                            reduceMotion ? nil : PPMotion.selection
                         ) {
                             isPencilViewportMode.toggle()
                         }
@@ -776,17 +855,17 @@ struct InkCaptureView: View {
                             .frame(width: 44, height: 44)
                             .foregroundStyle(
                                 isPencilViewportMode
-                                    ? Color.white
+                                    ? PPColor.onAccent
                                     : PPColor.textPrimary
                             )
                             .background(
                                 isPencilViewportMode
                                     ? PPColor.cyan
                                     : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 6)
+                                in: RoundedRectangle(cornerRadius: PPRadius.control)
                             )
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(PPPressButtonStyle())
                     .accessibilityLabel("Move and zoom page")
                     .accessibilityHint(
                         "Use one finger to move the page and two fingers to zoom. Choose a drawing tool to continue marking."
@@ -803,21 +882,21 @@ struct InkCaptureView: View {
                                 .font(.body.weight(.semibold))
                                 .frame(width: 44, height: 44)
                                 .foregroundStyle(
-                                    pencilPreset == preset
-                                        ? Color.white
+                                    pencilPreset == preset && !isPencilViewportMode
+                                        ? PPColor.onAccent
                                         : PPColor.textPrimary
                                 )
                                 .background(
-                                    pencilPreset == preset
+                                    pencilPreset == preset && !isPencilViewportMode
                                         ? PPColor.accent
                                         : Color.clear,
-                                    in: RoundedRectangle(cornerRadius: 6)
+                                    in: RoundedRectangle(cornerRadius: PPRadius.control)
                                 )
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(PPPressButtonStyle())
                         .accessibilityLabel(preset.title.localizedUI)
                         .accessibilityAddTraits(
-                            pencilPreset == preset ? .isSelected : []
+                            pencilPreset == preset && !isPencilViewportMode ? .isSelected : []
                         )
                     }
 
@@ -889,7 +968,7 @@ struct InkCaptureView: View {
         }
         .padding(.horizontal, PPSpacing.regular)
         .padding(.vertical, PPSpacing.small)
-        .background(.bar)
+        .background(PPColor.surface)
         .overlay(alignment: .top) {
             Rectangle()
                 .fill(PPColor.border.opacity(0.62))
@@ -1012,7 +1091,7 @@ struct InkCaptureView: View {
         isPencilViewportMode = false
         selectPencilPreset(.lasso)
         model[noticeFor: paperPathSceneID] = AppLocalization.format(
-            "%@ inserted · Lasso selected",
+            "%@ inserted · Drag to move, pinch or use the handle to resize",
             shape.title.localizedUI
         )
         pencilCommand = PencilCanvasCommand(
@@ -1101,6 +1180,13 @@ struct InkCaptureView: View {
                 }
             }
 
+            OperationBoundaryNotice(
+                title: "Visual signature only",
+                detail: "This places a handwritten mark in the PDF. It does not verify identity or create a certificate-backed digital signature.",
+                identifier: "visualSignatureBoundary",
+                symbol: "signature"
+            )
+
             Button {
                 signaturePreview = makeSignatureImage()
                 withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.22)) {
@@ -1131,6 +1217,7 @@ struct InkCaptureView: View {
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
+                .frame(minHeight: 44)
                 .disabled(
                     signatureLibraryTask != nil
                         || selectedSignatureID == nil
@@ -1158,6 +1245,7 @@ struct InkCaptureView: View {
                 .font(.subheadline.weight(.semibold))
                 .buttonStyle(.plain)
                 .foregroundStyle(PPColor.textSecondary)
+                .frame(minWidth: 44, minHeight: 44)
             }
         }
         .disabled(signatureLibraryTask != nil)
@@ -1232,21 +1320,7 @@ struct InkCaptureView: View {
                         in: Circle()
                     )
 
-                ZStack {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.white)
-                    if let image = signatureThumbnail(from: entry.data) {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .padding(4)
-                    } else {
-                        Image(systemName: "signature")
-                            .font(.caption)
-                            .foregroundStyle(PPColor.textSecondary)
-                    }
-                }
-                .frame(width: 58, height: 32)
+                SavedSignatureThumbnail(data: entry.data)
             }
             .padding(.horizontal, PPSpacing.small)
             .padding(.vertical, PPSpacing.xSmall)
@@ -1385,7 +1459,7 @@ struct InkCaptureView: View {
         } label: {
             Label(
                 "Place & Continue",
-                systemImage: "checkmark.shield"
+                systemImage: "checkmark"
             )
             .frame(maxWidth: .infinity)
         }
@@ -1428,7 +1502,8 @@ struct InkCaptureView: View {
                         .pen,
                         color: .black,
                         width: 4
-                    )
+                    ),
+                    command: pencilCommand
                 )
                 .clipShape(
                     RoundedRectangle(
@@ -1632,11 +1707,6 @@ struct InkCaptureView: View {
                 clearActiveSignatureAfterRemoval()
             }
         }
-    }
-
-    private func signatureThumbnail(from data: Data) -> UIImage? {
-        guard let saved = try? PKDrawing(data: data) else { return nil }
-        return makeSignatureImage(from: saved)
     }
 
     private func makeSignatureImage() -> UIImage? {
@@ -1910,11 +1980,6 @@ struct InkCaptureView: View {
             ? drawing.dataRepresentation()
             : nil
         operationTask = Task { @MainActor in
-#if DEBUG
-            // #region debug-point B:experience-presentations
-            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "B", "location": "InkCaptureView.save.begin", "msg": "[DEBUG] Ink save entered"]); URLSession.shared.dataTask(with: request).resume() }
-            // #endregion
-#endif
             let succeeded = await model.withFeedbackTarget(paperPathSceneID) {
                 let saved = await model.addInk(
                     recordID: recordID,
@@ -1926,11 +1991,6 @@ struct InkCaptureView: View {
                 }
                 return saved
             }
-#if DEBUG
-            // #region debug-point B:experience-presentations
-            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "B", "location": "InkCaptureView.save.completed", "msg": "[DEBUG] Ink save returned", "data": ["success": succeeded, "current": operationGeneration == generation, "saving": isSaving, "cancelled": Task.isCancelled]]); URLSession.shared.dataTask(with: request).resume() }
-            // #endregion
-#endif
             guard operationGeneration == generation else { return }
             let wasStopped =
                 saveStopRequested || Task.isCancelled
@@ -2178,16 +2238,202 @@ private struct PencilZoomCommand: Equatable {
     }
 }
 
+private enum PencilShapeAdjustment {
+    case move(CGSize)
+    case scale(CGFloat, anchor: PencilShapeScaleAnchor)
+    case resize(CGSize)
+}
+
+private enum PencilShapeScaleAnchor {
+    case center
+    case topLeading
+}
+
+private final class PencilShapeSelectionView:
+    UIView,
+    UIGestureRecognizerDelegate {
+    var onAdjustmentBegan: (() -> Void)?
+    var onAdjustmentChanged: ((PencilShapeAdjustment) -> Void)?
+    var onAdjustmentEnded: ((Bool) -> Void)?
+
+    private let outlineLayer = CAShapeLayer()
+    private let resizeHandle = UIImageView(
+        image: UIImage(
+            systemName: "arrow.up.left.and.arrow.down.right"
+        )
+    )
+    private lazy var moveGesture = UIPanGestureRecognizer(
+        target: self,
+        action: #selector(handleMove(_:))
+    )
+    private lazy var scaleGesture = UIPinchGestureRecognizer(
+        target: self,
+        action: #selector(handleScale(_:))
+    )
+    private lazy var resizeGesture = UIPanGestureRecognizer(
+        target: self,
+        action: #selector(handleResize(_:))
+    )
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        backgroundColor = .clear
+        isAccessibilityElement = false
+
+        outlineLayer.fillColor = UIColor.clear.cgColor
+        outlineLayer.strokeColor = UIColor.systemBlue.cgColor
+        outlineLayer.lineWidth = 2
+        outlineLayer.lineDashPattern = [6, 4]
+        layer.addSublayer(outlineLayer)
+
+        resizeHandle.tintColor = .white
+        resizeHandle.contentMode = .center
+        resizeHandle.backgroundColor = .systemBlue
+        resizeHandle.layer.cornerRadius = 12
+        resizeHandle.layer.shadowColor = UIColor.black.cgColor
+        resizeHandle.layer.shadowOpacity = 0.18
+        resizeHandle.layer.shadowRadius = 3
+        resizeHandle.layer.shadowOffset = CGSize(width: 0, height: 1)
+        resizeHandle.isUserInteractionEnabled = true
+        addSubview(resizeHandle)
+
+        moveGesture.delegate = self
+        scaleGesture.delegate = self
+        resizeGesture.delegate = self
+        addGestureRecognizer(moveGesture)
+        addGestureRecognizer(scaleGesture)
+        resizeHandle.addGestureRecognizer(resizeGesture)
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        outlineLayer.frame = bounds
+        outlineLayer.path = UIBezierPath(
+            roundedRect: bounds.insetBy(dx: 2, dy: 2),
+            cornerRadius: 5
+        ).cgPath
+        resizeHandle.frame = CGRect(
+            x: bounds.maxX - 32,
+            y: bounds.maxY - 32,
+            width: 24,
+            height: 24
+        )
+    }
+
+    func prioritizeGestures(over canvas: PKCanvasView) {
+        canvas.drawingGestureRecognizer.require(toFail: moveGesture)
+        canvas.drawingGestureRecognizer.require(toFail: scaleGesture)
+        canvas.drawingGestureRecognizer.require(toFail: resizeGesture)
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldReceive touch: UITouch
+    ) -> Bool {
+        if gestureRecognizer === moveGesture,
+           let touchedView = touch.view,
+           touchedView === resizeHandle
+                || touchedView.isDescendant(of: resizeHandle) {
+            return false
+        }
+        return true
+    }
+
+    @objc private func handleMove(_ gesture: UIPanGestureRecognizer) {
+        guard let container = superview else { return }
+        let translation = gesture.translation(in: container)
+        handle(
+            gesture.state,
+            adjustment: .move(
+                CGSize(
+                    width: translation.x,
+                    height: translation.y
+                )
+            )
+        )
+    }
+
+    @objc private func handleScale(_ gesture: UIPinchGestureRecognizer) {
+        handle(
+            gesture.state,
+            adjustment: .scale(
+                gesture.scale,
+                anchor: .center
+            )
+        )
+    }
+
+    @objc private func handleResize(_ gesture: UIPanGestureRecognizer) {
+        guard let container = superview else { return }
+        let translation = gesture.translation(in: container)
+        handle(
+            gesture.state,
+            adjustment: .resize(
+                CGSize(
+                    width: translation.x,
+                    height: translation.y
+                )
+            )
+        )
+    }
+
+    private func handle(
+        _ state: UIGestureRecognizer.State,
+        adjustment: PencilShapeAdjustment
+    ) {
+        switch state {
+        case .began:
+            onAdjustmentBegan?()
+            onAdjustmentChanged?(adjustment)
+        case .changed:
+            onAdjustmentChanged?(adjustment)
+        case .ended:
+            onAdjustmentChanged?(adjustment)
+            onAdjustmentEnded?(true)
+        case .cancelled, .failed:
+            onAdjustmentEnded?(false)
+        case .possible:
+            break
+        @unknown default:
+            onAdjustmentEnded?(false)
+        }
+    }
+}
+
 private final class PencilCanvasHostView: UIView {
+    let viewport = UIScrollView()
+    let contentView = UIView()
+    let backgroundImageView = UIImageView()
     let canvas = PKCanvasView()
-    var referenceSize: CGSize?
+    var referenceSize: CGSize? {
+        didSet {
+            setNeedsLayout()
+        }
+    }
     var onLayout: ((PKCanvasView) -> Void)?
     private var initialSize: CGSize?
+    private var configuredLogicalSize: CGSize = .zero
+    private var configuredViewportSize: CGSize = .zero
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         clipsToBounds = true
-        addSubview(canvas)
+        viewport.clipsToBounds = true
+        viewport.bouncesZoom = true
+        viewport.showsVerticalScrollIndicator = true
+        viewport.showsHorizontalScrollIndicator = true
+        viewport.contentInsetAdjustmentBehavior = .never
+        backgroundImageView.contentMode = .scaleAspectFit
+        backgroundImageView.backgroundColor = .white
+        backgroundImageView.isUserInteractionEnabled = false
+        contentView.addSubview(backgroundImageView)
+        contentView.addSubview(canvas)
+        viewport.addSubview(contentView)
+        addSubview(viewport)
     }
 
     required init?(coder: NSCoder) {
@@ -2197,17 +2443,84 @@ private final class PencilCanvasHostView: UIView {
     override func layoutSubviews() {
         super.layoutSubviews()
         guard bounds.width > 0, bounds.height > 0 else { return }
+        viewport.frame = bounds
         if initialSize == nil {
             initialSize = bounds.size
         }
         let logicalSize = referenceSize ?? initialSize ?? bounds.size
         guard logicalSize.width > 0, logicalSize.height > 0 else { return }
-        // Window resizing changes the viewport, never the saved stroke coordinates.
-        let scale = min(bounds.width / logicalSize.width, bounds.height / logicalSize.height)
-        canvas.bounds.size = logicalSize
-        canvas.center = CGPoint(x: bounds.midX, y: bounds.midY)
-        canvas.transform = CGAffineTransform(scaleX: scale, y: scale)
+        let fitScale = min(
+            bounds.width / logicalSize.width,
+            bounds.height / logicalSize.height
+        )
+        let geometryChanged =
+            configuredLogicalSize != logicalSize
+            || configuredViewportSize != bounds.size
+        if geometryChanged {
+            let relativeZoom = viewport.minimumZoomScale > 0
+                ? viewport.zoomScale / viewport.minimumZoomScale
+                : 1
+            viewport.minimumZoomScale = 0.01
+            viewport.maximumZoomScale = 100
+            viewport.setZoomScale(1, animated: false)
+            contentView.frame = CGRect(origin: .zero, size: logicalSize)
+            backgroundImageView.frame = contentView.bounds
+            canvas.frame = contentView.bounds
+            canvas.contentSize = logicalSize
+            viewport.contentSize = logicalSize
+            configuredLogicalSize = logicalSize
+            configuredViewportSize = bounds.size
+            viewport.minimumZoomScale = fitScale
+            viewport.maximumZoomScale = fitScale * 5
+            viewport.setZoomScale(
+                min(
+                    max(fitScale * relativeZoom, fitScale),
+                    viewport.maximumZoomScale
+                ),
+                animated: false
+            )
+        }
+        updateContentInsets()
         onLayout?(canvas)
+    }
+
+    func setViewportGesturesEnabled(_ enabled: Bool) {
+        viewport.isScrollEnabled = enabled
+        viewport.panGestureRecognizer.isEnabled = enabled
+        viewport.pinchGestureRecognizer?.isEnabled = enabled
+    }
+
+    func fitPage(animated: Bool) {
+        layoutIfNeeded()
+        viewport.setZoomScale(
+            viewport.minimumZoomScale,
+            animated: animated
+        )
+        updateContentInsets()
+        viewport.setContentOffset(
+            CGPoint(
+                x: -viewport.contentInset.left,
+                y: -viewport.contentInset.top
+            ),
+            animated: animated
+        )
+    }
+
+    func updateContentInsets() {
+        let horizontal = max(
+            0,
+            (viewport.bounds.width - contentView.frame.width) / 2
+        )
+        let vertical = max(
+            0,
+            (viewport.bounds.height - contentView.frame.height) / 2
+        )
+        viewport.contentInset = UIEdgeInsets(
+            top: vertical,
+            left: horizontal,
+            bottom: vertical,
+            right: horizontal
+        )
     }
 }
 
@@ -2238,6 +2551,8 @@ private struct PencilCanvas: UIViewRepresentable {
         host.referenceSize = referenceSize
         let canvas = host.canvas
         context.coordinator.canvas = canvas
+        context.coordinator.hostView = host
+        host.viewport.delegate = context.coordinator
         host.onLayout = { [weak coordinator = context.coordinator] canvas in
             coordinator?.layoutCanvas(canvas)
         }
@@ -2248,21 +2563,21 @@ private struct PencilCanvas: UIViewRepresentable {
         canvas.alwaysBounceVertical = false
         canvas.alwaysBounceHorizontal = false
         canvas.minimumZoomScale = 1
-        canvas.maximumZoomScale = 5
-        canvas.bouncesZoom = true
-        canvas.showsVerticalScrollIndicator = true
-        canvas.showsHorizontalScrollIndicator = true
+        canvas.maximumZoomScale = 1
+        canvas.bouncesZoom = false
+        canvas.showsVerticalScrollIndicator = false
+        canvas.showsHorizontalScrollIndicator = false
         canvas.contentInsetAdjustmentBehavior = .never
+        canvas.isScrollEnabled = false
+        canvas.panGestureRecognizer.isEnabled = false
+        canvas.pinchGestureRecognizer?.isEnabled = false
         canvas.isAccessibilityElement = true
         canvas.accessibilityLabel = "Drawing canvas".localizedUI
         canvas.accessibilityHint = canvasAccessibilityHint
+        canvas.accessibilityIdentifier = "inkCanvas"
         canvas.tool = tool
-        let imageView = UIImageView()
-        imageView.contentMode = .scaleAspectFit
-        imageView.backgroundColor = .white
-        imageView.isUserInteractionEnabled = false
-        canvas.insertSubview(imageView, at: 0)
-        context.coordinator.backgroundImageView = imageView
+        context.coordinator.backgroundImageView =
+            host.backgroundImageView
         let pencilInteraction: UIPencilInteraction
         if #available(iOS 17.5, *) {
             pencilInteraction = UIPencilInteraction(
@@ -2284,22 +2599,24 @@ private struct PencilCanvas: UIViewRepresentable {
         context.coordinator.onHistoryChange = onHistoryChange
         context.coordinator.onHardwareShortcut = onHardwareShortcut
         if canvas.drawing != drawing {
+            context.coordinator.clearShapeSelection()
             canvas.drawing = drawing
         }
         canvas.tool = tool
+        if !(tool is PKLassoTool) {
+            context.coordinator.clearShapeSelection()
+        }
         canvas.drawingPolicy = allowsViewportGestures
             ? .pencilOnly
             : drawingPolicy
-        canvas.isScrollEnabled = allowsViewportGestures
-        canvas.panGestureRecognizer.isEnabled = allowsViewportGestures
-        canvas.pinchGestureRecognizer?.isEnabled = allowsViewportGestures
+        host.setViewportGesturesEnabled(allowsViewportGestures)
+        context.coordinator.setShapeEditingEnabled(
+            !allowsViewportGestures
+        )
         canvas.drawingGestureRecognizer.isEnabled = !allowsViewportGestures
         canvas.accessibilityHint = canvasAccessibilityHint
         canvas.minimumZoomScale = 1
-        canvas.maximumZoomScale = 5
-        if canvas.zoomScale < canvas.minimumZoomScale {
-            canvas.zoomScale = canvas.minimumZoomScale
-        }
+        canvas.maximumZoomScale = 1
         let logicalContentSize = canvas.bounds.size
         if logicalContentSize.width > 0,
            logicalContentSize.height > 0,
@@ -2307,23 +2624,16 @@ private struct PencilCanvas: UIViewRepresentable {
             context.coordinator.logicalContentSize = logicalContentSize
             canvas.contentSize = logicalContentSize
         }
-        context.coordinator.backgroundImageView?.frame = CGRect(
-            origin: .zero,
-            size: context.coordinator.logicalContentSize == .zero
-                ? canvas.bounds.size
-                : context.coordinator.logicalContentSize
-        )
-        context.coordinator.backgroundImageView?.image = backgroundImage
-        if let imageView = context.coordinator.backgroundImageView {
-            canvas.sendSubviewToBack(imageView)
-        }
+        host.backgroundImageView.image = backgroundImage
         if let command,
            context.coordinator.commandID != command.id {
             context.coordinator.commandID = command.id
             switch command.action {
             case .undo:
+                context.coordinator.clearShapeSelection()
                 canvas.undoManager?.undo()
             case .redo:
+                context.coordinator.clearShapeSelection()
                 canvas.undoManager?.redo()
             case .clear:
                 context.coordinator.replaceDrawing(
@@ -2345,8 +2655,9 @@ private struct PencilCanvas: UIViewRepresentable {
             context.coordinator.zoomCommandID = zoomCommand.id
             switch zoomCommand.action {
             case .fit:
-                canvas.setZoomScale(1, animated: !UIAccessibility.isReduceMotionEnabled)
-                canvas.setContentOffset(.zero, animated: !UIAccessibility.isReduceMotionEnabled)
+                host.fitPage(
+                    animated: !UIAccessibility.isReduceMotionEnabled
+                )
             }
         }
         context.coordinator.scheduleStateReport(from: canvas)
@@ -2371,14 +2682,16 @@ private struct PencilCanvas: UIViewRepresentable {
         let canvas = host.canvas
         host.onLayout = nil
         coordinator.cancelPendingStateReport()
+        coordinator.clearShapeSelection()
+        host.viewport.delegate = nil
         canvas.delegate = nil
         canvas.accessibilityCustomActions = nil
         coordinator.canvas = nil
+        coordinator.hostView = nil
         if let pencilInteraction = coordinator.pencilInteraction {
             canvas.removeInteraction(pencilInteraction)
         }
         coordinator.pencilInteraction = nil
-        coordinator.backgroundImageView?.removeFromSuperview()
         coordinator.backgroundImageView = nil
     }
 
@@ -2393,10 +2706,27 @@ private struct PencilCanvas: UIViewRepresentable {
         var logicalContentSize: CGSize = .zero
         weak var backgroundImageView: UIImageView?
         weak var canvas: PKCanvasView?
+        weak var hostView: PencilCanvasHostView?
         var pencilInteraction: UIPencilInteraction?
         var onHardwareShortcut: (PencilHardwareShortcut) -> Void
         var onHistoryChange: (Bool, Bool) -> Void
         private var stateReportTask: Task<Void, Never>?
+        private var shapeSelection:
+            (range: Range<Int>, bounds: CGRect)?
+        private var shapeTransformSession:
+            (
+                drawing: PKDrawing,
+                strokes: [PKStroke],
+                bounds: CGRect
+            )?
+        private weak var shapeSelectionView:
+            PencilShapeSelectionView?
+        private var isShapeEditingEnabled = true
+#if DEBUG
+        var debugHasShapeSelection: Bool {
+            shapeSelection != nil
+        }
+#endif
 
         init(
             drawing: Binding<PKDrawing>,
@@ -2424,7 +2754,7 @@ private struct PencilCanvas: UIViewRepresentable {
                       let canvas
                 else { return }
                 stateReportTask = nil
-                canvasSize = canvas.bounds.size
+                canvasSize = contentBounds(in: canvas).size
                 reportHistory(from: canvas)
             }
         }
@@ -2438,9 +2768,19 @@ private struct PencilCanvas: UIViewRepresentable {
             if logicalContentSize != canvas.bounds.size {
                 logicalContentSize = canvas.bounds.size
                 canvas.contentSize = logicalContentSize
-                backgroundImageView?.frame = CGRect(origin: .zero, size: logicalContentSize)
             }
+            updateShapeSelection(in: canvas)
             scheduleStateReport(from: canvas)
+        }
+
+        func viewForZooming(in scrollView: UIScrollView) -> UIView? {
+            guard scrollView === hostView?.viewport else { return nil }
+            return hostView?.contentView
+        }
+
+        func scrollViewDidZoom(_ scrollView: UIScrollView) {
+            guard scrollView === hostView?.viewport else { return }
+            hostView?.updateContentInsets()
         }
 
         @objc private func accessibilityUndo(_ action: UIAccessibilityCustomAction) -> Bool {
@@ -2458,9 +2798,10 @@ private struct PencilCanvas: UIViewRepresentable {
         }
 
         @objc private func accessibilityFit(_ action: UIAccessibilityCustomAction) -> Bool {
-            guard let canvas else { return false }
-            canvas.setZoomScale(1, animated: !UIAccessibility.isReduceMotionEnabled)
-            canvas.setContentOffset(.zero, animated: !UIAccessibility.isReduceMotionEnabled)
+            guard let hostView else { return false }
+            hostView.fitPage(
+                animated: !UIAccessibility.isReduceMotionEnabled
+            )
             return true
         }
 
@@ -2541,14 +2882,42 @@ private struct PencilCanvas: UIViewRepresentable {
 
         func synchronize(from canvasView: PKCanvasView) {
             drawing = canvasView.drawing
-            canvasSize = canvasView.bounds.size
+            canvasSize = contentBounds(in: canvasView).size
+            updateShapeSelection(in: canvasView)
             reportHistory(from: canvasView)
         }
 
         func reportHistory(from canvasView: PKCanvasView) {
-            canvasView.accessibilityValue = AppLocalization.format(
-                "%lld strokes", canvasView.drawing.strokes.count
-            )
+            if let selection = shapeSelection {
+                let bounds = contentBounds(in: canvasView)
+                let horizontal = bounds.width > 0
+                    ? Int(
+                        (
+                            selection.bounds.midX
+                                / bounds.width * 100
+                        ).rounded()
+                    )
+                    : 0
+                let vertical = bounds.height > 0
+                    ? Int(
+                        (
+                            selection.bounds.midY
+                                / bounds.height * 100
+                        ).rounded()
+                    )
+                    : 0
+                canvasView.accessibilityValue = AppLocalization.format(
+                    "%lld strokes, shape selected at %lld%%, %lld%%",
+                    canvasView.drawing.strokes.count,
+                    horizontal,
+                    vertical
+                )
+            } else {
+                canvasView.accessibilityValue = AppLocalization.format(
+                    "%lld strokes",
+                    canvasView.drawing.strokes.count
+                )
+            }
             var actions: [UIAccessibilityCustomAction] = []
             if canvasView.undoManager?.canUndo == true {
                 actions.append(UIAccessibilityCustomAction(
@@ -2561,6 +2930,45 @@ private struct PencilCanvas: UIViewRepresentable {
                     name: "Redo stroke".localizedUI, target: self,
                     selector: #selector(accessibilityRedo(_:))
                 ))
+            }
+            if shapeSelection != nil {
+                actions.append(contentsOf: [
+                    UIAccessibilityCustomAction(
+                        name: "Move shape left".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityMoveShapeLeft(_:))
+                    ),
+                    UIAccessibilityCustomAction(
+                        name: "Move shape right".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityMoveShapeRight(_:))
+                    ),
+                    UIAccessibilityCustomAction(
+                        name: "Move shape up".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityMoveShapeUp(_:))
+                    ),
+                    UIAccessibilityCustomAction(
+                        name: "Move shape down".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityMoveShapeDown(_:))
+                    ),
+                    UIAccessibilityCustomAction(
+                        name: "Make shape larger".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityGrowShape(_:))
+                    ),
+                    UIAccessibilityCustomAction(
+                        name: "Make shape smaller".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityShrinkShape(_:))
+                    ),
+                    UIAccessibilityCustomAction(
+                        name: "Finish editing shape".localizedUI,
+                        target: self,
+                        selector: #selector(accessibilityFinishShape(_:))
+                    )
+                ])
             }
             actions.append(UIAccessibilityCustomAction(
                 name: "Fit page".localizedUI, target: self,
@@ -2583,8 +2991,9 @@ private struct PencilCanvas: UIViewRepresentable {
             widthScale: Double,
             in canvas: PKCanvasView
         ) {
-            guard canvas.bounds.width > 0,
-                  canvas.bounds.height > 0
+            let canvasBounds = contentBounds(in: canvas)
+            guard canvasBounds.width > 0,
+                  canvasBounds.height > 0
             else { return }
             let strokeColor = UIColor(
                 red: color.red,
@@ -2593,9 +3002,9 @@ private struct PencilCanvas: UIViewRepresentable {
                 alpha: color.alpha
             )
             let lineWidth = CGFloat(3.2 * widthScale)
-            let rect = canvas.bounds.insetBy(
-                dx: canvas.bounds.width * 0.24,
-                dy: canvas.bounds.height * 0.36
+            let rect = canvasBounds.insetBy(
+                dx: canvasBounds.width * 0.24,
+                dy: canvasBounds.height * 0.36
             )
             let paths = shapePaths(shape, in: rect)
             let ink = PKInk(.pen, color: strokeColor)
@@ -2607,10 +3016,15 @@ private struct PencilCanvas: UIViewRepresentable {
                 )
             }
             guard !newStrokes.isEmpty else { return }
+            let startIndex = canvas.drawing.strokes.count
             replaceDrawing(
                 with: PKDrawing(
                     strokes: canvas.drawing.strokes + newStrokes
                 ),
+                in: canvas
+            )
+            selectShape(
+                strokes: startIndex..<(startIndex + newStrokes.count),
                 in: canvas
             )
         }
@@ -2621,6 +3035,7 @@ private struct PencilCanvas: UIViewRepresentable {
         ) {
             let previous = canvas.drawing
             guard previous != replacement else { return }
+            clearShapeSelection()
             canvas.undoManager?.registerUndo(
                 withTarget: self
             ) { [weak canvas] coordinator in
@@ -2632,6 +3047,436 @@ private struct PencilCanvas: UIViewRepresentable {
             }
             canvas.drawing = replacement
             synchronize(from: canvas)
+        }
+
+        func clearShapeSelection() {
+            shapeTransformSession = nil
+            shapeSelection = nil
+            shapeSelectionView?.removeFromSuperview()
+            shapeSelectionView = nil
+            if let canvas {
+                reportHistory(from: canvas)
+            }
+        }
+
+        func setShapeEditingEnabled(_ enabled: Bool) {
+            isShapeEditingEnabled = enabled
+            shapeSelectionView?.isUserInteractionEnabled = enabled
+        }
+
+        private func selectShape(
+            strokes range: Range<Int>,
+            in canvas: PKCanvasView
+        ) {
+            guard range.lowerBound >= 0,
+                  range.upperBound <= canvas.drawing.strokes.count,
+                  !range.isEmpty
+            else {
+                clearShapeSelection()
+                return
+            }
+            let selected = Array(
+                canvas.drawing.strokes[range]
+            )
+            let bounds = PKDrawing(strokes: selected).bounds
+            guard isValidSelectionBounds(bounds) else {
+                clearShapeSelection()
+                return
+            }
+            shapeSelection = (range, bounds)
+
+            let selectionView =
+                shapeSelectionView ?? PencilShapeSelectionView()
+            selectionView.accessibilityIdentifier =
+                "insertedShapeSelection"
+            selectionView.isUserInteractionEnabled =
+                isShapeEditingEnabled
+            selectionView.onAdjustmentBegan = {
+                [weak self, weak canvas] in
+                guard let self, let canvas else { return }
+                beginShapeAdjustment(in: canvas)
+            }
+            selectionView.onAdjustmentChanged = {
+                [weak self, weak canvas] adjustment in
+                guard let self, let canvas else { return }
+                applyShapeAdjustment(adjustment, in: canvas)
+            }
+            selectionView.onAdjustmentEnded = {
+                [weak self, weak canvas] committed in
+                guard let self, let canvas else { return }
+                finishShapeAdjustment(
+                    committed: committed,
+                    in: canvas
+                )
+            }
+            if selectionView.superview !== canvas {
+                selectionView.removeFromSuperview()
+                canvas.addSubview(selectionView)
+            }
+            selectionView.prioritizeGestures(over: canvas)
+            shapeSelectionView = selectionView
+            updateShapeSelection(in: canvas)
+            reportHistory(from: canvas)
+        }
+
+        private func updateShapeSelection(in canvas: PKCanvasView) {
+            guard let selection = shapeSelection,
+                  selection.range.upperBound
+                    <= canvas.drawing.strokes.count,
+                  let selectionView = shapeSelectionView
+            else {
+                if shapeSelection != nil {
+                    clearShapeSelection()
+                }
+                return
+            }
+            let selected = Array(
+                canvas.drawing.strokes[selection.range]
+            )
+            let bounds = PKDrawing(strokes: selected).bounds
+            guard isValidSelectionBounds(bounds) else {
+                clearShapeSelection()
+                return
+            }
+            shapeSelection = (selection.range, bounds)
+            selectionView.frame = selectionFrame(
+                around: bounds,
+                in: contentBounds(in: canvas)
+            )
+            selectionView.setNeedsLayout()
+            canvas.bringSubviewToFront(selectionView)
+        }
+
+        private func beginShapeAdjustment(in canvas: PKCanvasView) {
+            guard shapeTransformSession == nil,
+                  let selection = shapeSelection,
+                  selection.range.upperBound
+                    <= canvas.drawing.strokes.count
+            else { return }
+            shapeTransformSession = (
+                drawing: canvas.drawing,
+                strokes: Array(
+                    canvas.drawing.strokes[selection.range]
+                ),
+                bounds: selection.bounds
+            )
+        }
+
+        private func applyShapeAdjustment(
+            _ adjustment: PencilShapeAdjustment,
+            in canvas: PKCanvasView
+        ) {
+            guard let selection = shapeSelection,
+                  let session = shapeTransformSession,
+                  selection.range.upperBound
+                    <= session.drawing.strokes.count
+            else { return }
+            let transform: CGAffineTransform
+            switch adjustment {
+            case .move(let requested):
+                let canvasBounds = contentBounds(in: canvas)
+                let x = min(
+                    max(
+                        requested.width,
+                        canvasBounds.minX - session.bounds.minX
+                    ),
+                    canvasBounds.maxX - session.bounds.maxX
+                )
+                let y = min(
+                    max(
+                        requested.height,
+                        canvasBounds.minY - session.bounds.minY
+                    ),
+                    canvasBounds.maxY - session.bounds.maxY
+                )
+                transform = CGAffineTransform(
+                    translationX: x,
+                    y: y
+                )
+            case .scale(let requested, let anchor):
+                let point = scaleAnchor(
+                    anchor,
+                    in: session.bounds
+                )
+                let scale = clampedScale(
+                    requested,
+                    around: point,
+                    selectionBounds: session.bounds,
+                    canvasBounds: contentBounds(in: canvas)
+                )
+                transform = scaleTransform(
+                    scale,
+                    around: point
+                )
+            case .resize(let translation):
+                let vector = CGVector(
+                    dx: session.bounds.width,
+                    dy: session.bounds.height
+                )
+                let denominator =
+                    vector.dx * vector.dx
+                    + vector.dy * vector.dy
+                guard denominator > 0 else { return }
+                let requested = 1 + (
+                    translation.width * vector.dx
+                    + translation.height * vector.dy
+                ) / denominator
+                let anchor = CGPoint(
+                    x: session.bounds.minX,
+                    y: session.bounds.minY
+                )
+                let scale = clampedScale(
+                    requested,
+                    around: anchor,
+                    selectionBounds: session.bounds,
+                    canvasBounds: contentBounds(in: canvas)
+                )
+                transform = scaleTransform(
+                    scale,
+                    around: anchor
+                )
+            }
+
+            let transformed = PKDrawing(
+                strokes: session.strokes
+            ).transformed(using: transform).strokes
+            var strokes = session.drawing.strokes
+            strokes.replaceSubrange(
+                selection.range,
+                with: transformed
+            )
+            canvas.drawing = PKDrawing(strokes: strokes)
+            synchronize(from: canvas)
+        }
+
+        private func finishShapeAdjustment(
+            committed: Bool,
+            in canvas: PKCanvasView
+        ) {
+            guard let session = shapeTransformSession else { return }
+            shapeTransformSession = nil
+            if !committed {
+                canvas.drawing = session.drawing
+                synchronize(from: canvas)
+                return
+            }
+            let current = canvas.drawing
+            guard current != session.drawing else {
+                updateShapeSelection(in: canvas)
+                return
+            }
+            canvas.undoManager?.registerUndo(
+                withTarget: self
+            ) { [weak canvas] coordinator in
+                guard let canvas else { return }
+                coordinator.replaceDrawing(
+                    with: session.drawing,
+                    in: canvas
+                )
+            }
+            canvas.undoManager?.setActionName(
+                "Transform Shape".localizedUI
+            )
+            synchronize(from: canvas)
+        }
+
+        private func applySingleShapeAdjustment(
+            _ adjustment: PencilShapeAdjustment
+        ) -> Bool {
+            guard let canvas, shapeSelection != nil else { return false }
+            beginShapeAdjustment(in: canvas)
+            guard shapeTransformSession != nil else { return false }
+            applyShapeAdjustment(adjustment, in: canvas)
+            finishShapeAdjustment(committed: true, in: canvas)
+            return true
+        }
+
+        @objc private func accessibilityMoveShapeLeft(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            applySingleShapeAdjustment(
+                .move(CGSize(width: -12, height: 0))
+            )
+        }
+
+        @objc private func accessibilityMoveShapeRight(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            applySingleShapeAdjustment(
+                .move(CGSize(width: 12, height: 0))
+            )
+        }
+
+        @objc private func accessibilityMoveShapeUp(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            applySingleShapeAdjustment(
+                .move(CGSize(width: 0, height: -12))
+            )
+        }
+
+        @objc private func accessibilityMoveShapeDown(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            applySingleShapeAdjustment(
+                .move(CGSize(width: 0, height: 12))
+            )
+        }
+
+        @objc private func accessibilityGrowShape(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            applySingleShapeAdjustment(
+                .scale(1.12, anchor: .center)
+            )
+        }
+
+        @objc private func accessibilityShrinkShape(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            applySingleShapeAdjustment(
+                .scale(0.88, anchor: .center)
+            )
+        }
+
+        @objc private func accessibilityFinishShape(
+            _ action: UIAccessibilityCustomAction
+        ) -> Bool {
+            guard shapeSelection != nil else { return false }
+            clearShapeSelection()
+            return true
+        }
+
+        private func contentBounds(in canvas: PKCanvasView) -> CGRect {
+            let size = logicalContentSize == .zero
+                ? canvas.bounds.size
+                : logicalContentSize
+            return CGRect(origin: .zero, size: size)
+        }
+
+        private func selectionFrame(
+            around bounds: CGRect,
+            in canvasBounds: CGRect
+        ) -> CGRect {
+            let proposed = bounds.insetBy(dx: -10, dy: -10)
+            let width = min(
+                max(proposed.width, 52),
+                canvasBounds.width
+            )
+            let height = min(
+                max(proposed.height, 52),
+                canvasBounds.height
+            )
+            let x = min(
+                max(
+                    bounds.midX - width / 2,
+                    canvasBounds.minX
+                ),
+                canvasBounds.maxX - width
+            )
+            let y = min(
+                max(
+                    bounds.midY - height / 2,
+                    canvasBounds.minY
+                ),
+                canvasBounds.maxY - height
+            )
+            return CGRect(
+                x: x,
+                y: y,
+                width: width,
+                height: height
+            )
+        }
+
+        private func scaleAnchor(
+            _ anchor: PencilShapeScaleAnchor,
+            in bounds: CGRect
+        ) -> CGPoint {
+            switch anchor {
+            case .center:
+                return CGPoint(x: bounds.midX, y: bounds.midY)
+            case .topLeading:
+                return CGPoint(x: bounds.minX, y: bounds.minY)
+            }
+        }
+
+        private func clampedScale(
+            _ requested: CGFloat,
+            around anchor: CGPoint,
+            selectionBounds: CGRect,
+            canvasBounds: CGRect
+        ) -> CGFloat {
+            guard requested.isFinite else { return 1 }
+            let largestDimension = max(
+                selectionBounds.width,
+                selectionBounds.height
+            )
+            let lower = min(
+                1,
+                max(
+                    0.12,
+                    largestDimension > 0
+                        ? 32 / largestDimension
+                        : 1
+                )
+            )
+            var upper: CGFloat = 12
+            let right = selectionBounds.maxX - anchor.x
+            if right > 0 {
+                upper = min(
+                    upper,
+                    (canvasBounds.maxX - anchor.x) / right
+                )
+            }
+            let left = anchor.x - selectionBounds.minX
+            if left > 0 {
+                upper = min(
+                    upper,
+                    (anchor.x - canvasBounds.minX) / left
+                )
+            }
+            let bottom = selectionBounds.maxY - anchor.y
+            if bottom > 0 {
+                upper = min(
+                    upper,
+                    (canvasBounds.maxY - anchor.y) / bottom
+                )
+            }
+            let top = anchor.y - selectionBounds.minY
+            if top > 0 {
+                upper = min(
+                    upper,
+                    (anchor.y - canvasBounds.minY) / top
+                )
+            }
+            let safeUpper = max(lower, upper)
+            return min(max(requested, lower), safeUpper)
+        }
+
+        private func scaleTransform(
+            _ scale: CGFloat,
+            around anchor: CGPoint
+        ) -> CGAffineTransform {
+            CGAffineTransform(
+                a: scale,
+                b: 0,
+                c: 0,
+                d: scale,
+                tx: anchor.x * (1 - scale),
+                ty: anchor.y * (1 - scale)
+            )
+        }
+
+        private func isValidSelectionBounds(_ bounds: CGRect) -> Bool {
+            !bounds.isNull
+                && !bounds.isInfinite
+                && bounds.origin.x.isFinite
+                && bounds.origin.y.isFinite
+                && bounds.width.isFinite
+                && bounds.height.isFinite
+                && bounds.width > 0
+                && bounds.height > 0
         }
 
         private func shapePaths(

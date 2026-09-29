@@ -196,6 +196,8 @@ struct BookmarksSheet: View {
     @State private var navigationReloadToken = UUID()
     @State private var loadGeneration = 0
     @State private var lifecycleGeneration = UUID()
+    @State private var protectedDataAvailable =
+        UIApplication.shared.isProtectedDataAvailable
     @State private var outlineCreationTask: Task<Void, Never>?
     @State private var outlineCreationGeneration = UUID()
     @State private var outlineCreationStopRequested = false
@@ -359,6 +361,14 @@ struct BookmarksSheet: View {
                 isLoadingNavigation = true
                 navigationLoadErrorMessage = nil
                 loadedContentRevisionID = nil
+                guard !Task.isCancelled,
+                      scenePhase == .active,
+                      protectedDataAvailable,
+                      UIApplication.shared.isProtectedDataAvailable
+                else {
+                    isLoadingNavigation = false
+                    return
+                }
                 guard let requestedRevisionID =
                         model.record(id: recordID)?
                             .contentRevisionID,
@@ -378,6 +388,9 @@ struct BookmarksSheet: View {
                 let labelIndexes = await Self.indexPageLabels(values.1)
                 guard !Task.isCancelled,
                       generation == loadGeneration,
+                      scenePhase == .active,
+                      protectedDataAvailable,
+                      UIApplication.shared.isProtectedDataAvailable,
                       model.record(id: recordID)?
                         .contentRevisionID == requestedRevisionID
                 else { return }
@@ -458,6 +471,8 @@ struct BookmarksSheet: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
+                    protectedDataAvailable =
+                        UIApplication.shared.isProtectedDataAvailable
                     lifecycleGeneration = UUID()
                 } else if phase == .background {
                     interruptProtectedNavigationWork()
@@ -469,6 +484,7 @@ struct BookmarksSheet: View {
                         .protectedDataWillBecomeUnavailableNotification
                 )
             ) { _ in
+                protectedDataAvailable = false
                 interruptProtectedNavigationWork()
             }
             .onReceive(
@@ -477,6 +493,7 @@ struct BookmarksSheet: View {
                         .protectedDataDidBecomeAvailableNotification
                 )
             ) { _ in
+                protectedDataAvailable = true
                 guard scenePhase == .active else { return }
                 lifecycleGeneration = UUID()
             }
@@ -646,7 +663,7 @@ struct BookmarksSheet: View {
     ) -> some View {
         HStack(spacing: PPSpacing.small) {
             TextField(
-                "Page number or label",
+                "Page number or label".localizedUI,
                 text: $pageInput
             )
             .textFieldStyle(.plain)
@@ -659,7 +676,10 @@ struct BookmarksSheet: View {
             Button {
                 openTypedPage(record)
             } label: {
-                Label("Go", systemImage: "arrow.right.circle.fill")
+                Label(
+                    "Go".localizedUI,
+                    systemImage: "arrow.right.circle.fill"
+                )
                     .labelStyle(.iconOnly)
                     .font(.title3)
                     .frame(width: 44, height: 44)
@@ -672,7 +692,7 @@ struct BookmarksSheet: View {
                         in: .whitespacesAndNewlines
                     ).isEmpty
             )
-            .accessibilityLabel("Go to page")
+            .accessibilityLabel("Go to page".localizedUI)
             .accessibilityHint(pageJumpAccessibilityHint(record))
             .accessibilityIdentifier("navigationGoToPage")
         }
@@ -691,9 +711,11 @@ struct BookmarksSheet: View {
             }
         } label: {
             Label(
-                record.bookmarkedPages.contains(currentPageIndex)
-                    ? "Remove current bookmark"
-                    : "Bookmark current page",
+                (
+                    record.bookmarkedPages.contains(currentPageIndex)
+                        ? "Remove current bookmark"
+                        : "Bookmark current page"
+                ).localizedUI,
                 systemImage:
                     record.bookmarkedPages.contains(currentPageIndex)
                     ? "bookmark.slash"
@@ -862,7 +884,8 @@ struct BookmarksSheet: View {
                         .frame(width: 44, height: 44)
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Rename bookmark")
+                .accessibilityLabel("Rename bookmark".localizedUI)
+                .accessibilityValue(displayName)
                 .disabled(hasActiveNavigationTask)
 
                 Button(role: .destructive) {
@@ -874,7 +897,8 @@ struct BookmarksSheet: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.red)
-                .accessibilityLabel("Remove bookmark")
+                .accessibilityLabel("Remove bookmark".localizedUI)
+                .accessibilityValue(displayName)
                 .disabled(hasActiveNavigationTask)
             }
             .frame(
@@ -1190,7 +1214,7 @@ struct BookmarksSheet: View {
             }
             .buttonStyle(.plain)
             .foregroundStyle(PPColor.textSecondary)
-            .accessibilityLabel("Clear Search")
+            .accessibilityLabel("Clear Search".localizedUI)
         }
         .frame(minHeight: 44)
     }
@@ -1220,9 +1244,13 @@ struct BookmarksSheet: View {
     private func filteredBookmarks(
         _ record: DocumentRecord
     ) -> [Int] {
-        let pages = record.bookmarkedPages.filter {
-            $0 >= 0 && $0 < record.profile.pageCount
-        }
+        let pages = Array(
+            Set(
+                record.bookmarkedPages.filter {
+                    $0 >= 0 && $0 < record.profile.pageCount
+                }
+            )
+        ).sorted()
         let query = searchText.trimmingCharacters(
             in: .whitespacesAndNewlines
         )
@@ -1584,6 +1612,7 @@ struct BookmarksSheet: View {
     }
 
     private func interruptProtectedNavigationWork() {
+        lifecycleGeneration = UUID()
         loadGeneration += 1
         outline.removeAll(keepingCapacity: false)
         pageLabelCount = 0
@@ -1627,7 +1656,9 @@ struct BookmarksSheet: View {
         byPage: [Int: String],
         byLabel: [String: Int]
     ) {
-        await Task.detached(priority: .utility) {
+        let worker = Task.detached(
+            priority: .utility
+        ) { () -> ([Int: String], [String: Int]) in
             var byPage: [Int: String] = [:]
             var byLabel: [String: Int] = [:]
             byPage.reserveCapacity(labels.count)
@@ -1645,14 +1676,22 @@ struct BookmarksSheet: View {
                 }
             }
             return (byPage, byLabel)
-        }.value
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
     }
 
     private static func loadOutline(
         from url: URL
     ) async -> [OutlineEntry]? {
-        await Task.detached(priority: .utility) {
-            guard let document = PDFDocument(url: url) else {
+        let worker = Task.detached(
+            priority: .utility
+        ) { () -> [OutlineEntry]? in
+            guard !Task.isCancelled,
+                  let document = PDFDocument(url: url) else {
                 return nil
             }
             guard let root = document.outlineRoot else {
@@ -1692,8 +1731,13 @@ struct BookmarksSheet: View {
             }
 
             walk(root, level: 0)
-            return result
-        }.value
+            return Task.isCancelled ? nil : result
+        }
+        return await withTaskCancellationHandler {
+            await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
     }
 }
 
@@ -2411,6 +2455,7 @@ struct FocusReaderSheet: View {
             }
         }
         .task(id: readerLoadRequest) {
+            normalizeReaderPreferences()
             guard scenePhase == .active, UIApplication.shared.isProtectedDataAvailable else { return }
             let request = readerLoadRequest
             guard let requestedRevisionID =
@@ -2524,11 +2569,18 @@ struct FocusReaderSheet: View {
         .accessibilityAction(.escape) {
             closeOrStopReader()
         }
-        .sensoryFeedback(.selection, trigger: selectedIndex)
+        .sensoryFeedback(
+            .selection,
+            trigger: selectedIndex
+        ) { _, _ in
+            !readAloud.isActive
+        }
         .sensoryFeedback(
             .selection,
             trigger: readAloud.isSpeaking
-        )
+        ) { _, _ in
+            scenePhase == .active
+        }
     }
 
     private var readerContextHeader: some View {
@@ -2551,7 +2603,10 @@ struct FocusReaderSheet: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: PPSpacing.small) {
                 Menu {
-                    Picker("Typeface", selection: $savedTypeface) {
+                    Picker(
+                        "Typeface".localizedUI,
+                        selection: $savedTypeface
+                    ) {
                         ForEach(FocusReaderTypeface.allCases) {
                             Text($0.title.localizedUI)
                                 .tag($0.rawValue)
@@ -2565,7 +2620,10 @@ struct FocusReaderSheet: View {
                 }
 
                 Menu {
-                    Picker("Text width", selection: $savedMeasure) {
+                    Picker(
+                        "Text width".localizedUI,
+                        selection: $savedMeasure
+                    ) {
                         ForEach(FocusReaderMeasure.allCases) {
                             Text($0.title.localizedUI)
                                 .tag($0.rawValue)
@@ -2580,7 +2638,11 @@ struct FocusReaderSheet: View {
 
                 Toggle(isOn: $readsContinuously) {
                     Label(
-                        readsContinuously ? "Continuous" : "One page",
+                        (
+                            readsContinuously
+                                ? "Continuous"
+                                : "One page"
+                        ).localizedUI,
                         systemImage: readsContinuously
                             ? "rectangle.stack"
                             : "doc"
@@ -2595,7 +2657,7 @@ struct FocusReaderSheet: View {
                         .frame(width: 44, height: 44)
                 }
                 .disabled(boundedFontSize <= 15)
-                .accessibilityLabel("Smaller text")
+                .accessibilityLabel("Smaller text".localizedUI)
 
                 Text("\(Int(boundedFontSize))")
                     .font(.caption.monospacedDigit().weight(.semibold))
@@ -2609,7 +2671,7 @@ struct FocusReaderSheet: View {
                         .frame(width: 44, height: 44)
                 }
                 .disabled(boundedFontSize >= 30)
-                .accessibilityLabel("Larger text")
+                .accessibilityLabel("Larger text".localizedUI)
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(PPColor.textPrimary)
@@ -2688,7 +2750,11 @@ struct FocusReaderSheet: View {
                     selectedIndex = index
                 } label: {
                     SectionEyebrow(
-                        text: "PAGE \(page.pageIndex + 1) OF \(pageCount)"
+                        text: AppLocalization.format(
+                            "PAGE %lld OF %lld",
+                            page.pageIndex + 1,
+                            pageCount
+                        )
                     )
                     .frame(minHeight: 44)
                     .contentShape(Rectangle())
@@ -2732,7 +2798,10 @@ struct FocusReaderSheet: View {
                     openPageInPDF(page.pageIndex)
                 } label: {
                     Label(
-                        "Open page \(page.pageIndex + 1) in PDF",
+                        AppLocalization.format(
+                            "Open page %lld in PDF",
+                            page.pageIndex + 1
+                        ),
                         systemImage: "doc.text.magnifyingglass"
                     )
                     .frame(minHeight: 44)
@@ -2868,7 +2937,7 @@ struct FocusReaderSheet: View {
             if sleepRemainingSeconds > 0 {
                 HStack {
                     Label(
-                        "Sleep timer",
+                        "Sleep timer".localizedUI,
                         systemImage: "moon.zzz.fill"
                     )
                     Spacer()
@@ -2881,7 +2950,9 @@ struct FocusReaderSheet: View {
                             .frame(width: 44, height: 44)
                     }
                     .buttonStyle(.plain)
-                    .accessibilityLabel("Cancel sleep timer")
+                    .accessibilityLabel(
+                        "Cancel sleep timer".localizedUI
+                    )
                 }
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(PPColor.textSecondary)
@@ -2957,8 +3028,12 @@ struct FocusReaderSheet: View {
             .font(.caption.monospacedDigit().weight(.semibold))
             .foregroundStyle(PPColor.textSecondary)
             .lineLimit(1)
-            .fixedSize(horizontal: true, vertical: false)
-            .frame(minWidth: 46)
+            .minimumScaleFactor(0.75)
+            .frame(
+                minWidth: 46,
+                idealWidth: 64,
+                maxWidth: .infinity
+            )
             .accessibilityLabel("Reader page position".localizedUI)
             .accessibilityValue(
                 AppLocalization.format(
@@ -3052,6 +3127,23 @@ struct FocusReaderSheet: View {
             : Double(AVSpeechUtteranceDefaultSpeechRate)
     }
 
+    private func normalizeReaderPreferences() {
+        if FocusReaderTypeface(rawValue: savedTypeface) == nil {
+            savedTypeface = FocusReaderTypeface.serif.rawValue
+        }
+        if FocusReaderMeasure(rawValue: savedMeasure) == nil {
+            savedMeasure = FocusReaderMeasure.comfortable.rawValue
+        }
+        let normalizedFontSize = boundedFontSize
+        if fontSize != normalizedFontSize {
+            fontSize = normalizedFontSize
+        }
+        let normalizedSpeechRate = boundedSpeechRate
+        if speechRate != normalizedSpeechRate {
+            speechRate = normalizedSpeechRate
+        }
+    }
+
     private var currentContentRevisionID: UUID? {
         model.record(id: recordID)?.contentRevisionID
     }
@@ -3124,14 +3216,6 @@ struct FocusReaderSheet: View {
             let pageIndex = pages[selectedIndex].pageIndex
             resumePageIndex = pageIndex
             resumeRevisionID = expectedContentRevisionID
-            Task {
-                await model.updateReadingPosition(
-                    recordID: recordID,
-                    pageIndex: pageIndex,
-                    expectedContentRevisionID:
-                        expectedContentRevisionID
-                )
-            }
         }
         readAloud.stop()
         cachedPages.removeAll(keepingCapacity: false)
@@ -3160,6 +3244,10 @@ struct FocusReaderSheet: View {
             }
             guard !Task.isCancelled,
                   readingPositionGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable,
+                  sourceContentRevisionID
+                    == expectedContentRevisionID,
                   model.record(id: recordID)?.contentRevisionID
                     == expectedContentRevisionID
             else { return }
@@ -3541,6 +3629,7 @@ private final class PDFReadAloudController:
         queuedPageCount = 0
         textForPage = nil
         nextPageOffset = 0
+        currentPageOffset = nil
     }
 
     nonisolated func speechSynthesizer(
@@ -3566,9 +3655,7 @@ private final class PDFReadAloudController:
             guard let self,
                   self.activeUtteranceID == utteranceID
             else { return }
-            self.activeUtteranceID = nil
-            self.isSpeaking = false
-            self.isPaused = false
+            self.finishQueue()
         }
     }
 }

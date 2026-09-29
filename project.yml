@@ -10,10 +10,22 @@ settings:
     SWIFT_VERSION: "5.0"
     DEVELOPMENT_TEAM: ""
     CODE_SIGN_STYLE: Automatic
-    CURRENT_PROJECT_VERSION: 2
-    MARKETING_VERSION: 0.1.0
+    CURRENT_PROJECT_VERSION: 5
+    MARKETING_VERSION: 1.1.0
 
 schemes:
+  PaperPathCommerce:
+    build:
+      targets:
+        PaperPath: [test, run, analyze]
+    run:
+      config: Debug
+      storeKitConfiguration: PaperPath/Resources/PaperPath.storekit
+    test:
+      config: Debug
+      testPlans:
+        - path: PaperPathCommerce.xctestplan
+          defaultPlan: true
   PaperPathOfficeRegression:
     build:
       targets:
@@ -21,18 +33,19 @@ schemes:
     test:
       config: Debug
       targets:
-        - PaperPathUITests
-      onlyTesting:
-        - PaperPathUITests/PaperPathUITests/testProfessionalPickerFlow
-        - PaperPathUITests/PaperPathUITests/testProfessionalReadingFlow
-        - PaperPathUITests/PaperPathUITests/testProfessionalOCRCopyFlow
-        - PaperPathUITests/PaperPathUITests/testProfessionalFavorites
-        - PaperPathUITests/PaperPathUITests/testOfficeCorpusNoticesSurviveReopening
-        - PaperPathUITests/PaperPathUITests/testNativeWorkbenchDocumentFlow
-        - PaperPathUITests/PaperPathUITests/testNativeWorkbenchHiddenPreview
-        - PaperPathUITests/PaperPathUITests/testNativeWorkbenchChineseLayouts
-        - PaperPathUITests/PaperPathUITests/testNativeWorkbenchChineseOutput
-        - PaperPathUITests/PaperPathUITests/testNativeWorkbenchPDFResults
+        - name: PaperPathUITests
+          parallelizable: false
+          selectedTests:
+            - PaperPathUITests/testProfessionalPickerFlow()
+            - PaperPathUITests/testProfessionalReadingFlow()
+            - PaperPathUITests/testProfessionalOCRCopyFlow()
+            - PaperPathUITests/testProfessionalFavorites()
+            - PaperPathUITests/testOfficeCorpusNoticesSurviveReopening()
+            - PaperPathUITests/testNativeWorkbenchDocumentFlow()
+            - PaperPathUITests/testNativeWorkbenchHiddenPreview()
+            - PaperPathUITests/testNativeWorkbenchChineseLayouts()
+            - PaperPathUITests/testNativeWorkbenchChineseOutput()
+            - PaperPathUITests/testNativeWorkbenchPDFResults()
 
 targets:
   PaperPath:
@@ -44,6 +57,9 @@ targets:
           - Info.plist
           - PaperPath.entitlements
           - Resources/PaperPath.storekit
+          - Resources/zh-Hans.lproj/Localizable.strings
+      - path: PaperPath/Resources/zh-Hans.lproj/Localizable.strings
+        buildPhase: resources
     dependencies:
       - target: PaperPathShareExtension
         embed: true
@@ -119,6 +135,8 @@ targets:
     platform: iOS
     sources:
       - path: PaperPathUITests
+      - path: PaperPath/Resources/PaperPath.storekit
+        buildPhase: resources
     dependencies:
       - target: PaperPath
     settings:

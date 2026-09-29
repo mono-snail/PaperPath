@@ -73,7 +73,9 @@ struct StampPickerView: View {
                                     pageIndex + 1
                                 )
                             )
-
+                            .accessibilityIdentifier(
+                                "stampOption-\(kind.rawValue)"
+                            )
                         }
                     }
                 }
@@ -1254,6 +1256,7 @@ struct BatesNumberingSheet: View {
                     ?? "Adds one editable Bates identifier to every selected page."
             ).localizedUI
         )
+        .accessibilityIdentifier("batesApplyAction")
     }
 
     private var selectedPageIndices: [Int] {
@@ -1758,6 +1761,7 @@ struct WatermarkSheet: View {
                         customText.count
                     )
                 )
+                .accessibilityIdentifier("watermarkCustomText")
             }
 
             if let textValidationMessage {
@@ -2013,6 +2017,7 @@ struct WatermarkSheet: View {
                     ?? "Adds one editable watermark to every selected page."
             ).localizedUI
         )
+        .accessibilityIdentifier("watermarkApplyAction")
     }
 
     private var selectedPageIndices: [Int] {
@@ -2248,6 +2253,7 @@ struct NoteComposerSheet: View {
                     .textFieldStyle(.plain)
                     .submitLabel(.done)
                     .onSubmit(submitNote)
+                    .accessibilityIdentifier("noteText")
                     .padding(PPSpacing.medium)
                     .background(PPColor.surface)
                     .overlay(alignment: .bottom) {
@@ -2281,6 +2287,7 @@ struct NoteComposerSheet: View {
                     Button("Add", action: submitNote)
                         .disabled(trimmedNote.isEmpty)
                         .keyboardShortcut(.defaultAction)
+                        .accessibilityIdentifier("noteAddAction")
                 }
             }
             .onChange(of: note) { _, value in

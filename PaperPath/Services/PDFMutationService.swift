@@ -2174,12 +2174,10 @@ struct PDFMutationService: Sendable {
                 annotation.border = border
             }
             annotation.modificationDate = Date()
-            if annotation.userName?
-                .trimmingCharacters(
-                    in: .whitespacesAndNewlines
-                ).isEmpty != false {
-                annotation.userName = "PaperPath"
-            }
+            annotation.userName =
+                PDFGeneratedAnnotationKind.resolve(
+                    author: annotation.userName
+                )?.author ?? "PaperPath"
         }
     }
 

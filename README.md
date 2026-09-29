@@ -13,7 +13,7 @@ shortest useful next actions.
 - Private: PDF inspection and OCR run on device.
 - Reversible: operations affect a sandbox working copy, not the import source.
 
-## Prototype Capabilities
+## PDF Workflows
 
 - Files-based PDF import
 - VisionKit multi-page document scanning
@@ -63,6 +63,16 @@ xcodebuild \
 
 ## Test
 
+Run the coverage contract before every test pass. It fails when a quick task
+or document tool is added without both logic and UI ownership:
+
+```bash
+node tools/CheckAutomationCoverage.mjs
+```
+
+The machine-readable ownership matrix is
+`docs/AUTOMATION_COVERAGE.json`.
+
 ```bash
 xcodebuild test \
   -project PaperPath.xcodeproj \
@@ -77,12 +87,25 @@ normal launch.
 
 ## Documentation
 
+- [Signature refinement: 50-round UI and interaction results](docs/APP_SIGNATURE_50_2026_09_27_ZH.md)
+- [Latest iPhone/iPad light and dark screenshots](design/app-signature-50-2026-09-27/README.md)
+- [Launch closure: 50-round audit and release evidence](docs/LAUNCH_CLOSURE_50_2026_09_27_ZH.md)
+- [Current competitor gaps and product boundaries](docs/LAUNCH_COMPETITIVE_GAPS_2026_09_27_ZH.md)
+- [App Store submission checklist](docs/APP_STORE_SUBMISSION_CHECK_2026_09_27_ZH.md)
 - `docs/PRODUCT_ARCHITECTURE_V1.md`
 - `docs/FEATURE_PRIORITIES_V1.md`
 - `docs/TECHNICAL_NOTES_PDFKIT_VISIONKIT.md`
-- `docs/PaperPath项目全维度持续迭代提示词.md`
+- `docs/RELEASE_20_2026_09_26_ZH.md`
+- `docs/APP_STORE_METADATA.md`
+- `docs/APP_REVIEW_NOTES_2026_09_26.md`
+- `docs/PRIVACY_POLICY_DRAFT.md`
 
 ## Remaining Device Validation
+
+The signature-refinement report contains the latest visual and interaction
+validation. It retains the launch-closure release boundaries: purchase
+verification, distribution signing, public support/privacy details, and
+device or OS checks that have not passed.
 
 The VisionKit document camera is unavailable in Simulator. Multi-page camera
 capture, permission copy, retake behavior, low-light and orientation handling,

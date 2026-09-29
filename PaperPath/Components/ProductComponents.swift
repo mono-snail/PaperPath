@@ -13,6 +13,60 @@ struct SectionEyebrow: View {
     }
 }
 
+/// A compact map of the existing privacy flow; the model owns completion.
+struct PrivacyWorkflowTrail: View {
+    let stage: Int
+    var onInk = false
+
+    private let titles = ["Scan", "Review", "Verified"]
+
+    var body: some View {
+        HStack(spacing: 8) {
+            ForEach(titles.indices, id: \.self) { index in
+                if index > 0 {
+                    Rectangle()
+                        .fill(onInk ? PPColor.onInkSecondary : PPColor.border)
+                        .frame(maxWidth: 24)
+                        .frame(height: 1)
+                        .accessibilityHidden(true)
+                }
+                HStack(spacing: 5) {
+                    Image(systemName: index < stage ? "checkmark.circle.fill" : "\(index + 1).circle\(index == stage ? ".fill" : "")")
+                        .font(.caption.weight(.semibold))
+                    Text(titles[index].localizedUI)
+                        .font(.caption.weight(index == stage ? .semibold : .regular))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(
+                    onInk
+                        ? (index == stage ? PPColor.inkAccent : PPColor.onInkSecondary)
+                        : (index == stage ? PPColor.accent : PPColor.textSecondary)
+                )
+                .accessibilityElement(children: .combine)
+                .accessibilityAddTraits(index == stage ? .isSelected : [])
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+struct PPPressButtonStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .overlay {
+                if configuration.isPressed {
+                    RoundedRectangle(cornerRadius: PPRadius.control)
+                        .fill(PPColor.textPrimary.opacity(0.05))
+                        .allowsHitTesting(false)
+                }
+            }
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .animation(reduceMotion ? nil : PPMotion.press, value: configuration.isPressed)
+    }
+}
+
 struct OfficeClockContinuitySection: View {
     var body: some View {
         TimelineView(.periodic(from: .now, by: 30)) { context in
@@ -1956,6 +2010,13 @@ struct PPIllustration: View {
                     .padding(.top, sheetHeight * 0.25)
                     .padding(.horizontal, sheetWidth * 0.16)
 
+                brandPath
+                    .frame(
+                        width: sheetWidth * 0.7,
+                        height: sheetHeight * 0.16
+                    )
+                    .padding(.top, sheetHeight * 0.66)
+
                 Path { path in
                     path.move(to: CGPoint(x: sheetWidth - 26, y: 0))
                     path.addLine(to: CGPoint(x: sheetWidth, y: 26))
@@ -1974,6 +2035,66 @@ struct PPIllustration: View {
             radius: isFront ? 12 : 7,
             y: isFront ? 7 : 4
         )
+    }
+
+    private var brandPath: some View {
+        Canvas { context, size in
+            var route = Path()
+            route.move(
+                to: CGPoint(x: size.width * 0.08, y: size.height * 0.34)
+            )
+            route.addCurve(
+                to: CGPoint(x: size.width * 0.5, y: size.height * 0.7),
+                control1: CGPoint(
+                    x: size.width * 0.23,
+                    y: size.height * 0.34
+                ),
+                control2: CGPoint(
+                    x: size.width * 0.34,
+                    y: size.height * 0.7
+                )
+            )
+            route.addCurve(
+                to: CGPoint(x: size.width * 0.92, y: size.height * 0.25),
+                control1: CGPoint(
+                    x: size.width * 0.68,
+                    y: size.height * 0.7
+                ),
+                control2: CGPoint(
+                    x: size.width * 0.75,
+                    y: size.height * 0.25
+                )
+            )
+            context.stroke(
+                route,
+                with: .color(PPColor.cyan.opacity(0.86)),
+                style: StrokeStyle(
+                    lineWidth: max(1.4, size.width * 0.045),
+                    lineCap: .round,
+                    lineJoin: .round
+                )
+            )
+
+            let radius = max(2.2, size.width * 0.055)
+            let checkpoints = [
+                CGPoint(x: size.width * 0.08, y: size.height * 0.34),
+                CGPoint(x: size.width * 0.5, y: size.height * 0.7),
+                CGPoint(x: size.width * 0.92, y: size.height * 0.25)
+            ]
+            for checkpoint in checkpoints {
+                let node = CGRect(
+                    x: checkpoint.x - radius,
+                    y: checkpoint.y - radius,
+                    width: radius * 2,
+                    height: radius * 2
+                )
+                context.fill(
+                    Path(ellipseIn: node),
+                    with: .color(PPColor.mint)
+                )
+            }
+        }
+        .accessibilityHidden(true)
     }
 
     private var documentLines: some View {
@@ -2341,6 +2462,45 @@ struct WorkflowCommandHeader: View {
     }
 }
 
+struct OperationBoundaryNotice: View {
+    let title: String
+    let detail: String
+    let identifier: String
+    var symbol = "exclamationmark.triangle.fill"
+    var tint = PPColor.amber
+
+    var body: some View {
+        HStack(alignment: .top, spacing: PPSpacing.small) {
+            Image(systemName: symbol)
+                .font(.subheadline.weight(.semibold))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(tint)
+                .frame(width: 22)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title.localizedUI)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.textPrimary)
+                Text(detail.localizedUI)
+                    .font(.caption)
+                    .foregroundStyle(PPColor.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.leading, PPSpacing.small)
+        .padding(.vertical, PPSpacing.xSmall)
+        .overlay(alignment: .leading) {
+            Rectangle()
+                .fill(tint.opacity(0.78))
+                .frame(width: 2)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(identifier)
+    }
+}
+
 struct StudioMetricCell: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
@@ -2349,6 +2509,7 @@ struct StudioMetricCell: View {
     let symbol: String
     let tint: Color
     var detail: String?
+    var allowsLabelWrapping = false
 
     var body: some View {
         HStack(alignment: .top, spacing: PPSpacing.small) {
@@ -2374,7 +2535,9 @@ struct StudioMetricCell: View {
                     .fontDesign(.monospaced)
                     .foregroundStyle(PPColor.textSecondary)
                     .lineLimit(
-                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 1
+                        dynamicTypeSize.ppPrefersExpandedLayout
+                            ? nil
+                            : allowsLabelWrapping ? 2 : 1
                     )
                     .fixedSize(horizontal: false, vertical: true)
                 if let detail {
@@ -2635,10 +2798,19 @@ struct PrecisionPlacementRail: View {
                     placementControls
                 }
             } else {
-                HStack(spacing: PPSpacing.small) {
-                    placementIdentity
-                    Spacer(minLength: 0)
-                    placementControls
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: PPSpacing.small) {
+                        placementIdentity
+                            .fixedSize(horizontal: true, vertical: false)
+                        Spacer(minLength: 0)
+                        placementControls
+                            .fixedSize(horizontal: true, vertical: false)
+                    }
+                    VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                        placementIdentity
+                        placementControls
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
             }
         }
@@ -2797,11 +2969,11 @@ struct PPEmptyState: View {
     }
 
     private var emptyIllustration: some View {
-        Image(systemName: emptySymbol)
-            .font(.system(size: 28, weight: .regular))
-            .foregroundStyle(PPColor.textSecondary)
-            .frame(width: 44, height: 44)
-            .accessibilityHidden(true)
+        ToolSymbolPlate(
+            symbol: emptySymbol,
+            tint: emptyTint,
+            size: 44
+        )
     }
 
     private var emptySymbol: String {
@@ -2813,6 +2985,21 @@ struct PPEmptyState: View {
         case .privacy: return "lock.shield"
         case .processing: return "hourglass"
         case .workspace: return "folder"
+        }
+    }
+
+    private var emptyTint: Color {
+        switch kind {
+        case .intake, .search:
+            return PPColor.cyan
+        case .tools, .workspace:
+            return PPColor.accent
+        case .locked:
+            return PPColor.amber
+        case .privacy:
+            return PPColor.mint
+        case .processing:
+            return PPColor.rose
         }
     }
 

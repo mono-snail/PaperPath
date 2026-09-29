@@ -98,12 +98,22 @@ struct CombineDocumentsView: View {
             allowedContentTypes: [.pdf],
             allowsMultipleSelection: true
         ) { result in
-            guard case .success(let urls) = result, !urls.isEmpty else {
-                if case .failure(let error) = result {
+            let urls: [URL]
+            switch result {
+            case .success(let selectedURLs):
+                var seenPaths = Set<String>()
+                urls = selectedURLs.filter {
+                    seenPaths.insert(
+                        $0.standardizedFileURL.path
+                    ).inserted
+                }
+            case .failure(let error):
+                if !Self.isFileImportCancellation(error) {
                     model.present(error, in: paperPathSceneID)
                 }
                 return
             }
+            guard !urls.isEmpty else { return }
             cancelImport()
             let generation = UUID()
             importGeneration = generation
@@ -209,11 +219,11 @@ struct CombineDocumentsView: View {
                         .frame(maxWidth: .infinity, alignment: .top)
                 }
             } else {
+                availableDocuments
                 if !selectedIDs.isEmpty {
                     selectedOrder
                     nameField
                 }
-                availableDocuments
             }
         }
     }
@@ -227,7 +237,7 @@ struct CombineDocumentsView: View {
                 : "Review order and name before creating the combined copy.",
             symbol: "square.stack.3d.up",
             tint: PPColor.mint,
-            metrics: [
+            metrics: selectedIDs.isEmpty ? [] : [
                 WorkflowMetric(
                     value: "\(selectedIDs.count)",
                     label: "Selected",
@@ -282,15 +292,14 @@ struct CombineDocumentsView: View {
             }
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.accent))
             .disabled(
-                model.isImporting
-                    || hasActiveTask
+                hasActiveTask
                     || !canAddMoreSources
             )
             .accessibilityHint(
                 (
                     selectionLimitMessage
                         ?? (
-                            hasActiveTask || model.isImporting
+                            hasActiveTask
                                 ? "Wait for the current operation to finish."
                                 : "Choose one or more PDFs from Files."
                         )
@@ -320,7 +329,15 @@ struct CombineDocumentsView: View {
                 Menu {
                     Button {
                         selectedIDs = selectedRecords.sorted {
-                            $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending
+                            let comparison = $0.displayName
+                                .localizedStandardCompare(
+                                    $1.displayName
+                                )
+                            if comparison != .orderedSame {
+                                return comparison == .orderedAscending
+                            }
+                            return $0.id.uuidString
+                                < $1.id.uuidString
                         }.map(\.id)
                     } label: {
                         Label("Sort merge order by name".localizedUI, systemImage: "textformat.abc")
@@ -380,7 +397,9 @@ struct CombineDocumentsView: View {
         _ record: DocumentRecord,
         at index: Int
     ) -> some View {
-        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+        let expandsRow = horizontalSizeClass != .regular
+            || dynamicTypeSize.ppPrefersExpandedLayout
+        let layout = expandsRow
             ? AnyLayout(
                 VStackLayout(
                     alignment: .leading,
@@ -411,7 +430,7 @@ struct CombineDocumentsView: View {
                         .lineLimit(
                             dynamicTypeSize.ppPrefersExpandedLayout
                                 ? nil
-                                : 1
+                                : 2
                         )
                         .fixedSize(horizontal: false, vertical: true)
                     Text(record.subtitle)
@@ -420,7 +439,7 @@ struct CombineDocumentsView: View {
                         .monospacedDigit()
                 }
 
-                if !dynamicTypeSize.ppPrefersExpandedLayout {
+                if !expandsRow {
                     Spacer(minLength: 0)
                 }
             }
@@ -433,6 +452,7 @@ struct CombineDocumentsView: View {
                 ) {
                     move(from: index, to: index - 1)
                 }
+                .accessibilityValue(record.displayName)
                 orderButton(
                     symbol: "arrow.down",
                     label: "Move later",
@@ -440,6 +460,7 @@ struct CombineDocumentsView: View {
                 ) {
                     move(from: index, to: index + 1)
                 }
+                .accessibilityValue(record.displayName)
                 orderButton(
                     symbol: "xmark",
                     label: "Remove",
@@ -447,15 +468,19 @@ struct CombineDocumentsView: View {
                 ) {
                     selectedIDs.remove(at: index)
                 }
+                .accessibilityValue(record.displayName)
             }
             .frame(
-                maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
+                maxWidth: expandsRow
                     ? .infinity
                     : nil,
                 alignment: .trailing
             )
         }
         .padding(.vertical, PPSpacing.small)
+        .accessibilityIdentifier(
+            "mergeSelectedDocument-\(record.id.uuidString)"
+        )
         .contextMenu {
             Button {
                 move(from: index, to: 0)
@@ -526,6 +551,7 @@ struct CombineDocumentsView: View {
                     style: .continuous
                 )
             )
+            .accessibilityIdentifier("mergeOutputName")
     }
 
     private var mergeNamePasteButton: some View {
@@ -700,6 +726,9 @@ struct CombineDocumentsView: View {
                         : "Unlock this PDF before merging it."
                     ).localizedUI
         )
+        .accessibilityIdentifier(
+            "mergeAvailableDocument-\(record.id.uuidString)"
+        )
     }
 
     @ViewBuilder
@@ -859,6 +888,7 @@ struct CombineDocumentsView: View {
                 }
                 .buttonStyle(PPPrimaryButtonStyle())
                 .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("mergeOpenResult")
             } else {
                 Button {
                     let generation = UUID()
@@ -911,7 +941,6 @@ struct CombineDocumentsView: View {
                                 .maximumSourceDocumentCount
                         || selectedPageCount
                             > PDFCompositionService.maximumPageCount
-                        || model.isImporting
                         || hasActiveTask
                 )
                 .accessibilityHint(
@@ -920,6 +949,7 @@ struct CombineDocumentsView: View {
                             ?? "Creates a separate private working copy."
                     ).localizedUI
                 )
+                .accessibilityIdentifier("mergeCreateAction")
             }
         }
         .padding(.horizontal, PPSpacing.regular)
@@ -995,9 +1025,6 @@ struct CombineDocumentsView: View {
         if selectedPageCount
             > PDFCompositionService.maximumPageCount {
             return "Choose no more than 100,000 pages."
-        }
-        if model.isImporting {
-            return "Wait for PDF import to finish."
         }
         if hasActiveTask {
             return "Wait for the current operation to finish."
@@ -1136,5 +1163,16 @@ struct CombineDocumentsView: View {
         createdSourceCount = 0
         isAddingFiles = false
         dismiss()
+    }
+
+    private nonisolated static func isFileImportCancellation(
+        _ error: Error
+    ) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSCocoaErrorDomain
+            && nsError.code == NSUserCancelledError
     }
 }

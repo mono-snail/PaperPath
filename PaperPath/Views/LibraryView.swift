@@ -427,16 +427,23 @@ private struct DeliveryPackageFailureAlertModifier: ViewModifier {
     }
 }
 
+private enum ReviewedImageImportKind: Sendable {
+    case scan
+    case photos
+}
+
 private struct ScanReviewSession: Identifiable, @unchecked Sendable {
     let id: UUID
     let pages: [ScanPageImage]
     let fallbackOptions: ScanProcessingOptions
     let initialPageIndex: Int
+    let importKind: ReviewedImageImportKind
 
     init(
         id: UUID = UUID(),
         images: [UIImage],
-        initialOptions: ScanProcessingOptions
+        initialOptions: ScanProcessingOptions,
+        importKind: ReviewedImageImportKind = .scan
     ) {
         self.id = id
         pages = images.map {
@@ -447,13 +454,15 @@ private struct ScanReviewSession: Identifiable, @unchecked Sendable {
         }
         fallbackOptions = initialOptions
         initialPageIndex = 0
+        self.importKind = importKind
     }
 
     init(
         id: UUID = UUID(),
         pages: [ScanPageImage],
         fallbackOptions: ScanProcessingOptions = .document,
-        initialPageIndex: Int = 0
+        initialPageIndex: Int = 0,
+        importKind: ReviewedImageImportKind = .scan
     ) {
         self.id = id
         self.pages = pages
@@ -461,12 +470,25 @@ private struct ScanReviewSession: Identifiable, @unchecked Sendable {
         self.initialPageIndex = pages.isEmpty
             ? 0
             : min(max(0, initialPageIndex), pages.count - 1)
+        self.importKind = importKind
     }
 }
 
 private extension View {
     func eraseLibraryViewType() -> AnyView {
         AnyView(self)
+    }
+}
+
+struct LibraryForegroundActivity: Equatable, Sendable {
+    let isFileImportActive: Bool
+    let isPhotoPreparationActive: Bool
+    let isScanCreationActive: Bool
+
+    var blocksInteraction: Bool {
+        isFileImportActive
+            || isPhotoPreparationActive
+            || isScanCreationActive
     }
 }
 
@@ -506,6 +528,8 @@ struct LibraryView: View {
     @State private var scanPresentationGeneration = UUID()
     @State private var pendingReviewedScanPages: [ScanPageImage]?
     @State private var pendingReviewedScanSessionID: UUID?
+    @State private var pendingReviewedImageImportKind =
+        ReviewedImageImportKind.scan
     @State private var documentPickerTask: PDFQuickTask?
     @State private var toolDocumentQuery = ""
     @State private var isToolDocumentSearchPresented = false
@@ -527,6 +551,8 @@ struct LibraryView: View {
     @State private var committedScanRecordID: UUID?
     @State private var pendingScanDraft: [ScanPageImage]?
     @State private var pendingScanDraftID: UUID?
+    @State private var pendingScanDraftImportKind =
+        ReviewedImageImportKind.scan
     @State private var didPresentScanReviewForUITest = false
     @Binding private var searchText: String
     @Binding private var appliedSearchText: String
@@ -733,7 +759,7 @@ struct LibraryView: View {
                     Image(systemName: "gearshape")
                 }
                 .keyboardShortcut(",", modifiers: .command)
-                .accessibilityLabel("Settings")
+                .accessibilityLabel("Settings".localizedUI)
                 .accessibilityIdentifier("settings")
                 .help("Settings".localizedUI)
                 .disabled(
@@ -906,27 +932,23 @@ struct LibraryView: View {
                             )
                         }
                     } label: {
-                        Image(systemName: "plus")
+                        Image(systemName: "ellipsis")
                     }
                     .disabled(
                         isShowingProcessingOverlay
                             || isLibraryHandoffActive
                             || isSelectingDocuments
                     )
-                    .accessibilityLabel("Add or manage PDFs")
+                    .accessibilityLabel(
+                        "Add or manage PDFs".localizedUI
+                    )
+                    .accessibilityIdentifier("libraryMoreActions")
                 }
             }
         }
         .eraseLibraryViewType()
 
         let importPresentation = libraryRoot
-#if DEBUG
-        .onChange(of: isImportingFile) { _, value in
-            // #region debug-point A:experience-presentations
-            if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "A", "location": "LibraryView.importState", "msg": "[DEBUG] Import state changed", "data": ["presented": value, "sidebar": isWorkspaceSidebar]]); URLSession.shared.dataTask(with: request).resume() }
-            // #endregion
-        }
-#endif
         .sheet(
             item: $deliveryPackageVerificationReport,
             onDismiss: {
@@ -1216,7 +1238,8 @@ struct LibraryView: View {
                         id: session.id,
                         pages: pages,
                         fallbackOptions: session.fallbackOptions,
-                        initialPageIndex: pageIndex
+                        initialPageIndex: pageIndex,
+                        importKind: session.importKind
                     )
                     scanReviewSession = nil
                 }
@@ -1224,6 +1247,7 @@ struct LibraryView: View {
                 suspendedScanReviewSession = nil
                 pendingReviewedScanPages = pages
                 pendingReviewedScanSessionID = session.id
+                pendingReviewedImageImportKind = session.importKind
                 scanReviewSession = nil
             }
         }
@@ -1365,7 +1389,6 @@ struct LibraryView: View {
             selectedDocumentIDs.formIntersection(Set(activeIDs))
         }
         .onChange(of: filteredDocuments.map(\.id)) { _, _ in
-            reconcileDocumentSelection()
             if usesDeskPreview, let record = deskFocusedRecord {
                 focusDeskRecord(record)
             }
@@ -1412,11 +1435,21 @@ struct LibraryView: View {
             resumeSuspendedScanReview()
             completeReviewedScanHandoff()
         }
-        .sensoryFeedback(.success, trigger: model.documents.count)
+        .sensoryFeedback(
+            .success,
+            trigger: model.documents.count
+        ) { previousCount, currentCount in
+            currentCount > previousCount
+        }
         .sensoryFeedback(.selection, trigger: showsAllPDFTools)
         .sensoryFeedback(.selection, trigger: savedQuickTools)
         .sensoryFeedback(.selection, trigger: taskStartFeedback)
-        .sensoryFeedback(.selection, trigger: selectedDocumentIDs.count)
+        .sensoryFeedback(
+            .selection,
+            trigger: selectedDocumentIDs.count
+        ) { _, _ in
+            isSelectingDocuments
+        }
         .sensoryFeedback(.selection, trigger: savedLibraryViewMode)
         .sensoryFeedback(.selection, trigger: savedWorkspaceLane)
         .sensoryFeedback(.selection, trigger: searchScope)
@@ -1527,6 +1560,7 @@ struct LibraryView: View {
         hasWideDeskViewport && !isWorkspaceSidebar
             && workspaceLane == .work && !isSearching
             && !dynamicTypeSize.isAccessibilitySize
+            && !model.documents.isEmpty
     }
 
     private var usesDeskPreview: Bool {
@@ -1555,34 +1589,48 @@ struct LibraryView: View {
             Text(
                 workspaceLane.title.localizedUI
             )
-            .font(dynamicTypeSize.isAccessibilitySize ? .headline : .title2.weight(.semibold))
+            .font(dynamicTypeSize.isAccessibilitySize ? .headline : PPType.display)
             .foregroundStyle(PPColor.textPrimary)
             .fixedSize(horizontal: false, vertical: true)
             .accessibilityAddTraits(.isHeader)
+            Text(AppBrand.subtitle.localizedUI)
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
     private var deskCreationCommands: some View {
         HStack(alignment: .top, spacing: PPSpacing.small) {
-            DeskIconButton(
-                title: "Import PDFs", symbol: "square.and.arrow.down",
-                isProminent: true
-            ) {
+            Button {
                 requestFileImport(.pdf)
-#if DEBUG
-                // #region debug-point A:experience-presentations
-                if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "A", "location": "LibraryView.deskImport", "msg": "[DEBUG] Import requested", "data": ["presented": isImportingFile, "sidebar": isWorkspaceSidebar]]); URLSession.shared.dataTask(with: request).resume() }
-                // #endregion
-#endif
+            } label: {
+                Label("Import".localizedUI, systemImage: "square.and.arrow.down")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.onAccent)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, PPSpacing.medium)
+                    .frame(minHeight: PPDeskLayout.touchTarget)
+                    .background(PPColor.accent, in: RoundedRectangle(cornerRadius: PPRadius.control))
             }
+            .buttonStyle(PPPressButtonStyle())
             .keyboardShortcut("o", modifiers: .command)
+            .accessibilityLabel("Import PDFs".localizedUI)
             .accessibilityIdentifier("deskImport")
-            DeskIconButton(
-                title: "Scan Paper", symbol: "viewfinder", tint: PPColor.cyan
-            ) {
+            Button {
                 beginScan()
+            } label: {
+                Label("Scan".localizedUI, systemImage: "viewfinder")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(PPColor.accent)
+                    .fixedSize(horizontal: true, vertical: false)
+                    .padding(.horizontal, PPSpacing.small)
+                    .frame(minHeight: PPDeskLayout.touchTarget)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(PPPressButtonStyle())
             .keyboardShortcut("n", modifiers: [.command, .shift])
+            .accessibilityLabel("Scan Paper".localizedUI)
             .accessibilityIdentifier("deskScan")
             Menu {
                 Button {
@@ -1629,7 +1677,14 @@ struct LibraryView: View {
         let continuingIDs = Set(continuing.map(\.id))
         let recent = model.workingDocuments
             .filter { !continuingIDs.contains($0.id) && $0.lastViewedAt != nil }
-            .sorted { ($0.lastViewedAt ?? .distantPast) > ($1.lastViewedAt ?? .distantPast) }
+            .sorted { lhs, rhs in
+                let lhsDate = lhs.lastViewedAt ?? .distantPast
+                let rhsDate = rhs.lastViewedAt ?? .distantPast
+                if lhsDate != rhsDate {
+                    return lhsDate > rhsDate
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
+            }
         return Array((continuing + recent.prefix(3)).prefix(3))
     }
 
@@ -1890,7 +1945,7 @@ struct LibraryView: View {
                         .foregroundStyle(PPColor.onAccent)
                         .frame(maxWidth: .infinity, minHeight: 36)
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(PPPrimaryButtonStyle())
                 .keyboardShortcut(.return, modifiers: [])
                 .accessibilityIdentifier("deskOpenDocument")
                 deskDocumentActions(record)
@@ -2132,10 +2187,12 @@ struct LibraryView: View {
             } else if isWorkspaceSidebar {
                 sections.append(.library)
             } else {
-                if recoverableBatchRun != nil || hasOfficeQueueRecovery {
+                sections.append(.deskHeader)
+                if recoverableBatchRun != nil
+                    || hasOfficeQueueRecovery
+                    || homePriorityRecord != nil {
                     sections.append(.commandCenter)
-                }
-                if !hasActiveFilters && !isSelectingDocuments
+                } else if !hasActiveFilters && !isSelectingDocuments
                     && !dynamicTypeSize.isAccessibilitySize
                     && !deskRecentRecords.isEmpty && !usesDeskPreview {
                     sections.append(.deskResume)
@@ -2287,7 +2344,7 @@ struct LibraryView: View {
                 }
                 .buttonStyle(.plain)
                 .dynamicTypeSize(...DynamicTypeSize.accessibility1)
-                .accessibilityLabel("Workspace")
+                .accessibilityLabel("Workspace".localizedUI)
                 .accessibilityValue(workspaceLane.title.localizedUI)
             } else {
                 HStack(spacing: 0) {
@@ -2333,18 +2390,10 @@ struct LibraryView: View {
             )
             .padding(.horizontal, 8)
             .frame(minHeight: 44)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(
-                        selected
-                            ? tint
-                            : PPColor.border.opacity(0.55)
-                    )
-                    .frame(height: selected ? 2 : 0.6)
-            }
+            .background(selected ? PPColor.surface : .clear, in: RoundedRectangle(cornerRadius: PPRadius.control))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PPPressButtonStyle())
         .hoverEffect(.highlight)
         .keyboardShortcut(
             workspaceLaneShortcut(lane),
@@ -2367,7 +2416,7 @@ struct LibraryView: View {
             return
         }
         withAnimation(
-            reduceMotion ? nil : .snappy(duration: 0.2)
+            reduceMotion ? nil : PPMotion.selection
         ) {
             savedWorkspaceLane = lane.rawValue
             isLibrarySearchPresented = false
@@ -2409,14 +2458,13 @@ struct LibraryView: View {
                                 : 56
                     )
                     .contentShape(Rectangle())
-                    .overlay(alignment: .top) {
-                        Rectangle()
-                            .fill(
-                                selected
-                                    ? workspaceLaneTint(lane)
-                                    : .clear
-                            )
-                            .frame(height: 2)
+                    .background {
+                        if selected {
+                            RoundedRectangle(cornerRadius: PPRadius.control)
+                                .fill(PPColor.surfaceMuted)
+                                .padding(.horizontal, PPSpacing.small)
+                                .padding(.vertical, 3)
+                        }
                     }
                 }
                 .buttonStyle(.plain)
@@ -2430,6 +2478,7 @@ struct LibraryView: View {
                 .accessibilityValue(
                     (selected ? "Selected" : "").localizedUI
                 )
+                .accessibilityAddTraits(selected ? .isSelected : [])
                 .accessibilityIdentifier(
                     workspaceLaneIdentifier(lane)
                 )
@@ -2693,24 +2742,12 @@ struct LibraryView: View {
             model.taskPackageRecommendation(for: $0)
         }
 
-        return VStack(alignment: .leading, spacing: PPSpacing.small) {
-            SectionEyebrow(text: "CONTINUE")
+        return VStack(alignment: .leading, spacing: 0) {
             commandCenterPrimaryButton(
                 summary,
                 priorityRecord: priorityRecord,
                 priorityRecommendation: priorityRecommendation
             )
-        }
-        .padding(.vertical, PPSpacing.small)
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.62))
-                .frame(height: 0.6)
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.62))
-                .frame(height: 0.6)
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("workbenchCommandCenter")
@@ -2748,103 +2785,56 @@ struct LibraryView: View {
                 priorityRecommendation: priorityRecommendation
             )
         } label: {
-            Group {
-                if usesExpandedLayout {
-                    VStack(
-                        alignment: .leading,
-                        spacing: PPSpacing.small
-                    ) {
-                        HStack(
-                            alignment: .firstTextBaseline,
-                            spacing: PPSpacing.small
-                        ) {
-                            commandCenterPrimaryIcon(symbol)
-                            Text(title)
-                                .font(.headline)
-                                .fontDesign(.serif)
-                                .fixedSize(
-                                    horizontal: false,
-                                    vertical: true
-                                )
-                            Spacer(minLength: PPSpacing.xSmall)
-                            commandCenterPrimaryDisclosure
-                        }
-                        Text(detail)
-                            .font(.caption)
-                            .fixedSize(
-                                horizontal: false,
-                                vertical: true
-                            )
-                            .foregroundStyle(
-                                PPColor.onAccent.opacity(0.78)
-                            )
-                    }
+            HStack(alignment: .center, spacing: PPSpacing.regular) {
+                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                    Label("CONTINUE".localizedUI, systemImage: symbol)
+                        .font(.caption2.weight(.semibold))
+                        .tracking(0.7)
+                        .foregroundStyle(PPColor.inkAccent)
+                    Text(title)
+                        .font(PPType.display)
+                        .lineLimit(usesExpandedLayout ? nil : 2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Text(detail)
+                        .font(.caption)
+                        .lineLimit(usesExpandedLayout ? nil : 3)
+                        .foregroundStyle(PPColor.onInkSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if let record = priorityRecord,
+                   recoverableBatchRun == nil, !hasOfficeQueueRecovery,
+                   !usesExpandedLayout {
+                    deskThumbnail(record, pageIndex: 0, width: 62)
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                        .padding(5)
+                        .background(PPColor.onInk, in: RoundedRectangle(cornerRadius: 8))
+                        .rotationEffect(.degrees(4))
+                        .accessibilityHidden(true)
                 } else {
-                    HStack(
-                        alignment: .center,
-                        spacing: PPSpacing.medium
-                    ) {
-                        commandCenterPrimaryIcon(symbol)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(title)
-                                .font(.headline)
-                                .fontDesign(.serif)
-                                .lineLimit(2)
-                                .fixedSize(
-                                    horizontal: false,
-                                    vertical: true
-                                )
-                            Text(detail)
-                                .font(.caption)
-                                .lineLimit(2)
-                                .fixedSize(
-                                    horizontal: false,
-                                    vertical: true
-                                )
-                                .foregroundStyle(
-                                    PPColor.onAccent.opacity(0.78)
-                                )
-                        }
-                        Spacer(minLength: PPSpacing.small)
+                    commandCenterPrimaryIcon(symbol)
+                        .foregroundStyle(PPColor.inkAccent)
+                }
+                if !usesExpandedLayout {
+                    VStack {
                         commandCenterPrimaryDisclosure
+                            .foregroundStyle(PPColor.inkAccent)
                     }
                 }
             }
-            .foregroundStyle(PPColor.onAccent)
-            .padding(.horizontal, PPSpacing.medium)
-            .padding(
-                .vertical,
-                usesExpandedLayout
-                    ? PPSpacing.medium
-                    : 0
-            )
+            .multilineTextAlignment(.leading)
+            .foregroundStyle(PPColor.onInk)
+            .padding(PPSpacing.large)
             .frame(maxWidth: .infinity)
-            .frame(minHeight: 68)
-            .background(
-                commandCenterPrimaryTint(
-                    summary,
-                    priorityRecord: priorityRecord,
-                    priorityRecommendation: priorityRecommendation
-                )
-            )
-            .clipShape(
-                UnevenRoundedRectangle(
-                    topLeadingRadius: 2,
-                    bottomLeadingRadius: 7,
-                    bottomTrailingRadius: 7,
-                    topTrailingRadius: 2,
-                    style: .continuous
-                )
-            )
-            .overlay(alignment: .leading) {
-                Rectangle()
-                    .fill(PPColor.onAccent.opacity(0.78))
-                    .frame(width: 2)
-                    .padding(.vertical, 7)
+            .frame(minHeight: 132)
+            .background(PPColor.ink, in: RoundedRectangle(cornerRadius: PPRadius.surface))
+            .overlay {
+                RoundedRectangle(cornerRadius: PPRadius.surface)
+                    .strokeBorder(PPColor.onInkSecondary.opacity(0.22), lineWidth: 0.7)
             }
-            .contentShape(Rectangle())
+            .contentShape(RoundedRectangle(cornerRadius: PPRadius.surface))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PPPressButtonStyle())
         .accessibilityLabel(title)
         .accessibilityHint(detail)
         .accessibilityIdentifier("homePrimaryAction")
@@ -3289,10 +3279,12 @@ struct LibraryView: View {
            let pages = pendingReviewedScanPages {
             suspendedScanReviewSession = ScanReviewSession(
                 id: pendingReviewedScanSessionID ?? UUID(),
-                pages: pages
+                pages: pages,
+                importKind: pendingReviewedImageImportKind
             )
             pendingReviewedScanPages = nil
             pendingReviewedScanSessionID = nil
+            pendingReviewedImageImportKind = .scan
         }
         cancelForegroundImports(
             preservesScanDraft: preservesSuspendedScanReview
@@ -3303,6 +3295,7 @@ struct LibraryView: View {
             suspendedScanReviewSession = nil
             pendingReviewedScanPages = nil
             pendingReviewedScanSessionID = nil
+            pendingReviewedImageImportKind = .scan
         }
         stopDeliveryPackageVerification()
         deliveryPackageVerificationReport = nil
@@ -3548,33 +3541,6 @@ struct LibraryView: View {
         if summary.scansNeedingOCRCount > 0 { return "text.viewfinder" }
         if summary.batchEligibleCount >= 2 { return "checklist" }
         return "checkmark.shield"
-    }
-
-    private func commandCenterPrimaryTint(
-        _ summary: LibraryCommandSummary,
-        priorityRecord: DocumentRecord?,
-        priorityRecommendation:
-            PDFTaskPackagePlanner.Recommendation?
-    ) -> Color {
-        if recoverableBatchRun != nil || hasOfficeQueueRecovery {
-            return PPColor.amber
-        }
-        if let record = priorityRecord {
-            if record.profile.isLocked {
-                return PPColor.amber
-            }
-            if record.deliveryReceipt != nil,
-               !record.hasCurrentDeliveryReceipt {
-                return PPColor.amber
-            }
-            if let package = priorityRecommendation?.package {
-                return taskPackageTint(package)
-            }
-            return PPColor.cyan
-        }
-        if summary.staleReceiptCount > 0 { return PPColor.amber }
-        if summary.scansNeedingOCRCount > 0 { return PPColor.cyan }
-        return PPColor.mint
     }
 
     private func performCommandCenterPrimary(
@@ -4542,20 +4508,24 @@ struct LibraryView: View {
         let recordsByLane: [
             DeliveryBoardLane: [DocumentRecord]
         ] = [
-            .source: model.workingDocuments
-                .filter {
+            .source: mostRecentlyModifiedFirst(
+                model.workingDocuments.filter {
                     !$0.profile.isLocked
                         && !producingIDs.contains($0.id)
                         && !reviewIDs.contains($0.id)
                         && model.verifiedShareTarget(for: $0.id) == nil
                 }
-                .sorted { $0.modifiedAt > $1.modifiedAt },
-            .producing: model.documents
-                .filter { producingIDs.contains($0.id) }
-                .sorted { $0.modifiedAt > $1.modifiedAt },
-            .review: model.documents
-                .filter { reviewIDs.contains($0.id) }
-                .sorted { $0.modifiedAt > $1.modifiedAt },
+            ),
+            .producing: mostRecentlyModifiedFirst(
+                model.documents.filter {
+                    producingIDs.contains($0.id)
+                }
+            ),
+            .review: mostRecentlyModifiedFirst(
+                model.documents.filter {
+                    reviewIDs.contains($0.id)
+                }
+            ),
             .verified: outputRecords
                 .filter(\.hasCurrentDeliveryReceipt)
         ]
@@ -4863,10 +4833,17 @@ struct LibraryView: View {
 
         let priorityID = homePriorityRecord?.id
         let orderedRecords = model.workingDocuments.sorted { lhs, rhs in
-            if lhs.id == priorityID { return true }
-            if rhs.id == priorityID { return false }
-            return (lhs.lastViewedAt ?? lhs.modifiedAt)
-                > (rhs.lastViewedAt ?? rhs.modifiedAt)
+            let lhsIsPriority = lhs.id == priorityID
+            let rhsIsPriority = rhs.id == priorityID
+            if lhsIsPriority != rhsIsPriority {
+                return lhsIsPriority
+            }
+            let lhsDate = lhs.lastViewedAt ?? lhs.modifiedAt
+            let rhsDate = rhs.lastViewedAt ?? rhs.modifiedAt
+            if lhsDate != rhsDate {
+                return lhsDate > rhsDate
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
         }
         for record in orderedRecords.prefix(12) {
             if let recommendation =
@@ -5317,7 +5294,7 @@ struct LibraryView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel("Search scope")
+                .accessibilityLabel("Search scope".localizedUI)
                 .accessibilityValue(searchScope.title.localizedUI)
             } else {
                 Picker(
@@ -5432,7 +5409,9 @@ struct LibraryView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
-                .accessibilityHint("Retries the same local search")
+                .accessibilityHint(
+                    "Retries the same local search".localizedUI
+                )
             } else if summary.pageCount == 0,
                       summary.hasTruncatedIndices {
                 partialIndexSearchNotice
@@ -5562,8 +5541,12 @@ struct LibraryView: View {
                 if left != right {
                     return left > right
                 }
-                return (lhs.lastViewedAt ?? lhs.modifiedAt)
-                    > (rhs.lastViewedAt ?? rhs.modifiedAt)
+                let lhsDate = lhs.lastViewedAt ?? lhs.modifiedAt
+                let rhsDate = rhs.lastViewedAt ?? rhs.modifiedAt
+                if lhsDate != rhsDate {
+                    return lhsDate > rhsDate
+                }
+                return lhs.id.uuidString < rhs.id.uuidString
             }
     }
 
@@ -6186,16 +6169,11 @@ struct LibraryView: View {
         LazyVGrid(
             columns: quickToolColumns,
             alignment: .leading,
-            spacing: 0
+            spacing: PPSpacing.small
         ) {
             ForEach(tasks) { task in
                 quickToolButton(task)
             }
-        }
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.7))
-                .frame(height: 0.6)
         }
     }
 
@@ -6247,16 +6225,16 @@ struct LibraryView: View {
             .padding(.horizontal, PPSpacing.small)
             .padding(.vertical, 6)
             .contentShape(Rectangle())
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(PPColor.border.opacity(0.55))
-                    .frame(height: 0.5)
+            .background(PPColor.surface, in: RoundedRectangle(cornerRadius: PPRadius.control))
+            .overlay {
+                RoundedRectangle(cornerRadius: PPRadius.control)
+                    .strokeBorder(PPColor.border.opacity(0.5), lineWidth: 0.6)
             }
         }
         .disabled(
             task.requiresDocument && toolTargetRecord.map { !task.supports($0) } == true
         )
-        .buttonStyle(.plain)
+        .buttonStyle(PPPressButtonStyle())
         .accessibilityHint(task.detail.localizedUI)
         .accessibilityIdentifier("quickTool-\(task.rawValue)")
     }
@@ -6312,8 +6290,24 @@ struct LibraryView: View {
         }
         switch task {
         case .scanToPDF:
+#if DEBUG
+            if presentImageReviewFixtureForUITest(
+                argument: "UITEST_SCAN_CAPTURE_FIXTURE",
+                importKind: .scan
+            ) {
+                return
+            }
+#endif
             beginScan()
         case .imagesToPDF:
+#if DEBUG
+            if presentImageReviewFixtureForUITest(
+                argument: "UITEST_IMAGE_IMPORT_FIXTURE",
+                importKind: .photos
+            ) {
+                return
+            }
+#endif
             isPresentingPhotoPicker = true
         case .mergePDFs:
             isPresentingCombine = true
@@ -6326,9 +6320,6 @@ struct LibraryView: View {
             if eligible.isEmpty {
                 pendingImportTask = task
                 requestFileImport(.pdf)
-            } else if let record = eligible.first,
-                      eligible.count == 1 {
-                open(task, recordID: record.id)
             } else {
                 documentPickerTask = task
             }
@@ -6396,11 +6387,6 @@ struct LibraryView: View {
             return
         }
         guard let route = pendingLibraryRoute else { return }
-#if DEBUG
-        // #region debug-point B:picker-handoff
-        if let endpoint = ProcessInfo.processInfo.environment["PICKER_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "picker-row-hit", "runId": ProcessInfo.processInfo.environment["PICKER_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "B", "msg": "[DEBUG] Picker handoff", "data": ["phase": "\(scenePhase)", "protected": UIApplication.shared.isProtectedDataAvailable]]); URLSession.shared.dataTask(with: request).resume() }
-        // #endregion
-#endif
         pendingLibraryRoute = nil
         activeLibraryRoute = route
         libraryHandoffFeedback += 1
@@ -6425,11 +6411,6 @@ struct LibraryView: View {
                     "The document is no longer available".localizedUI
                 return
             }
-            // #region debug-point C:picker-navigation
-#if DEBUG
-            if let endpoint = ProcessInfo.processInfo.environment["PICKER_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "picker-row-hit", "runId": ProcessInfo.processInfo.environment["PICKER_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "C", "msg": "[DEBUG] Picker navigation", "data": ["current": model.record(id: route.recordID)?.contentRevisionID == route.expectedContentRevisionID]]); URLSession.shared.dataTask(with: request).resume() }
-#endif
-            // #endregion
             onOpen(route)
         }
     }
@@ -6482,11 +6463,6 @@ struct LibraryView: View {
                     }
                     ForEach(matches) { record in
                         Button {
-#if DEBUG
-                            // #region debug-point A:picker-row-hit
-                            if let endpoint = ProcessInfo.processInfo.environment["PICKER_DEBUG_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "picker-row-hit", "runId": ProcessInfo.processInfo.environment["PICKER_DEBUG_RUN"] ?? "pre-fix", "hypothesisId": "A", "msg": "[DEBUG] Picker action", "data": ["phase": "\(scenePhase)", "available": model.record(id: record.id) != nil]]); URLSession.shared.dataTask(with: request).resume() }
-                            // #endregion
-#endif
                             scheduleOpen(
                                 DocumentRoute(
                                     recordID: record.id,
@@ -6525,7 +6501,7 @@ struct LibraryView: View {
                                     )
                                         .font(.caption)
                                         .foregroundStyle(PPColor.textSecondary)
-                                        .lineLimit(2)
+                                        .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2)
                                 }
                                 Spacer()
                                 Image(systemName: "chevron.right")
@@ -6992,13 +6968,33 @@ struct LibraryView: View {
             var skippedCount = 0
             for (offset, item) in items.enumerated() {
                 guard !Task.isCancelled,
-                      photoImportGeneration == generation
+                      photoImportGeneration == generation,
+                      scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
                 else { return }
-                let transfer = try? await item.loadTransferable(
-                    type: ProtectedPhotoTransfer.self
-                )
+                let transfer: ProtectedPhotoTransfer?
+                do {
+                    transfer = try await item.loadTransferable(
+                        type: ProtectedPhotoTransfer.self
+                    )
+                } catch is CancellationError {
+                    return
+                } catch {
+                    guard !LocalFileSecurity
+                        .isInsufficientStorageError(error)
+                    else {
+                        model.present(
+                            PaperPathError.insufficientStorage,
+                            in: paperPathSceneID
+                        )
+                        return
+                    }
+                    transfer = nil
+                }
                 guard !Task.isCancelled,
-                      photoImportGeneration == generation
+                      photoImportGeneration == generation,
+                      scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
                 else {
                     transfer?.discard()
                     return
@@ -7026,7 +7022,9 @@ struct LibraryView: View {
                     worker.cancel()
                 }
                 guard !Task.isCancelled,
-                      photoImportGeneration == generation
+                      photoImportGeneration == generation,
+                      scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
                 else { return }
                 if let image {
                     images.append(image)
@@ -7037,7 +7035,9 @@ struct LibraryView: View {
             }
 
             guard !Task.isCancelled,
-                  photoImportGeneration == generation
+                  photoImportGeneration == generation,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
             else { return }
             guard !images.isEmpty else {
                 model.present(
@@ -7048,7 +7048,8 @@ struct LibraryView: View {
             }
             scanReviewSession = ScanReviewSession(
                 images: images,
-                initialOptions: .original
+                initialOptions: .original,
+                importKind: .photos
             )
             if skippedCount > 0 {
                 model[noticeFor: paperPathSceneID] = AppLocalization.format(
@@ -7070,13 +7071,15 @@ struct LibraryView: View {
         let kind = fileImportKind
         let requestedTask = pendingImportTask
         pendingImportTask = nil
-#if DEBUG
-        // #region debug-point A:experience-presentations
-        if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "A", "location": "LibraryView.import.completed", "msg": "[DEBUG] File picker completed"]); URLSession.shared.dataTask(with: request).resume() }
-        // #endregion
-#endif
-        guard case .success(let urls) = result, !urls.isEmpty else {
-            if case .failure(let error) = result {
+        let urls: [URL]
+        switch result {
+        case .success(let selectedURLs):
+            var seenPaths = Set<String>()
+            urls = selectedURLs.filter {
+                seenPaths.insert($0.standardizedFileURL.path).inserted
+            }
+        case .failure(let error):
+            if !Self.isFileImportCancellation(error) {
                 model.present(error, in: paperPathSceneID)
                 if kind == .deliveryPackage {
                     deliveryPackageVerificationErrorFeedback += 1
@@ -7084,12 +7087,24 @@ struct LibraryView: View {
             }
             return
         }
+        guard !urls.isEmpty else { return }
         switch kind {
         case .pdf:
             startFileImport(urls, requestedTask: requestedTask)
         case .deliveryPackage:
             verifyDeliveryPackage(urls[0])
         }
+    }
+
+    private nonisolated static func isFileImportCancellation(
+        _ error: Error
+    ) -> Bool {
+        if error is CancellationError {
+            return true
+        }
+        let nsError = error as NSError
+        return nsError.domain == NSCocoaErrorDomain
+            && nsError.code == NSUserCancelledError
     }
 
     private func startFileImport(
@@ -7170,7 +7185,8 @@ struct LibraryView: View {
 
     private func startScanCreation(
         _ pages: [ScanPageImage],
-        draftID: UUID
+        draftID: UUID,
+        importKind: ReviewedImageImportKind
     ) {
         cancelScanCreation()
         let generation = UUID()
@@ -7179,20 +7195,32 @@ struct LibraryView: View {
         committedScanRecordID = nil
         pendingScanDraft = pages
         pendingScanDraftID = draftID
+        pendingScanDraftImportKind = importKind
         scanCreationTask = Task { @MainActor in
-            let record = await model.withFeedbackTarget(
+            let record: DocumentRecord? = await model.withFeedbackTarget(
                 paperPathSceneID
             ) {
-                await model.importScan(
-                    pages: pages,
-                    onCommit: { committed in
-                        acknowledgeCommittedScanDraft(draftID)
-                        guard scanCreationGeneration == generation else {
-                            return
-                        }
-                        committedScanRecordID = committed.id
+                let onCommit: (DocumentRecord) -> Void = { committed in
+                    acknowledgeCommittedScanDraft(draftID)
+                    guard scanCreationGeneration == generation else {
+                        return
                     }
-                )
+                    committedScanRecordID = committed.id
+                }
+                switch importKind {
+                case .scan:
+                    return await model.importScan(
+                        pages: pages,
+                        progressID: generation,
+                        onCommit: onCommit
+                    )
+                case .photos:
+                    return await model.importImages(
+                        pages: pages,
+                        progressID: generation,
+                        onCommit: onCommit
+                    )
+                }
             }
             guard scanCreationGeneration == generation else { return }
             let wasStopped =
@@ -7216,6 +7244,7 @@ struct LibraryView: View {
                 if committedRecord != nil {
                     pendingScanDraft = nil
                     pendingScanDraftID = nil
+                    pendingScanDraftImportKind = .scan
                     model[noticeFor: paperPathSceneID] =
                         "Scan finished before stopping · copy kept in Library"
                             .localizedUI
@@ -7230,6 +7259,7 @@ struct LibraryView: View {
             }
             pendingScanDraft = nil
             pendingScanDraftID = nil
+            pendingScanDraftImportKind = .scan
             openAfterCompletedLibraryWork(
                 DocumentRoute(recordID: committedRecord.id)
             )
@@ -7242,9 +7272,15 @@ struct LibraryView: View {
               UIApplication.shared.isProtectedDataAvailable
         else { return }
         let draftID = pendingReviewedScanSessionID ?? UUID()
+        let importKind = pendingReviewedImageImportKind
         pendingReviewedScanPages = nil
         pendingReviewedScanSessionID = nil
-        startScanCreation(pages, draftID: draftID)
+        pendingReviewedImageImportKind = .scan
+        startScanCreation(
+            pages,
+            draftID: draftID,
+            importKind: importKind
+        )
     }
 
     private func cancelScanCreation(
@@ -7252,6 +7288,7 @@ struct LibraryView: View {
     ) {
         let draft = restoresDraft ? pendingScanDraft : nil
         let draftID = pendingScanDraftID
+        let importKind = pendingScanDraftImportKind
         scanCreationGeneration = UUID()
         scanCreationTask?.cancel()
         scanCreationTask = nil
@@ -7259,10 +7296,12 @@ struct LibraryView: View {
         committedScanRecordID = nil
         pendingScanDraft = nil
         pendingScanDraftID = nil
+        pendingScanDraftImportKind = .scan
         guard let draft else { return }
         let session = ScanReviewSession(
             id: draftID ?? UUID(),
-            pages: draft
+            pages: draft,
+            importKind: importKind
         )
         if scenePhase == .active,
            UIApplication.shared.isProtectedDataAvailable {
@@ -7285,11 +7324,14 @@ struct LibraryView: View {
     private func restorePendingScanDraft() {
         guard let pendingScanDraft else { return }
         let draftID = pendingScanDraftID
+        let importKind = pendingScanDraftImportKind
         self.pendingScanDraft = nil
         pendingScanDraftID = nil
+        pendingScanDraftImportKind = .scan
         let session = ScanReviewSession(
             id: draftID ?? UUID(),
-            pages: pendingScanDraft
+            pages: pendingScanDraft,
+            importKind: importKind
         )
         if scenePhase == .active,
            UIApplication.shared.isProtectedDataAvailable {
@@ -7303,6 +7345,7 @@ struct LibraryView: View {
         if pendingScanDraftID == draftID {
             pendingScanDraft = nil
             pendingScanDraftID = nil
+            pendingScanDraftImportKind = .scan
         }
         if scanReviewSession?.id == draftID {
             scanReviewSession = nil
@@ -7316,6 +7359,7 @@ struct LibraryView: View {
         if pendingReviewedScanSessionID == draftID {
             pendingReviewedScanPages = nil
             pendingReviewedScanSessionID = nil
+            pendingReviewedImageImportKind = .scan
         }
     }
 
@@ -7521,51 +7565,38 @@ struct LibraryView: View {
 
             }
 
-            if !activeDocumentFilterLabels.isEmpty {
-                HStack(spacing: PPSpacing.small) {
-                    Image(
-                        systemName:
-                            "line.3.horizontal.decrease.circle.fill"
-                    )
+            activeFilterSummary
+        }
+    }
+
+    @ViewBuilder
+    private var activeFilterSummary: some View {
+        if !activeDocumentFilterLabels.isEmpty {
+            HStack(spacing: PPSpacing.small) {
+                Image(systemName: "line.3.horizontal.decrease.circle.fill")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(PPColor.cyan)
-
-                    Text(
-                        activeDocumentFilterLabels.joined(
-                            separator: " · "
-                        )
-                    )
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .lineLimit(
-                        dynamicTypeSize.ppPrefersExpandedLayout
-                            ? nil
-                            : 2
-                    )
+                    .foregroundStyle(PPColor.accent)
+                Text(activeDocumentFilterLabels.joined(separator: " · "))
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(PPColor.textPrimary)
+                    .lineLimit(dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2)
                     .fixedSize(horizontal: false, vertical: true)
-
-                    Spacer(minLength: PPSpacing.small)
-
-                    Button {
-                        clearDocumentFilters()
-                    } label: {
-                        Image(systemName: "xmark")
-                            .frame(width: 44, height: 44)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .accessibilityLabel("Clear filters")
-                    .help("Clear filters")
+                Spacer(minLength: PPSpacing.small)
+                Button {
+                    clearDocumentFilters()
+                } label: {
+                    Image(systemName: "xmark")
+                        .frame(width: 44, height: 44)
                 }
-                .padding(.leading, PPSpacing.small)
-                .overlay(alignment: .leading) {
-                    Rectangle()
-                        .fill(PPColor.cyan.opacity(0.62))
-                        .frame(width: 2)
-                }
-                .accessibilityElement(children: .contain)
-                .accessibilityIdentifier("activeLibraryFilters")
+                .buttonStyle(PPPressButtonStyle())
+                .foregroundStyle(PPColor.textSecondary)
+                .accessibilityLabel("Clear filters".localizedUI)
+                .help("Clear filters")
             }
+            .padding(.leading, PPSpacing.medium)
+            .background(PPColor.surfaceMuted, in: RoundedRectangle(cornerRadius: PPRadius.control))
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("activeLibraryFilters")
         }
     }
 
@@ -7622,7 +7653,9 @@ struct LibraryView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(PPColor.textSecondary)
-                    .accessibilityLabel("Clear tag filter")
+                    .accessibilityLabel(
+                        "Clear tag filter".localizedUI
+                    )
                 }
             }
 
@@ -7842,6 +7875,32 @@ struct LibraryView: View {
         didPresentScanReviewForUITest = true
         await Task.yield()
         guard !Task.isCancelled else { return }
+        scanReviewSession = makeImageReviewFixtureForUITest()
+#endif
+    }
+
+#if DEBUG
+    @discardableResult
+    private func presentImageReviewFixtureForUITest(
+        argument: String,
+        importKind: ReviewedImageImportKind
+    ) -> Bool {
+        guard ProcessInfo.processInfo.arguments.contains(argument)
+        else { return false }
+        scanReviewSession = makeImageReviewFixtureForUITest(
+            importKind: importKind
+        )
+        return true
+    }
+
+    private func makeImageReviewFixtureForUITest()
+        -> ScanReviewSession {
+        makeImageReviewFixtureForUITest(importKind: .scan)
+    }
+
+    private func makeImageReviewFixtureForUITest(
+        importKind: ReviewedImageImportKind
+    ) -> ScanReviewSession {
         let renderer = UIGraphicsImageRenderer(
             size: CGSize(width: 600, height: 800)
         )
@@ -7869,12 +7928,13 @@ struct LibraryView: View {
                 )
             }
         }
-        scanReviewSession = ScanReviewSession(
+        return ScanReviewSession(
             images: images,
-            initialOptions: .original
+            initialOptions: .original,
+            importKind: importKind
         )
-#endif
     }
+#endif
 
     @ViewBuilder
     private var librarySection: some View {
@@ -7893,6 +7953,9 @@ struct LibraryView: View {
                 )
             )
         VStack(alignment: .leading, spacing: PPSpacing.small) {
+            if !isSearching {
+                activeFilterSummary
+            }
             headerLayout {
                 VStack(alignment: .leading, spacing: 3) {
                     if isSearching {
@@ -8173,18 +8236,21 @@ struct LibraryView: View {
                             }
                         }
                         } label: {
-                            Image(systemName: "line.3.horizontal.decrease")
+                            Image(systemName: hasActiveFilters
+                                ? "line.3.horizontal.decrease.circle.fill"
+                                : "line.3.horizontal.decrease")
                                 .font(.system(size: 18, weight: .semibold))
                                 .frame(width: 44, height: 44)
                         }
                         .buttonStyle(.plain)
-                        .foregroundStyle(PPColor.textSecondary)
+                        .foregroundStyle(hasActiveFilters ? PPColor.accent : PPColor.textSecondary)
                         .accessibilityLabel(
                             AppLocalization.format(
                                 "Library display: %@",
                                 librarySort.title.localizedUI
                             )
                         )
+                        .accessibilityValue(hasActiveFilters ? "Filters active".localizedUI : "")
                         .accessibilityIdentifier("libraryDisplay")
                     }
                     .frame(
@@ -8461,6 +8527,18 @@ struct LibraryView: View {
                 }
                 .buttonStyle(.plain)
                 .hoverEffect(.highlight)
+                .accessibilityIdentifier("documentBoard-\(record.id.uuidString)")
+                .accessibilityAddTraits(
+                    (isSelectingDocuments
+                        ? selectedDocumentIDs.contains(record.id)
+                        : isCurrent) ? .isSelected : []
+                )
+                .accessibilityHint(
+                    (isSelectingDocuments
+                        ? (selectedDocumentIDs.contains(record.id)
+                            ? "Deselect document" : "Select document")
+                        : "Open document").localizedUI
+                )
 
                 if isSelectingDocuments {
                     Image(
@@ -8482,6 +8560,9 @@ struct LibraryView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(PPColor.textSecondary)
+                    .accessibilityLabel(
+                        AppLocalization.format("More actions for %@", record.displayName)
+                    )
                 }
             }
 
@@ -8728,6 +8809,19 @@ struct LibraryView: View {
                 .accessibilityIdentifier(
                     "documentGrid-\(record.id.uuidString)"
                 )
+                .accessibilityAddTraits(
+                    (isSelectingDocuments
+                        ? selectedDocumentIDs.contains(record.id)
+                        : isFocusedLibraryRecord(record)) ? .isSelected : []
+                )
+                .accessibilityHint(
+                    (isSelectingDocuments
+                        ? (selectedDocumentIDs.contains(record.id)
+                            ? "Deselect document" : "Select document")
+                        : canUseDeskPreview
+                            ? (deskShowsPreview ? "Preview document" : "Select document")
+                            : "Open document").localizedUI
+                )
 
                 if isSelectingDocuments {
                     Image(
@@ -8831,7 +8925,7 @@ struct LibraryView: View {
                             }
                             .frame(maxWidth: .infinity, alignment: .leading)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(PPPressButtonStyle())
                         .hoverEffect(.highlight)
                         .accessibilityIdentifier(
                             "documentRow-\(record.id.uuidString)"
@@ -8931,10 +9025,10 @@ struct LibraryView: View {
                 }
                 .background(
                     selectedDocumentIDs.contains(record.id)
-                        ? PPColor.accent.opacity(0.08)
+                        ? PPColor.selection
                         : (
                             isFocusedLibraryRecord(record)
-                                ? PPColor.accent.opacity(0.08)
+                                ? PPColor.selection
                                 : Color.clear
                         )
                 )
@@ -8969,16 +9063,11 @@ struct LibraryView: View {
                 }
             }
         }
-        .background(PPColor.surface.opacity(0.72))
-        .overlay(alignment: .top) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.68))
-                .frame(height: 0.6)
-        }
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.68))
-                .frame(height: 0.6)
+        .background(PPColor.surface)
+        .clipShape(RoundedRectangle(cornerRadius: PPRadius.surface))
+        .overlay {
+            RoundedRectangle(cornerRadius: PPRadius.surface)
+                .strokeBorder(PPColor.border.opacity(0.5), lineWidth: 0.6)
         }
     }
 
@@ -8993,6 +9082,7 @@ struct LibraryView: View {
         } else {
             HStack(spacing: PPSpacing.medium) {
                 deskThumbnail(record, pageIndex: 0, width: PPDeskLayout.rowPreviewWidth)
+                    .clipShape(RoundedRectangle(cornerRadius: 5))
                 VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
                     HStack(spacing: PPSpacing.small) {
                         if record.isPinned {
@@ -9042,7 +9132,7 @@ struct LibraryView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
-                if !hasWideDeskViewport {
+                if !hasWideDeskViewport, record.workflowStatus != .inbox {
                     Image(systemName: record.workflowStatus.symbol)
                         .font(.system(size: 16))
                         .foregroundStyle(workflowTint(record.workflowStatus))
@@ -9366,7 +9456,7 @@ struct LibraryView: View {
         }
         .buttonStyle(.plain)
         .foregroundStyle(PPColor.accent)
-        .accessibilityLabel("Finish selecting")
+        .accessibilityLabel("Finish selecting".localizedUI)
         .keyboardShortcut(.cancelAction)
     }
 
@@ -9437,13 +9527,6 @@ struct LibraryView: View {
             || libraryPageSearchSnapshot.query == query
     }
 
-    private func reconcileDocumentSelection() {
-        guard isSelectingDocuments else { return }
-        selectedDocumentIDs.formIntersection(
-            Set(filteredDocuments.map(\.id))
-        )
-    }
-
     private func toggleDocumentSelection(_ id: UUID) {
         withAnimation(reduceMotion ? nil : .snappy(duration: 0.18)) {
             if selectedDocumentIDs.contains(id) {
@@ -9473,11 +9556,6 @@ struct LibraryView: View {
 
         if UIDevice.current.userInterfaceIdiom == .pad {
             Button {
-#if DEBUG
-                // #region debug-point E:experience-presentations
-                if let endpoint = ProcessInfo.processInfo.environment["DEBUG_SERVER_URL"], let url = URL(string: endpoint) { var request = URLRequest(url: url); request.httpMethod = "POST"; request.httpBody = try? JSONSerialization.data(withJSONObject: ["sessionId": "experience-presentations", "runId": ProcessInfo.processInfo.environment["DEBUG_RUN_ID"] ?? "pre-fix", "hypothesisId": "E", "location": "LibraryView.openWindow", "msg": "[DEBUG] New window requested", "data": ["supported": UIApplication.shared.supportsMultipleScenes, "scenes": UIApplication.shared.connectedScenes.count]]); URLSession.shared.dataTask(with: request).resume() }
-                // #endregion
-#endif
                 openWindow(value: record.id)
             } label: {
                 Label(
@@ -9642,75 +9720,52 @@ struct LibraryView: View {
     }
 
     private var emptyResults: some View {
-        let hasTaskResults = !matchingTaskPackages.isEmpty
-            || !matchingQuickTasks.isEmpty
-        let layout = dynamicTypeSize.ppPrefersExpandedLayout
-            ? AnyLayout(
-                VStackLayout(
-                    alignment: .leading,
-                    spacing: PPSpacing.small
-                )
-            )
-            : AnyLayout(
-                HStackLayout(spacing: PPSpacing.medium)
-            )
+        let hasTaskResults = isSearching && searchScope != .documents
+            && (!matchingTaskPackages.isEmpty || !matchingQuickTasks.isEmpty)
 
-        return layout {
-            PPIllustration(kind: .search, width: 92)
-                .frame(width: 88, height: 72)
+        return VStack(alignment: .leading, spacing: PPSpacing.medium) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(
-                    hasTaskResults
-                        ? "No matching documents"
-                        : "No matching documents or tools"
+                    !isSearching ? "No PDFs in this view"
+                        : searchScope == .documents || hasTaskResults
+                            ? "No matching documents"
+                            : "No matching documents or tools"
                 )
                 .font(.headline)
                 .foregroundStyle(PPColor.textPrimary)
                 Text(
-                    hasTaskResults
-                        ? "Matching tasks are shown above."
-                        : "Try sign, compress, redact, or pages."
+                    !isSearching
+                        ? "Clear the filters to see all your documents."
+                        : hasTaskResults
+                            ? "Matching tasks are shown above."
+                            : searchScope == .documents
+                                ? "Try a document name or a word from the PDF."
+                                : "Try sign, compress, redact, or pages."
                 )
-                .font(.caption)
+                .font(.subheadline)
                 .foregroundStyle(PPColor.textSecondary)
-            }
-            if !dynamicTypeSize.ppPrefersExpandedLayout {
-                Spacer(minLength: 0)
+                .fixedSize(horizontal: false, vertical: true)
             }
             Button {
                 resetLibrarySearchAndFilters()
             } label: {
-                Group {
-                    if dynamicTypeSize.ppPrefersExpandedLayout {
-                        Label(
-                            "Clear search and filters",
-                            systemImage: "xmark.circle.fill"
-                        )
-                    } else {
-                        Image(systemName: "xmark.circle.fill")
-                    }
-                }
-                .frame(
-                    maxWidth:
-                        dynamicTypeSize.ppPrefersExpandedLayout
-                            ? .infinity
-                            : nil,
-                    minHeight: 44
+                Label(
+                    (isSearching ? "Clear search and filters" : "Clear filters").localizedUI,
+                    systemImage: "xmark.circle"
                 )
-                .frame(
-                    width:
-                        dynamicTypeSize.ppPrefersExpandedLayout
-                            ? nil
-                            : 44
-                )
+                .font(.subheadline.weight(.semibold))
+                .frame(minHeight: 44)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(PPColor.textSecondary)
-            .accessibilityLabel("Clear search and filters")
+            .foregroundStyle(PPColor.accent)
+            .accessibilityLabel(
+                "Clear search and filters".localizedUI
+            )
+            .accessibilityIdentifier("libraryClearEmptyResults")
             .help("Clear search and filters")
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, PPSpacing.small)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.vertical, PPSpacing.regular)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(PPColor.border.opacity(0.62))
@@ -9719,23 +9774,33 @@ struct LibraryView: View {
     }
 
     private var emptyLibrary: some View {
-        VStack(alignment: .leading, spacing: PPSpacing.large) {
-            HStack(spacing: PPSpacing.medium) {
+        let headerLayout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.medium))
+            : AnyLayout(HStackLayout(spacing: PPSpacing.medium))
+
+        return VStack(alignment: .leading, spacing: PPSpacing.large) {
+            headerLayout {
                 PPIllustration(kind: .workspace, width: 92)
                     .frame(width: 88, height: 72)
-                Text("No PDFs yet")
-                    .font(.headline)
-                    .foregroundStyle(PPColor.textPrimary)
-                    .fixedSize(horizontal: false, vertical: true)
+                VStack(alignment: .leading, spacing: PPSpacing.small) {
+                    Text("No PDFs yet")
+                        .font(PPType.display)
+                        .foregroundStyle(PPColor.textPrimary)
+                    Text("Importing creates a private copy. Your original stays untouched.")
+                        .font(.subheadline)
+                        .foregroundStyle(PPColor.textSecondary)
+                }
+                .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 0)
             }
             Button {
                 requestFileImport(.pdf)
             } label: {
                 Label("Import PDFs", systemImage: "square.and.arrow.down")
-                    .frame(minHeight: 36)
+                    .frame(maxWidth: .infinity, minHeight: 44)
             }
-            .buttonStyle(.borderedProminent)
+            .buttonStyle(PPPrimaryButtonStyle())
+            .accessibilityIdentifier("emptyLibraryImport")
             Button {
                 beginScan()
             } label: {
@@ -9744,13 +9809,9 @@ struct LibraryView: View {
             }
             .buttonStyle(.plain)
         }
+        .frame(maxWidth: 640, alignment: .leading)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, PPSpacing.large)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(PPColor.border.opacity(0.62))
-                .frame(height: 0.6)
-        }
+        .ppCard(padding: PPSpacing.large)
     }
 
     private var loadingLibrary: some View {
@@ -10010,10 +10071,11 @@ struct LibraryView: View {
     }
 
     private var isShowingProcessingOverlay: Bool {
-        (model.isImporting && !model.isExternalPDFImportActive)
-            || fileImportOperationTask != nil
-            || isPreparingPhotoImport
-            || scanCreationTask != nil
+        LibraryForegroundActivity(
+            isFileImportActive: fileImportOperationTask != nil,
+            isPhotoPreparationActive: isPreparingPhotoImport,
+            isScanCreationActive: scanCreationTask != nil
+        ).blocksInteraction
     }
 
     private var isLibraryHandoffActive: Bool {
@@ -10046,7 +10108,9 @@ struct LibraryView: View {
             )
         }
         if scanCreationTask != nil,
-           let fraction = model.scanImportFraction {
+           let fraction = model.scanImportFraction(
+               for: scanCreationGeneration
+           ) {
             if fraction >= 1 {
                 return "Finalizing local document".localizedUI
             }
@@ -10071,7 +10135,9 @@ struct LibraryView: View {
                 / Double(photoImportTotalCount)
         }
         if scanCreationTask != nil {
-            return model.scanImportFraction
+            return model.scanImportFraction(
+                for: scanCreationGeneration
+            )
         }
         return nil
     }
@@ -10550,7 +10616,6 @@ struct LibraryView: View {
                 hasTruncatedIndices:
                     storedSnapshot.hasTruncatedIndices
             )
-            reconcileDocumentSelection()
             isSearchingPageIndex = false
             libraryPageSearchFailure = nil
         } catch is CancellationError {
@@ -10610,6 +10675,17 @@ struct LibraryView: View {
         librarySearchHistory = Array(
             librarySearchHistory.prefix(6)
         )
+    }
+
+    private func mostRecentlyModifiedFirst(
+        _ records: [DocumentRecord]
+    ) -> [DocumentRecord] {
+        records.sorted { lhs, rhs in
+            if lhs.modifiedAt != rhs.modifiedAt {
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
+            return lhs.id.uuidString < rhs.id.uuidString
+        }
     }
 }
 
@@ -15524,7 +15600,7 @@ private enum SignerIdentityPhotoDecoder {
     static func analyze(
         _ fileURL: URL
     ) async throws -> SignerIdentityPhotoScanResult {
-        try await Task.detached(priority: .userInitiated) {
+        let worker = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
             let values = try? fileURL.resourceValues(
                 forKeys: [
@@ -15600,7 +15676,20 @@ private enum SignerIdentityPhotoDecoder {
                     cgImage: image,
                     options: [:]
                 )
-                try handler.perform([request])
+                do {
+                    try await withTaskCancellationHandler {
+                        try Task.checkCancellation()
+                        try handler.perform([request])
+                    } onCancel: {
+                        request.cancel()
+                    }
+                } catch {
+                    if Task.isCancelled {
+                        throw CancellationError()
+                    }
+                    throw error
+                }
+                try Task.checkCancellation()
                 for payload in request.results?
                     .compactMap(\.payloadStringValue) ?? []
                     where payload.hasPrefix(
@@ -15622,7 +15711,14 @@ private enum SignerIdentityPhotoDecoder {
                 analyzedMaxPixelSize: targetSizes.last ?? sourceMax,
                 passCount: targetSizes.count
             )
-        }.value
+        }
+        let result = try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        try Task.checkCancellation()
+        return result
     }
 }
 
@@ -16629,9 +16725,7 @@ private struct PaperTemplateCreatorView: View {
                                 .frame(minWidth: 44, minHeight: 44)
                         }
                     }
-                    .disabled(
-                        creationTask != nil || model.isImporting
-                    )
+                    .disabled(creationTask != nil)
                     .keyboardShortcut(.defaultAction)
                 }
             }
@@ -16715,7 +16809,6 @@ private struct PaperTemplateCreatorView: View {
 
     private func createTemplate() {
         guard creationTask == nil,
-              !model.isImporting,
               scenePhase == .active,
               UIApplication.shared.isProtectedDataAvailable
         else { return }
@@ -25618,12 +25711,14 @@ struct PrivacyCenterView: View {
     @EnvironmentObject private var appLock: AppLockController
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @Environment(\.paperPathSceneID) private var paperPathSceneID
     @AppStorage("privacy.hideLibraryPreviews")
     private var hideLibraryPreviews = false
     @AppStorage(AppPreferences.metadataSyncEnabledKey)
     private var metadataSyncEnabled = false
     @State private var boundaryFocus = BoundaryFocus.all
+    @State private var showsStorageDetails = false
 
     let onLockNow: () -> Void
 
@@ -25638,11 +25733,24 @@ struct PrivacyCenterView: View {
                         spacing: PPSpacing.xLarge
                     ) {
                         privacyHero
-                        localMetrics
-                        processingLedger
                         accessBoundary
                         previewBoundary
                         metadataBoundary
+                        DisclosureGroup(isExpanded: $showsStorageDetails) {
+                            VStack(alignment: .leading, spacing: PPSpacing.large) {
+                                localMetrics
+                                processingLedger
+                            }
+                            .padding(.top, PPSpacing.medium)
+                        } label: {
+                            Label(
+                                "Storage and data boundaries".localizedUI,
+                                systemImage: "internaldrive"
+                            )
+                            .font(.headline)
+                            .frame(minHeight: 44)
+                        }
+                        .accessibilityIdentifier("privacyStorageDetails")
                     }
                     .frame(maxWidth: 860)
                     .padding(PPSpacing.regular)
@@ -25668,13 +25776,15 @@ struct PrivacyCenterView: View {
         Group {
             if dynamicTypeSize.isAccessibilitySize {
                 VStack(alignment: .leading, spacing: PPSpacing.medium) {
-                    PPIllustration(kind: .privacy, width: 132)
-                        .frame(maxWidth: .infinity)
                     privacyHeroCopy
                 }
             } else {
                 HStack(spacing: PPSpacing.large) {
-                    PPIllustration(kind: .privacy, width: 132)
+                    PPIllustration(
+                        kind: .privacy,
+                        width: horizontalSizeClass == .regular ? 132 : 72
+                    )
+                    .accessibilityHidden(true)
                     privacyHeroCopy
                     Spacer(minLength: 0)
                 }
@@ -25690,12 +25800,12 @@ struct PrivacyCenterView: View {
 
     private var privacyHeroCopy: some View {
         VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
-            SectionEyebrow(text: "STORAGE BOUNDARIES")
-            Text("Local document desk")
+            SectionEyebrow(text: "PRIVACY")
+            Text("Your privacy controls".localizedUI)
                 .font(.title2.bold())
                 .fontDesign(.serif)
                 .foregroundStyle(PPColor.textPrimary)
-            Text("Inspect what is stored on this device and what can sync.")
+            Text("Choose access, previews, and optional sync.".localizedUI)
                 .font(.subheadline)
                 .foregroundStyle(PPColor.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -25704,7 +25814,9 @@ struct PrivacyCenterView: View {
 
     private var localMetrics: some View {
         LazyVGrid(
-            columns: [
+            columns: dynamicTypeSize.ppPrefersExpandedLayout
+                ? [GridItem(.flexible())]
+                : [
                 GridItem(
                     .adaptive(minimum: 132, maximum: 210),
                     spacing: PPSpacing.large

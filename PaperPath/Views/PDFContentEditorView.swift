@@ -355,6 +355,7 @@ struct PDFContentEditorView: View {
                     }
                     .disabled(!canCreate || isSaving)
                     .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("contentCreateCopy")
                 }
             }
             .task(id: pagePreviewRequestID) {
@@ -671,6 +672,12 @@ struct PDFContentEditorView: View {
                 )
             }
 
+            OperationBoundaryNotice(
+                title: "Document extras may not carry into the copy",
+                detail: "Embedded files, bookmarks, and custom page labels may not be preserved. The source PDF stays unchanged.",
+                identifier: "addContentStructureBoundary"
+            )
+
             let picker = Picker("Content type", selection: $kind) {
                 ForEach(ContentKind.allCases) { item in
                     Label(
@@ -683,13 +690,16 @@ struct PDFContentEditorView: View {
             if dynamicTypeSize.ppPrefersExpandedLayout {
                 picker
                     .pickerStyle(.menu)
+                    .accessibilityIdentifier("contentKindPicker")
                     .frame(
                         maxWidth: .infinity,
                         minHeight: 44,
                         alignment: .leading
                     )
             } else {
-                picker.pickerStyle(.segmented)
+                picker
+                    .pickerStyle(.segmented)
+                    .accessibilityIdentifier("contentKindPicker")
             }
 
             PrecisionPlacementRail(
@@ -747,6 +757,7 @@ struct PDFContentEditorView: View {
                 .lineLimit(1...3)
                 .textFieldStyle(.roundedBorder)
                 .submitLabel(.done)
+                .accessibilityIdentifier("contentText")
                 .disabled(isSaving)
                 .onChange(of: text) { _, value in
                     guard value.count > 2_000 else { return }
@@ -1028,15 +1039,38 @@ struct PDFContentEditorView: View {
                     photoItem = nil
                 }
             }
-            guard let transfer = try? await item.loadTransferable(
-                type: ProtectedPhotoTransfer.self
-            )
-            else {
-                guard generation == photoLoadGeneration else {
+            let transfer: ProtectedPhotoTransfer?
+            do {
+                transfer = try await item.loadTransferable(
+                    type: ProtectedPhotoTransfer.self
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled,
+                      generation == photoLoadGeneration,
+                      scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
+                else { return }
+                if LocalFileSecurity.isInsufficientStorageError(error) {
+                    model.present(
+                        PaperPathError.insufficientStorage,
+                        in: paperPathSceneID
+                    )
                     return
                 }
                 model[noticeFor: paperPathSceneID] = "The selected photo could not be opened"
                     .localizedUI
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == photoLoadGeneration,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            guard let transfer else {
+                model[noticeFor: paperPathSceneID] =
+                    "The selected photo could not be opened".localizedUI
                 return
             }
             defer { transfer.discard() }
@@ -1053,7 +1087,9 @@ struct PDFContentEditorView: View {
                 return
             }
             guard !Task.isCancelled,
-                  generation == photoLoadGeneration
+                  generation == photoLoadGeneration,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
             else { return }
             photoData = prepared
             photoPreview = UIImage(data: prepared)
@@ -3255,13 +3291,36 @@ struct PDFImageReplacementView: View {
                     replacementItem = nil
                 }
             }
-            guard let transfer = try? await item.loadTransferable(
-                type: ProtectedPhotoTransfer.self
-            )
-            else {
-                guard generation == photoLoadGeneration else {
+            let transfer: ProtectedPhotoTransfer?
+            do {
+                transfer = try await item.loadTransferable(
+                    type: ProtectedPhotoTransfer.self
+                )
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled,
+                      generation == photoLoadGeneration,
+                      scenePhase == .active,
+                      UIApplication.shared.isProtectedDataAvailable
+                else { return }
+                if LocalFileSecurity.isInsufficientStorageError(error) {
+                    model.present(
+                        PaperPathError.insufficientStorage,
+                        in: paperPathSceneID
+                    )
                     return
                 }
+                model[noticeFor: paperPathSceneID] =
+                    "The selected photo could not be opened".localizedUI
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == photoLoadGeneration,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
+            else { return }
+            guard let transfer else {
                 model[noticeFor: paperPathSceneID] =
                     "The selected photo could not be opened".localizedUI
                 return
@@ -3280,7 +3339,9 @@ struct PDFImageReplacementView: View {
                 return
             }
             guard !Task.isCancelled,
-                  generation == photoLoadGeneration
+                  generation == photoLoadGeneration,
+                  scenePhase == .active,
+                  UIApplication.shared.isProtectedDataAvailable
             else { return }
             replacementData = prepared
             replacementPreview = UIImage(data: prepared)

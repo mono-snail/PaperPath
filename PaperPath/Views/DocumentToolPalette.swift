@@ -57,13 +57,8 @@ struct DocumentToolPalette: View {
                             alignment: .leading,
                             spacing: PPSpacing.medium
                         ) {
-                            paletteHero
-
-                            if hasSearchQuery {
-                                toolSearchSummary
-                            }
-
-                            if searchText.isEmpty {
+                            if !hasSearchQuery {
+                                paletteHero
                                 paletteViewPicker
                             }
 
@@ -117,6 +112,10 @@ struct DocumentToolPalette: View {
                             if filteredTools.isEmpty {
                                 emptyToolsState
                             }
+
+                            if hasSearchQuery {
+                                toolSearchSummary
+                            }
                         }
                         .frame(
                             maxWidth: horizontalSizeClass == .regular
@@ -135,24 +134,6 @@ struct DocumentToolPalette: View {
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Close") {
-#if DEBUG
-                        // #region debug-point B:tools-close-requested
-                        reportFrequentUIFreezeDebugEvent(
-                            hypothesisID: "B",
-                            location:
-                                "DocumentToolPalette.closeButton",
-                            message: "Tools sheet close requested",
-                            data: [
-                                "isCommittingSelection": String(
-                                    isCommittingSelection
-                                ),
-                                "hasSearchQuery": String(
-                                    hasSearchQuery
-                                )
-                            ]
-                        )
-                        // #endregion
-#endif
                         guard !isCommittingSelection else { return }
                         dismiss()
                     }

@@ -109,8 +109,17 @@ struct DocumentScannerView: UIViewControllerRepresentable {
                 images.reserveCapacity(pageCount)
                 for pageIndex in 0..<pageCount {
                     guard !Task.isCancelled else { return }
+                    let scannedImage = scan.imageOfPage(
+                        at: pageIndex
+                    )
+                    guard Self.hasUsableDimensions(scannedImage) else {
+                        self.processingTask = nil
+                        self.hidePreparationOverlay()
+                        self.onError(PaperPathError.unreadableImage)
+                        return
+                    }
                     let source = ImageBox(
-                        scan.imageOfPage(at: pageIndex)
+                        scannedImage
                     )
                     let preparationTask = Task.detached(
                         priority: .userInitiated
@@ -135,6 +144,12 @@ struct DocumentScannerView: UIViewControllerRepresentable {
                     guard !Task.isCancelled,
                           self.processingGeneration == generation
                     else { return }
+                    guard Self.hasUsableDimensions(prepared.image) else {
+                        self.processingTask = nil
+                        self.hidePreparationOverlay()
+                        self.onError(PaperPathError.unreadableImage)
+                        return
+                    }
                     images.append(prepared.image)
                     self.updatePreparationProgress(
                         completed: pageIndex + 1,
@@ -420,6 +435,16 @@ struct DocumentScannerView: UIViewControllerRepresentable {
             default:
                 return sourceSize
             }
+        }
+
+        nonisolated private static func hasUsableDimensions(
+            _ image: UIImage
+        ) -> Bool {
+            let size = orientedPixelSize(of: image)
+            return size.width.isFinite
+                && size.height.isFinite
+                && size.width >= 1
+                && size.height >= 1
         }
     }
 }
