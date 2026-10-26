@@ -1335,13 +1335,13 @@ struct RootView: View {
                 .navigationSplitViewColumnWidth(
                     min: dynamicTypeSize.ppPrefersExpandedLayout
                         ? 340
-                        : 300,
+                        : 260,
                     ideal: dynamicTypeSize.ppPrefersExpandedLayout
                         ? 400
-                        : 360,
+                        : 280,
                     max: dynamicTypeSize.ppPrefersExpandedLayout
                         ? 480
-                        : 440
+                        : 320
                 )
             } detail: {
                 if let route = selectedWorkspaceRoute,
@@ -1393,7 +1393,12 @@ struct RootView: View {
                             Button {
                                 isInspectorPresented.toggle()
                             } label: {
-                                Image(systemName: "sidebar.right")
+                                HStack(spacing: PPSpacing.xSmall) {
+                                    Image(systemName: "sidebar.right")
+                                    Text("Tools".localizedUI)
+                                        .font(.subheadline.weight(.semibold))
+                                }
+                                .fixedSize(horizontal: true, vertical: false)
                             }
                             .keyboardShortcut(
                                 "i",
@@ -1438,6 +1443,7 @@ struct RootView: View {
                         StudioDocumentInspector(
                             recordID: route.recordID
                         ) { nextRoute in
+                            isInspectorPresented = false
                             open(nextRoute)
                         } onCompare: { revisedRecordID in
                             beginComparison(
@@ -2442,6 +2448,7 @@ private struct StudioDocumentInspector: View {
     private var savedInspectorActions = ""
     @AppStorage("document.favoriteTools")
     private var savedFavoriteTools = ""
+    @State private var showsDocumentDetails = false
     @State private var recentVersions: [PDFVersionSnapshot] = []
     @State private var isPresentingVersionHistory = false
     @State private var initialVersionHistoryID: UUID?
@@ -2467,16 +2474,25 @@ private struct StudioDocumentInspector: View {
                         alignment: .leading,
                         spacing: PPSpacing.large
                     ) {
-                        StudioSectionRule(
-                            title: "LIVE INSPECTOR",
-                            detail: "Current private copy",
-                            symbol: "sidebar.right",
-                            tint: PPColor.rose
-                        )
-                        documentIdentity(record)
-                        evidenceLedger(record)
-                        revisionTimeline(record)
-                        nextActions(record)
+                        Text("Document tools".localizedUI)
+                            .font(.headline)
+                            .accessibilityAddTraits(.isHeader)
+                        VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                            Text(record.displayName).font(.subheadline.weight(.semibold))
+                            Text(record.subtitle).font(.caption).foregroundStyle(PPColor.textSecondary)
+                        }
+                        documentTools(record)
+                        DisclosureGroup("Document details".localizedUI, isExpanded: $showsDocumentDetails) {
+                            VStack(alignment: .leading, spacing: PPSpacing.large) {
+                                documentIdentity(record)
+                                evidenceLedger(record)
+                                revisionTimeline(record)
+                                nextActions(record)
+                            }
+                            .padding(.top, PPSpacing.medium)
+                        }
+                        .font(.subheadline)
+                        .accessibilityIdentifier("inspectorDocumentDetails")
                     }
                     .padding(PPSpacing.regular)
                 }
@@ -2529,6 +2545,35 @@ private struct StudioDocumentInspector: View {
             .selection,
             trigger: versionSelectionFeedback
         )
+    }
+
+    private func documentTools(_ record: DocumentRecord) -> some View {
+        VStack(spacing: 0) {
+            ForEach([PDFQuickTask.fillForms, .signPDF, .organizePages, .compressPDF, .recognizeText, .safeShare], id: \.self) { task in
+                let supported = task.supports(record) && !model.isProcessing(record.id)
+                Button {
+                    guard supported else { return }
+                    onOpen(DocumentRoute(recordID: record.id, quickTask: task)
+                        .bindingExpectedRevision(record.contentRevisionID))
+                } label: {
+                    HStack(spacing: PPSpacing.medium) {
+                        Image(systemName: task.symbol).frame(width: 24)
+                        Text(task.title.localizedUI).font(.subheadline.weight(.medium))
+                        Spacer(minLength: 0)
+                        Image(systemName: "chevron.right").font(.caption2)
+                    }
+                    .foregroundStyle(task == .safeShare ? PPColor.accent : PPColor.textPrimary)
+                    .frame(minHeight: 52)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(!supported)
+                .opacity(supported ? 1 : 0.45)
+                .accessibilityHint(task.compatibilityNote(for: record).localizedUI)
+                .accessibilityIdentifier("inspectorTool-\(task.rawValue)")
+                Divider()
+            }
+        }
     }
 
     private var versionLoadRequest: VersionLoadRequest {

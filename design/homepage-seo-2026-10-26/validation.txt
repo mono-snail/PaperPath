@@ -1,0 +1,11 @@
+CheckMarketingWebsite.py: PASS (15 pages).
+CheckHomepageSEO.py: PASS (15 production-candidate pages).
+git diff --check: PASS.
+Browser checks (CSS layout viewport / content width / broken loaded images):
+en 320 / 320 / 0
+zh-Hans 390 / 390 / 0
+zh-Hans 1440 / 1440 / 0
+ja 768 / 768 / 0
+Alternate widths use an actual same-origin iframe, not device emulation.
+Sites access remains restricted/custom. Preview robots: noindex,nofollow.
+Public-domain indexing, search rankings, real-user Core Web Vitals and conversion uplift are not verified.

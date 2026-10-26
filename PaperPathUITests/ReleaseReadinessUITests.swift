@@ -53,6 +53,68 @@ final class ReleaseReadinessUITests: XCTestCase {
     }
 
 #if targetEnvironment(simulator)
+    private func commerceSession() throws -> SKTestSession {
+        try XCTSkipUnless(
+            ProcessInfo.processInfo.environment["PAPERPATH_LOCAL_STOREKIT"] == "1",
+            "Run the PaperPathCommerce scheme to activate the local StoreKit catalog."
+        )
+        let session = try SKTestSession(configurationFileNamed: "PaperPath")
+        session.resetToDefaultState()
+        session.clearTransactions()
+        session.disableDialogs = true
+        return session
+    }
+
+    private func openPurchase(_ app: XCUIApplication) {
+        app.buttons["settings"].tap()
+        XCTAssertTrue(app.buttons["settingsPurchase"].waitForExistence(timeout: 8))
+        app.buttons["settingsPurchase"].tap()
+    }
+
+    func testRestoreWithoutPurchaseShowsRecoverableFailure() throws {
+        let session = try commerceSession()
+        defer { session.clearTransactions(); session.resetToDefaultState() }
+        let app = launch()
+        openPurchase(app)
+        let restore = app.buttons["purchaseRestore"]
+        XCTAssertTrue(waitForEnabled(restore))
+        restore.tap()
+        XCTAssertTrue(app.staticTexts["No lifetime purchase was found."].waitForExistence(timeout: 15))
+        XCTAssertTrue(waitForEnabled(app.buttons["purchasePrimaryAction"]))
+        XCTAssertFalse(app.staticTexts["Lifetime Access Active"].exists)
+        screenshot("No purchase restore can be retried", app)
+    }
+
+    func testPurchasePersistsAcrossProcessRelaunchAndRefundRevokesAccess() async throws {
+        let session = try commerceSession()
+        defer { session.clearTransactions(); session.resetToDefaultState() }
+        let app = launch()
+        openPurchase(app)
+        let purchase = app.buttons["purchasePrimaryAction"]
+        XCTAssertTrue(waitForEnabled(purchase))
+        XCTAssertTrue(purchase.label.contains("Unlock for"))
+        purchase.tap()
+        XCTAssertTrue(app.staticTexts["Lifetime Access Active"].waitForExistence(timeout: 15))
+        let transaction = try XCTUnwrap(session.allTransactions().first)
+        app.terminate()
+        app.launchArguments.removeAll { $0 == "UITEST_RESET_DEMO" }
+        app.launch()
+        XCTAssertTrue(app.buttons["settings"].waitForExistence(timeout: 15))
+        openPurchase(app)
+        XCTAssertTrue(app.staticTexts["Lifetime Access Active"].waitForExistence(timeout: 15))
+        try session.refundTransaction(identifier: transaction.identifier)
+        XCTAssertTrue(purchase.waitForExistence(timeout: 15))
+        XCTAssertTrue(waitForEnabled(purchase))
+        XCTAssertFalse(app.staticTexts["Lifetime Access Active"].exists)
+        screenshot("Refund removes lifetime access", app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(app.buttons["settings"].waitForExistence(timeout: 15))
+        openPurchase(app)
+        XCTAssertTrue(waitForEnabled(app.buttons["purchasePrimaryAction"]))
+        XCTAssertFalse(app.staticTexts["Lifetime Access Active"].exists)
+    }
+
     func testPendingPurchaseSurvivesRecheckAndReopenThenApproves() throws {
         try XCTSkipUnless(
             ProcessInfo.processInfo.environment["PAPERPATH_LOCAL_STOREKIT"] == "1",
@@ -132,7 +194,7 @@ final class ReleaseReadinessUITests: XCTestCase {
         XCTAssertTrue(app.navigationBars["隐私与数据"].waitForExistence(timeout: 5))
         XCTAssertTrue(app.staticTexts["文件与数据，由你掌控"].exists)
         let backupDisclosure = app.staticTexts.matching(
-            NSPredicate(format: "label CONTAINS %@", "自动备份")
+            NSPredicate(format: "label CONTAINS %@", "PDF 不会备份")
         ).firstMatch
         XCTAssertTrue(reveal(backupDisclosure, app))
         screenshot("Chinese privacy and backup boundary standard size", app)

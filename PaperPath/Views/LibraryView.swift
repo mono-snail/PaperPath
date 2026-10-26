@@ -29,7 +29,10 @@ private struct LibrarySearchBar: UIViewRepresentable {
     func makeUIView(context: Context) -> SearchBar {
         let bar = SearchBar()
         bar.searchBarStyle = .minimal
-        bar.showsCancelButton = true
+        // UISearchBar can remove its cancel control after resigning focus or
+        // returning from a document. The surrounding SwiftUI header owns a
+        // persistent cancel action instead.
+        bar.showsCancelButton = false
         bar.autocapitalizationType = .none
         bar.autocorrectionType = .no
         bar.delegate = context.coordinator
@@ -39,6 +42,8 @@ private struct LibrarySearchBar: UIViewRepresentable {
 
     func updateUIView(_ bar: SearchBar, context: Context) {
         context.coordinator.parent = self
+        context.coordinator.isUpdatingView = true
+        defer { context.coordinator.isUpdatingView = false }
         bar.placeholder = prompt
         bar.tintColor = UIColor(PPColor.accent)
         bar.requestsFocus = isFocused
@@ -54,19 +59,26 @@ private struct LibrarySearchBar: UIViewRepresentable {
 
     final class Coordinator: NSObject, UISearchBarDelegate {
         var parent: LibrarySearchBar
+        var isUpdatingView = false
 
         init(_ parent: LibrarySearchBar) { self.parent = parent }
 
         func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
-            parent.text = searchText
+            if !isUpdatingView, parent.text != searchText {
+                parent.text = searchText
+            }
         }
 
         func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
-            parent.isFocused = true
+            if !isUpdatingView, !parent.isFocused {
+                parent.isFocused = true
+            }
         }
 
         func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
-            parent.isFocused = false
+            if !isUpdatingView, parent.isFocused {
+                parent.isFocused = false
+            }
         }
 
         func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
@@ -1409,6 +1421,12 @@ struct LibraryView: View {
         }
         .task(id: scenePhase) {
             guard scenePhase == .active else { return }
+            // onDisappear suspends search while a document covers the library.
+            // Returning in the same active scene does not fire onChange of
+            // scenePhase; restart the search generation on appearance as well.
+            guard UIApplication.shared.isProtectedDataAvailable else { return }
+            isLibrarySearchSuspended = false
+            librarySearchLifecycleGeneration = UUID()
             await model.restoreCommittedImportsForForeground()
             guard !Task.isCancelled else { return }
             model.resumeDeferredBackgroundWork()
@@ -1583,6 +1601,16 @@ struct LibraryView: View {
                 }
             )
             .frame(height: 52)
+            Button("Cancel".localizedUI) {
+                isLibrarySearchFocused = false
+                searchText = ""
+                appliedSearchText = ""
+                isLibrarySearchPresented = false
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(PPColor.accent)
+            .frame(minWidth: 44, minHeight: 44)
+            .accessibilityIdentifier("librarySearchCancel")
             if !librarySearchHistory.isEmpty {
                 Menu {
                     ForEach(librarySearchHistory, id: \.self) { query in
@@ -1662,12 +1690,13 @@ struct LibraryView: View {
     private var deskHeader: some View {
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .center, spacing: PPSpacing.regular) {
-                deskIdentity
-                Spacer(minLength: PPSpacing.medium)
+                if horizontalSizeClass == .regular { deskIdentity }
+                Spacer(minLength: 0)
                 deskCreationCommands
+                if horizontalSizeClass != .regular { Spacer(minLength: 0) }
             }
             VStack(alignment: .leading, spacing: PPSpacing.medium) {
-                deskIdentity
+                if horizontalSizeClass == .regular { deskIdentity }
                 deskCreationCommands
             }
         }
@@ -4928,7 +4957,7 @@ struct LibraryView: View {
 
     private var homeGoalsSection: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            Label("On-device processing · No document uploads".localizedUI,
+            Label("On device · No uploads".localizedUI,
                   systemImage: "lock.shield")
                 .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
@@ -4960,52 +4989,41 @@ struct LibraryView: View {
 
     private var homeGoalColumns: [GridItem] {
         Array(
-            repeating: GridItem(.flexible(), spacing: 0),
-            count: dynamicTypeSize.ppPrefersExpandedLayout ? 1 : 2
+            repeating: GridItem(.flexible(), spacing: PPSpacing.xSmall),
+            count: dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 4
         )
     }
 
-    private func homeGoalButton(
-        _ task: PDFQuickTask
-    ) -> some View {
-        Button {
-            start(task)
-        } label: {
-            HStack(alignment: .top, spacing: PPSpacing.small) {
-                ToolSymbolPlate(
-                    symbol: task.symbol,
-                    tint: quickToolTint(task.group),
-                    size: 28
-                )
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(homeGoalTitle(task).localizedUI)
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(PPColor.textPrimary)
-                        .fixedSize(
-                            horizontal: false,
-                            vertical: true
-                        )
-
-                }
-                Spacer(minLength: 0)
+    private func homeGoalButton(_ task: PDFQuickTask) -> some View {
+        Button { start(task) } label: {
+            VStack(spacing: PPSpacing.small) {
+                Image(systemName: task.symbol)
+                    .font(.system(size: 21, weight: .medium))
+                    .frame(height: 26)
+                Text(homeGoalShortTitle(task).localizedUI)
+                    .font(.caption.weight(.semibold))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.center)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .frame(
-                minHeight:
-                    dynamicTypeSize.isAccessibilitySize ? 64 : 56
-            )
-            .padding(.horizontal, PPSpacing.small)
-            .padding(.vertical, 6)
-            .overlay(alignment: .bottom) {
-                Rectangle()
-                    .fill(PPColor.border.opacity(0.55))
-                    .frame(height: 0.6)
-            }
+            .foregroundStyle(PPColor.accent)
+            .frame(maxWidth: .infinity, minHeight: 68)
+            .padding(.vertical, PPSpacing.xSmall)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PPPressButtonStyle())
+        .accessibilityLabel(homeGoalTitle(task).localizedUI)
         .accessibilityHint(homeGoalDetail(task).localizedUI)
         .accessibilityIdentifier("homeGoal-\(task.rawValue)")
+    }
+
+    private func homeGoalShortTitle(_ task: PDFQuickTask) -> String {
+        switch task {
+        case .mergePDFs: return "Merge"
+        case .splitPDF: return "Split"
+        case .compressPDF: return "Compress"
+        case .recognizeText: return "OCR"
+        default: return task.title
+        }
     }
 
     private func homeGoalTitle(
@@ -10468,7 +10486,7 @@ struct LibraryView: View {
         if hasActiveFilters {
             return "Search results"
         }
-        return "Recent documents"
+        return isWorkspaceSidebar ? "Recent" : "Recent documents"
     }
 
     private func selectSmartView(

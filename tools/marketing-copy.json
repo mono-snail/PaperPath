@@ -1,0 +1,957 @@
+{
+  "en": {
+    "title": "PaperPath — Offline PDF Tools for iPhone & iPad",
+    "description": "Merge, split, compress and OCR PDFs offline on iPhone and iPad. No PDF uploads, no subscription. Fill, sign and redact while keeping your originals.",
+    "ogLocale": "en_US",
+    "imageAlt": "PaperPath PDF workspace and privacy review on iPhone and iPad",
+    "skip": "Skip to content",
+    "navigation": "Main navigation",
+    "language": "Choose language",
+    "navWorkflow": "How it works",
+    "navPrivacy": "Privacy",
+    "navPrice": "Pricing",
+    "navCTA": "Pricing & launch",
+    "hero1": "PDF tools.",
+    "hero2": "No uploads.",
+    "heroDescription": "Merge, split, compress and OCR PDFs offline on iPhone and iPad. Fill, sign and redact when you need more. Keep your originals.",
+    "explore": "See PDF tools",
+    "oneTime": "One-time purchase",
+    "promise1": "No PDF uploads",
+    "promise2": "Works offline",
+    "promise3": "No subscription",
+    "ipadAlt": "Actual PaperPath iPad document workspace with form, signature, page and delivery tools",
+    "verifiedAlt": "Actual PaperPath redacted-copy result showing removal checks and the unchanged original",
+    "realScreens": "Actual app screens. Fictional sample documents.",
+    "strip1": "Your documents stay in your hands.",
+    "strip2": "Your original stays intact.",
+    "strip3": "Your next step stays clear.",
+    "workflowTag": "One document. One clear path.",
+    "workflowTitle": "From unfinished PDF to ready-to-send copy.",
+    "workflowIntro": "A contract to sign. A scan to search. A client file to redact. Keep the work together, from import to handoff.",
+    "homeAlt": "PaperPath document library with import, scan, merge, split, compress and OCR actions",
+    "original": "Imported original",
+    "sourceSafe": "Preserved outside your working copy",
+    "steps": [
+      [
+        "Bring your document in",
+        "Import from Files or scan paper pages. PaperPath creates a private working copy of your imported PDF.",
+        "PDF import · Document scanning"
+      ],
+      [
+        "Make it ready",
+        "Fill forms, place a signature, organize pages or recognize scanned text. Choose the next action for this document.",
+        "Forms · Signatures · OCR · Page tools"
+      ],
+      [
+        "Review, then share",
+        "Review private details and preview the result. Verified Output reopens its flattened copy and records file checks.",
+        "Redaction · Output preview · Delivery receipts"
+      ]
+    ],
+    "privacyTag": "Private details deserve a closer look.",
+    "privacyTitle": "Find it. Review it. Remove it.",
+    "privacyIntro": "Look for supported kinds of sensitive information locally. Check the candidates on the page, then choose what belongs in your shared copy.",
+    "privacySteps": "Privacy review steps",
+    "privacyPanels": [
+      [
+        "Find",
+        "A focused list, not a guessing game.",
+        "Review detected candidates by type and page. Jump back to the PDF to see each one in context."
+      ],
+      [
+        "Review",
+        "You choose what leaves the document.",
+        "Confirm the selected regions and removal style before creating a permanently redacted copy."
+      ],
+      [
+        "Remove",
+        "Share the copy you checked.",
+        "Review the result and removal checks. The imported original remains unchanged."
+      ]
+    ],
+    "privacyBoundary": "Automatic detection can miss information. Review before sharing. Image-based redacted or flattened copies can lose searchable text, links, forms and editable layers. Checks do not certify content, identity or legal compliance.",
+    "privacyAlts": [
+      "Actual privacy scan candidate review",
+      "Actual confirmation before permanent redaction",
+      "Actual redacted-copy removal check result"
+    ],
+    "featuresTag": "The tools behind the handoff.",
+    "featuresTitle": "Merge, split, compress and OCR. All on device.",
+    "features": [
+      [
+        "pen",
+        "Fill & sign",
+        "Complete supported forms, place handwritten signatures and add annotations."
+      ],
+      [
+        "scan",
+        "Scan & recognize",
+        "Review scans, run on-device OCR and make searchable PDF copies."
+      ],
+      [
+        "pages",
+        "Organize & reduce",
+        "Merge, split, reorder, rotate, crop and compress documents."
+      ],
+      [
+        "export",
+        "Convert & deliver",
+        "Export to Office, images or text. Review formatting before using the result."
+      ]
+    ],
+    "featureList": [
+      "PDF forms and handwritten signatures",
+      "On-device OCR and searchable PDF copies",
+      "PDF merge, split and page organization",
+      "Privacy review and permanent redaction",
+      "Flattened output checks and delivery receipts"
+    ],
+    "ipadTag": "Space for the document.",
+    "ipadTitle": "Built for the way you work on iPad.",
+    "ipadIntro": "Keep the document in view while choosing tools. A dedicated iPad workspace gives your PDFs room; iPhone keeps the next action close.",
+    "ipadNote": "Native iPhone and iPad app. iOS / iPadOS 17 or later. Mac support has not been announced.",
+    "ipadDarkAlt": "Actual PaperPath iPad document library in dark appearance",
+    "priceTag": "A tool you buy once.",
+    "priceTitle": "Your PDF studio. One purchase.",
+    "priceIntro": "Pay once to download PaperPath for iPhone and iPad. No PaperPath subscription. No account to create.",
+    "supportLink": "Support",
+    "priceTerm": "One-time paid download",
+    "priceIncludes": [
+      "On-device PDF tools",
+      "OCR and privacy review",
+      "Verified Output and batch delivery",
+      "iPhone and iPad"
+    ],
+    "comingSoon": "Coming to the App Store",
+    "priceNote": "Planned US launch price. Local prices and availability will appear on the App Store.",
+    "faqTitle": "A few things worth knowing.",
+    "faq": [
+      [
+        "Does PaperPath upload my PDFs?",
+        "Core PDF processing, OCR and privacy detection run on your device. System sharing and optional iCloud metadata sync use the services you choose. Metadata sync does not sync PDF files."
+      ],
+      [
+        "What does Verified Output check?",
+        "It creates an image-based flattened copy, reopens its pages and records file checks. It does not certify content accuracy, signer identity or legal compliance. Flattening removes searchable text, links, forms and editable layers."
+      ],
+      [
+        "Is this a subscription?",
+        "No. The planned launch model is a US$9.99 one-time paid download, with no separate PaperPath Pro unlock. The App Store will show the local price when available."
+      ],
+      [
+        "Can I use it on Mac?",
+        "The current release is designed for iPhone and iPad. Mac compatibility is still unverified, so Mac support is not included in the launch promise."
+      ],
+      [
+        "Are my PDFs backed up automatically?",
+        "The private document library is excluded from automatic device backups. Optional iCloud metadata sync does not back up PDFs. Export important documents before deleting the app or changing devices."
+      ],
+      [
+        "Can I work with PDFs without an internet connection?",
+        "Merge, split, compress and OCR run on your device. Downloading PaperPath, Apple purchases and optional iCloud metadata sync use the internet. Sharing or exporting may send files to the destination you choose."
+      ],
+      [
+        "Can I merge PDFs and change their order locally?",
+        "Merge supported unlocked PDFs and drag the selected sources into order before creating the combined copy. Original files stay unchanged. Resource limits still apply to large jobs."
+      ],
+      [
+        "Does PDF compression reduce quality?",
+        "Choose Readable, Balanced or Compact and review a sampled size estimate. Compression rebuilds pages as images and removes searchable text, links, forms and editable notes. If the rebuilt copy would be larger, PaperPath keeps the smaller original."
+      ]
+    ],
+    "closing": "Keep the original. Share with care.",
+    "closingCTA": "Explore PaperPath",
+    "footerNav": "Footer navigation",
+    "privacyLink": "Privacy policy",
+    "back": "Back to PaperPath",
+    "supportIntro": "Help with importing, processing and exporting your PDFs in PaperPath.",
+    "contactNote": "Include your app version, device, iOS version, steps and the error message. Do not send confidential PDFs, passwords or signatures.",
+    "support": [
+      [
+        "Keep important files",
+        "The private library is not included in automatic device backups. Export important PDFs to Files before deleting PaperPath or changing devices."
+      ],
+      [
+        "A cloud PDF will not open",
+        "Wait for the file provider to finish downloading the PDF, then import it again. Protected PDFs may require their password."
+      ],
+      [
+        "OCR or privacy detection missed something",
+        "Inspect the page and recognized text. Automatic detection can miss or misread information; always review your output."
+      ],
+      [
+        "The exported file looks different",
+        "Office conversion may change layout. Redacted and flattened copies may remove text, links and form fields. Keep the original and preview the output before sharing."
+      ],
+      [
+        "Payment and downloading",
+        "The launch plan is a one-time paid App Store download. Apple manages payments, download history and refund requests. Download again using the Apple Account that purchased the app."
+      ]
+    ],
+    "heroAvailability": "Coming soon to the App Store · Planned launch price"
+  },
+  "zh-Hans": {
+    "title": "PaperPath PDF — iPhone、iPad 本地合并、压缩与 OCR",
+    "description": "在 iPhone 和 iPad 离线合并、拆分、压缩和 OCR 识别 PDF。不上传文档，无订阅；支持填写签名、隐私脱敏，保留原件。",
+    "ogLocale": "zh_CN",
+    "imageAlt": "PaperPath 的 iPad PDF 工作区与 iPhone 隐私复核实际界面",
+    "skip": "跳到主要内容",
+    "navigation": "主导航",
+    "language": "选择语言",
+    "navWorkflow": "工作流程",
+    "navPrivacy": "隐私处理",
+    "navPrice": "价格",
+    "navCTA": "价格与上架",
+    "hero1": "PDF 工具，",
+    "hero2": "无需上传。",
+    "heroDescription": "在 iPhone 和 iPad 离线合并、拆分、压缩与 OCR。需要时也能填写、签名、隐私脱敏，原始文件保持不变。",
+    "explore": "查看 PDF 工具",
+    "oneTime": "一次购买",
+    "promise1": "文档不上传",
+    "promise2": "离线也能用",
+    "promise3": "无需订阅",
+    "ipadAlt": "PaperPath iPad 真实文档工作区，显示填写表单、签名、页面整理和核验交付工具",
+    "verifiedAlt": "PaperPath 永久脱敏结果实际界面，显示移除检查与原件保持不变",
+    "realScreens": "App 实际界面，使用虚构示例文档。",
+    "strip1": "文档，始终由你掌控。",
+    "strip2": "原件，始终为你保留。",
+    "strip3": "下一步，清楚就在眼前。",
+    "workflowTag": "围绕一份文件，走完一条流程。",
+    "workflowTitle": "从待处理，到准备好发送。",
+    "workflowIntro": "一份待签合同，一叠待识别扫描件，一份需要脱敏的客户资料。从导入到交付，连贯完成。",
+    "homeAlt": "PaperPath 文档库真实界面，包含导入、扫描、合并、拆分、压缩和 OCR",
+    "original": "导入前的原件",
+    "sourceSafe": "处理工作副本，保留来源文件",
+    "steps": [
+      [
+        "把文件带进来",
+        "从“文件”导入，或扫描纸质页面。导入 PDF 后建立本地工作副本。",
+        "PDF 导入 · 多页扫描"
+      ],
+      [
+        "把事情做完",
+        "填写表单、放置签名、整理页序、识别文字。围绕当前文档，选择真正需要的动作。",
+        "表单 · 签名 · OCR · 页面整理"
+      ],
+      [
+        "核对后，再分享",
+        "复核隐私并预览结果。Verified Output 会重新打开生成的扁平化副本，记录文件检查回执。",
+        "永久脱敏 · 输出预览 · 交付回执"
+      ]
+    ],
+    "privacyTag": "要分享的文件，值得再看仔细。",
+    "privacyTitle": "发现隐私。由你确认。永久移除。",
+    "privacyIntro": "在本机寻找支持类型的敏感信息。回到原页核对候选，再决定哪些内容不该出现在分享副本里。",
+    "privacySteps": "隐私处理步骤",
+    "privacyPanels": [
+      [
+        "发现",
+        "需要关注的内容，集中看清。",
+        "候选项按类型和页面整理。回到 PDF 原页，结合上下文逐项核对。"
+      ],
+      [
+        "确认",
+        "哪些内容移除，由你决定。",
+        "检查选中范围与遮盖样式，确认后再创建永久脱敏副本。"
+      ],
+      [
+        "移除",
+        "交出去的是你检查过的副本。",
+        "查看脱敏结果和移除检查。导入前的原始 PDF 保持不变。"
+      ]
+    ],
+    "privacyBoundary": "自动检测可能遗漏信息，分享前仍需人工复核。图像型脱敏或扁平化副本可能不再保留可搜索文字、链接、表单和可编辑图层。文件检查不认证内容、身份或法律合规。",
+    "privacyAlts": [
+      "隐私扫描候选复核实际界面",
+      "永久脱敏前确认实际界面",
+      "永久脱敏副本移除检查实际界面"
+    ],
+    "featuresTag": "把一份文档完成所需的工具。",
+    "featuresTitle": "合并、拆分、压缩、OCR，都在本机。",
+    "features": [
+      [
+        "pen",
+        "填写与签名",
+        "填写受支持的表单，放置手写签名，添加批注与标记。"
+      ],
+      [
+        "scan",
+        "扫描与识别",
+        "复核扫描页，本机 OCR，创建可搜索 PDF 副本。"
+      ],
+      [
+        "pages",
+        "整理与压缩",
+        "合并、拆分、排序、旋转、裁切与压缩文档。"
+      ],
+      [
+        "export",
+        "转换与交付",
+        "导出 Office、图片或文本；使用结果前核对排版。"
+      ]
+    ],
+    "featureList": [
+      "PDF 表单填写与手写签名",
+      "本地 OCR 与可搜索 PDF 副本",
+      "PDF 合并拆分与页面整理",
+      "隐私复核与永久脱敏",
+      "扁平化副本检查与交付回执"
+    ],
+    "ipadTag": "给文档留出工作空间。",
+    "ipadTitle": "为 iPad 的工作方式而设计。",
+    "ipadIntro": "选择工具时，文档依然在眼前。iPad 专用工作区给 PDF 更多空间；iPhone 让下一步操作随手可达。",
+    "ipadNote": "原生 iPhone 与 iPad App，支持 iOS / iPadOS 17 及以上。Mac 支持尚未公布。",
+    "ipadDarkAlt": "PaperPath iPad 深色模式文档库实际界面",
+    "priceTag": "一次购买的日常工具。",
+    "priceTitle": "你的 PDF 工作室，一次买下。",
+    "priceIntro": "付费下载，在 iPhone 和 iPad 使用。无需 PaperPath 订阅，也不用注册账号。",
+    "supportLink": "使用帮助",
+    "priceTerm": "一次付费下载",
+    "priceIncludes": [
+      "本机 PDF 处理工具",
+      "OCR 与隐私复核",
+      "核验输出与批量交付",
+      "iPhone 与 iPad"
+    ],
+    "comingSoon": "即将登陆 App Store",
+    "priceNote": "计划中的美国区首发价格。各地区价格与可用性以上架后的 App Store 为准。",
+    "faqTitle": "重要的问题，直接回答。",
+    "faq": [
+      [
+        "PDF 会上传到服务器吗？",
+        "核心 PDF 处理、OCR 和隐私检测在本机运行。系统分享和可选 iCloud 元数据同步使用你选择的服务；元数据同步不包含 PDF 文件。"
+      ],
+      [
+        "Verified Output 检查什么？",
+        "它创建图像型扁平化副本，重新打开各页并记录文件检查。它不认证内容准确性、签署人身份或法律合规；扁平化会移除可搜索文字、链接、表单与可编辑图层。"
+      ],
+      [
+        "需要订阅或再次解锁吗？",
+        "不需要。计划以 US$9.99 一次付费下载，不另设 PaperPath Pro 解锁。上架后可在 App Store 查看当地价格。"
+      ],
+      [
+        "可以在 Mac 上用吗？",
+        "当前版本面向 iPhone 和 iPad。Mac 兼容性尚未验证，因此首发不承诺 Mac 支持。"
+      ],
+      [
+        "PDF 会自动备份吗？",
+        "私有文档库不包含在设备自动备份中，可选 iCloud 元数据同步也不备份 PDF。删除 App 或更换设备前，请先导出重要文件。"
+      ],
+      [
+        "断网也能处理 PDF 吗？",
+        "合并、拆分、压缩和 OCR 都在本机运行。下载 App、Apple 购买与可选的 iCloud 元数据同步需要联网；分享或导出可能把文件发送到你选择的目标。"
+      ],
+      [
+        "合并 PDF 后能调整文件顺序吗？",
+        "可以在本机选择受支持的未加锁 PDF，拖动已选文件调整顺序，再创建合并副本。原始文件保持不变；大任务仍受资源保护上限约束。"
+      ],
+      [
+        "压缩 PDF 会影响画质吗？",
+        "可选清晰、平衡或紧凑三档，并查看采样大小预估。压缩将页面重建为图像，会移除可搜索文字、链接、表单和可编辑批注。如果重建副本反而更大，PaperPath 会保留更小的原件。"
+      ]
+    ],
+    "closing": "保留原件，把分享的那份做好。",
+    "closingCTA": "认识 PaperPath",
+    "footerNav": "页脚导航",
+    "privacyLink": "隐私政策",
+    "back": "返回 PaperPath",
+    "supportIntro": "了解 PaperPath 中的文档导入、处理与导出。",
+    "contactNote": "请提供 App 版本、设备与 iOS 版本、操作步骤及错误提示。请勿发送机密 PDF、密码或签名。",
+    "support": [
+      [
+        "先保存重要文件",
+        "私有文档库不包含在设备自动备份中。删除 PaperPath 或更换设备前，先将重要 PDF 导出至“文件”。"
+      ],
+      [
+        "云端 PDF 打不开",
+        "等待文件提供方下载完成后重新导入。受密码保护的 PDF 可能需要输入密码。"
+      ],
+      [
+        "识别或隐私检测有遗漏",
+        "核对页面与识别文字。自动检测可能遗漏或误读，使用结果前请人工复核。"
+      ],
+      [
+        "导出的文件排版不同",
+        "Office 转换可能改变布局；脱敏与扁平化副本可能移除文字、链接和表单。保留原件，分享前先预览。"
+      ],
+      [
+        "购买与重新下载",
+        "首发计划为 App Store 一次付费下载。付款、下载历史与退款由 Apple 管理；重新下载时请使用原购买 Apple 账户。"
+      ]
+    ],
+    "heroAvailability": "即将登陆 App Store · 当前为计划首发价格"
+  },
+  "zh-Hant": {
+    "title": "PaperPath PDF — iPhone、iPad 本機合併、壓縮與 OCR",
+    "description": "在 iPhone 和 iPad 離線合併、分割、壓縮與 OCR 辨識 PDF。不上傳文件，無訂閱；支援填寫簽名、隱私遮蔽，保留原檔。",
+    "ogLocale": "zh_TW",
+    "imageAlt": "PaperPath 的 iPad PDF 工作區與 iPhone 隱私檢查實際介面",
+    "skip": "跳至主要內容",
+    "navigation": "主導覽",
+    "language": "選擇語言",
+    "navWorkflow": "工作流程",
+    "navPrivacy": "隱私處理",
+    "navPrice": "價格",
+    "navCTA": "價格與上架",
+    "hero1": "PDF 工具，",
+    "hero2": "無需上傳。",
+    "heroDescription": "在 iPhone 和 iPad 離線合併、分割、壓縮與 OCR。需要時也能填寫、簽名、隱私遮蔽，原始檔案保持不變。",
+    "explore": "查看 PDF 工具",
+    "oneTime": "一次購買",
+    "promise1": "文件不上傳",
+    "promise2": "離線也能用",
+    "promise3": "無需訂閱",
+    "ipadAlt": "PaperPath iPad 真實文件工作區，顯示填寫表單、簽名、頁面整理和輸出檢查工具",
+    "verifiedAlt": "PaperPath 永久遮蔽結果實際介面，顯示移除檢查與原檔保持不變",
+    "realScreens": "App 實際介面，使用虛構示例文件。",
+    "strip1": "文件，始終由你掌控。",
+    "strip2": "原檔，始終為你保留。",
+    "strip3": "下一步，清楚就在眼前。",
+    "workflowTag": "圍繞一份文件，走完一條流程。",
+    "workflowTitle": "從待處理，到準備好傳送。",
+    "workflowIntro": "一份待簽合約，一疊待辨識掃描文件，一份需要遮蔽的客戶資料。從匯入到交付，連貫完成。",
+    "homeAlt": "PaperPath 文件庫真實介面，包含匯入、掃描、合併、分割、壓縮和 OCR",
+    "original": "匯入前的原檔",
+    "sourceSafe": "處理工作副本，保留來源文件",
+    "steps": [
+      [
+        "把文件帶進來",
+        "從「檔案」匯入，或掃描紙本頁面。匯入 PDF 後建立本機工作副本。",
+        "PDF 匯入 · 多頁掃描"
+      ],
+      [
+        "把事情做完",
+        "填寫表單、放置簽名、整理頁序、辨識文字。圍繞目前文件，選擇真正需要的動作。",
+        "表單 · 簽名 · OCR · 頁面整理"
+      ],
+      [
+        "檢查後，再分享",
+        "檢查隱私並預覽結果。Verified Output 會重新開啟產生的平面化副本，記錄文件檢查收據。",
+        "永久遮蔽 · 輸出預覽 · 交付收據"
+      ]
+    ],
+    "privacyTag": "要分享的文件，值得再看仔細。",
+    "privacyTitle": "找出隱私。由你確認。永久移除。",
+    "privacyIntro": "在本機尋找支援類型的敏感資訊。回到原頁檢查候選項目，再決定哪些內容不該出現在分享副本裡。",
+    "privacySteps": "隱私處理步驟",
+    "privacyPanels": [
+      [
+        "發現",
+        "需要關注的內容，集中看清。",
+        "候選項目按類型和頁面整理。回到 PDF 原頁，結合上下文逐項檢查。"
+      ],
+      [
+        "確認",
+        "哪些內容移除，由你決定。",
+        "檢查選取範圍與遮蔽樣式，確認後再建立永久遮蔽副本。"
+      ],
+      [
+        "移除",
+        "交出去的是你檢查過的副本。",
+        "查看遮蔽結果和移除檢查。匯入前的原始 PDF 保持不變。"
+      ]
+    ],
+    "privacyBoundary": "自動偵測可能遺漏資訊，分享前仍需人工檢查。影像型遮蔽或平面化副本可能不再保留可搜尋文字、連結、表單和可編輯圖層。文件檢查不認證內容、身分或法律合規。",
+    "privacyAlts": [
+      "隱私掃描候選檢查實際介面",
+      "永久遮蔽前確認實際介面",
+      "永久遮蔽副本移除檢查實際介面"
+    ],
+    "featuresTag": "把一份文件完成所需的工具。",
+    "featuresTitle": "合併、分割、壓縮、OCR，都在本機。",
+    "features": [
+      [
+        "pen",
+        "填寫與簽名",
+        "填寫受支援的表單，放置手寫簽名，新增註解與標記。"
+      ],
+      [
+        "scan",
+        "掃描與辨識",
+        "檢查掃描頁，本機 OCR，建立可搜尋 PDF 副本。"
+      ],
+      [
+        "pages",
+        "整理與壓縮",
+        "合併、分割、排序、旋轉、裁切與壓縮文件。"
+      ],
+      [
+        "export",
+        "轉換與交付",
+        "匯出 Office、圖片或文字；使用結果前檢查排版。"
+      ]
+    ],
+    "featureList": [
+      "PDF 表單填寫與手寫簽名",
+      "本地 OCR 與可搜尋 PDF 副本",
+      "PDF 合併分割與頁面整理",
+      "隱私檢查與永久遮蔽",
+      "扁平化副本檢查與交付收據"
+    ],
+    "ipadTag": "給文件留出工作空間。",
+    "ipadTitle": "為 iPad 的工作方式而設計。",
+    "ipadIntro": "選擇工具時，文件依然在眼前。iPad 專用工作區給 PDF 更多空間；iPhone 讓下一步操作隨手可及。",
+    "ipadNote": "原生 iPhone 與 iPad App，支援 iOS / iPadOS 17 及以上。Mac 支援尚未公布。",
+    "ipadDarkAlt": "PaperPath iPad 深色模式文件庫實際介面",
+    "priceTag": "一次購買的日常工具。",
+    "priceTitle": "你的 PDF 工作室，一次買下。",
+    "priceIntro": "付費下載，在 iPhone 和 iPad 使用。無需 PaperPath 訂閱，也不用註冊帳號。",
+    "supportLink": "使用說明",
+    "priceTerm": "一次付費下載",
+    "priceIncludes": [
+      "本機 PDF 處理工具",
+      "OCR 與隱私檢查",
+      "輸出檢查與批次交付",
+      "iPhone 與 iPad"
+    ],
+    "comingSoon": "即將登上 App Store",
+    "priceNote": "規劃中的美國區首發價格。各地區價格與供應情況以上架後的 App Store 為準。",
+    "faqTitle": "重要的問題，直接回答。",
+    "faq": [
+      [
+        "PDF 會上傳到伺服器嗎？",
+        "核心 PDF 處理、OCR 和隱私偵測在本機執行。系統分享和可選 iCloud 中繼資料同步使用你選擇的服務；同步不包含 PDF 檔案。"
+      ],
+      [
+        "Verified Output 檢查什麼？",
+        "它建立影像型平面化副本，重新開啟各頁並記錄文件檢查。它不認證內容準確性、簽署人身分或法律合規；平面化會移除可搜尋文字、連結、表單與可編輯圖層。"
+      ],
+      [
+        "需要訂閱或再次解鎖嗎？",
+        "不需要。規劃以 US$9.99 一次付費下載，不另設 PaperPath Pro 解鎖。上架後可在 App Store 查看當地價格。"
+      ],
+      [
+        "可以在 Mac 上用嗎？",
+        "目前版本面向 iPhone 和 iPad。Mac 相容性尚未驗證，因此首發不承諾 Mac 支援。"
+      ],
+      [
+        "PDF 會自動備份嗎？",
+        "私有文件庫不包含在裝置自動備份中，可選 iCloud 中繼資料同步也不備份 PDF。刪除 App 或更換裝置前，請先匯出重要文件。"
+      ],
+      [
+        "離線也能處理 PDF 嗎？",
+        "合併、分割、壓縮與 OCR 都在本機執行。下載 App、Apple 購買與選用的 iCloud 中繼資料同步需要連線；分享或匯出可能將檔案傳送至你選擇的目的地。"
+      ],
+      [
+        "合併 PDF 時可以調整檔案順序嗎？",
+        "在本機選取支援的未鎖定 PDF，拖動已選檔案調整順序，再建立合併副本。原始檔案保持不變；大型工作仍受資源保護上限限制。"
+      ],
+      [
+        "壓縮 PDF 會影響畫質嗎？",
+        "可選清晰、平衡或緊湊三種品質，並查看取樣大小預估。壓縮會將頁面重建為影像，移除可搜尋文字、連結、表單與可編輯註解。若重建副本反而更大，會保留較小的原檔。"
+      ]
+    ],
+    "closing": "保留原檔，把分享的那份做好。",
+    "closingCTA": "認識 PaperPath",
+    "footerNav": "頁尾導覽",
+    "privacyLink": "隱私權政策",
+    "back": "返回 PaperPath",
+    "supportIntro": "了解 PaperPath 中的文件匯入、處理與匯出。",
+    "contactNote": "請提供 App 版本、裝置與 iOS 版本、操作步驟及錯誤訊息。請勿傳送機密 PDF、密碼或簽名。",
+    "support": [
+      [
+        "先保存重要文件",
+        "私有文件庫不包含在裝置自動備份中。刪除 PaperPath 或更換裝置前，先將重要 PDF 匯出至「檔案」。"
+      ],
+      [
+        "雲端 PDF 無法開啟",
+        "等待檔案提供者下載完成後重新匯入。受密碼保護的 PDF 可能需要輸入密碼。"
+      ],
+      [
+        "辨識或隱私偵測有遺漏",
+        "檢查頁面與辨識文字。自動偵測可能遺漏或誤讀，使用結果前請人工檢查。"
+      ],
+      [
+        "匯出的文件排版不同",
+        "Office 轉換可能改變版面；遮蔽與平面化副本可能移除文字、連結和表單。保留原檔，分享前先預覽。"
+      ],
+      [
+        "購買與重新下載",
+        "首發規劃為 App Store 一次付費下載。付款、下載記錄與退款由 Apple 管理；重新下載時請使用原購買 Apple 帳號。"
+      ]
+    ],
+    "heroAvailability": "即將登陸 App Store · 目前為預計首發價格"
+  },
+  "ja": {
+    "title": "PaperPath — iPhone・iPadでオフラインPDF結合・圧縮・OCR",
+    "description": "iPhone・iPadでPDFの結合、分割、圧縮、OCRをオフラインで。PDFのアップロード不要、サブスクリプションなし。記入、署名、墨消しにも対応し、原本を保持します。",
+    "ogLocale": "ja_JP",
+    "imageAlt": "PaperPathのiPad作業画面とiPhoneのプライバシー確認画面",
+    "skip": "本文へ",
+    "navigation": "メインナビゲーション",
+    "language": "言語を選択",
+    "navWorkflow": "使い方",
+    "navPrivacy": "プライバシー",
+    "navPrice": "価格",
+    "navCTA": "価格と公開予定",
+    "hero1": "PDFツール。",
+    "hero2": "アップロード不要。",
+    "heroDescription": "iPhone・iPadで結合、分割、圧縮、OCRをオフラインで。記入、署名、墨消しにも対応。原本はそのまま残ります。",
+    "explore": "PDFツールを見る",
+    "oneTime": "買い切り",
+    "promise1": "PDFアップロード不要",
+    "promise2": "オフライン処理",
+    "promise3": "サブスクなし",
+    "ipadAlt": "フォーム、署名、ページ整理、出力確認ツールを表示した実際のiPad文書画面",
+    "verifiedAlt": "原本を保持した墨消しコピーの除去チェック画面",
+    "realScreens": "実際のアプリ画面。文書は架空のサンプルです。",
+    "strip1": "文書を自分の手元に。",
+    "strip2": "原本はそのままに。",
+    "strip3": "次の操作を明確に。",
+    "workflowTag": "ひとつの文書を、最後まで。",
+    "workflowTitle": "未完成のPDFから、送れる一部へ。",
+    "workflowIntro": "署名する契約書、検索したいスキャン、墨消しが必要な資料。読み込みから共有まで、ひとつの流れで。",
+    "homeAlt": "読み込み、スキャン、結合、分割、圧縮、OCRを備えた実際の文書一覧",
+    "original": "読み込み元の原本",
+    "sourceSafe": "原本を残してコピーを編集",
+    "steps": [
+      [
+        "文書を取り込む",
+        "「ファイル」からPDFを読み込むか、紙のページをスキャン。読み込んだPDFの作業用コピーを作成します。",
+        "PDF読み込み・スキャン"
+      ],
+      [
+        "作業を仕上げる",
+        "フォーム記入、手書き署名、ページ整理、文字認識。今の文書に必要な操作を選べます。",
+        "フォーム・署名・OCR・ページ整理"
+      ],
+      [
+        "確認して共有する",
+        "機密情報と出力を確認。Verified Outputは画像化したコピーを再度開き、ファイルのチェック結果を記録します。",
+        "墨消し・プレビュー・出力記録"
+      ]
+    ],
+    "privacyTag": "共有する前に、もう一度。",
+    "privacyTitle": "見つける。確かめる。取り除く。",
+    "privacyIntro": "対応する機密情報を端末内で検出。元のページで候補を確認し、共有コピーから取り除く内容を選びます。",
+    "privacySteps": "プライバシー確認の手順",
+    "privacyPanels": [
+      [
+        "検出",
+        "確認すべき箇所を一覧に。",
+        "種類とページごとに候補を確認し、PDFに戻って文脈を確かめられます。"
+      ],
+      [
+        "確認",
+        "取り除く内容は自分で選択。",
+        "範囲と表示方法を確認してから、恒久的な墨消しコピーを作成します。"
+      ],
+      [
+        "除去",
+        "確認したコピーを共有。",
+        "処理結果と除去チェックを確認。読み込み元のPDFは変わりません。"
+      ]
+    ],
+    "privacyBoundary": "自動検出には見落としがあります。共有前に確認してください。画像化・フラット化したコピーでは検索可能な文字、リンク、フォーム、編集可能なレイヤーが失われることがあります。チェックは内容、身元、法令順守の認証ではありません。",
+    "privacyAlts": [
+      "機密情報候補の確認画面",
+      "恒久的な墨消しの確認画面",
+      "墨消しコピーのチェック結果画面"
+    ],
+    "featuresTag": "仕上げに必要な道具を。",
+    "featuresTitle": "結合・分割・圧縮・OCRを端末内で。",
+    "features": [
+      [
+        "pen",
+        "記入と署名",
+        "対応フォームに記入し、手書き署名や注釈を追加。"
+      ],
+      [
+        "scan",
+        "スキャンと文字認識",
+        "ページを確認し、端末内OCRで検索可能なPDFを作成。"
+      ],
+      [
+        "pages",
+        "整理と圧縮",
+        "結合、分割、並べ替え、回転、トリミング、圧縮。"
+      ],
+      [
+        "export",
+        "変換と共有",
+        "Office、画像、テキストへ出力。使用前にレイアウトを確認。"
+      ]
+    ],
+    "featureList": [
+      "PDFフォームと手書き署名",
+      "端末内OCRと検索可能なPDF",
+      "PDF結合・分割とページ整理",
+      "機密情報の確認と恒久的な墨消し",
+      "画像化したコピーのチェックと出力記録"
+    ],
+    "ipadTag": "文書に、作業の余白を。",
+    "ipadTitle": "iPadの使い方に合わせた作業空間。",
+    "ipadIntro": "文書を見ながらツールを選択。iPadでは広い作業空間、iPhoneでは次の操作が手元に。",
+    "ipadNote": "iPhone・iPad用。iOS / iPadOS 17以降。Mac対応は未発表です。",
+    "ipadDarkAlt": "ダークモードの実際のiPad文書一覧",
+    "priceTag": "一度購入する道具。",
+    "priceTitle": "PDFスタジオを、買い切りで。",
+    "priceIntro": "iPhoneとiPad向け有料ダウンロード。PaperPathの定期購読やアカウント登録は不要です。",
+    "supportLink": "サポート",
+    "priceTerm": "一度だけのお支払い",
+    "priceIncludes": [
+      "端末内PDF処理",
+      "OCRとプライバシー確認",
+      "出力確認と一括共有",
+      "iPhoneとiPad"
+    ],
+    "comingSoon": "App Storeで近日公開",
+    "priceNote": "米国での予定価格です。地域ごとの価格と提供状況は公開後のApp Storeでご確認ください。",
+    "faqTitle": "よくある質問。",
+    "faq": [
+      [
+        "PDFはサーバーに送られますか？",
+        "主なPDF処理、OCR、機密情報検出は端末内で行います。システム共有や任意のiCloudメタデータ同期には選択したサービスを利用します。PDF自体は同期しません。"
+      ],
+      [
+        "Verified Outputは何を確認しますか？",
+        "画像化したコピーを作成して各ページを再度開き、ファイルのチェック結果を記録します。内容、署名者の身元、法令順守を認証しません。検索可能な文字、リンク、フォーム、編集レイヤーは失われます。"
+      ],
+      [
+        "定期購読ですか？",
+        "いいえ。US$9.99の有料ダウンロードを予定しており、別途Pro解除はありません。地域の価格は公開後のApp Storeで表示します。"
+      ],
+      [
+        "Macで使えますか？",
+        "現在はiPhoneとiPad向けです。Mac互換性は未確認のため、初回公開の対応範囲に含みません。"
+      ],
+      [
+        "PDFは自動バックアップされますか？",
+        "アプリ内文書は端末の自動バックアップに含まれません。iCloudメタデータ同期もPDFを保存しません。削除や機種変更の前に重要な文書を書き出してください。"
+      ],
+      [
+        "インターネット接続なしでPDFを処理できますか？",
+        "結合、分割、圧縮、OCRは端末内で動作します。Appのダウンロード、Appleでの購入、任意のiCloudメタデータ同期には接続が必要です。共有・書き出しでは、選択した送信先にファイルが送られる場合があります。"
+      ],
+      [
+        "PDFの結合順序は端末内で変更できますか？",
+        "対応するロックされていないPDFを選び、ドラッグで順序を変えてから結合コピーを作成できます。原本は変更されません。大きな処理にはリソース保護の上限があります。"
+      ],
+      [
+        "PDF圧縮で画質は下がりますか？",
+        "Readable、Balanced、Compactの3段階と、サンプルに基づくサイズ予測を利用できます。圧縮はページを画像化するため、検索可能な文字、リンク、フォーム、編集可能な注釈は失われます。コピーが大きくなる場合は、小さい原本を保持します。"
+      ]
+    ],
+    "closing": "原本を残し、共有する一部を仕上げる。",
+    "closingCTA": "PaperPathを見る",
+    "footerNav": "フッターナビゲーション",
+    "privacyLink": "プライバシーポリシー",
+    "back": "PaperPathに戻る",
+    "supportIntro": "PaperPathでのPDF読み込み、処理、書き出しについて。",
+    "contactNote": "アプリとiOSのバージョン、機種、操作手順、エラーをお知らせください。機密PDF、パスワード、署名は送らないでください。",
+    "support": [
+      [
+        "重要な文書を保存する",
+        "アプリ内文書は自動バックアップ対象外です。削除や機種変更の前に「ファイル」へ書き出してください。"
+      ],
+      [
+        "クラウドPDFを開けない",
+        "提供元でダウンロードが完了してから再度読み込んでください。保護されたPDFにはパスワードが必要な場合があります。"
+      ],
+      [
+        "認識や検出に誤りがある",
+        "元のページと認識文字を確認してください。自動検出には見落としや誤認識があります。"
+      ],
+      [
+        "出力の見た目が違う",
+        "Office変換はレイアウトが変わる場合があります。画像化したコピーは文字、リンク、フォームが失われる場合があります。原本を保存し出力を確認してください。"
+      ],
+      [
+        "購入と再ダウンロード",
+        "有料ダウンロードを予定しています。支払い、購入履歴、返金はAppleが管理します。購入に使ったApple Accountで再ダウンロードしてください。"
+      ]
+    ],
+    "heroAvailability": "App Storeで近日公開 · 予定の発売価格"
+  },
+  "ko": {
+    "title": "PaperPath — iPhone·iPad 오프라인 PDF 병합·압축·OCR",
+    "description": "iPhone과 iPad에서 PDF 병합, 분할, 압축, OCR을 오프라인으로. PDF 업로드와 구독 없이 양식 작성, 서명, 민감 정보 삭제를 처리하고 원본을 보존하세요.",
+    "ogLocale": "ko_KR",
+    "imageAlt": "PaperPath의 iPad PDF 작업 화면과 iPhone 개인정보 검토 화면",
+    "skip": "본문으로 건너뛰기",
+    "navigation": "주 메뉴",
+    "language": "언어 선택",
+    "navWorkflow": "사용 방법",
+    "navPrivacy": "개인정보 보호",
+    "navPrice": "가격",
+    "navCTA": "가격 및 출시",
+    "hero1": "PDF 도구.",
+    "hero2": "업로드 없이.",
+    "heroDescription": "iPhone과 iPad에서 병합, 분할, 압축, OCR을 오프라인으로. 양식 작성, 서명, 민감 정보 삭제도 지원하며 원본은 그대로 보존합니다.",
+    "explore": "PDF 도구 보기",
+    "oneTime": "일회성 구매",
+    "promise1": "PDF 업로드 없음",
+    "promise2": "오프라인 처리",
+    "promise3": "구독 없음",
+    "ipadAlt": "양식, 서명, 페이지 정리와 전달 도구를 표시하는 실제 iPad 문서 작업 화면",
+    "verifiedAlt": "원본을 보존한 민감 정보 삭제 사본의 검사 결과 화면",
+    "realScreens": "실제 앱 화면. 문서는 가상의 예시입니다.",
+    "strip1": "문서는 내 손 안에.",
+    "strip2": "원본은 그대로.",
+    "strip3": "다음 작업은 명확하게.",
+    "workflowTag": "하나의 문서를 처음부터 끝까지.",
+    "workflowTitle": "미완성 PDF를 보낼 준비가 된 사본으로.",
+    "workflowIntro": "서명할 계약서, 검색할 스캔 문서, 민감 정보를 삭제할 자료. 가져오기부터 전달까지 이어서 작업하세요.",
+    "homeAlt": "가져오기, 스캔, 병합, 분할, 압축과 OCR이 있는 실제 문서 보관함",
+    "original": "가져오기 전 원본",
+    "sourceSafe": "원본을 보존하고 작업 사본 편집",
+    "steps": [
+      [
+        "문서 가져오기",
+        "파일에서 PDF를 가져오거나 종이를 스캔하세요. 가져온 PDF의 비공개 작업 사본을 만듭니다.",
+        "PDF 가져오기 · 문서 스캔"
+      ],
+      [
+        "작업 마무리",
+        "양식 작성, 자필 서명, 페이지 정리, 문자 인식. 현재 문서에 필요한 작업을 선택하세요.",
+        "양식 · 서명 · OCR · 페이지 도구"
+      ],
+      [
+        "검토 후 공유",
+        "민감 정보와 출력을 확인하세요. Verified Output은 이미지 기반 사본을 다시 열어 파일 검사 결과를 기록합니다.",
+        "영구 삭제 · 미리보기 · 전달 기록"
+      ]
+    ],
+    "privacyTag": "공유할 문서를 한 번 더 살펴보세요.",
+    "privacyTitle": "찾고. 검토하고. 삭제하세요.",
+    "privacyIntro": "지원되는 민감 정보를 기기 내에서 찾습니다. 원래 페이지에서 후보를 확인하고 공유 사본에서 삭제할 내용을 선택하세요.",
+    "privacySteps": "개인정보 검토 단계",
+    "privacyPanels": [
+      [
+        "찾기",
+        "확인이 필요한 부분을 한눈에.",
+        "유형과 페이지별 후보를 검토하고 PDF에서 문맥을 확인하세요."
+      ],
+      [
+        "검토",
+        "삭제할 내용은 직접 선택.",
+        "영역과 표시 방식을 확인한 후 민감 정보를 영구 삭제한 사본을 만드세요."
+      ],
+      [
+        "삭제",
+        "확인한 사본을 공유.",
+        "처리 결과와 삭제 검사를 확인하세요. 가져온 원본 PDF는 변경되지 않습니다."
+      ]
+    ],
+    "privacyBoundary": "자동 감지는 정보를 놓칠 수 있습니다. 공유 전 직접 검토하세요. 이미지 기반 사본은 검색 가능한 텍스트, 링크, 양식과 편집 레이어가 제거될 수 있습니다. 검사는 내용, 신원 또는 법적 준수를 인증하지 않습니다.",
+    "privacyAlts": [
+      "민감 정보 후보 검토 화면",
+      "영구 삭제 확인 화면",
+      "삭제 사본 검사 결과 화면"
+    ],
+    "featuresTag": "문서 완성에 필요한 도구.",
+    "featuresTitle": "병합·분할·압축·OCR을 기기 안에서.",
+    "features": [
+      [
+        "pen",
+        "작성 및 서명",
+        "지원되는 양식 작성, 자필 서명과 주석 추가."
+      ],
+      [
+        "scan",
+        "스캔 및 문자 인식",
+        "스캔을 검토하고 기기 내 OCR로 검색 가능한 PDF 생성."
+      ],
+      [
+        "pages",
+        "정리 및 압축",
+        "병합, 분할, 순서 변경, 회전, 자르기와 압축."
+      ],
+      [
+        "export",
+        "변환 및 전달",
+        "Office, 이미지와 텍스트로 내보내기. 사용 전 레이아웃 확인."
+      ]
+    ],
+    "featureList": [
+      "PDF 양식과 자필 서명",
+      "기기 내 OCR 및 검색 가능한 PDF",
+      "PDF 병합, 분할과 페이지 정리",
+      "개인정보 검토 및 영구 삭제",
+      "이미지 사본 검사 및 전달 기록"
+    ],
+    "ipadTag": "문서를 위한 작업 공간.",
+    "ipadTitle": "iPad 작업 방식에 맞춘 설계.",
+    "ipadIntro": "문서를 보면서 도구를 선택하세요. iPad는 넓은 작업 공간을, iPhone은 가까운 다음 동작을 제공합니다.",
+    "ipadNote": "iPhone 및 iPad 앱. iOS / iPadOS 17 이상. Mac 지원은 아직 발표되지 않았습니다.",
+    "ipadDarkAlt": "실제 iPad 다크 모드 문서 보관함",
+    "priceTag": "한 번 구매하는 도구.",
+    "priceTitle": "나만의 PDF 스튜디오, 한 번의 구매.",
+    "priceIntro": "iPhone과 iPad용 유료 다운로드. PaperPath 구독이나 계정 가입이 필요 없습니다.",
+    "supportLink": "지원",
+    "priceTerm": "일회성 유료 다운로드",
+    "priceIncludes": [
+      "기기 내 PDF 도구",
+      "OCR 및 개인정보 검토",
+      "출력 확인과 일괄 전달",
+      "iPhone 및 iPad"
+    ],
+    "comingSoon": "App Store 출시 예정",
+    "priceNote": "미국 출시 예정 가격입니다. 지역별 가격과 이용 가능 여부는 출시 후 App Store에서 확인하세요.",
+    "faqTitle": "자주 묻는 질문.",
+    "faq": [
+      [
+        "PDF가 서버에 업로드되나요?",
+        "핵심 PDF 처리, OCR과 민감 정보 감지는 기기 내에서 실행됩니다. 시스템 공유와 선택적 iCloud 메타데이터 동기화는 선택한 서비스를 이용합니다. PDF 파일은 동기화하지 않습니다."
+      ],
+      [
+        "Verified Output은 무엇을 검사하나요?",
+        "이미지 기반 사본을 생성하고 페이지를 다시 열어 파일 검사 결과를 기록합니다. 내용 정확성, 서명자 신원이나 법적 준수를 인증하지 않습니다. 검색 텍스트, 링크, 양식과 편집 레이어는 제거됩니다."
+      ],
+      [
+        "구독이 필요한가요?",
+        "아니요. US$9.99 유료 다운로드로 출시할 예정이며 별도 Pro 잠금 해제는 없습니다. 지역 가격은 출시 후 App Store에서 표시합니다."
+      ],
+      [
+        "Mac에서 사용할 수 있나요?",
+        "현재 iPhone과 iPad용입니다. Mac 호환성이 검증되지 않아 최초 출시 지원 범위에는 포함되지 않습니다."
+      ],
+      [
+        "PDF가 자동 백업되나요?",
+        "비공개 문서 보관함은 기기 자동 백업에서 제외됩니다. iCloud 메타데이터 동기화도 PDF를 백업하지 않습니다. 앱 삭제나 기기 변경 전에 중요 문서를 내보내세요."
+      ],
+      [
+        "인터넷 연결 없이 PDF를 처리할 수 있나요?",
+        "병합, 분할, 압축, OCR은 기기에서 실행됩니다. 앱 다운로드, Apple 구매, 선택적 iCloud 메타데이터 동기화에는 인터넷이 필요합니다. 공유 또는 내보내기는 선택한 대상으로 파일을 보낼 수 있습니다."
+      ],
+      [
+        "PDF 병합 순서를 기기에서 변경할 수 있나요?",
+        "지원되는 잠기지 않은 PDF를 선택하고 드래그로 순서를 정한 뒤 병합 사본을 만들 수 있습니다. 원본은 변경되지 않으며, 큰 작업에는 리소스 보호 한도가 적용됩니다."
+      ],
+      [
+        "PDF 압축은 화질에 영향을 주나요?",
+        "Readable, Balanced, Compact 중에서 선택하고 표본 기반 예상 크기를 확인할 수 있습니다. 압축은 페이지를 이미지로 재구성하므로 검색 가능한 텍스트, 링크, 양식, 편집 가능한 주석이 제거됩니다. 사본이 더 커지면 더 작은 원본을 보존합니다."
+      ]
+    ],
+    "closing": "원본은 보존하고, 공유할 사본은 완성하세요.",
+    "closingCTA": "PaperPath 알아보기",
+    "footerNav": "하단 메뉴",
+    "privacyLink": "개인정보 처리방침",
+    "back": "PaperPath로 돌아가기",
+    "supportIntro": "PaperPath의 PDF 가져오기, 처리 및 내보내기를 도와드립니다.",
+    "contactNote": "앱 버전, 기기, iOS 버전, 단계와 오류 메시지를 알려주세요. 기밀 PDF, 암호나 서명은 보내지 마세요.",
+    "support": [
+      [
+        "중요 문서 보관",
+        "앱 문서는 자동 백업 대상이 아닙니다. 앱 삭제나 기기 변경 전 파일 앱으로 내보내세요."
+      ],
+      [
+        "클라우드 PDF를 열 수 없음",
+        "파일 제공자의 다운로드가 끝나면 다시 가져오세요. 보호된 PDF는 암호가 필요할 수 있습니다."
+      ],
+      [
+        "인식이나 감지 오류",
+        "페이지와 인식 문자를 검토하세요. 자동 감지는 누락되거나 잘못 읽을 수 있습니다."
+      ],
+      [
+        "내보낸 파일이 다르게 보임",
+        "Office 변환은 배치가 달라질 수 있습니다. 이미지 사본은 텍스트, 링크와 양식이 제거될 수 있습니다. 원본을 보관하고 미리보세요."
+      ],
+      [
+        "구매와 재다운로드",
+        "일회성 유료 다운로드로 출시할 예정입니다. 결제, 구매 기록과 환불은 Apple이 관리합니다. 구매한 Apple Account로 다시 다운로드하세요."
+      ]
+    ],
+    "heroAvailability": "App Store 출시 예정 · 계획된 출시 가격"
+  }
+}

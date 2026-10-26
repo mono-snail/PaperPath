@@ -1,33 +1,14 @@
 # PaperPath website deployment
 
-The `website/` directory is a dependency-free static site. Deploy its contents
-as the web root for `paperpath.monoware.app`.
+`website/` is the production-ready static source for `https://paperpath.monoware.app`. There is no package installation or build dependency for hosting. Deploy its public contents as the document root; do not serve `.openai/` or local QA files.
 
-Before production:
+Regenerate pages: `python3 tools/BuildMarketingWebsite.py`. Validate: `python3 tools/CheckMarketingWebsite.py`. Local preview: `python3 -m http.server 4173 --directory website`.
 
-1. Connect `paperpath.monoware.app` and confirm the canonical domain. If the
-   production hostname changes, update `sitemap.xml` and `robots.txt`.
-2. Replace each localized "Coming soon" status with the public App Store URL
-   after the listing is live.
-3. Confirm `hello@monoware.app` and the MonoWare support form remain the
-   published privacy contact routes.
-4. The requested blog destination is `https://blog.monoware.app/`. It did not
-   resolve during the 2026-09-30 build, so configure that host before launch.
+Five languages have independent URLs: `/`, `/en/`, `/zh-hant/`, `/ja/`, `/ko/`. Each has `privacy/` and `support/`. Language links are explicit; no automatic redirects. Production canonical/hreflang, robots and sitemap use the MonoWare domain.
 
-Localized product and privacy pages:
+Owner-private Sites preview: https://paperpath-studio.aquaox32.chatgpt.site
+Project identity is recorded in `.openai/hosting.json`. The deployment source lives in the ignored `.artifacts/paperpath-site/`, with the site in `dist/`; its canonical domain is rewritten to the preview origin and all pages are noindex. This preview deployment does not modify DNS or deploy the MonoWare domain.
 
-- Simplified Chinese: `/` and `/privacy/`
-- Traditional Chinese: `/zh-hant/` and `/zh-hant/privacy/`
-- English: `/en/` and `/en/privacy/`
-- Japanese: `/ja/` and `/ja/privacy/`
-- Korean: `/ko/` and `/ko/privacy/`
+Before public launch: verify privacy identity, policy revision and support email; deploy the production source to the intended domain; replace Coming soon with the public App Store link after availability. App Store ID: **6827073389**. Listing creation alone does not make a public listing available. Do not announce Mac support until verified.
 
-The unprefixed routes negotiate the visitor's saved choice or browser language
-before rendering. Unsupported languages fall back to English. Crawlers remain
-on the canonical Simplified Chinese route so `hreflang` indexing stays stable.
-
-Local preview:
-
-```bash
-python3 -m http.server 4173 --directory website
-```
+See `docs/app-store-connect-2026-10-26/SEO_AND_LAUNCH_ZH.md` for indexing, caching and Search Console handoff.

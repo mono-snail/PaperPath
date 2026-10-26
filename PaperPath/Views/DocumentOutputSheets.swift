@@ -219,38 +219,18 @@ struct BatchCompressionView: View {
     }
 
     private var taskHeader: some View {
-        WorkflowCommandHeader(
-            eyebrow: "BATCH COMPRESSION",
-            title: "Compress PDF",
-            detail: "Create separate smaller copies while sources stay unchanged.",
-            symbol: "arrow.down.right.and.arrow.up.left",
-            tint: PPColor.accent,
-            metrics: [
-                WorkflowMetric(
-                    value: "\(selectedIDs.count)",
-                    label: "Selected",
-                    symbol: "checkmark.circle",
-                    tint: PPColor.accent
-                ),
-                WorkflowMetric(
-                    value: formattedSelectedSize,
-                    label: "Input",
-                    symbol: "internaldrive",
-                    tint: PPColor.cyan
-                ),
-                WorkflowMetric(
-                    value: quality.title,
-                    label: "Quality",
-                    symbol: "slider.horizontal.3",
-                    tint: PPColor.mint
-                )
-            ]
-        )
+        HStack {
+            Text(AppLocalization.format("%lld selected", selectedIDs.count))
+            Spacer()
+            Text(formattedSelectedSize).monospacedDigit()
+        }
+        .font(.subheadline)
+        .foregroundStyle(PPColor.textSecondary)
     }
 
     private var qualityControl: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            SectionEyebrow(text: "OUTPUT QUALITY")
+            Text("Compression quality".localizedUI).font(.subheadline.weight(.semibold))
             CompressionQualityPicker(selection: $quality)
 
             Text(quality.detail.localizedUI)
@@ -1155,6 +1135,8 @@ struct CompressionSheet: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.paperPathSceneID) private var paperPathSceneID
 
+    @AppStorage("privacy.hideLibraryPreviews") private var hideSourcePreview = false
+
     let recordID: UUID
     let onCreated: (DocumentRoute) -> Void
     @State private var quality: PDFCompressionQuality = .balanced
@@ -1180,48 +1162,28 @@ struct CompressionSheet: View {
                             alignment: .leading,
                             spacing: PPSpacing.large
                         ) {
-                            WorkflowCommandHeader(
-                                eyebrow: "COMPRESSION WORKFLOW",
-                                title: "Create smaller copy",
-                                detail: "Choose the balance between visual detail and file size.",
-                                symbol: "arrow.down.right.and.arrow.up.left",
-                                tint: PPColor.accent,
-                                metrics: [
-                                    WorkflowMetric(
-                                        value: record.profile.formattedSize,
-                                        label: "Current",
-                                        symbol: "internaldrive",
-                                        tint: PPColor.textSecondary
-                                    ),
-                                    WorkflowMetric(
-                                        value: estimate?.formattedSize
-                                            ?? (estimateFailed
-                                                ? "Unavailable"
-                                                : "Checking"),
-                                        label: "Estimated",
-                                        symbol: "chart.line.downtrend.xyaxis",
-                                        tint: estimate?.savingsPercent == nil
-                                            ? PPColor.amber
-                                            : PPColor.mint
-                                    ),
-                                    WorkflowMetric(
-                                        value: estimate?.savingsPercent.map {
-                                            "\($0)%"
-                                        } ?? "—",
-                                        label: "Saved",
-                                        symbol: "percent",
-                                        tint: PPColor.mint
+                            HStack(spacing: PPSpacing.medium) {
+                                if !hideSourcePreview, let url = model.url(for: recordID) {
+                                    PDFPageThumbnailView(
+                                        url: url, pageIndex: 0,
+                                        refreshToken: model.refreshToken(for: recordID), width: 52
                                     )
-                                ]
-                            )
+                                }
+                                VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                                    Text(record.displayName)
+                                        .font(.headline)
+                                        .foregroundStyle(PPColor.textPrimary)
+                                    Text(record.subtitle)
+                                        .font(.caption)
+                                        .foregroundStyle(PPColor.textSecondary)
+                                }
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.vertical, PPSpacing.small)
 
-                            WorkflowSectionHeader(
-                                eyebrow: "OUTPUT INTENT",
-                                title: quality.title
-                            )
-                            CompressionQualityPicker(
-                                selection: $quality
-                            )
+                            Text("Compression quality".localizedUI)
+                                .font(.subheadline.weight(.semibold))
+                            CompressionQualityPicker(selection: $quality)
 
                             Text(quality.detail.localizedUI)
                                 .font(.caption)
@@ -1235,6 +1197,26 @@ struct CompressionSheet: View {
                                     horizontal: false,
                                     vertical: true
                                 )
+
+                            VStack(spacing: PPSpacing.medium) {
+                                LabeledContent("Original size".localizedUI, value: record.profile.formattedSize)
+                                Divider()
+                                LabeledContent("Estimated size".localizedUI, value: estimate?.formattedSize
+                                    ?? (estimateFailed ? "Unavailable".localizedUI : "—"))
+                                if estimate == nil && !estimateFailed {
+                                    HStack(spacing: PPSpacing.small) {
+                                        ProgressView().controlSize(.small)
+                                        Text("Checking on device".localizedUI)
+                                        Spacer()
+                                    }
+                                    .font(.caption)
+                                    .foregroundStyle(PPColor.textSecondary)
+                                }
+                            }
+                            .font(.subheadline.monospacedDigit())
+                            .padding(PPSpacing.regular)
+                            .background(PPColor.surfaceMuted, in: RoundedRectangle(cornerRadius: PPRadius.control))
+                            .accessibilityIdentifier("compressionSizeEstimate")
 
                             OperationBoundaryNotice(
                                 title: "Compressed copy is image-based",

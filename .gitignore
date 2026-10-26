@@ -10,3 +10,6 @@ build/
 .artifacts/
 .dbg/
 debug-*.md
+__pycache__/
+
+.wrangler/

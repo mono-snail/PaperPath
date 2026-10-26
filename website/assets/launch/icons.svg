@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg"><defs>
+<symbol id="arrow" viewBox="0 0 24 24"><path d="M4 12h15m-6-6 6 6-6 6"/></symbol>
+<symbol id="globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><ellipse cx="12" cy="12" rx="4" ry="9"/><path d="M3 12h18"/></symbol>
+<symbol id="device" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M10 19h4"/></symbol>
+<symbol id="local" viewBox="0 0 24 24"><path d="m12 3 8 4v6c0 5-8 9-8 9s-8-4-8-9V7z"/><rect x="9" y="10" width="6" height="6" rx="1"/><path d="M10 10V8a2 2 0 0 1 4 0v2"/></symbol>
+<symbol id="copy" viewBox="0 0 24 24"><path d="M8 2h9l4 4v14H8zM3 6v16h13M16 2v5h5M11 11h7m-7 4h7"/></symbol>
+<symbol id="check" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></symbol>
+<symbol id="pen" viewBox="0 0 24 24"><path d="m4 16-1 5 5-1L21 7a2 2 0 0 0-4-4zM15 5l4 4M11 21h10"/></symbol>
+<symbol id="scan" viewBox="0 0 24 24"><path d="M3 8V3h5m8 0h5v5m0 8v5h-5m-8 0H3v-5M3 12h18M8 8h8m-8 8h8"/></symbol>
+<symbol id="pages" viewBox="0 0 24 24"><path d="m12 2 10 5-10 5L2 7zm-9 10 9 5 9-5M3 17l9 5 9-5"/></symbol>
+<symbol id="export" viewBox="0 0 24 24"><path d="M14 2H4v20h16V10M12 12 22 2m-8 0h8v8M8 16h8M8 19h5"/></symbol>
+</defs></svg>

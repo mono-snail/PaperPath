@@ -63,6 +63,12 @@ xcodebuild \
 
 ## Test
 
+For the complete release automation (unit tests, coverage gates, full iPhone and
+iPad UI suites, StoreKit purchase/refund, and a Release build), see
+[发布测试与一键运行](docs/RELEASE_TESTING_ZH.md). The runner preserves failures and
+rejects unexpected skipped or missing tests; automation success still requires
+the documented physical-device and distribution checks before release.
+
 Run the coverage contract before every test pass. It fails when a quick task
 or document tool is added without both logic and UI ownership:
 

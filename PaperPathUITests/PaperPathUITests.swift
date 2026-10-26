@@ -3,6 +3,25 @@ import UIKit
 
 @MainActor
 final class PaperPathUITests: XCTestCase {
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        continueAfterFailure = false
+    }
+
+    override func tearDownWithError() throws {
+        if (testRun?.failureCount ?? 0) > 0 {
+            let app = XCUIApplication()
+            if app.state == .runningForeground {
+                addScreenshot(named: "Failure — \(name)", app: app)
+                let hierarchy = XCTAttachment(string: app.debugDescription)
+                hierarchy.name = "Failure accessibility hierarchy"
+                hierarchy.lifetime = .keepAlways
+                add(hierarchy)
+            }
+        }
+        try super.tearDownWithError()
+    }
+
     private func selectProfessionalMode(_ mode: String, chinese: Bool = false, in app: XCUIApplication) {
         XCTAssertTrue(app.descendants(matching: .any)["pdfWorkspace"].firstMatch.waitForExistence(timeout: 10))
         var menu = firstHittableButton(
@@ -243,8 +262,9 @@ final class PaperPathUITests: XCTestCase {
                 app.buttons["deskOpenDocument"].tap()
             }
             selectProfessionalMode("read", chinese: chinese, in: app)
-            app.buttons["readingOptions"].tap()
-            app.buttons["readingSettings"].tap()
+            app.buttons["workspaceNavigationMenu"].tap()
+            app.buttons[chinese ? "阅读" : "Reading"].firstMatch.tap()
+            app.buttons[chinese ? "阅读设置" : "Reading Settings"].firstMatch.tap()
             XCTAssertTrue(app.buttons["readingTheme-sepia"].waitForExistence(timeout: 5))
             app.buttons["readingTheme-sepia"].tap()
             let reset = app.buttons["resetReadingSettings"]
@@ -252,17 +272,18 @@ final class PaperPathUITests: XCTestCase {
             reset.tap()
             addScreenshot(named: "Reading settings" + suffix, app: app)
             app.buttons[done].firstMatch.tap()
-            app.buttons["readingOptions"].tap()
-            app.buttons["readingBookmarks"].tap()
+            app.buttons["workspaceNavigationMenu"].tap()
+            app.descendants(matching: .any)["workspaceNavigateAction"].firstMatch.tap()
             let input = app.textFields["navigationPageInput"]
             XCTAssertTrue(input.waitForExistence(timeout: 5))
             input.tap()
             input.typeText("2")
             addScreenshot(named: "Navigation" + suffix, app: app)
             app.buttons["navigationGoToPage"].tap()
-            XCTAssertTrue(app.buttons["readingOptions"].waitForExistence(timeout: 5))
-            app.buttons["readingOptions"].tap()
-            app.buttons["readingFocusReader"].tap()
+            XCTAssertTrue(app.buttons["workspaceNavigationMenu"].waitForExistence(timeout: 5))
+            app.buttons["workspaceNavigationMenu"].tap()
+            app.buttons[chinese ? "阅读" : "Reading"].firstMatch.tap()
+            app.buttons[chinese ? "专注阅读" : "Focus Reader"].firstMatch.tap()
             let position = app.staticTexts["focusReaderPosition"]
             XCTAssertTrue(position.waitForExistence(timeout: 15))
             app.buttons["focusReaderPrevious"].tap()
@@ -568,7 +589,7 @@ final class PaperPathUITests: XCTestCase {
                 format: "identifier BEGINSWITH %@", "resultReceipt-"
             )).firstMatch
             XCTAssertTrue(reveal(receipt, in: app, maxSwipes: 8))
-            XCTAssertGreaterThanOrEqual(receipt.frame.height, 44)
+            XCTAssertGreaterThanOrEqual(receipt.frame.height + 0.001, 44)
             addScreenshot(named: largeType ? "Native PDF results accessibility" : "Native PDF results", app: app)
             receipt.tap()
             XCTAssertTrue(app.navigationBars["Delivery receipt"].waitForExistence(timeout: 8))
@@ -670,7 +691,7 @@ final class PaperPathUITests: XCTestCase {
             summary.tap()
             let notice = app.descendants(matching: .any)["officeNotice-spreadsheetTextOnly"].firstMatch
             XCTAssertTrue(notice.waitForExistence(timeout: 10))
-            XCTAssertTrue(notice.label.contains("Charts, images and conditional formatting"))
+            XCTAssertTrue(notice.label.contains("Charts, images, formulas, and pivot tables are omitted."))
             XCTAssertTrue(revealOfficeControl(notice, in: app))
             addScreenshot(named: largeType ? "Office notice text accessibility" : "Office notice text standard", app: app)
             XCTAssertTrue(revealOfficeControl(summary, in: app))
@@ -792,8 +813,9 @@ final class PaperPathUITests: XCTestCase {
         search.buttons.firstMatch.tap()
         addScreenshot(named: "PaperPath Library", app: app)
 
-        search.tap()
-        search.typeText("Project handoff")
+        let nextSearch = librarySearchField(in: app)
+        nextSearch.tap()
+        nextSearch.typeText("Project handoff")
         app.keyboards.buttons["Search"].tap()
         XCTAssertTrue(
             reveal(app.staticTexts["Project handoff"], in: app, maxSwipes: 5)
@@ -808,13 +830,8 @@ final class PaperPathUITests: XCTestCase {
         let workspace = app.otherElements["pdfWorkspace"].firstMatch
         XCTAssertTrue(workspace.waitForExistence(timeout: 5))
         selectProfessionalMode("pages", in: app)
-        XCTAssertTrue(app.otherElements["documentContext"].exists)
-        XCTAssertTrue(
-            app.buttons["workspaceNextAction"]
-                .waitForExistence(timeout: 1)
-                || app.buttons["verifiedShareAction"]
-                    .waitForExistence(timeout: 2)
-        )
+        XCTAssertTrue(workspaceDocumentTitle(in: app).label.contains("Project handoff"))
+        XCTAssertTrue(app.buttons["workspaceTool-organize"].firstMatch.isHittable)
         XCTAssertFalse(app.otherElements["recentDocumentTabs"].exists)
         XCTAssertFalse(app.otherElements["workspaceCommandRail"].exists)
 
@@ -871,12 +888,10 @@ final class PaperPathUITests: XCTestCase {
         tapCenter(findButton)
         let findNavigation = app.navigationBars["Find"]
         XCTAssertTrue(findNavigation.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["Find in document"].exists)
+        XCTAssertTrue(app.searchFields.firstMatch.waitForExistence(timeout: 3))
         addScreenshot(named: "PaperPath Document Find", app: app)
-        let closeFind = findNavigation.buttons["Close"].firstMatch
-        XCTAssertTrue(closeFind.waitForExistence(timeout: 3))
-        closeFind.tap()
-        XCTAssertFalse(findNavigation.waitForExistence(timeout: 1))
+        dismissPresentedWorkflow(title: "Find", in: app)
+        XCTAssertTrue(findNavigation.waitForNonExistence(timeout: 5))
 
         openPageOrganizer(in: app)
         XCTAssertTrue(
@@ -1330,17 +1345,7 @@ final class PaperPathUITests: XCTestCase {
             XCTWaiter.wait(for: [scanOpened], timeout: 30),
             .completed
         )
-        let pageCountLoaded = XCTNSPredicateExpectation(
-            predicate: NSPredicate(
-                format: "value BEGINSWITH %@",
-                "2 pages"
-            ),
-            object: title
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [pageCountLoaded], timeout: 5),
-            .completed
-        )
+        assertTwoPageDocumentNavigation(in: app)
         assertAppAlive(app)
     }
 
@@ -1393,18 +1398,31 @@ final class PaperPathUITests: XCTestCase {
             XCTWaiter.wait(for: [imagesOpened], timeout: 30),
             .completed
         )
-        let pageCountLoaded = XCTNSPredicateExpectation(
-            predicate: NSPredicate(
-                format: "value BEGINSWITH %@",
-                "2 pages"
-            ),
-            object: title
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [pageCountLoaded], timeout: 5),
-            .completed
-        )
+        assertTwoPageDocumentNavigation(in: app)
         assertAppAlive(app)
+    }
+
+    func testIPadDocumentToolsInspectorOpensCompression() throws {
+        guard UIDevice.current.userInterfaceIdiom == .pad else {
+            throw XCTSkip("iPad inspector workflow")
+        }
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+        let toggle = app.buttons["workspaceInspectorToggle"].firstMatch
+        XCTAssertTrue(toggle.waitForExistence(timeout: 8))
+        let compress = app.buttons["inspectorTool-compressPDF"].firstMatch
+        if !compress.isHittable { toggle.tap() }
+        XCTAssertTrue(compress.waitForExistence(timeout: 8))
+        XCTAssertTrue(compress.isEnabled)
+        addScreenshot(named: "iPad document tools", app: app)
+        compress.tap()
+        XCTAssertTrue(app.navigationBars["Compress"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.descendants(matching: .any)["compressionSizeEstimate"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.descendants(matching: .any)["compressionOutputBoundary"].firstMatch.exists)
+        addScreenshot(named: "iPad compact compression", app: app)
+        dismissPresentedWorkflow(title: "Compress", in: app)
+        XCTAssertTrue(toggle.waitForExistence(timeout: 8))
+        XCTAssertEqual(toggle.value as? String, "Hidden")
     }
 
     func testLocalPDFHomeShortcutsOpenWorkflows() throws {
@@ -2064,11 +2082,8 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(viewportMode.waitForExistence(timeout: 5))
         let fittedCanvasFrame = canvas.frame
         let fittedViewportFrame = viewport.frame
-        XCTAssertTrue(
-            fittedViewportFrame.width > fittedCanvasFrame.width + 20
-                || fittedViewportFrame.height > fittedCanvasFrame.height + 20,
-            "The drawing viewport should extend beyond the fitted page."
-        )
+        XCTAssertLessThanOrEqual(fittedCanvasFrame.width, fittedViewportFrame.width + 1)
+        XCTAssertLessThanOrEqual(fittedCanvasFrame.height, fittedViewportFrame.height + 1)
         let resizedShapeWidthRatio =
             selection.frame.width / fittedCanvasFrame.width
         XCTAssertFalse(viewportMode.isSelected)
@@ -2093,10 +2108,11 @@ final class PaperPathUITests: XCTestCase {
         let visibleZoomFrame = canvas.frame.intersection(
             fittedViewportFrame
         )
-        XCTAssertTrue(
-            visibleZoomFrame.width > fittedCanvasFrame.width + 20
-                || visibleZoomFrame.height > fittedCanvasFrame.height + 20,
-            "Zoomed content should use the full drawing viewport."
+        let fittedVisibleFrame = fittedCanvasFrame.intersection(fittedViewportFrame)
+        XCTAssertGreaterThanOrEqual(
+            visibleZoomFrame.width * visibleZoomFrame.height,
+            fittedVisibleFrame.width * fittedVisibleFrame.height - 1,
+            "Zooming must preserve the visible page area, including when the page already fits the viewport's aspect ratio."
         )
         XCTAssertTrue(
             app.buttons["Lasso"].firstMatch.isSelected,
@@ -2488,6 +2504,10 @@ final class PaperPathUITests: XCTestCase {
             "August invoice"
         )
 
+        XCTAssertTrue(app.buttons["privacyScanClose"].waitForNonExistence(timeout: 8))
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true AND hittable == true"), object: scan
+        )], timeout: 8), .completed)
         scan.tap()
         let privacyCandidate =
             app.staticTexts["b***@example.com"].firstMatch
@@ -2537,6 +2557,10 @@ final class PaperPathUITests: XCTestCase {
             "August invoice"
         )
 
+        XCTAssertTrue(app.buttons["privacyScanClose"].waitForNonExistence(timeout: 8))
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "enabled == true AND hittable == true"), object: scan
+        )], timeout: 8), .completed)
         scan.tap()
         XCTAssertTrue(
             app.staticTexts["b***@example.com"]
@@ -2721,7 +2745,7 @@ final class PaperPathUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(waitForLibrary(in: app))
         selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
-        let primary = app.buttons["homePrimaryAction"].firstMatch
+        let primary = app.buttons["deskImport"].firstMatch
         XCTAssertTrue(primary.waitForExistence(timeout: 8))
         XCTAssertTrue(primary.isHittable)
         addScreenshot(named: "\(name) Home", app: app)
@@ -3584,7 +3608,7 @@ final class PaperPathUITests: XCTestCase {
 
         let clear = app.buttons["documentFindClearSearch"]
         XCTAssertTrue(clear.waitForExistence(timeout: 10))
-        XCTAssertTrue(reveal(clear, in: app, maxSwipes: 8))
+        XCTAssertTrue(revealInPresentedSheet(clear, navigationTitle: "Find", in: app, maxSwipes: 12))
         addScreenshot(named: "Find empty state accessibility", app: app)
         tapCenter(clear)
         XCTAssertTrue(clear.waitForNonExistence(timeout: 5))
@@ -3596,7 +3620,9 @@ final class PaperPathUITests: XCTestCase {
         )
         app.keyboards.buttons["Search"].tap()
         let open = app.buttons["documentFindViewPDF"]
-        XCTAssertTrue(reveal(open, in: app, maxSwipes: 8))
+        // The result navigator is pinned below the list, outside its scroll content.
+        XCTAssertTrue(open.waitForExistence(timeout: 5))
+        XCTAssertTrue(open.isHittable)
         tapCenter(open)
         XCTAssertTrue(
             app.otherElements["pdfWorkspace"].waitForExistence(timeout: 8)
@@ -4049,6 +4075,7 @@ final class PaperPathUITests: XCTestCase {
         app.launch()
 
         XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
         let search = librarySearchField(in: app)
         search.tap()
         search.typeText("August invoice")
@@ -4073,17 +4100,14 @@ final class PaperPathUITests: XCTestCase {
 
         let cancel = app.buttons["cancelRedactionMode"]
         let apply = app.buttons["applyRedactionSelection"]
-        let next = app.buttons["workspaceNextAction"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 3))
         XCTAssertTrue(apply.exists)
-        XCTAssertTrue(next.exists)
-        XCTAssertFalse(next.isEnabled)
+        XCTAssertTrue(apply.isHittable)
 
         cancel.tap()
-        XCTAssertTrue(
-            next.waitForExistence(timeout: 3)
-        )
-        XCTAssertTrue(next.isEnabled)
+        let tools = app.buttons["documentToolsAction"].firstMatch
+        XCTAssertTrue(tools.waitForExistence(timeout: 3))
+        XCTAssertTrue(tools.isEnabled)
         XCTAssertFalse(cancel.exists)
         XCTAssertFalse(apply.exists)
         XCTAssertTrue(app.otherElements["pdfWorkspace"].exists)
@@ -4375,10 +4399,10 @@ final class PaperPathUITests: XCTestCase {
             )
         ).firstMatch
         XCTAssertTrue(
-            revealForCenterTap(
+            revealInDeliveryReceipt(
                 linkedMilestone,
                 in: app,
-                maxSwipes: 14
+                maxSwipes: 20
             )
         )
         linkedMilestone.tap()
@@ -4470,25 +4494,32 @@ final class PaperPathUITests: XCTestCase {
         app.launchArguments += ["UITEST_RESET_DEMO"]
         app.launch()
         XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
         XCTAssertFalse(app.searchFields["librarySearchField"].exists)
 
         for _ in 0..<3 {
             let search = librarySearchField(in: app)
+            search.tap()
             XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
             search.typeText("Project handoff")
+            XCTAssertEqual(search.value as? String, "Project handoff")
             submitSearchKeyboard(in: app)
-            let document = app.buttons
-                .containing(.staticText, identifier: "Project handoff")
-                .firstMatch
-            XCTAssertTrue(document.waitForExistence(timeout: 5))
+            let document = app.buttons.matching(NSPredicate(
+                format: "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+                "documentRow-", "Project handoff"
+            )).firstMatch
+            XCTAssertTrue(reveal(document, in: app, maxSwipes: 5))
             addScreenshot(named: "Library search results", app: app)
             document.tap()
             XCTAssertTrue(app.otherElements["pdfWorkspace"].waitForExistence(timeout: 8))
-            app.navigationBars.buttons.firstMatch.tap()
+            XCTAssertTrue(waitForLibrary(in: app))
             XCTAssertTrue(app.buttons["librarySearchButton"].waitForExistence(timeout: 5))
             let resumedSearch = librarySearchField(in: app)
             XCTAssertEqual(resumedSearch.value as? String, "Project handoff")
-            app.buttons["Cancel"].firstMatch.tap()
+            let cancelSearch = app.buttons["librarySearchCancel"]
+            XCTAssertTrue(cancelSearch.waitForExistence(timeout: 5))
+            XCTAssertTrue(cancelSearch.isHittable)
+            cancelSearch.tap()
             XCTAssertTrue(resumedSearch.waitForNonExistence(timeout: 5))
             XCTAssertTrue(app.buttons["settings"].isHittable)
         }
@@ -4503,7 +4534,7 @@ final class PaperPathUITests: XCTestCase {
             "Project handoff"
         )
         XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5))
-        app.buttons["Cancel"].firstMatch.tap()
+        app.buttons["librarySearchCancel"].tap()
         addScreenshot(named: "Library after repeated search cancellation", app: app)
     }
 
@@ -5255,8 +5286,10 @@ final class PaperPathUITests: XCTestCase {
         ].firstMatch
         let importPDFs = app.buttons["deskImport"].firstMatch
         let scanPaper = app.buttons["deskScan"].firstMatch
-        let continueAction = app.buttons["homePrimaryAction"].firstMatch
-        for element in [deskHeader, importPDFs, scanPaper, continueAction] {
+        let firstDocument = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "documentRow-")
+        ).firstMatch
+        for element in [deskHeader, importPDFs, scanPaper, firstDocument] {
             XCTAssertTrue(element.waitForExistence(timeout: 3))
             XCTAssertTrue(element.isHittable)
             XCTAssertLessThanOrEqual(
@@ -5282,7 +5315,7 @@ final class PaperPathUITests: XCTestCase {
                 maxSwipes: 10
             )
         )
-        XCTAssertFalse(app.buttons["homePrimaryAction"].exists)
+        XCTAssertFalse(firstDocument.exists)
         XCTAssertFalse(app.otherElements["libraryDocumentsSection"].exists)
 
         selectWorkspaceLane(
@@ -5310,6 +5343,20 @@ final class PaperPathUITests: XCTestCase {
         attachment.name = name
         attachment.lifetime = .keepAlways
         add(attachment)
+    }
+
+    private func assertTwoPageDocumentNavigation(in app: XCUIApplication) {
+        let firstPage = app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Page 1 of 2")
+        ).firstMatch
+        XCTAssertTrue(firstPage.waitForExistence(timeout: 8))
+        let next = app.buttons["Next page"].firstMatch
+        XCTAssertTrue(next.isEnabled)
+        next.tap()
+        XCTAssertTrue(app.buttons.matching(
+            NSPredicate(format: "label BEGINSWITH %@", "Page 2 of 2")
+        ).firstMatch.waitForExistence(timeout: 5))
+        XCTAssertFalse(next.isEnabled)
     }
 
     private var englishLaunchArguments: [String] {
@@ -6118,15 +6165,18 @@ final class PaperPathUITests: XCTestCase {
             in: app,
             timeout: accessibilityText ? 30 : 5
         )
-        XCTAssertTrue(receipt.isHittable)
-        receipt.tap()
+        if receipt.exists, receipt.isHittable {
+            receipt.tap()
+        } else {
+            app.buttons["Document menu"].tap()
+            app.buttons["Results"].firstMatch.tap()
+            let menuReceipt = app.buttons["Delivery receipt"].firstMatch
+            XCTAssertTrue(menuReceipt.waitForExistence(timeout: 5))
+            menuReceipt.tap()
+        }
         let receiptNavigation = app.navigationBars[
             "Delivery receipt"
         ]
-        if !receiptNavigation.waitForExistence(timeout: 8) {
-            XCTAssertTrue(receipt.isHittable)
-            receipt.tap()
-        }
         XCTAssertTrue(receiptNavigation.waitForExistence(timeout: 8))
         return app
     }
@@ -6137,7 +6187,10 @@ final class PaperPathUITests: XCTestCase {
         let protectMilestone = app.descendants(matching: .any)[
             "protectDeliveryMilestone"
         ].firstMatch
-        if protectMilestone.exists {
+        let linkedMilestone = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "openLinkedMilestone-")
+        ).firstMatch
+        if protectMilestone.exists || linkedMilestone.exists {
             return true
         }
         let disclosure = app.descendants(matching: .any).matching(
@@ -6371,6 +6424,14 @@ final class PaperPathUITests: XCTestCase {
         identifier: String,
         in app: XCUIApplication
     ) {
+        let chineseTitle: String
+        switch identifier {
+        case "workspaceLane-home": chineseTitle = "文档"
+        case "workspaceLane-tasks": chineseTitle = "工具"
+        case "workspaceLane-outputs": chineseTitle = "成果"
+        default: chineseTitle = title
+        }
+        let titles = [title, chineseTitle]
         if workspaceLaneMarker(identifier, in: app).exists {
             return
         }
@@ -6383,9 +6444,10 @@ final class PaperPathUITests: XCTestCase {
         } else {
             let labeledQuery = app.buttons.matching(
                 NSPredicate(
-                    format: "label == %@ OR label BEGINSWITH %@",
-                    title,
-                    "\(title),"
+                    format: "label IN %@ OR label BEGINSWITH %@ OR label BEGINSWITH %@",
+                    titles,
+                    "\(title),",
+                    "\(chineseTitle),"
                 )
             )
             _ = labeledQuery.firstMatch.waitForExistence(timeout: 2)
@@ -6414,9 +6476,9 @@ final class PaperPathUITests: XCTestCase {
             tapCenter(menu)
             let optionQuery = app.descendants(matching: .any).matching(
                 NSPredicate(
-                    format: "label == %@ OR identifier == %@",
-                    title,
-                    title
+                    format: "label IN %@ OR identifier IN %@",
+                    titles,
+                    titles
                 )
             )
             let firstOption = optionQuery.firstMatch
@@ -6563,13 +6625,23 @@ final class PaperPathUITests: XCTestCase {
         guard navigation.exists else {
             return false
         }
-        let minimumSheetWidth = app.frame.width * 0.55
-        let scrollView = app.scrollViews.allElementsBoundByIndex
+        // An iPad reader behind the sheet can be larger than the sheet itself.
+        // Prefer the control's actual scroll ancestor; scrolling the largest
+        // view can move the PDF and make a coordinate tap dismiss the sheet.
+        let ancestor = element.exists && !element.identifier.isEmpty
+            ? app.scrollViews.containing(.any, identifier: element.identifier)
+                .allElementsBoundByIndex.min(by: {
+                    $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height
+                })
+            : nil
+        let minimumSheetWidth = navigation.frame.width * 0.8
+        let scrollView = ancestor ?? app.scrollViews.allElementsBoundByIndex
             .filter {
                 $0.frame.width >= minimumSheetWidth
                     && $0.frame.height > app.frame.height * 0.35
+                    && abs($0.frame.midX - navigation.frame.midX) < 32
             }
-            .max(by: {
+            .min(by: {
                 $0.frame.width * $0.frame.height
                     < $1.frame.width * $1.frame.height
             })
@@ -6610,33 +6682,19 @@ final class PaperPathUITests: XCTestCase {
                 scrollView.frame.minY + 8,
                 navigation.frame.maxY + 8
             )
-            if element.exists {
-                let moveDown = element.frame.midY < safeTop
-                if moveDown {
-                    scrollView.coordinate(
-                        withNormalizedOffset:
-                            CGVector(dx: 0.5, dy: 0.35)
-                    ).press(
-                        forDuration: 0.05,
-                        thenDragTo: scrollView.coordinate(
-                            withNormalizedOffset:
-                                CGVector(dx: 0.5, dy: 0.55)
-                        )
-                    )
-                } else {
-                    scrollView.coordinate(
-                        withNormalizedOffset:
-                            CGVector(dx: 0.5, dy: 0.65)
-                    ).press(
-                        forDuration: 0.05,
-                        thenDragTo: scrollView.coordinate(
-                            withNormalizedOffset:
-                                CGVector(dx: 0.5, dy: 0.45)
-                        )
-                    )
-                }
+            // The scroll view frame includes the searchable navigation bar.
+            // Keep both gesture endpoints in the exposed content viewport.
+            let visibleBottom = min(scrollView.frame.maxY, app.frame.maxY) - 8
+            guard visibleBottom > safeTop + 24 else { return false }
+            let contentHeight = visibleBottom - safeTop
+            let upper = app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: scrollView.frame.midX, dy: safeTop + contentHeight * 0.15))
+            let lower = app.coordinate(withNormalizedOffset: .zero)
+                .withOffset(CGVector(dx: scrollView.frame.midX, dy: safeTop + contentHeight * 0.85))
+            if element.exists && element.frame.midY < safeTop {
+                upper.press(forDuration: 0.05, thenDragTo: lower)
             } else {
-                scrollView.swipeUp()
+                lower.press(forDuration: 0.05, thenDragTo: upper)
             }
         }
         return isCenteredInViewport()

@@ -1406,7 +1406,7 @@ struct DocumentWorkspaceView: View {
                                         dismissesPresentedSheet: false
                                     )
                                 }
-                                .presentationDetents([.medium, .large])
+                                .presentationDetents(dynamicTypeSize.isAccessibilitySize ? [.large] : [.medium, .large])
                                 .presentationDragIndicator(.visible)
                             case .annotations:
                                 AnnotationReviewView(recordID: recordID) { pageIndex in
@@ -3164,6 +3164,9 @@ struct DocumentWorkspaceView: View {
             }
             .scrollTargetLayout()
         }
+        // Each mode has a different leading action. Reusing the old horizontal
+        // offset can leave Find or page tools clipped after closing All tools.
+        .id(toolMode)
         .scrollTargetBehavior(.viewAligned)
         .scrollIndicators(.hidden)
         .accessibilityIdentifier("workspaceToolRow")

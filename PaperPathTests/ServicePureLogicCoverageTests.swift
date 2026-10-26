@@ -7,6 +7,152 @@ import UniformTypeIdentifiers
 import XCTest
 @testable import PaperPath
 
+@MainActor
+final class ReleaseExperienceLogicTests: XCTestCase {
+    // Restore every preference we touch: these tests share the host application.
+    private func withHistory(_ body: (UserDefaults) throws -> Void) rethrows {
+        let defaults = UserDefaults.standard
+        let keys = ["commerce.verifiedOutputCount", "commerce.lastVerifiedOutputAt",
+                    "commerce.lastVerifiedFailureAt", "experience.ratingRequested"]
+        let previous = keys.map { defaults.object(forKey: $0) }
+        defer {
+            for (key, value) in zip(keys, previous) { defaults.set(value, forKey: key) }
+        }
+        for key in keys { defaults.removeObject(forKey: key) }
+        try body(defaults)
+    }
+
+    func testRatingRequiresTwoSuccessfulOutputsAndOnlyRequestsOnce() {
+        withHistory { _ in
+            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 1)
+            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 2)
+            XCTAssertTrue(AppEntitlement.shouldRequestRating)
+            AppEntitlement.markRatingRequested()
+            AppEntitlement.recordVerifiedOutput()
+            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+        }
+    }
+
+    func testRatingSuppressedAfterFailureUntilLaterSuccess() {
+        withHistory { defaults in
+            defaults.set(2, forKey: "commerce.verifiedOutputCount")
+            let now = Date()
+            defaults.set(now.addingTimeInterval(-60), forKey: "commerce.lastVerifiedOutputAt")
+            defaults.set(now, forKey: "commerce.lastVerifiedFailureAt")
+            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            defaults.set(now.addingTimeInterval(-120), forKey: "commerce.lastVerifiedFailureAt")
+            XCTAssertTrue(AppEntitlement.shouldRequestRating)
+            defaults.set(now.addingTimeInterval(-60), forKey: "commerce.lastVerifiedFailureAt")
+            XCTAssertFalse(AppEntitlement.shouldRequestRating, "Equal timestamps must fail closed")
+        }
+    }
+
+    func testRatingRejectsMissingMalformedAndImplausibleSuccessDates() {
+        withHistory { defaults in
+            defaults.set(2, forKey: "commerce.verifiedOutputCount")
+            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            let invalidDates: [Any] = ["invalid", Date(timeIntervalSince1970: -1),
+                                       Date().addingTimeInterval(3600)]
+            for invalid in invalidDates {
+                defaults.set(invalid, forKey: "commerce.lastVerifiedOutputAt")
+                XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            }
+        }
+    }
+
+    func testRatingRejectsImplausibleFailureDates() {
+        withHistory { defaults in
+            defaults.set(2, forKey: "commerce.verifiedOutputCount")
+            defaults.set(Date(), forKey: "commerce.lastVerifiedOutputAt")
+            for invalid in [Date(timeIntervalSince1970: -1), Date().addingTimeInterval(3600)] {
+                defaults.set(invalid, forKey: "commerce.lastVerifiedFailureAt")
+                XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            }
+        }
+    }
+
+    func testOutputHistoryClampsCorruptCountsAndSaturates() {
+        withHistory { defaults in
+            defaults.set(-100, forKey: "commerce.verifiedOutputCount")
+            XCTAssertEqual(AppEntitlement.verifiedOutputCount, 0)
+            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 1)
+            defaults.set(Int.max, forKey: "commerce.verifiedOutputCount")
+            XCTAssertEqual(AppEntitlement.verifiedOutputCount, 1_000_000)
+            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 1_000_000)
+            AppEntitlement.recordVerifiedFailure()
+            XCTAssertNotNil(defaults.object(forKey: "commerce.lastVerifiedFailureAt") as? Date)
+            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+        }
+    }
+
+    func testDefaultsRegistrationPreservesExplicitUserChoices() throws {
+        let suite = "ReleaseExperience-\(UUID())"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        defaults.set(true, forKey: AppPreferences.metadataSyncEnabledKey)
+        defaults.set(true, forKey: AppPreferences.dueRemindersEnabledKey)
+        defaults.set("economy", forKey: AppPreferences.previewQualityKey)
+        AppPreferences.registerDefaults(defaults: defaults)
+        XCTAssertTrue(defaults.bool(forKey: AppPreferences.metadataSyncEnabledKey))
+        XCTAssertTrue(defaults.bool(forKey: AppPreferences.dueRemindersEnabledKey))
+        XCTAssertEqual(defaults.string(forKey: AppPreferences.previewQualityKey), "economy")
+    }
+
+    func testUnknownPreviewPreferenceFallsBackToBoundedAutomaticMode() {
+        let defaults = UserDefaults.standard
+        let key = AppPreferences.previewQualityKey
+        let previous = defaults.object(forKey: key)
+        defer { defaults.set(previous, forKey: key) }
+        defaults.set("removed-quality", forKey: key)
+        XCTAssertEqual(ThumbnailPreviewQuality.selected, .automatic)
+        for quality in ThumbnailPreviewQuality.allCases {
+            XCTAssertGreaterThan(quality.renderScale, 0)
+            XCTAssertLessThanOrEqual(quality.renderScale, 2)
+            XCTAssertGreaterThan(quality.cacheEntryLimit, 0)
+            XCTAssertLessThanOrEqual(quality.cacheEntryLimit, 72)
+            XCTAssertLessThanOrEqual(quality.cacheByteLimit, 18 * 1024 * 1024)
+            XCTAssertLessThanOrEqual(quality.cacheDocumentLimit, 3)
+        }
+    }
+
+    func testDiagnosticBundleContainsOnlyDeclaredAggregateFieldsAndIsDiscarded() throws {
+        let url = try SupportBundleService.create(
+            documentCount: 7, deletedCount: 2, pageCount: 31, localByteCount: 8192,
+            indexedDocumentCount: 4, ocrDocumentCount: 3, receiptCount: 1,
+            metadataSyncState: "idle")
+        defer { SupportBundleService.discard(url) }
+        let data = try Data(contentsOf: url)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(Set(json.keys), ["generatedAt", "app", "device", "library", "settings", "privacy"])
+        let library = try XCTUnwrap(json["library"] as? [String: Int])
+        XCTAssertEqual(library, ["documentCount": 7, "trashCount": 2, "pageCount": 31,
+                                 "allocatedPDFBytes": 8192, "indexedDocumentCount": 4,
+                                 "ocrDocumentCount": 3, "receiptCount": 1])
+        let privacy = try XCTUnwrap(json["privacy"] as? [String: Bool])
+        XCTAssertEqual(Set(privacy.keys), ["containsPDFBytes", "containsFileNames",
+                        "containsExtractedText", "containsPasswords", "containsSignatures"])
+        XCTAssertTrue(privacy.values.allSatisfy { !$0 })
+        let app = try XCTUnwrap(json["app"] as? [String: String])
+        XCTAssertEqual(app["version"], Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+        SupportBundleService.discard(url)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path))
+        SupportBundleService.discard(url) // Repeated cancellation/cleanup must be safe.
+        SupportBundleService.discard(nil)
+    }
+
+    func testDiagnosticDiscardCannotRemoveUnrelatedFiles() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("Unrelated-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let url = directory.appendingPathComponent("keep.json")
+        try Data("private".utf8).write(to: url)
+        SupportBundleService.discard(url)
+        XCTAssertEqual(try Data(contentsOf: url), Data("private".utf8))
+    }
+}
+
 final class ServicePureLogicCoverageTests: XCTestCase {
     private var temporaryDirectory: URL!
 

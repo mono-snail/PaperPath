@@ -23,7 +23,9 @@
     {
       "parallelizable": false,
       "selectedTests": [
-        "ReleaseReadinessUITests/testPendingPurchaseSurvivesRecheckAndReopenThenApproves()"
+        "ReleaseReadinessUITests/testPendingPurchaseSurvivesRecheckAndReopenThenApproves()",
+        "ReleaseReadinessUITests/testRestoreWithoutPurchaseShowsRecoverableFailure()",
+        "ReleaseReadinessUITests/testPurchasePersistsAcrossProcessRelaunchAndRefundRevokesAccess()"
       ],
       "target": {
         "containerPath": "container:PaperPath.xcodeproj",

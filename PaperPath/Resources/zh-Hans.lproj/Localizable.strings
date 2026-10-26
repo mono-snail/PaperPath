@@ -6293,3 +6293,23 @@
 "Works offline" = "支持离线使用";
 "Merge, split, compress, and recognize text on this device. No document uploads or PaperPath processing server. Apple purchases and optional iCloud metadata sync use the internet. Sharing or exporting may send files to the destination you choose." = "合并、拆分、压缩和文字识别均在本机完成，无需上传文档或使用 PaperPath 处理服务器。Apple 购买和可选的 iCloud 元数据同步需要联网。分享或导出可能将文件发送至你选择的目标。";
 "Local OCR" = "本地 OCR";
+
+"On device · No uploads" = "本机处理 · 不上传文档";
+
+"%lld PDFs · %lld pages" = "%lld 份 PDF · %lld 页";
+
+"From your library" = "从文档库添加";
+
+"Originals stay unchanged" = "原始文件保持不变";
+
+"Compression quality" = "压缩质量";
+
+"Original size" = "原始大小";
+
+"Selected PDFs" = "已选 PDF";
+
+"New copy name" = "新副本名称";
+
+"Split" = "拆分";
+
+"Recent" = "最近";

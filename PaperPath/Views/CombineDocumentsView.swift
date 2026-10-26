@@ -14,6 +14,7 @@ struct CombineDocumentsView: View {
     let onCreated: (UUID) -> Void
 
     @State private var selectedIDs: [UUID] = []
+    @State private var isLibraryExpanded = true
     @State private var draggedID: UUID?
     @State private var mergeRowFrames: [UUID: CGRect] = [:]
     @State private var outputName = ""
@@ -53,6 +54,7 @@ struct CombineDocumentsView: View {
                 if createdID == nil {
                     ToolbarItem(placement: .primaryAction) {
                         Button {
+                            isLibraryExpanded = true
                             sourceSearchFocused = true
                         } label: {
                             Image(systemName: "magnifyingglass")
@@ -189,6 +191,10 @@ struct CombineDocumentsView: View {
         .onAppear {
             reconcileSelection()
         }
+        .onChange(of: selectedIDs.count) { oldCount, newCount in
+            if newCount < 2 { isLibraryExpanded = true }
+            else if oldCount < 2 { isLibraryExpanded = false }
+        }
         .sensoryFeedback(.selection, trigger: selectedIDs.count)
         .sensoryFeedback(.success, trigger: createdID)
     }
@@ -196,73 +202,62 @@ struct CombineDocumentsView: View {
     private var selectionContent: some View {
         VStack(alignment: .leading, spacing: PPSpacing.large) {
             taskHeader
-            sourceActions
+            if horizontalSizeClass == .regular,
+               !dynamicTypeSize.ppPrefersExpandedLayout {
+                HStack(alignment: .top, spacing: PPSpacing.xLarge) {
+                    VStack(alignment: .leading, spacing: PPSpacing.large) {
+                        if !selectedIDs.isEmpty {
+                            selectedOrder
+                            nameField
+                        } else { compactMergeHint }
+                        sourceActions
+                    }
+                    .frame(maxWidth: .infinity, alignment: .top)
+                    librarySources
+                        .frame(maxWidth: .infinity, alignment: .top)
+                }
+            } else {
+                if !selectedIDs.isEmpty {
+                    selectedOrder
+                    nameField
+                }
+                sourceActions
+                DisclosureGroup(isExpanded: $isLibraryExpanded) {
+                    librarySources.padding(.top, PPSpacing.small)
+                } label: {
+                    Text("From your library".localizedUI)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(PPColor.textPrimary)
+                }
+                .accessibilityIdentifier("mergeLibraryDisclosure")
+            }
+            Label("Originals stay unchanged".localizedUI, systemImage: "doc")
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+        }
+    }
+
+    private var librarySources: some View {
+        VStack(alignment: .leading, spacing: PPSpacing.medium) {
             TextField("Search PDFs to merge".localizedUI, text: $sourceQuery)
                 .textFieldStyle(.roundedBorder)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .focused($sourceSearchFocused)
                 .disabled(hasActiveTask)
-
-            if horizontalSizeClass == .regular,
-               !dynamicTypeSize.ppPrefersExpandedLayout {
-                HStack(alignment: .top, spacing: PPSpacing.large) {
-                    VStack(alignment: .leading, spacing: PPSpacing.medium) {
-                        if !selectedIDs.isEmpty {
-                            selectedOrder
-                            nameField
-                        } else {
-                            compactMergeHint
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .top)
-
-                    availableDocuments
-                        .frame(maxWidth: .infinity, alignment: .top)
-                }
-            } else {
-                availableDocuments
-                if !selectedIDs.isEmpty {
-                    selectedOrder
-                    nameField
-                }
-            }
+            availableDocuments
         }
     }
 
     private var taskHeader: some View {
-        WorkflowCommandHeader(
-            eyebrow: "MERGE WORKFLOW",
-            title: "Merge PDFs",
-            detail: selectedIDs.isEmpty
-                ? "Choose PDFs, set their order, then create one private copy."
-                : "Review order and name before creating the combined copy.",
-            symbol: "square.stack.3d.up",
-            tint: PPColor.mint,
-            metrics: selectedIDs.isEmpty ? [] : [
-                WorkflowMetric(
-                    value: "\(selectedIDs.count)",
-                    label: "Selected",
-                    symbol: "checkmark.circle",
-                    tint: PPColor.mint
-                ),
-                WorkflowMetric(
-                    value: "\(selectedPageCount)",
-                    label: "Pages",
-                    symbol: "doc.on.doc",
-                    tint: PPColor.accent
-                ),
-                WorkflowMetric(
-                    value: ByteCountFormatter.string(
-                        fromByteCount: selectedByteCount,
-                        countStyle: .file
-                    ),
-                    label: "Input",
-                    symbol: "internaldrive",
-                    tint: PPColor.cyan
-                )
-            ]
-        )
+        HStack {
+            Text(AppLocalization.format("%lld PDFs · %lld pages", selectedIDs.count, selectedPageCount))
+                .font(.subheadline)
+            Spacer()
+            Text(ByteCountFormatter.string(fromByteCount: selectedByteCount, countStyle: .file))
+                .font(.caption.monospacedDigit())
+        }
+        .foregroundStyle(PPColor.textSecondary)
     }
 
     private var compactMergeHint: some View {
@@ -322,7 +317,7 @@ struct CombineDocumentsView: View {
     private var selectedOrder: some View {
         VStack(alignment: .leading, spacing: PPSpacing.medium) {
             HStack {
-                SectionEyebrow(text: "MERGE ORDER")
+                Text("Selected PDFs".localizedUI).font(.headline)
                 Spacer()
                 Text("\(selectedIDs.count)")
                     .font(.caption.weight(.semibold))
@@ -401,8 +396,7 @@ struct CombineDocumentsView: View {
         _ record: DocumentRecord,
         at index: Int
     ) -> some View {
-        let expandsRow = horizontalSizeClass != .regular
-            || dynamicTypeSize.ppPrefersExpandedLayout
+        let expandsRow = dynamicTypeSize.ppPrefersExpandedLayout
         let layout = expandsRow
             ? AnyLayout(
                 VStackLayout(
@@ -419,10 +413,8 @@ struct CombineDocumentsView: View {
                 Text("\(index + 1)")
                     .font(.caption.weight(.bold))
                     .monospacedDigit()
-                    .foregroundStyle(.white)
-                    .frame(width: 28, height: 28)
-                    .background(PPColor.mint)
-                    .clipShape(Circle())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(width: 22, height: 28)
                     .contextMenu {
                         Button("Move to Beginning".localizedUI) { move(from: index, to: 0) }
                             .disabled(index == 0 || hasActiveTask)
@@ -434,8 +426,7 @@ struct CombineDocumentsView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text(record.displayName)
-                        .font(.body.weight(.semibold))
-                        .fontDesign(.serif)
+                        .font(.subheadline.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(
                             dynamicTypeSize.ppPrefersExpandedLayout
@@ -475,6 +466,7 @@ struct CombineDocumentsView: View {
                     .accessibilityLabel("Drag to reorder".localizedUI)
                     .accessibilityHint("Or use Move earlier and Move later.".localizedUI)
                     .accessibilityIdentifier("mergeDrag-\(record.id.uuidString)")
+                if horizontalSizeClass == .regular || expandsRow {
                 orderButton(
                     symbol: "arrow.up",
                     label: "Move earlier",
@@ -491,6 +483,7 @@ struct CombineDocumentsView: View {
                     move(from: index, to: index + 1)
                 }
                 .accessibilityValue(record.displayName)
+                }
                 orderButton(
                     symbol: "xmark",
                     label: "Remove",
@@ -511,6 +504,8 @@ struct CombineDocumentsView: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .contain)
         .accessibilityLabel(record.displayName)
+        .accessibilityAction(named: Text("Move earlier".localizedUI)) { move(from: index, to: index - 1) }
+        .accessibilityAction(named: Text("Move later".localizedUI)) { move(from: index, to: index + 1) }
         .accessibilityIdentifier(
             "mergeSelectedDocument-\(record.id.uuidString)"
         )
@@ -558,7 +553,7 @@ struct CombineDocumentsView: View {
 
     private var nameField: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            SectionEyebrow(text: "NEW COPY NAME")
+            Text("New copy name".localizedUI).font(.subheadline.weight(.semibold))
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: PPSpacing.small) {
                     mergeNameTextField

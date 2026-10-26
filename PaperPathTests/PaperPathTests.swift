@@ -31,7 +31,9 @@ final class OCRAccuracyTests: XCTestCase {
             ("chinese-11pt", chineseLines, 11, 0),
             ("chinese-8pt", chineseLines, 8, 0),
             ("english-8pt", englishLines, 8, 0),
-            ("bilingual-rotated", zip(chineseLines, englishLines).flatMap { [$0, $1] }, 10, 90)
+            ("bilingual-rotated", zip(chineseLines, englishLines).flatMap { [$0, $1] }, 10, 90),
+            ("chinese-rotated-180", chineseLines, 11, 180),
+            ("english-rotated-270", englishLines, 8, 270)
         ]
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("OCRAccuracy-\(UUID().uuidString)")
@@ -57,11 +59,15 @@ final class OCRAccuracyTests: XCTestCase {
                     )
                 }
             }
-            let document = PDFDocument()
-            let page = try XCTUnwrap(PDFPage(image: scan))
-            page.setBounds(bounds, for: .mediaBox)
+            // Draw the full-resolution scan into a point-sized PDF page.
+            // Changing PDFPage(image:)'s media box crops pixels rather than scaling them.
+            let pdfData = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
+                context.beginPage()
+                scan.draw(in: bounds)
+            }
+            let document = try XCTUnwrap(PDFDocument(data: pdfData))
+            let page = try XCTUnwrap(document.page(at: 0))
             page.rotation = rotation
-            document.insert(page, at: 0)
             XCTAssertTrue(document.write(to: source))
             XCTAssertTrue(PDFDocument(url: source)?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
             let started = Date()
@@ -106,6 +112,24 @@ final class OCRAccuracyTests: XCTestCase {
         }
         for result in results {
             XCTAssertEqual(result, results[0])
+        }
+    }
+
+    func testTwoColumnReadingOrderIsStableAroundSpanningHeadings() {
+        func block(_ text: String, _ x: Double, _ y: Double, _ width: Double = 0.2) -> OCRTextBlock {
+            OCRTextBlock(text: text, confidence: 1, normalizedX: x, normalizedY: y,
+                         normalizedWidth: width, normalizedHeight: 0.02)
+        }
+        let blocks = [block("Header", 0.1, 0.95, 0.8),
+                      block("L1", 0.1, 0.8), block("R1", 0.7, 0.8005),
+                      block("L2", 0.1, 0.6), block("R2", 0.7, 0.6005),
+                      block("L3", 0.1, 0.4), block("R3", 0.7, 0.4005),
+                      block("Footer", 0.1, 0.1, 0.8)]
+        let expected = ["Header", "L1", "L2", "L3", "R1", "R2", "R3", "Footer"]
+        for offset in blocks.indices {
+            let rotated = Array(blocks[offset...]) + Array(blocks[..<offset])
+            XCTAssertEqual(VisionOCRService().readingOrder(rotated).map(\.text), expected)
+            XCTAssertEqual(VisionOCRService().readingOrder(Array(rotated.reversed())).map(\.text), expected)
         }
     }
 

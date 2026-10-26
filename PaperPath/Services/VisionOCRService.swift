@@ -6,7 +6,7 @@ import UIKit
 @preconcurrency import Vision
 
 struct OCRCheckpointIdentity: Codable, Hashable, Sendable {
-    static let currentEngineVersion = 1
+    static let currentEngineVersion = 2
 
     let recordID: UUID
     let revisionID: UUID
@@ -369,12 +369,11 @@ struct VisionOCRService: Sendable {
         longestEdge: CGFloat
     ) -> CGImage? {
         guard let sourcePage = page.pageRef else { return nil }
+        // OCR blocks are stored in the PDF's media-box coordinate space, as
+        // consumed by searchable-copy and privacy-scan services. Cancel the
+        // display rotation here rather than sorting sideways bounding boxes.
         let rotation = ((page.rotation % 360) + 360) % 360
-        let swapsEdges = rotation == 90 || rotation == 270
-        let sourceSize = CGSize(
-            width: swapsEdges ? bounds.height : bounds.width,
-            height: swapsEdges ? bounds.width : bounds.height
-        )
+        let sourceSize = bounds.size
         let scale = min(
             longestEdge / max(sourceSize.width, sourceSize.height),
             4
@@ -404,11 +403,18 @@ struct VisionOCRService: Sendable {
         )
         context.setFillColor(UIColor.white.cgColor)
         context.fill(imageBounds)
+        // CGPDFPage's drawing transform may keep small pages at native size.
+        // Apply the raster scale explicitly so an A4 page uses the OCR pixel
+        // budget instead of becoming a tiny page in the middle of that bitmap.
+        context.scaleBy(
+            x: CGFloat(pixelWidth) / sourceSize.width,
+            y: CGFloat(pixelHeight) / sourceSize.height
+        )
         context.concatenate(
             sourcePage.getDrawingTransform(
                 .mediaBox,
-                rect: imageBounds,
-                rotate: 0,
+                rect: CGRect(origin: .zero, size: sourceSize),
+                rotate: -Int32(rotation),
                 preserveAspectRatio: true
             )
         )
@@ -474,7 +480,7 @@ struct VisionOCRService: Sendable {
         _ blocks: [OCRTextBlock]
     ) -> [OCRTextBlock] {
         guard hasTwoColumns(blocks) else {
-            return blocks.sorted(by: lineOrder)
+            return orderedLines(blocks)
         }
         let spanning = blocks.filter {
             $0.normalizedWidth >= 0.58
@@ -483,7 +489,7 @@ struct VisionOCRService: Sendable {
                         && $0.normalizedX + $0.normalizedWidth > 0.65
                 )
         }
-        .sorted(by: lineOrder)
+        let orderedSpanning = orderedLines(spanning)
         let spanningIDs = Set(spanning.map(\.id))
         let narrow = blocks.filter {
             !spanningIDs.contains($0.id)
@@ -493,15 +499,15 @@ struct VisionOCRService: Sendable {
                 + $0.normalizedHeight * 0.5
             let rightCenter = $1.normalizedY
                 + $1.normalizedHeight * 0.5
-            if abs(leftCenter - rightCenter) > 0.001 {
+            if leftCenter != rightCenter {
                 return leftCenter > rightCenter
             }
-            return $0.normalizedX < $1.normalizedX
+            return lineOrder($0, $1)
         }
         var result: [OCRTextBlock] = []
         result.reserveCapacity(blocks.count)
         var narrowIndex = 0
-        for anchor in spanning {
+        for anchor in orderedSpanning {
             guard !Task.isCancelled else { return [] }
             let anchorY = anchor.normalizedY
                 + anchor.normalizedHeight * 0.5
@@ -575,24 +581,53 @@ struct VisionOCRService: Sendable {
                 right.append(block)
             }
         }
-        left.sort(by: lineOrder)
-        right.sort(by: lineOrder)
-        return left + right
+        return orderedLines(left) + orderedLines(right)
+    }
+
+    // A pairwise vertical tolerance is not a strict ordering: A can share a
+    // line with B and B with C while A and C compare vertically. Sort by an
+    // exact key first, then group against a fixed row anchor so Vision's
+    // observation order cannot change the resulting text.
+    private func orderedLines(_ blocks: [OCRTextBlock]) -> [OCRTextBlock] {
+        let vertical = blocks.sorted(by: lineOrder)
+        var result: [OCRTextBlock] = []
+        var row: [OCRTextBlock] = []
+        var anchor: OCRTextBlock?
+        func appendRow() {
+            result.append(contentsOf: row.sorted {
+                if $0.normalizedX != $1.normalizedX {
+                    return $0.normalizedX < $1.normalizedX
+                }
+                return lineOrder($0, $1)
+            })
+        }
+        for block in vertical {
+            if let first = anchor,
+               first.normalizedY - block.normalizedY
+                > max(first.normalizedHeight, block.normalizedHeight) * 0.55 {
+                appendRow()
+                row.removeAll(keepingCapacity: true)
+                anchor = nil
+            }
+            if anchor == nil { anchor = block }
+            row.append(block)
+        }
+        appendRow()
+        return result
     }
 
     func lineOrder(
         _ left: OCRTextBlock,
         _ right: OCRTextBlock
     ) -> Bool {
-        let verticalTolerance = max(
-            left.normalizedHeight,
-            right.normalizedHeight
-        ) * 0.55
-        if abs(left.normalizedY - right.normalizedY)
-            > verticalTolerance {
+        if left.normalizedY != right.normalizedY {
             return left.normalizedY > right.normalizedY
         }
-        return left.normalizedX < right.normalizedX
+        if left.normalizedX != right.normalizedX {
+            return left.normalizedX < right.normalizedX
+        }
+        if left.text != right.text { return left.text < right.text }
+        return left.id.uuidString < right.id.uuidString
     }
 
     func validated(

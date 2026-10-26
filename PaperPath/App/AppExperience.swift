@@ -424,6 +424,7 @@ final class PurchaseController: ObservableObject {
     }
 
     func refreshForLaunch() async {
+        let preservesPendingStatus = status == .pending
         let ownsOperation = begin(.refreshing)
         defer {
             if ownsOperation {
@@ -432,7 +433,7 @@ final class PurchaseController: ObservableObject {
         }
         guard await refreshEntitlement() else { return }
         if ownsOperation {
-            restoreStableStatus()
+            restoreStableStatus(preservingPending: preservesPendingStatus)
         }
     }
 

@@ -1,0 +1,11 @@
+Native UI implementation validation, iOS 26.0 Simulator.
+Test Case '-[PaperPathUITests.PaperPathUITests testCompressJourneyExplainsAlreadySmallerOriginalAfterReentry]' passed (74.672 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testCompressPDFQuickJourneyKeepsAlreadySmallerOriginal]' passed (51.117 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testLocalPDFHomeShortcutsOpenWorkflows]' passed (46.812 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry]' passed (46.797 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testIPadDocumentToolsInspectorOpensCompression]' passed (38.774 seconds).
+Build + selected test runs succeeded.
+Automation coverage contract: passed.
+Localization plist: passed.
+git diff --check: passed.
+Large-text-specific tuning/testing excluded by user request.
