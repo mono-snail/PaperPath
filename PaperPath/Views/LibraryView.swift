@@ -8,6 +8,81 @@ import UniformTypeIdentifiers
 import Vision
 import VisionKit
 
+private struct LibrarySearchBar: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    let prompt: String
+    let onSubmit: () -> Void
+    let onCancel: () -> Void
+
+    final class SearchBar: UISearchBar {
+        var requestsFocus = false
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil && requestsFocus {
+                becomeFirstResponder()
+            }
+        }
+    }
+
+    func makeUIView(context: Context) -> SearchBar {
+        let bar = SearchBar()
+        bar.searchBarStyle = .minimal
+        bar.showsCancelButton = true
+        bar.autocapitalizationType = .none
+        bar.autocorrectionType = .no
+        bar.delegate = context.coordinator
+        bar.searchTextField.accessibilityIdentifier = "librarySearchField"
+        return bar
+    }
+
+    func updateUIView(_ bar: SearchBar, context: Context) {
+        context.coordinator.parent = self
+        bar.placeholder = prompt
+        bar.tintColor = UIColor(PPColor.accent)
+        bar.requestsFocus = isFocused
+        if bar.text != text { bar.text = text }
+        if isFocused && bar.window != nil && !bar.searchTextField.isFirstResponder {
+            bar.becomeFirstResponder()
+        } else if !isFocused && bar.searchTextField.isFirstResponder {
+            bar.resignFirstResponder()
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    final class Coordinator: NSObject, UISearchBarDelegate {
+        var parent: LibrarySearchBar
+
+        init(_ parent: LibrarySearchBar) { self.parent = parent }
+
+        func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) {
+            parent.text = searchText
+        }
+
+        func searchBarTextDidBeginEditing(_ searchBar: UISearchBar) {
+            parent.isFocused = true
+        }
+
+        func searchBarTextDidEndEditing(_ searchBar: UISearchBar) {
+            parent.isFocused = false
+        }
+
+        func searchBarSearchButtonClicked(_ searchBar: UISearchBar) {
+            parent.isFocused = false
+            searchBar.resignFirstResponder()
+            parent.onSubmit()
+        }
+
+        func searchBarCancelButtonClicked(_ searchBar: UISearchBar) {
+            parent.isFocused = false
+            searchBar.resignFirstResponder()
+            parent.onCancel()
+        }
+    }
+}
+
 private func saturatedLibraryByteTotal<S: Sequence>(
     _ values: S
 ) -> Int64 where S.Element == Int64 {
@@ -620,6 +695,7 @@ struct LibraryView: View {
     @State private var librarySearchLifecycleGeneration = UUID()
     @State private var isLibrarySearchSuspended = false
     @State private var isLibrarySearchPresented = false
+    @State private var isLibrarySearchFocused = false
     @State private var librarySearchHistory: [String] = []
     @AppStorage("library.quickTools") private var savedQuickTools = ""
     @AppStorage("library.sort")
@@ -768,28 +844,33 @@ struct LibraryView: View {
                         || isSelectingDocuments
                 )
             }
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    isLibrarySearchPresented = true
+                    isLibrarySearchFocused = true
+                } label: {
+                    Image(systemName: "magnifyingglass")
+                }
+                .keyboardShortcut(
+                    "f",
+                    modifiers: [.command, .shift]
+                )
+                .accessibilityLabel(
+                    "Search Library".localizedUI
+                )
+                .accessibilityIdentifier(
+                    "librarySearchButton"
+                )
+                .disabled(
+                    isShowingProcessingOverlay
+                        || isLibraryHandoffActive
+                        || isSelectingDocuments
+                )
+            }
             if !model.workingDocuments.isEmpty {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
-                        Button {
-                            isLibrarySearchPresented = true
-                        } label: {
-                            Label(
-                                "Search Library",
-                                systemImage: "magnifyingglass"
-                            )
-                        }
-                        .keyboardShortcut(
-                            "f",
-                            modifiers: [.command, .shift]
-                        )
-                        .accessibilityHint(
-                            "Focuses the Library search field."
-                                .localizedUI
-                        )
-
                         if canUseDeskPreview {
-                            Divider()
                             Button {
                                 selectAdjacentDeskDocument(-1)
                             } label: {
@@ -1253,7 +1334,7 @@ struct LibraryView: View {
         }
         .eraseLibraryViewType()
 
-        let searchPresentation = editorPresentation
+        let confirmedPresentation = editorPresentation
         .confirmationDialog(
             AppLocalization.format(
                 "Move %lld private copies to Trash?",
@@ -1288,53 +1369,16 @@ struct LibraryView: View {
                 "The copies remain recoverable. Original imported files stay untouched."
             )
         }
-        .searchable(
-            text: $searchText,
-            isPresented: $isLibrarySearchPresented,
-            placement: .navigationBarDrawer(
-                displayMode: verticalSizeClass == .compact || dynamicTypeSize.isAccessibilitySize
-                    ? .automatic
-                    : .always
-            ),
-            prompt: Text(
-                (workspaceLane == .deliver ? "Search saved results" : "Search PDFs or tools").localizedUI
-            )
-        )
-        .searchSuggestions {
-            if searchText
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-                .isEmpty,
-               !librarySearchHistory.isEmpty {
-                Section("Recent Searches") {
-                    ForEach(librarySearchHistory, id: \.self) { query in
-                        Button {
-                            searchText = query
-                            appliedSearchText = query
-                            recordLibrarySearch(query)
-                        } label: {
-                            Label(
-                                query,
-                                systemImage: "clock.arrow.circlepath"
-                            )
-                        }
-                    }
+        .eraseLibraryViewType()
 
-                    Button(role: .destructive) {
-                        librarySearchHistory.removeAll(
-                            keepingCapacity: false
-                        )
-                    } label: {
-                        Label(
-                            "Clear Search History",
-                            systemImage: "trash"
-                        )
-                    }
-                }
+        let searchPresentation = confirmedPresentation
+        .safeAreaInset(edge: .top, spacing: 0) {
+            if isLibrarySearchPresented || isSearching {
+                librarySearchHeader
             }
         }
-        .onSubmit(of: .search) {
-            appliedSearchText = searchText
-            recordLibrarySearch(searchText)
+        .onChange(of: isLibrarySearchPresented) { _, isPresented in
+            if !isPresented { isLibrarySearchFocused = false }
         }
         .onChange(of: searchText) { _, value in
             officeResultLimit = 4
@@ -1518,6 +1562,54 @@ struct LibraryView: View {
         horizontalSizeClass == .regular ? PPDeskLayout.maximumWidth : 760
     }
 
+    private var librarySearchHeader: some View {
+        HStack(spacing: 0) {
+            LibrarySearchBar(
+                text: $searchText,
+                isFocused: $isLibrarySearchFocused,
+                prompt: (
+                    workspaceLane == .deliver
+                        ? "Search saved results"
+                        : "Search PDFs or tools"
+                ).localizedUI,
+                onSubmit: {
+                    appliedSearchText = searchText
+                    recordLibrarySearch(searchText)
+                },
+                onCancel: {
+                    searchText = ""
+                    appliedSearchText = ""
+                    isLibrarySearchPresented = false
+                }
+            )
+            .frame(height: 52)
+            if !librarySearchHistory.isEmpty {
+                Menu {
+                    ForEach(librarySearchHistory, id: \.self) { query in
+                        Button(query) {
+                            searchText = query
+                            appliedSearchText = query
+                            isLibrarySearchFocused = false
+                            recordLibrarySearch(query)
+                        }
+                    }
+                    Button("Clear Search History", role: .destructive) {
+                        librarySearchHistory.removeAll(keepingCapacity: false)
+                    }
+                } label: {
+                    Image(systemName: "clock.arrow.circlepath")
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel("Recent Searches".localizedUI)
+                .accessibilityIdentifier("librarySearchHistory")
+            }
+        }
+        .padding(.horizontal, PPSpacing.small)
+        .frame(maxWidth: libraryContentMaxWidth)
+        .frame(maxWidth: .infinity)
+        .background(PPColor.canvas)
+    }
+
     private var libraryScrollContent: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -1593,7 +1685,18 @@ struct LibraryView: View {
             .foregroundStyle(PPColor.textPrimary)
             .fixedSize(horizontal: false, vertical: true)
             .accessibilityAddTraits(.isHeader)
-            Text(AppBrand.subtitle.localizedUI)
+            Text(
+                model.workingDocuments.count == 1
+                    ? AppLocalization.format(
+                        "1 PDF · %@",
+                        librarySort.title.localizedUI
+                    )
+                    : AppLocalization.format(
+                        "%lld PDFs · %@",
+                        model.workingDocuments.count,
+                        librarySort.title.localizedUI
+                    )
+            )
                 .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1935,6 +2038,7 @@ struct LibraryView: View {
                             .foregroundStyle(dueDateTint(dueAt))
                     }
                 }
+                deskDocumentRelationship(record)
                 Button {
                     onOpen(DocumentRoute(
                         recordID: record.id, pageIndex: page,
@@ -1948,7 +2052,6 @@ struct LibraryView: View {
                 .buttonStyle(PPPrimaryButtonStyle())
                 .keyboardShortcut(.return, modifiers: [])
                 .accessibilityIdentifier("deskOpenDocument")
-                deskDocumentActions(record)
             }
             .disabled(isSelectingDocuments)
             .onChange(of: [record.id, record.contentRevisionID], initial: true) { _, _ in
@@ -2047,85 +2150,94 @@ struct LibraryView: View {
         isChoosingDeskPage = false
     }
 
-    private func deskDocumentActions(_ record: DocumentRecord) -> some View {
-        VStack(alignment: .leading, spacing: PPSpacing.regular) {
-            LazyVGrid(
-                columns: [GridItem(.flexible()), GridItem(.flexible())],
-                alignment: .leading, spacing: PPSpacing.small
-            ) {
-                ForEach([PDFQuickTask.organizePages, .signPDF, .fillForms, .exportText]
-                    .filter { $0.supports(record) }) { task in
-                    Button {
-                        open(task, recordID: record.id)
-                    } label: {
-                        Label(task.title.localizedUI, systemImage: task.symbol)
-                            .font(.caption.weight(.medium))
-                            .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                            .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(PPColor.accent)
-                    .hoverEffect(.highlight)
-                }
-            }
-            Button {
-                selectWorkspaceLane(.create)
-                savedToolTargetRecordID = record.id.uuidString
-            } label: {
-                Label("All tools".localizedUI, systemImage: "ellipsis")
-                    .font(.subheadline)
-                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(PPColor.textSecondary)
-            .hoverEffect(.highlight)
-            Divider()
-            if let verified = model.verifiedShareTarget(for: record.id),
-               model.url(for: verified.id) != nil {
-                Button {
-                    prepareLibraryShareCopy(recordID: verified.id)
-                } label: {
-                    Label("Share Verified Copy", systemImage: "checkmark.shield")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(minHeight: 44)
-                }
-                .foregroundStyle(PPColor.mint)
-            } else if record.profile.isLocked {
-                Button {
-                    prepareLibraryShareCopy(recordID: record.id)
-                } label: {
-                    Label("Share Encrypted PDF", systemImage: "lock.doc")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(minHeight: 44)
-                }
+    @ViewBuilder
+    private func deskDocumentRelationship(
+        _ record: DocumentRecord
+    ) -> some View {
+        if record.isDeliveryArtifact {
+            if let source = model.sourceRecord(for: record) {
+                deskRelationshipButton(
+                    title: "Result copy",
+                    detail: AppLocalization.format(
+                        "Source: %@",
+                        source.displayName
+                    ),
+                    symbol: "checkmark.seal.fill",
+                    tint: PPColor.mint,
+                    destination: source
+                )
             } else {
-                Button {
-                    open(.safeShare, recordID: record.id)
-                } label: {
-                    Label("Verify & Share", systemImage: "checkmark.shield")
-                        .font(.subheadline.weight(.semibold))
-                        .frame(minHeight: 44)
-                }
-                .disabled(!PDFQuickTask.safeShare.supports(record))
+                Label(
+                    "Source unavailable".localizedUI,
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(PPColor.amber)
             }
-            if record.deliveryReceipt != nil {
-                Button {
-                    deliveryReceiptRecord = record
-                } label: {
-                    Label(
-                        (record.hasCurrentDeliveryReceipt ? "Delivery receipt" : "Receipt needs recheck").localizedUI,
-                        systemImage: record.hasCurrentDeliveryReceipt
-                            ? "checkmark.seal" : "exclamationmark.circle"
-                    )
-                    .font(.caption)
-                    .frame(minHeight: 44)
+        } else if let latest = model.deliveryHistoryOutputs(
+            for: record.id
+        ).first {
+            deskRelationshipButton(
+                title: "Working copy",
+                detail: AppLocalization.format(
+                    "Latest: %@",
+                    latest.displayName
+                ),
+                symbol: "doc.on.doc",
+                tint: PPColor.cyan,
+                destination: latest
+            )
+        }
+    }
+
+    private func deskRelationshipButton(
+        title: String,
+        detail: String,
+        symbol: String,
+        tint: Color,
+        destination: DocumentRecord
+    ) -> some View {
+        Button {
+            activateLibraryRoute(
+                DocumentRoute(
+                    recordID: destination.id,
+                    pageIndex: destination.lastPageIndex,
+                    expectedContentRevisionID:
+                        destination.contentRevisionID
+                )
+            )
+        } label: {
+            HStack(spacing: PPSpacing.small) {
+                Image(systemName: symbol)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(tint)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title.localizedUI)
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.textPrimary)
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(PPColor.textSecondary)
+                        .lineLimit(1)
                 }
-                .foregroundStyle(record.hasCurrentDeliveryReceipt ? PPColor.mint : PPColor.amber)
+                Spacer(minLength: PPSpacing.small)
+                Image(systemName: "arrow.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(PPColor.textSecondary)
             }
+            .padding(.horizontal, PPSpacing.small)
+            .frame(maxWidth: .infinity, minHeight: 52)
+            .background(
+                tint.opacity(0.07),
+                in: RoundedRectangle(
+                    cornerRadius: PPRadius.document
+                )
+            )
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .disabled(model.isProcessing(record.id) || libraryShareTask != nil)
+        .accessibilityIdentifier("deskDocumentRelationship")
     }
 
     private var visibleLibraryContentSections: [LibraryContentSection] {
@@ -2184,13 +2296,16 @@ struct LibraryView: View {
         case .work:
             if model.workingDocuments.isEmpty {
                 sections.append(.library)
+                sections.append(.homeGoals)
             } else if isWorkspaceSidebar {
                 sections.append(.library)
             } else {
                 sections.append(.deskHeader)
+                if !hasActiveFilters && !isSelectingDocuments {
+                    sections.append(.homeGoals)
+                }
                 if recoverableBatchRun != nil
-                    || hasOfficeQueueRecovery
-                    || homePriorityRecord != nil {
+                    || hasOfficeQueueRecovery {
                     sections.append(.commandCenter)
                 } else if !hasActiveFilters && !isSelectingDocuments
                     && !dynamicTypeSize.isAccessibilitySize
@@ -2787,52 +2902,82 @@ struct LibraryView: View {
         } label: {
             HStack(alignment: .center, spacing: PPSpacing.regular) {
                 VStack(alignment: .leading, spacing: PPSpacing.small) {
-                    Label("CONTINUE".localizedUI, systemImage: symbol)
-                        .font(.caption2.weight(.semibold))
-                        .tracking(0.7)
-                        .foregroundStyle(PPColor.inkAccent)
+                    Text(
+                        (
+                            recoverableBatchRun != nil
+                                || hasOfficeQueueRecovery
+                                || priorityRecord?.taskCheckpoint != nil
+                                || priorityRecommendation == nil
+                                ? "Continue"
+                                : "Next step"
+                        ).localizedUI
+                    )
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(PPColor.accent)
                     Text(title)
-                        .font(PPType.display)
+                        .font(.headline)
+                        .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(usesExpandedLayout ? nil : 2)
                         .fixedSize(horizontal: false, vertical: true)
                     Text(detail)
                         .font(.caption)
-                        .lineLimit(usesExpandedLayout ? nil : 3)
-                        .foregroundStyle(PPColor.onInkSecondary)
+                        .lineLimit(usesExpandedLayout ? nil : 2)
+                        .foregroundStyle(PPColor.textSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 if let record = priorityRecord,
                    recoverableBatchRun == nil, !hasOfficeQueueRecovery,
                    !usesExpandedLayout {
-                    deskThumbnail(record, pageIndex: 0, width: 62)
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                        .padding(5)
-                        .background(PPColor.onInk, in: RoundedRectangle(cornerRadius: 8))
-                        .rotationEffect(.degrees(4))
+                    deskThumbnail(record, pageIndex: 0, width: 44)
+                        .clipShape(
+                            RoundedRectangle(
+                                cornerRadius: PPRadius.document
+                            )
+                        )
                         .accessibilityHidden(true)
                 } else {
                     commandCenterPrimaryIcon(symbol)
-                        .foregroundStyle(PPColor.inkAccent)
+                        .foregroundStyle(PPColor.accent)
                 }
                 if !usesExpandedLayout {
                     VStack {
                         commandCenterPrimaryDisclosure
-                            .foregroundStyle(PPColor.inkAccent)
+                            .foregroundStyle(PPColor.textSecondary)
                     }
                 }
             }
             .multilineTextAlignment(.leading)
-            .foregroundStyle(PPColor.onInk)
-            .padding(PPSpacing.large)
+            .padding(.horizontal, PPSpacing.regular)
+            .padding(.vertical, PPSpacing.medium)
             .frame(maxWidth: .infinity)
-            .frame(minHeight: 132)
-            .background(PPColor.ink, in: RoundedRectangle(cornerRadius: PPRadius.surface))
+            .frame(minHeight: 84)
+            .background(
+                PPColor.surface,
+                in: RoundedRectangle(
+                    cornerRadius: PPRadius.document
+                )
+            )
             .overlay {
-                RoundedRectangle(cornerRadius: PPRadius.surface)
-                    .strokeBorder(PPColor.onInkSecondary.opacity(0.22), lineWidth: 0.7)
+                RoundedRectangle(
+                    cornerRadius: PPRadius.document
+                )
+                .strokeBorder(
+                    PPColor.border.opacity(0.74),
+                    lineWidth: 0.7
+                )
             }
-            .contentShape(RoundedRectangle(cornerRadius: PPRadius.surface))
+            .overlay(alignment: .leading) {
+                Rectangle()
+                    .fill(PPColor.accent)
+                    .frame(width: 3)
+            }
+            .clipShape(
+                RoundedRectangle(cornerRadius: PPRadius.document)
+            )
+            .contentShape(
+                RoundedRectangle(cornerRadius: PPRadius.document)
+            )
         }
         .buttonStyle(PPPressButtonStyle())
         .accessibilityLabel(title)
@@ -4783,11 +4928,12 @@ struct LibraryView: View {
 
     private var homeGoalsSection: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            SectionEyebrow(text: "COMMON GOALS")
-            Text("What do you want to do?")
-                .font(.headline)
-                .fontDesign(.serif)
-                .foregroundStyle(PPColor.textPrimary)
+            Label("On-device processing · No document uploads".localizedUI,
+                  systemImage: "lock.shield")
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("localProcessingPromise")
 
             LazyVGrid(
                 columns: homeGoalColumns,
@@ -4809,61 +4955,7 @@ struct LibraryView: View {
     }
 
     private var homeGoalTasks: [PDFQuickTask] {
-        guard !model.workingDocuments.isEmpty else {
-            return [
-                .signPDF,
-                .fillForms,
-                .mergePDFs,
-                .compressPDF
-            ]
-        }
-
-        let primaryTask = homePriorityRecord.flatMap {
-            model.taskPackageRecommendation(for: $0)?.task
-        }
-        var tasks: [PDFQuickTask] = []
-        func append(_ task: PDFQuickTask) {
-            guard task != primaryTask,
-                  !tasks.contains(task),
-                  !task.requiresDocument
-                    || model.workingDocuments.contains(where: task.supports)
-            else { return }
-            tasks.append(task)
-        }
-
-        let priorityID = homePriorityRecord?.id
-        let orderedRecords = model.workingDocuments.sorted { lhs, rhs in
-            let lhsIsPriority = lhs.id == priorityID
-            let rhsIsPriority = rhs.id == priorityID
-            if lhsIsPriority != rhsIsPriority {
-                return lhsIsPriority
-            }
-            let lhsDate = lhs.lastViewedAt ?? lhs.modifiedAt
-            let rhsDate = rhs.lastViewedAt ?? rhs.modifiedAt
-            if lhsDate != rhsDate {
-                return lhsDate > rhsDate
-            }
-            return lhs.id.uuidString < rhs.id.uuidString
-        }
-        for record in orderedRecords.prefix(12) {
-            if let recommendation =
-                model.taskPackageRecommendation(for: record) {
-                append(recommendation.task)
-            }
-        }
-        for task in PDFQuickTaskPlanner.quickAccess(
-            for: model.workingDocuments
-        ) {
-            append(task)
-        }
-        for fallback in [
-            PDFQuickTask.mergePDFs,
-            .scanToPDF,
-            .imagesToPDF
-        ] {
-            append(fallback)
-        }
-        return Array(tasks.prefix(4))
+        [.mergePDFs, .splitPDF, .compressPDF, .recognizeText]
     }
 
     private var homeGoalColumns: [GridItem] {
@@ -4883,39 +4975,24 @@ struct LibraryView: View {
                 ToolSymbolPlate(
                     symbol: task.symbol,
                     tint: quickToolTint(task.group),
-                    size: 38
+                    size: 28
                 )
                 VStack(alignment: .leading, spacing: 2) {
                     Text(homeGoalTitle(task).localizedUI)
                         .font(.subheadline.weight(.semibold))
-                        .fontDesign(.serif)
                         .foregroundStyle(PPColor.textPrimary)
                         .fixedSize(
                             horizontal: false,
                             vertical: true
                         )
-                    Text(homeGoalDetail(task).localizedUI)
-                        .font(.caption)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(
-                            dynamicTypeSize.isAccessibilitySize
-                                ? nil
-                                : 2
-                        )
-                        .fixedSize(
-                            horizontal: false,
-                            vertical: true
-                        )
+
                 }
                 Spacer(minLength: 0)
-                Image(systemName: "arrow.right")
-                    .font(.caption2.weight(.bold))
-                    .foregroundStyle(PPColor.textSecondary)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(
                 minHeight:
-                    dynamicTypeSize.isAccessibilitySize ? 78 : 68
+                    dynamicTypeSize.isAccessibilitySize ? 64 : 56
             )
             .padding(.horizontal, PPSpacing.small)
             .padding(.vertical, 6)
@@ -4937,8 +5014,9 @@ struct LibraryView: View {
         switch task {
         case .signPDF: return "Sign a PDF"
         case .fillForms: return "Fill a form"
-        case .mergePDFs: return "Combine PDFs"
-        case .compressPDF: return "Reduce file size"
+        case .mergePDFs: return "Merge PDFs"
+        case .compressPDF: return "Compress PDF"
+        case .recognizeText: return "Local OCR"
         default: return task.title
         }
     }
@@ -11790,7 +11868,7 @@ private struct OfficeProductionCenterView: View {
             .accessibilityLabel("Delivery package actions")
             .accessibilityHint(
                 reportExpired
-                    ? "The verification report can still be shared, but the package must be created again before delivery."
+                    ? "Report available. Recreate the package before delivery."
                     : "Share, retain, or delete this delivery package."
             )
         }
@@ -13497,11 +13575,11 @@ private struct OfficeVerifiedArtifactsView: View {
         }
         switch verification.trustStatus {
         case .thisDevice:
-            return "The signature and exact file bytes were verified with this device's signing identity."
+            return "Signature and file bytes verified on this device."
         case .trusted:
-            return "The signature and exact file bytes were verified with a signer trusted on this device."
+            return "Signature and file bytes verified with a trusted signer."
         case .unknown:
-            return "The signature is valid and the exact bytes match, but this signer is not trusted on this device."
+            return "Signature and bytes match, but the signer is not trusted."
         case .invalid, .unsupported:
             return "These files are unavailable because signature verification did not pass."
         }
@@ -13849,7 +13927,7 @@ private struct OfficeVerifiedArtifactsView: View {
 
     private var privacyBoundary: some View {
         Label(
-            "Report validity and exact file bytes are rechecked before sharing. Protected temporary copies are removed when verification closes.",
+            "Files are rechecked before sharing. Temporary copies are removed on close.",
             systemImage: "lock.shield"
         )
         .font(.caption)
@@ -13946,7 +14024,7 @@ private struct OfficeDeliveryFileMatchView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "The JSON includes source PDF names, delivery output names, selected file names, byte sizes, and SHA-256 fingerprints. Document bytes are not included."
+                "Includes file names, sizes, and SHA-256 fingerprints. No document content."
             )
         }
         .sensoryFeedback(.success, trigger: exportFeedback)
@@ -14170,8 +14248,8 @@ private struct OfficeDeliveryFileMatchView: View {
         VStack(alignment: .leading, spacing: 6) {
             Label(
                 evidenceVerified
-                    ? "The report signature was verified first. File matches use complete SHA-256 bytes; names are labels only."
-                    : "This imported report did not pass complete verification. Its saved conclusions are untrusted.",
+                    ? "Report signature verified. Files match by SHA-256, not name."
+                    : "Report verification failed. Saved conclusions are untrusted.",
                 systemImage: evidenceVerified
                     ? "checkmark.shield"
                     : "exclamationmark.shield"
@@ -17218,7 +17296,7 @@ private struct StorageCenterView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Milestone names remain, but receipt links are removed. Older versions may be removed immediately by the 12-version and 1 GB rotation policy."
+                "Receipt links are removed. Older versions may be deleted now."
             )
         }
         .confirmationDialog(
@@ -17894,11 +17972,11 @@ private struct StorageCenterView: View {
             snapshot?.pageMatchStorage
                 ?? PDFManualPageMatchStorageSummary.empty
         guard summary.correctionCount > 0 else {
-            return "Saved page-match metadata will be removed from this device. Your PDFs will not be changed."
+            return "Removes saved page matches. PDFs stay unchanged."
                 .localizedUI
         }
         return AppLocalization.format(
-            "%lld saved comparison records will be removed from this device. Your PDFs will not be changed.",
+            "Removes %lld saved page matches. PDFs stay unchanged.",
             summary.correctionCount
         )
     }
@@ -18581,7 +18659,7 @@ private struct StorageCenterView: View {
                             .fontDesign(.serif)
                             .foregroundStyle(PPColor.textPrimary)
                         Text(
-                            "Verifies locally; signed V49 milestones can be recovered as private copies."
+                            "Verified V49 milestones can be recovered as private copies."
                         )
                         .font(.caption)
                         .foregroundStyle(PPColor.textSecondary)
@@ -18694,7 +18772,7 @@ private struct StorageCenterView: View {
                 }
             } else {
                 Text(
-                    "Verify that a readable change report still matches its on-device Ed25519 signature."
+                    "Checks the report's on-device Ed25519 signature."
                         .localizedUI
                 )
                 .font(.subheadline)
@@ -18881,7 +18959,7 @@ private struct StorageCenterView: View {
                             .fontDesign(.serif)
                             .foregroundStyle(PPColor.textPrimary)
                         Text(
-                            "New signed comparison reports are retained here after their signature is verified."
+                            "Verified signed comparison reports are kept here."
                                 .localizedUI
                         )
                         .font(.caption)
@@ -19543,10 +19621,10 @@ private struct StorageCenterView: View {
         _ milestone: PDFVersionSnapshot
     ) -> String {
         if milestone.linkedDeliveryReceiptID != nil {
-            return "Milestone name remains, but its Receipt link is removed. If this version falls outside standard retention, its local PDF may be deleted immediately."
+            return "Receipt link is removed. The local version may be deleted now."
                 .localizedUI
         }
-        return "Milestone name remains. If this version falls outside standard retention, its local PDF may be deleted immediately."
+        return "The local version may be deleted now."
             .localizedUI
     }
 
@@ -21213,12 +21291,12 @@ struct ChangeReportVerificationView: View {
                 tint: PPColor.amber
             )
             Label(
-                "The signature binds this readable Markdown body to its report identity and evidence summary."
+                "The signature covers this report and its evidence summary."
                     .localizedUI,
                 systemImage: "checkmark.shield"
             )
             Label(
-                "It does not certify a person, organization, timestamp authority, or either source PDF."
+                "It does not certify identity, time, or either PDF."
                     .localizedUI,
                 systemImage: "exclamationmark.shield"
             )
@@ -22201,13 +22279,13 @@ private struct VersionArchiveVerificationView: View {
 
     private var recoveryContractMessage: String {
         if report.canRecoverArtifacts {
-            return "Recovered milestones become independent private copies; the source archive is never modified."
+            return "Recovered milestones become separate copies. The archive is unchanged."
         }
         if report.isLegacyUnsigned {
-            return "V47 and V48 archives can be inspected, but unsigned PDFs cannot be recovered into the private library."
+            return "Older V47/V48 archives can be inspected, but not recovered."
         }
         if report.status == .failed {
-            return "Recovery stays locked until the signature and every archived PDF pass verification."
+            return "Recovery unlocks after the signature and every PDF pass."
         }
         return "Choose the archive again to recover a milestone."
     }
@@ -22879,7 +22957,7 @@ private struct DeliveryPackageVerificationView: View {
         .buttonStyle(PPPrimaryButtonStyle())
         .disabled(importTask != nil || shareTask != nil || isTrusting)
         .accessibilityHint(
-            "Imports the exact verified bytes into PaperPath without linking the temporary file."
+            "Imports the verified bytes as a new private copy."
                 .localizedUI
         )
         .accessibilityIdentifier("importVerifiedDeliveryArtifact")
@@ -22919,7 +22997,7 @@ private struct DeliveryPackageVerificationView: View {
         .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
         .disabled(importTask != nil || shareTask != nil || isTrusting)
         .accessibilityHint(
-            "Rechecks the signed size, page count, and SHA-256 before sharing a new protected copy."
+            "Rechecks size, page count, and SHA-256 before sharing."
                 .localizedUI
         )
         .accessibilityIdentifier("shareVerifiedDeliveryArtifact")
@@ -23219,7 +23297,7 @@ private struct DeliveryPackageVerificationView: View {
 
     private var scopeNotice: some View {
         Label(
-            "This verifies package integrity and local signer trust, not a certificate-backed legal identity.",
+            "Verifies package integrity and local trust, not legal identity.",
             systemImage: "info.circle"
         )
         .font(.caption)
@@ -23518,7 +23596,7 @@ private struct VerifiedDeliveryArtifactPreview: View {
                             : "Rechecking exact PDF"
                     )
                     .accessibilityHint(
-                        "Rechecks the signed size, page count, and SHA-256 before sharing a protected copy."
+                        "Rechecks size, page count, and SHA-256 before sharing."
                             .localizedUI
                     )
                 }
@@ -26371,7 +26449,7 @@ struct PrivacyCenterView: View {
 
             privacyRow(
                 title: "Editing previews stay available",
-                detail: "Page organization, signatures, redaction review, and output inspection keep their working thumbnails",
+                detail: "Editing and review tools keep required previews",
                 symbol: "rectangle.on.rectangle",
                 tint: PPColor.textSecondary
             )
@@ -26382,13 +26460,13 @@ struct PrivacyCenterView: View {
         privacySection(title: "NETWORK BOUNDARY") {
             privacyRow(
                 title: "No PaperPath document service",
-                detail: "PaperPath does not upload PDF content or extracted text to an app-managed server",
+                detail: "No PDF content or extracted text is sent to PaperPath servers",
                 symbol: "network.slash",
                 tint: PPColor.mint
             )
             privacyRow(
                 title: "Explicit handoff only",
-                detail: "Files leave the private library only through Share, Files export, or source replacement",
+                detail: "Files leave only when you share, export, or replace a source",
                 symbol: "square.and.arrow.up",
                 tint: PPColor.accent
             )

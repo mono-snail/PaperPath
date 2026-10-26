@@ -93,7 +93,7 @@ struct OfficeClockContinuitySection: View {
 struct OfficeClockContinuityNotice: View {
     var body: some View {
         Label(
-            "System time moved backward. Expiry checks remain monotonic; new signed evidence is paused."
+            "System time moved back. New signed evidence is paused."
                 .localizedUI,
             systemImage: "clock.badge.exclamationmark"
         )
@@ -102,7 +102,7 @@ struct OfficeClockContinuityNotice: View {
         .fixedSize(horizontal: false, vertical: true)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "System time moved backward. Existing signature integrity is unchanged. Expiry checks use PaperPath’s latest observed time, and new signed evidence is paused until the clock catches up."
+            "System time moved back. Existing signatures remain valid; new evidence is paused."
                 .localizedUI
         )
         .accessibilityHint(
@@ -3022,15 +3022,25 @@ private struct DeskToolNamesKey: EnvironmentKey {
     static let defaultValue = false
 }
 
+private struct DeskToolLabelWidthKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 88
+}
+
 extension EnvironmentValues {
     var deskToolNamesVisible: Bool {
         get { self[DeskToolNamesKey.self] }
         set { self[DeskToolNamesKey.self] = newValue }
     }
+
+    var deskToolLabelWidth: CGFloat {
+        get { self[DeskToolLabelWidthKey.self] }
+        set { self[DeskToolLabelWidthKey.self] = newValue }
+    }
 }
 
 struct DeskToolLabel: View {
     @Environment(\.deskToolNamesVisible) private var showsToolName
+    @Environment(\.deskToolLabelWidth) private var labelWidth
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @ScaledMetric(relativeTo: .caption2) private var captionHeight = 30
     let title: String
@@ -3057,11 +3067,11 @@ struct DeskToolLabel: View {
                     .multilineTextAlignment(.center)
                     .lineLimit(dynamicTypeSize.isAccessibilitySize ? nil : 2)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(width: 88, alignment: .top)
+                    .frame(width: labelWidth, alignment: .top)
                     .frame(minHeight: captionHeight, alignment: .top)
             }
         }
-        .frame(width: showsToolName ? 88 : PPDeskLayout.touchTarget)
+        .frame(width: showsToolName ? labelWidth : PPDeskLayout.touchTarget)
         .contentShape(Rectangle())
     }
 }

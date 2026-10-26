@@ -14,6 +14,8 @@ struct CombineDocumentsView: View {
     let onCreated: (UUID) -> Void
 
     @State private var selectedIDs: [UUID] = []
+    @State private var draggedID: UUID?
+    @State private var mergeRowFrames: [UUID: CGRect] = [:]
     @State private var outputName = ""
     @State private var sourceQuery = ""
     @FocusState private var sourceSearchFocused: Bool
@@ -141,7 +143,7 @@ struct CombineDocumentsView: View {
                 if skippedForCapacity > 0 {
                     model.present(
                         PaperPathError.insufficientSelection(
-                            "Some imported PDFs remain in the library because this merge reached its 64-PDF or 100,000-page limit."
+                            "Merge limit reached. Extra PDFs remain in the Library."
                         ),
                         in: paperPathSceneID
                     )
@@ -380,6 +382,8 @@ struct CombineDocumentsView: View {
                     }
                 }
             }
+            .coordinateSpace(name: "mergeOrder")
+            .onPreferenceChange(MergeOrderFramePreference.self) { mergeRowFrames = $0 }
             .overlay(alignment: .top) {
                 Rectangle()
                     .fill(PPColor.border.opacity(0.62))
@@ -419,6 +423,12 @@ struct CombineDocumentsView: View {
                     .frame(width: 28, height: 28)
                     .background(PPColor.mint)
                     .clipShape(Circle())
+                    .contextMenu {
+                        Button("Move to Beginning".localizedUI) { move(from: index, to: 0) }
+                            .disabled(index == 0 || hasActiveTask)
+                        Button("Move to End".localizedUI) { move(from: index, to: selectedIDs.count - 1) }
+                            .disabled(index == selectedIDs.count - 1 || hasActiveTask)
+                    }
 
                 sourcePreview(record)
 
@@ -445,6 +455,26 @@ struct CombineDocumentsView: View {
             }
 
             HStack(spacing: 0) {
+                Image(systemName: "line.3.horizontal")
+                    .foregroundStyle(PPColor.textSecondary)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+                    .highPriorityGesture(
+                        DragGesture(minimumDistance: 8, coordinateSpace: .named("mergeOrder"))
+                            .onChanged { value in
+                                guard !hasActiveTask else { return }
+                                draggedID = record.id
+                            }
+                            .onEnded { value in
+                                reorder(record.id, at: value.location)
+                                draggedID = nil
+                            }
+                    )
+                    .allowsHitTesting(!hasActiveTask)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("Drag to reorder".localizedUI)
+                    .accessibilityHint("Or use Move earlier and Move later.".localizedUI)
+                    .accessibilityIdentifier("mergeDrag-\(record.id.uuidString)")
                 orderButton(
                     symbol: "arrow.up",
                     label: "Move earlier",
@@ -478,23 +508,31 @@ struct CombineDocumentsView: View {
             )
         }
         .padding(.vertical, PPSpacing.small)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(record.displayName)
         .accessibilityIdentifier(
             "mergeSelectedDocument-\(record.id.uuidString)"
         )
-        .contextMenu {
-            Button {
-                move(from: index, to: 0)
-            } label: {
-                Label("Move to Beginning".localizedUI, systemImage: "arrow.up.to.line")
+        .background {
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: MergeOrderFramePreference.self,
+                    value: [record.id: geometry.frame(in: .named("mergeOrder"))]
+                )
             }
-            .disabled(index == 0 || hasActiveTask)
-            Button {
-                move(from: index, to: selectedIDs.count - 1)
-            } label: {
-                Label("Move to End".localizedUI, systemImage: "arrow.down.to.line")
-            }
-            .disabled(index == selectedIDs.count - 1 || hasActiveTask)
         }
+        .background(PPColor.accent.opacity(draggedID == record.id ? 0.08 : 0))
+    }
+
+    private func reorder(_ sourceID: UUID, at location: CGPoint) {
+        guard !hasActiveTask,
+              let source = selectedIDs.firstIndex(of: sourceID),
+              let destination = selectedIDs.firstIndex(where: {
+                  $0 != sourceID && mergeRowFrames[$0]?.contains(location) == true
+              })
+        else { return }
+        move(from: source, to: destination)
     }
 
     private func orderButton(
@@ -1174,5 +1212,12 @@ struct CombineDocumentsView: View {
         let nsError = error as NSError
         return nsError.domain == NSCocoaErrorDomain
             && nsError.code == NSUserCancelledError
+    }
+}
+
+private struct MergeOrderFramePreference: PreferenceKey {
+    static var defaultValue: [UUID: CGRect] { [:] }
+    static func reduce(value: inout [UUID: CGRect], nextValue: () -> [UUID: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
 }

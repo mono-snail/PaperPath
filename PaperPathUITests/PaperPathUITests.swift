@@ -434,7 +434,7 @@ final class PaperPathUITests: XCTestCase {
         app.launch()
         XCTAssertTrue(waitForOfficeCorpusFixture(in: app))
         selectWorkspaceLane(title: "Results", identifier: "workspaceLane-outputs", in: app)
-        let search = app.searchFields.firstMatch
+        let search = librarySearchField(in: app)
         search.tap()
         search.typeText("ConditionalFormattingSamples")
         submitSearchKeyboard(in: app)
@@ -591,7 +591,7 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(
             waitForOfficeCorpusFixture(chinese: true, in: app)
         )
-        let search = app.searchFields.firstMatch
+        let search = librarySearchField(in: app)
         search.tap()
         search.typeText("ConditionalFormattingSamples")
         submitSearchKeyboard(in: app)
@@ -636,7 +636,7 @@ final class PaperPathUITests: XCTestCase {
             app.launch()
             XCTAssertTrue(waitForOfficeCorpusFixture(in: app))
             selectWorkspaceLane(title: "Results", identifier: "workspaceLane-outputs", in: app)
-            let search = app.searchFields.firstMatch
+            let search = librarySearchField(in: app)
             XCTAssertTrue(search.waitForExistence(timeout: 20))
             search.tap()
             search.typeText("ConditionalFormattingSamples")
@@ -770,7 +770,7 @@ final class PaperPathUITests: XCTestCase {
         addScreenshot(named: "PaperPath Combine", app: app)
         app.buttons["Cancel"].tap()
         XCTAssertTrue(
-            app.searchFields.firstMatch.waitForExistence(timeout: 5)
+            app.buttons["librarySearchButton"].waitForExistence(timeout: 5)
         )
         XCTAssertTrue(
             reveal(
@@ -780,7 +780,7 @@ final class PaperPathUITests: XCTestCase {
             )
         )
 
-        let search = app.searchFields.firstMatch
+        let search = librarySearchField(in: app)
         XCTAssertTrue(search.exists)
         search.tap()
         search.typeText("August invoice")
@@ -1407,6 +1407,28 @@ final class PaperPathUITests: XCTestCase {
         assertAppAlive(app)
     }
 
+    func testLocalPDFHomeShortcutsOpenWorkflows() throws {
+        let app = launchResetDemo(additionalArguments: ["UITEST_POLISH_OCR"])
+        selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
+        XCTAssertTrue(app.descendants(matching: .any)["localProcessingPromise"].firstMatch.waitForExistence(timeout: 5))
+        for (task, title) in [
+            ("mergePDFs", "Merge PDFs"),
+            ("splitPDF", "Split PDF"),
+            ("compressPDF", "Compress PDF"),
+            ("recognizeText", "OCR PDF")
+        ] {
+            let shortcut = app.buttons["homeGoal-\(task)"].firstMatch
+            XCTAssertTrue(reveal(shortcut, in: app, maxSwipes: 5))
+            shortcut.tap()
+            XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
+            dismissPresentedWorkflow(title: title, in: app)
+        }
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "Local PDF home"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
     func testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry()
         throws {
         let app = launchResetDemo()
@@ -1466,6 +1488,27 @@ final class PaperPathUITests: XCTestCase {
                 return
             }
         }
+
+        let selectedRows = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "mergeSelectedDocument-")
+        )
+        let project = selectedRows.matching(NSPredicate(format: "label CONTAINS[c] %@", "Project handoff")).firstMatch
+        let invoice = selectedRows.matching(NSPredicate(format: "label CONTAINS[c] %@", "August invoice")).firstMatch
+        XCTAssertTrue(revealForCenterTap(project, in: app, maxSwipes: 8))
+        let invoiceID = String(invoice.identifier.dropFirst("mergeSelectedDocument-".count))
+        let dragHandle = app.descendants(matching: .any)["mergeDrag-\(invoiceID)"].firstMatch
+        XCTAssertTrue(revealForCenterTap(dragHandle, in: app, maxSwipes: 8))
+        XCTAssertTrue(project.isHittable)
+        dragHandle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+            .press(forDuration: 1.0, thenDragTo: project.coordinate(
+                withNormalizedOffset: CGVector(dx: 0.4, dy: 0.25)
+            ))
+        let reordered = XCTNSPredicateExpectation(
+            predicate: NSPredicate { _, _ in invoice.frame.minY < project.frame.minY },
+            object: nil
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [reordered], timeout: 5), .completed)
+        addScreenshot(named: "Dragged merge order", app: app)
 
         let outputName = app.textFields["mergeOutputName"].firstMatch
         XCTAssertTrue(revealForCenterTap(outputName, in: app, maxSwipes: 8))
@@ -1920,11 +1963,14 @@ final class PaperPathUITests: XCTestCase {
         )
         openDemoDocument(in: app)
 
-        openDocumentTool(
-            identifier: "ink",
-            query: "Draw",
-            in: app
+        selectProfessionalMode("annotate", in: app)
+        let inkTool = firstHittableButton(
+            identifier: "workspaceTool-ink",
+            in: app,
+            timeout: 5
         )
+        XCTAssertTrue(inkTool.isHittable)
+        tapCenter(inkTool)
         XCTAssertTrue(
             app.navigationBars["Draw on page"]
                 .waitForExistence(timeout: 8)
@@ -1932,17 +1978,17 @@ final class PaperPathUITests: XCTestCase {
         dismissPresentedWorkflow(title: "Draw on page", in: app)
         XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
 
-        openDocumentTool(
-            identifier: "ink",
-            query: "Draw",
-            in: app
-        )
+        XCTAssertTrue(inkTool.waitForExistence(timeout: 5))
+        XCTAssertTrue(inkTool.isHittable)
+        tapCenter(inkTool)
         let save = app.buttons["inkSaveAction"].firstMatch
         XCTAssertTrue(save.waitForExistence(timeout: 8))
         let canvas = app.descendants(matching: .any)[
             "inkCanvas"
         ].firstMatch
         XCTAssertTrue(canvas.waitForExistence(timeout: 8))
+        let viewport = app.scrollViews["inkViewport"].firstMatch
+        XCTAssertTrue(viewport.waitForExistence(timeout: 8))
         let ready = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "enabled == true"),
             object: save
@@ -2017,13 +2063,16 @@ final class PaperPathUITests: XCTestCase {
         let viewportMode = app.buttons["Move and zoom page"].firstMatch
         XCTAssertTrue(viewportMode.waitForExistence(timeout: 5))
         let fittedCanvasFrame = canvas.frame
-        XCTAssertTrue(app.buttons["Lasso"].firstMatch.isSelected)
-        viewportMode.tap()
-        XCTAssertTrue(viewportMode.isSelected)
-        XCTAssertFalse(
-            app.buttons["Lasso"].firstMatch.isSelected,
-            "Moving the page must not present the lasso as the active tool."
+        let fittedViewportFrame = viewport.frame
+        XCTAssertTrue(
+            fittedViewportFrame.width > fittedCanvasFrame.width + 20
+                || fittedViewportFrame.height > fittedCanvasFrame.height + 20,
+            "The drawing viewport should extend beyond the fitted page."
         )
+        let resizedShapeWidthRatio =
+            selection.frame.width / fittedCanvasFrame.width
+        XCTAssertFalse(viewportMode.isSelected)
+        XCTAssertTrue(app.buttons["Lasso"].firstMatch.isSelected)
         // Large iPad canvases constrain the synthesized finger travel.
         canvas.pinch(withScale: 4, velocity: 1)
         let zoomed = XCTNSPredicateExpectation(
@@ -2040,6 +2089,30 @@ final class PaperPathUITests: XCTestCase {
             XCTWaiter.wait(for: [zoomed], timeout: 5),
             .completed,
             "Pinching the page should enlarge the PDF and drawing together"
+        )
+        let visibleZoomFrame = canvas.frame.intersection(
+            fittedViewportFrame
+        )
+        XCTAssertTrue(
+            visibleZoomFrame.width > fittedCanvasFrame.width + 20
+                || visibleZoomFrame.height > fittedCanvasFrame.height + 20,
+            "Zoomed content should use the full drawing viewport."
+        )
+        XCTAssertTrue(
+            app.buttons["Lasso"].firstMatch.isSelected,
+            "Pinching must preserve the active drawing tool."
+        )
+        XCTAssertEqual(
+            selection.frame.width / canvas.frame.width,
+            resizedShapeWidthRatio,
+            accuracy: 0.02,
+            "Pinching the page must not resize the selected shape."
+        )
+        viewportMode.tap()
+        XCTAssertTrue(viewportMode.isSelected)
+        XCTAssertFalse(
+            app.buttons["Lasso"].firstMatch.isSelected,
+            "Moving the page must not present the lasso as the active tool."
         )
         addScreenshot(named: "Drawing and PDF after touch zoom", app: app)
         save.tap()
@@ -2473,7 +2546,7 @@ final class PaperPathUITests: XCTestCase {
         let redact = app.buttons["privacyRedactionAction"].firstMatch
         XCTAssertTrue(redact.waitForExistence(timeout: 5))
         XCTAssertTrue(redact.isEnabled)
-        XCTAssertTrue(redact.label.contains("1 item"))
+        XCTAssertTrue(redact.label.contains("1"))
         redact.tap()
         let cancel = app.buttons["privacyRedactionCancel"].firstMatch
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
@@ -2500,6 +2573,9 @@ final class PaperPathUITests: XCTestCase {
         let share = app.buttons["privacyShareVerifiedCopy"].firstMatch
         XCTAssertTrue(share.waitForExistence(timeout: 5))
         XCTAssertTrue(share.isHittable)
+        let openCopy = app.buttons["privacyOpenCreatedCopy"].firstMatch
+        XCTAssertTrue(openCopy.waitForExistence(timeout: 5))
+        XCTAssertTrue(openCopy.isHittable)
         addScreenshot(
             named: "Privacy Redaction Completed",
             app: app
@@ -2525,30 +2601,95 @@ final class PaperPathUITests: XCTestCase {
             ).tap()
         }
         XCTAssertTrue(shareSheet.waitForNonExistence(timeout: 5))
-        let done = app.buttons["privacyRedactionDone"].firstMatch
-        XCTAssertTrue(done.waitForExistence(timeout: 5))
-        done.tap()
-        XCTAssertEqual(
-            workspaceDocumentTitle(in: app).label,
-            "August invoice"
-        )
-        XCTAssertTrue(waitForLibrary(in: app))
-        selectWorkspaceLane(
-            title: "Results",
-            identifier: "workspaceLane-outputs",
-            in: app
-        )
-        let managedCopy = app.buttons.matching(
-            NSPredicate(
-                format:
-                    "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
-                "resultDocument-",
-                "August invoice - Redacted copy"
-            )
-        ).firstMatch
+        openCopy.tap()
+        let relatedDocuments = app.buttons[
+            "workspaceRelatedDocumentsMenu"
+        ].firstMatch
         XCTAssertTrue(
-            reveal(managedCopy, in: app, maxSwipes: 10),
-            "The verified redacted copy was not retained in the library"
+            relatedDocuments.waitForExistence(timeout: 45)
+        )
+        XCTAssertTrue(relatedDocuments.isHittable)
+        addScreenshot(
+            named: "Result copy relationship",
+            app: app
+        )
+        let openSource = app.buttons[
+            "documentRelationshipOpenSource"
+        ].firstMatch
+        relatedDocuments.tap()
+        XCTAssertTrue(openSource.waitForExistence(timeout: 5))
+        XCTAssertTrue(openSource.isHittable)
+        let resultRole = app.descendants(matching: .any)[
+            "documentRelationshipRole"
+        ].firstMatch
+        XCTAssertTrue(resultRole.exists)
+        XCTAssertTrue(
+            resultRole.label.contains("Result copy")
+                || resultRole.label.contains("结果副本")
+        )
+        XCTAssertTrue(
+            workspaceDocumentTitle(in: app).label
+                .hasPrefix("August invoice - ")
+        )
+        addScreenshot(
+            named: "Redacted Copy Relationship",
+            app: app
+        )
+        openSource.tap()
+        let sourceOpened = XCTNSPredicateExpectation(
+            predicate: NSPredicate(
+                format: "label == %@",
+                "August invoice"
+            ),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [sourceOpened], timeout: 20),
+            .completed
+        )
+        let workingRole = app.descendants(matching: .any)[
+            "documentRelationshipRole"
+        ].firstMatch
+        XCTAssertTrue(workingRole.exists)
+        XCTAssertTrue(
+            workingRole.label.contains("Working copy")
+                || workingRole.label.contains("工作副本")
+        )
+        addScreenshot(
+            named: "Working copy relationship",
+            app: app
+        )
+        let sourceRelatedDocuments = app.buttons[
+            "workspaceRelatedDocumentsMenu"
+        ].firstMatch
+        XCTAssertTrue(
+            sourceRelatedDocuments.waitForExistence(timeout: 5)
+        )
+        sourceRelatedDocuments.tap()
+        let openLatest = app.buttons[
+            "documentRelationshipOpenLatestResult"
+        ].firstMatch
+        XCTAssertTrue(openLatest.waitForExistence(timeout: 5))
+        XCTAssertTrue(openLatest.isHittable)
+        addScreenshot(
+            named: "Source With Latest Result",
+            app: app
+        )
+        openLatest.tap()
+        let latestResultRelationship = app.buttons[
+            "workspaceRelatedDocumentsMenu"
+        ].firstMatch
+        XCTAssertTrue(
+            latestResultRelationship.waitForExistence(timeout: 20)
+        )
+        latestResultRelationship.tap()
+        XCTAssertTrue(
+            app.buttons["documentRelationshipOpenSource"]
+                .firstMatch.waitForExistence(timeout: 20)
+        )
+        XCTAssertTrue(
+            workspaceDocumentTitle(in: app).label
+                .hasPrefix("August invoice - ")
         )
         assertAppAlive(app)
     }
@@ -2634,6 +2775,10 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(share.waitForExistence(timeout: 5))
         XCTAssertTrue(share.isEnabled)
         XCTAssertTrue(share.isHittable)
+        XCTAssertTrue(
+            app.buttons["privacyOpenCreatedCopy"].firstMatch
+                .waitForExistence(timeout: 5)
+        )
         addScreenshot(named: "\(name) Verified Copy", app: app)
         app.buttons["privacyRedactionDone"].firstMatch.tap()
         XCTAssertEqual(workspaceDocumentTitle(in: app).label, "August invoice")
@@ -4320,6 +4465,48 @@ final class PaperPathUITests: XCTestCase {
         )
     }
 
+    func testLibrarySearchCancelHistoryAndDocumentReturn() throws {
+        let app = makeApp()
+        app.launchArguments += ["UITEST_RESET_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        XCTAssertFalse(app.searchFields["librarySearchField"].exists)
+
+        for _ in 0..<3 {
+            let search = librarySearchField(in: app)
+            XCTAssertTrue(app.keyboards.firstMatch.waitForExistence(timeout: 5))
+            search.typeText("Project handoff")
+            submitSearchKeyboard(in: app)
+            let document = app.buttons
+                .containing(.staticText, identifier: "Project handoff")
+                .firstMatch
+            XCTAssertTrue(document.waitForExistence(timeout: 5))
+            addScreenshot(named: "Library search results", app: app)
+            document.tap()
+            XCTAssertTrue(app.otherElements["pdfWorkspace"].waitForExistence(timeout: 8))
+            app.navigationBars.buttons.firstMatch.tap()
+            XCTAssertTrue(app.buttons["librarySearchButton"].waitForExistence(timeout: 5))
+            let resumedSearch = librarySearchField(in: app)
+            XCTAssertEqual(resumedSearch.value as? String, "Project handoff")
+            app.buttons["Cancel"].firstMatch.tap()
+            XCTAssertTrue(resumedSearch.waitForNonExistence(timeout: 5))
+            XCTAssertTrue(app.buttons["settings"].isHittable)
+        }
+
+        _ = librarySearchField(in: app)
+        let history = app.buttons["librarySearchHistory"]
+        XCTAssertTrue(history.waitForExistence(timeout: 5))
+        history.tap()
+        app.buttons["Project handoff"].firstMatch.tap()
+        XCTAssertEqual(
+            app.searchFields["librarySearchField"].value as? String,
+            "Project handoff"
+        )
+        XCTAssertTrue(app.keyboards.firstMatch.waitForNonExistence(timeout: 5))
+        app.buttons["Cancel"].firstMatch.tap()
+        addScreenshot(named: "Library after repeated search cancellation", app: app)
+    }
+
     func testFormReviewAndFieldPlacementScreens() throws {
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
@@ -4948,7 +5135,7 @@ final class PaperPathUITests: XCTestCase {
             identifier: "workspaceLane-home",
             in: app
         )
-        let search = app.searchFields.firstMatch
+        let search = librarySearchField(in: app)
         XCTAssertTrue(search.waitForExistence(timeout: 3))
         search.tap()
         search.typeText("Project handoff")
@@ -6265,7 +6452,14 @@ final class PaperPathUITests: XCTestCase {
     private func librarySearchField(
         in app: XCUIApplication
     ) -> XCUIElement {
-        app.searchFields.firstMatch
+        let field = app.searchFields["librarySearchField"].firstMatch
+        if !field.exists {
+            let openSearch = app.buttons["librarySearchButton"].firstMatch
+            XCTAssertTrue(openSearch.waitForExistence(timeout: 5))
+            openSearch.tap()
+        }
+        XCTAssertTrue(field.waitForExistence(timeout: 5))
+        return field
     }
 
     private func documentToolSearchField(

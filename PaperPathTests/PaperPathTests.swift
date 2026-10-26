@@ -5,6 +5,134 @@ import UIKit
 import XCTest
 @testable import PaperPath
 
+final class OCRAccuracyTests: XCTestCase {
+    func testRecognizeImageOnlyDocumentsAcrossLanguagesAndSizes() async throws {
+        let chineseLines = [
+            "\u{6587}\u{6863}\u{5185}\u{5bb9}\u{8bc6}\u{522b}\u{4e0e}\u{9690}\u{79c1}\u{4fdd}\u{62a4}",
+            "\u{5408}\u{540c}\u{7f16}\u{53f7}: PP-2026-1002",
+            "\u{7532}\u{65b9}: \u{661f}\u{6cb3}\u{79d1}\u{6280}\u{6709}\u{9650}\u{516c}\u{53f8}",
+            "\u{8054}\u{7cfb}\u{7535}\u{8bdd}: 13800138000",
+            "\u{9879}\u{76ee}\u{91d1}\u{989d}: 1280.50 \u{5143}",
+            "\u{4ed8}\u{6b3e}\u{65e5}\u{671f}: 2026-10-02",
+            "\u{8bf7}\u{5728}\u{53d1}\u{9001}\u{524d}\u{68c0}\u{67e5}\u{6240}\u{6709}\u{6587}\u{5b57}\u{548c}\u{6570}\u{5b57}\u{3002}",
+            "\u{4fdd}\u{5b58}\u{540e}\u{53ef}\u{7ee7}\u{7eed}\u{7f16}\u{8f91}\u{5f53}\u{524d}\u{6587}\u{6863}\u{3002}"
+        ]
+        let englishLines = [
+            "Document recognition and privacy protection",
+            "Contract reference: PP-2026-1002",
+            "Company: Northstar Technology Limited",
+            "Telephone: 13800138000",
+            "Invoice total: 1280.50",
+            "Payment date: 2026-10-02",
+            "Please check all text and numbers before sending.",
+            "Continue editing the same document after saving."
+        ]
+        let cases: [(String, [String], CGFloat, Int)] = [
+            ("chinese-11pt", chineseLines, 11, 0),
+            ("chinese-8pt", chineseLines, 8, 0),
+            ("english-8pt", englishLines, 8, 0),
+            ("bilingual-rotated", zip(chineseLines, englishLines).flatMap { [$0, $1] }, 10, 90)
+        ]
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("OCRAccuracy-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        var measurements: [[String: Any]] = []
+        for (name, lines, fontSize, rotation) in cases {
+            let source = directory.appendingPathComponent("\(name).pdf")
+            let bounds = CGRect(x: 0, y: 0, width: 595, height: 842)
+            let format = UIGraphicsImageRendererFormat()
+            format.scale = 300 / 72
+            format.opaque = true
+            let scan = UIGraphicsImageRenderer(size: bounds.size, format: format).image { context in
+                UIColor.white.setFill()
+                context.fill(bounds)
+                for (index, line) in lines.enumerated() {
+                    (line as NSString).draw(
+                        at: CGPoint(x: 48, y: 60 + CGFloat(index) * 27),
+                        withAttributes: [
+                            .font: UIFont.systemFont(ofSize: fontSize),
+                            .foregroundColor: UIColor.black
+                        ]
+                    )
+                }
+            }
+            let document = PDFDocument()
+            let page = try XCTUnwrap(PDFPage(image: scan))
+            page.setBounds(bounds, for: .mediaBox)
+            page.rotation = rotation
+            document.insert(page, at: 0)
+            XCTAssertTrue(document.write(to: source))
+            XCTAssertTrue(PDFDocument(url: source)?.string?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            let started = Date()
+            let result = try await VisionOCRService().recognize(url: source)
+            let expected = lines.joined(separator: "\n")
+            let accuracy = characterAccuracy(expected: expected, actual: result.pages.first?.text ?? "")
+            let measurement: [String: Any] = [
+                "sample": name, "accuracy": accuracy,
+                "seconds": Date().timeIntervalSince(started),
+                "confidence": result.pages.first?.confidence ?? 0,
+                "expected": expected, "recognized": result.pages.first?.text ?? ""
+            ]
+            measurements.append(measurement)
+            let attachment = XCTAttachment(data: try Data(contentsOf: source), uniformTypeIdentifier: "com.adobe.pdf")
+            attachment.name = name
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            print("OCR_ACCURACY \(name) \(accuracy) \(result.pages.first?.text ?? "")")
+            XCTAssertGreaterThanOrEqual(accuracy, 0.92, name)
+        }
+        let attachment = XCTAttachment(
+            data: try JSONSerialization.data(withJSONObject: measurements, options: [.prettyPrinted, .sortedKeys]),
+            uniformTypeIdentifier: "public.json"
+        )
+        attachment.name = "ocr-accuracy-measurements"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+    }
+
+    func testReadingOrderIsStableAcrossInputPermutations() {
+        let blocks = (0..<3).map { index in
+            OCRTextBlock(
+                text: ["A", "B", "C"][index], confidence: 1,
+                normalizedX: 0.1 + Double(index) * 0.3,
+                normalizedY: 0.8 + Double(index) * 0.01,
+                normalizedWidth: 0.2, normalizedHeight: 0.02
+            )
+        }
+        let permutations = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]]
+        let results = permutations.map { order in
+            VisionOCRService().readingOrder(order.map { blocks[$0] }).map(\.text)
+        }
+        for result in results {
+            XCTAssertEqual(result, results[0])
+        }
+    }
+
+    private func characterAccuracy(expected: String, actual: String) -> Double {
+        func characters(_ text: String) -> [Character] {
+            Array(String(text.unicodeScalars.filter {
+                CharacterSet.alphanumerics.contains($0)
+            }).lowercased())
+        }
+        let reference = characters(expected)
+        let recognized = characters(actual)
+        var previous = Array(0...recognized.count)
+        for (row, character) in reference.enumerated() {
+            var current = [row + 1]
+            for (column, candidate) in recognized.enumerated() {
+                current.append(min(
+                    previous[column + 1] + 1,
+                    current[column] + 1,
+                    previous[column] + (character == candidate ? 0 : 1)
+                ))
+            }
+            previous = current
+        }
+        return 1 - Double(previous.last ?? 0) / Double(max(1, reference.count))
+    }
+}
+
 final class PaperPathTests: XCTestCase {
     private var temporaryDirectory: URL!
     private var previousLanguageCode: String?
@@ -1811,6 +1939,37 @@ final class PaperPathTests: XCTestCase {
         XCTAssertEqual(controller.lockGeneration, 2)
     }
 
+    func testAppLockLifecycleDoesNotRepeatAuthenticationForSystemPrompt()
+    {
+        XCTAssertTrue(
+            AppLockLifecyclePolicy.preservesAuthenticationTask(
+                isAuthenticating: true
+            )
+        )
+        XCTAssertTrue(
+            AppLockLifecyclePolicy.shouldAttemptAutomaticUnlock(
+                becameGloballyActive: true,
+                isLocked: true,
+                isAuthenticating: false
+            )
+        )
+        XCTAssertFalse(
+            AppLockLifecyclePolicy.shouldAttemptAutomaticUnlock(
+                becameGloballyActive: false,
+                isLocked: true,
+                isAuthenticating: false
+            ),
+            "A system authentication prompt is not a new foreground activation."
+        )
+        XCTAssertFalse(
+            AppLockLifecyclePolicy.shouldAttemptAutomaticUnlock(
+                becameGloballyActive: true,
+                isLocked: true,
+                isAuthenticating: true
+            )
+        )
+    }
+
     @MainActor
     func testAppLock_repeatedSceneChurnKeepsOverlayDismissed_BitsUT()
         async throws {
@@ -3086,6 +3245,31 @@ final class PaperPathTests: XCTestCase {
             document.page(at: 0)?.annotations.first?.type,
             "Ink"
         )
+    }
+
+    func testInkAnnotationPersistsSinglePointStroke() throws {
+        let source = temporaryDirectory.appendingPathComponent("ink-dot.pdf")
+        try makePDF(at: source, pages: ["Mark here"])
+        let payload = PDFInkPayload(
+            pageIndex: 0,
+            strokes: [
+                PDFInkStroke(
+                    points: [PDFInkPoint(x: 0.5, y: 0.5)],
+                    normalizedLineWidth: 0.01
+                )
+            ],
+            placement: .page
+        )
+
+        try PDFMutationService().addInk(payload, in: source)
+
+        let document = try XCTUnwrap(PDFDocument(url: source))
+        let annotation = try XCTUnwrap(
+            document.page(at: 0)?.annotations.first
+        )
+        XCTAssertEqual(annotation.type, "Ink")
+        let path = try XCTUnwrap(annotation.paths?.first)
+        XCTAssertGreaterThan(path.bounds.width, 0)
     }
 
     func testAnnotationPropertiesRebuildAppearanceAndVerify()

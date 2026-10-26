@@ -1273,7 +1273,7 @@ struct ScanReviewView: View {
             if purpose == .createPDF {
                 DisclosureGroup {
                     Text(
-                        "Pages are fitted to standard Letter-sized sheets and may be downsampled. Run Recognize Text afterward to search or copy."
+                        "Creates image-based Letter pages. Use Recognize Text for search."
                             .localizedUI
                     )
                     .font(.caption)
@@ -1450,7 +1450,7 @@ struct ScanReviewView: View {
                 .localizedUI
         }
         if previewMode == .original {
-            return "Switch to Processed to verify the inserted page, not just the camera capture."
+            return "Switch to Processed to check the inserted page."
                 .localizedUI
         }
         return "The replacement handoff unlocks after the processed preview is current."

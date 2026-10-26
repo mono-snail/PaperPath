@@ -1,4 +1,4 @@
 User-agent: *
 Allow: /
 
-# Add the production sitemap URL after the final domain is connected.
+Sitemap: https://paperpath.monoware.app/sitemap.xml

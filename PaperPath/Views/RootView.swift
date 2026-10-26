@@ -33,6 +33,22 @@ enum AppLockDelay: Int, CaseIterable, Identifiable {
     }
 }
 
+enum AppLockLifecyclePolicy {
+    static func preservesAuthenticationTask(
+        isAuthenticating: Bool
+    ) -> Bool {
+        isAuthenticating
+    }
+
+    static func shouldAttemptAutomaticUnlock(
+        becameGloballyActive: Bool,
+        isLocked: Bool,
+        isAuthenticating: Bool
+    ) -> Bool {
+        becameGloballyActive && isLocked && !isAuthenticating
+    }
+}
+
 @MainActor
 final class AppLockController: ObservableObject {
     static let defaultsKey = "privacy.appLockEnabled"
@@ -1926,6 +1942,9 @@ struct RootView: View {
     ) {
         pendingGlobalActivation =
             pendingGlobalActivation || becameGloballyActive
+        guard !AppLockLifecyclePolicy.preservesAuthenticationTask(
+            isAuthenticating: appLock.isAuthenticating
+        ) else { return }
         activeLifecycleTask?.cancel()
         let generation = UUID()
         activeLifecycleGeneration = generation
@@ -1935,8 +1954,11 @@ struct RootView: View {
                     activeLifecycleTask = nil
                 }
             }
-            if appLock.isLocked,
-               !appLock.isAuthenticating {
+            if AppLockLifecyclePolicy.shouldAttemptAutomaticUnlock(
+                becameGloballyActive: becameGloballyActive,
+                isLocked: appLock.isLocked,
+                isAuthenticating: appLock.isAuthenticating
+            ) {
                 _ = await appLock.unlock()
             }
             guard !Task.isCancelled,
@@ -1990,6 +2012,9 @@ struct RootView: View {
     private func suspendActiveLifecycle() {
         pendingGlobalActivation =
             pendingGlobalActivation || model.isLoading
+        guard !AppLockLifecyclePolicy.preservesAuthenticationTask(
+            isAuthenticating: appLock.isAuthenticating
+        ) else { return }
         activeLifecycleGeneration = UUID()
         activeLifecycleTask?.cancel()
         activeLifecycleTask = nil
@@ -4634,7 +4659,7 @@ private struct StudioComparisonWorkspace: View {
               UIApplication.shared.isProtectedDataAvailable
         else {
             errorMessage =
-                "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+                "Comparison stopped. Start again when PaperPath is active."
             return
         }
         comparisonGeneration &+= 1
@@ -4705,7 +4730,7 @@ private struct StudioComparisonWorkspace: View {
         guard isComparing else { return }
         stopComparison()
         errorMessage =
-            "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+            "Comparison stopped. Start again when PaperPath is active."
     }
 
     private func invalidateComparisonEvidenceForRevisionChange() {
@@ -4721,7 +4746,7 @@ private struct StudioComparisonWorkspace: View {
         comparisonMetrics = .empty
         guard hadEvidence else { return }
         errorMessage =
-            "A compared PDF changed. Compare again before reviewing or exporting evidence."
+            "A PDF changed. Compare again before reviewing evidence."
     }
 
     private var fullProofAccessibilityHint: String {

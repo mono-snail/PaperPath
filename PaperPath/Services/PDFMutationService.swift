@@ -717,19 +717,40 @@ struct PDFMutationService: Sendable {
                     : CGFloat(style.halfPointWidth) / 2
                 annotation.border = border
 
-                for stroke in strokes where stroke.points.count > 1 {
+                for stroke in strokes {
                     let path = UIBezierPath()
-                    for (index, point) in stroke.points.enumerated() {
-                        let mapped = CGPoint(
+                    let mappedPoints = stroke.points.map { point in
+                        CGPoint(
                             x: point.x * annotationBounds.width,
                             y: (1 - point.y) * annotationBounds.height
                         )
-                        if index == 0 {
-                            path.move(to: mapped)
-                        } else {
-                            path.addLine(to: mapped)
+                    }
+                    if let point = mappedPoints.first,
+                       mappedPoints.count == 1 {
+                        let radius = max(border.lineWidth * 0.1, 0.1)
+                        path.move(
+                            to: CGPoint(
+                                x: max(0, point.x - radius),
+                                y: point.y
+                            )
+                        )
+                        path.addLine(
+                            to: CGPoint(
+                                x: min(annotationBounds.width, point.x + radius),
+                                y: point.y
+                            )
+                        )
+                    } else {
+                        for (index, point) in mappedPoints.enumerated() {
+                            if index == 0 {
+                                path.move(to: point)
+                            } else {
+                                path.addLine(to: point)
+                            }
                         }
                     }
+                    path.lineCapStyle = .round
+                    path.lineJoinStyle = .round
                     annotation.add(path)
                 }
                 page.addAnnotation(annotation)
@@ -2984,7 +3005,7 @@ struct PDFMutationService: Sendable {
             }
             let (nextPointCount, overflow) = totalPointCount
                 .addingReportingOverflow(stroke.points.count)
-            guard (2...PDFInkPayload.maximumPointsPerStroke)
+            guard (1...PDFInkPayload.maximumPointsPerStroke)
                     .contains(stroke.points.count),
                   !overflow,
                   nextPointCount <= PDFInkPayload.maximumTotalPointCount,

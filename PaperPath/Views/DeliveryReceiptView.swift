@@ -378,7 +378,7 @@ struct ReceivedPackageProvenanceView: View {
                 Label(
                     isCurrent
                         ? "Receipt signature and exact PDF bytes were checked locally."
-                        : "Verification applies to the received bytes. Verify the edited copy again before delivery.",
+                        : "The PDF changed. Verify it again before delivery.",
                     systemImage: isCurrent
                         ? "iphone"
                         : "checkmark.shield"
@@ -1867,7 +1867,7 @@ struct DeliveryReceiptView: View {
             .accessibilityHint(
                 (
                     activeTaskDescription
-                        ?? "Creates a local package that keeps the PDF and its verification evidence together."
+                        ?? "Creates a package with the PDF and its verification evidence."
                 ).localizedUI
             )
             .accessibilityIdentifier("shareDeliveryPackage")
@@ -3176,7 +3176,7 @@ struct DeliveryReceiptView: View {
                             (
                                 availability == .protectCurrent
                                     ? "Keep the exact checked PDF outside automatic version rotation."
-                                    : "The working copy changed. Preserve the recovery version that matches this receipt."
+                                    : "Keep the recovery version that matches this receipt."
                             ).localizedUI
                         )
                         .font(.caption)
@@ -3262,7 +3262,7 @@ struct DeliveryReceiptView: View {
                         .foregroundStyle(PPColor.textPrimary)
                     Text(
                         (receiptOverride == nil
-                            ? "The receipt remains, but its exact PDF version is no longer in local history."
+                            ? "The receipt remains, but its PDF version is no longer stored."
                             : "No protected version remains linked to this archived receipt.").localizedUI
                     )
                     .font(.caption)
@@ -4494,7 +4494,7 @@ struct CompareVersionsView: View {
               UIApplication.shared.isProtectedDataAvailable
         else {
             errorMessage =
-                "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+                "Comparison stopped. Start again when PaperPath is active."
             return
         }
         stopComparison()
@@ -4586,7 +4586,7 @@ struct CompareVersionsView: View {
         focusedChangeID = nil
         guard hadEvidence else { return }
         errorMessage =
-            "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+            "Comparison stopped. Start again when PaperPath is active."
     }
 
     private func invalidateComparisonEvidenceForRevisionChange() {
@@ -4603,7 +4603,7 @@ struct CompareVersionsView: View {
         stopChangeReportPreparation()
         guard hadEvidence else { return }
         errorMessage =
-            "A compared PDF changed. Compare again before reviewing or exporting evidence."
+            "A PDF changed. Compare again before reviewing evidence."
     }
 
     private func openComparisonProof(
@@ -5334,7 +5334,7 @@ private struct PDFChangeReviewSummary: View {
             .buttonStyle(PPQuietButtonStyle(tint: PPColor.cyan))
             .disabled(isExportingReport)
             .accessibilityHint(
-                "Includes bounded text evidence and an Ed25519 signature, but neither PDF file."
+                "Includes limited text evidence and a signature, but no PDFs."
                     .localizedUI
             )
             .accessibilityIdentifier("exportChangeReport")

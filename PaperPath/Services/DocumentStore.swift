@@ -708,7 +708,7 @@ actor DocumentStore {
         )
         guard summary.canAdd(bytes: report.byteCount) else {
             throw PaperPathError.insufficientSelection(
-                "The signed report vault keeps up to 24 reports and 64 MB. Delete an older report before retaining another."
+                "Report storage is full. Delete an older report first."
             )
         }
         reports.append(report)

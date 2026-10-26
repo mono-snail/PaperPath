@@ -1842,7 +1842,7 @@ struct ExternalBatesReceiptView: View {
                 symbol: "key"
             )
             Label(
-                "This proves the manifest was signed by the shown key. It is not a certificate signature, legal identity, or trusted timestamp.",
+                "Confirms the shown key signed the manifest. It does not verify identity or time.",
                 systemImage: "info.circle"
             )
             .font(.caption)
@@ -2290,7 +2290,7 @@ struct ExternalBatesFileMatchView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "The JSON includes receipt document names, selected PDF file names, byte sizes, and SHA-256 fingerprints. PDF bytes are not included."
+                "Includes file names, sizes, and SHA-256 fingerprints. No PDF content."
             )
         }
         .onChange(of: scenePhase) { _, phase in
@@ -2360,7 +2360,7 @@ struct ExternalBatesFileMatchView: View {
 
     private var explanation: some View {
         Label(
-            "Matches use PDF bytes and SHA-256 only. File names are labels, not evidence.",
+            "Matches use PDF bytes and SHA-256. Names are labels only.",
             systemImage: "checkmark.shield"
         )
         .font(.caption)
@@ -2754,7 +2754,7 @@ struct BatesMatchReportInspectionView: View {
                 symbol: "clock"
             )
             Label(
-                "This verifies the saved report and its embedded receipt. It does not re-read the listed PDFs.",
+                "Checks the saved report and receipt, not the listed PDFs.",
                 systemImage: "info.circle"
             )
             .font(.caption)
@@ -3206,7 +3206,7 @@ struct BatesBatchReceiptView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "Only PDFs that still exactly match this signed batch will change. PaperPath will save recovery versions, remove its Bates annotations, and sign the cleared file hashes."
+                "Only exact matches change. Recovery versions and a signed removal receipt are saved."
             )
         }
     }
@@ -3233,7 +3233,7 @@ struct BatesBatchReceiptView: View {
             } ?? report?.detail
                 ?? (
                     verificationFailed
-                        ? "Receipt verification failed. Recheck when the private copies are available."
+                        ? "Verification failed. Recheck when the copies are available."
                         : "Checking the signature and current private copies."
                 ),
             symbol: reportSymbol,

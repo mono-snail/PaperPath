@@ -1703,7 +1703,7 @@ struct PDFVersionHistoryView: View {
                 }
             } message: {
                 Text(
-                    "Your current working copy will be saved first. The Files original stays untouched."
+                    "Saves the current copy first. The Files original stays unchanged."
                 )
             }
             .interactiveDismissDisabled(
@@ -2342,7 +2342,7 @@ struct PDFVersionHistoryView: View {
             )
             .accessibilityHint(
                 versionActionHint(
-                    "Includes bounded text evidence and an Ed25519 signature, but neither PDF file."
+                    "Includes limited text evidence and a signature, but no PDFs."
                 )
             )
         }
@@ -3218,7 +3218,7 @@ struct PDFVersionHistoryView: View {
         cleanupChangeReport()
         guard wasComparing else { return }
         comparisonError =
-            "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+            "Comparison stopped. Start again when PaperPath is active."
     }
 
     private func invalidateRevisionEvidenceForWorkingCopyChange() {
@@ -3236,7 +3236,7 @@ struct PDFVersionHistoryView: View {
         cleanupChangeReport()
         guard hadEvidence else { return }
         comparisonError =
-            "The working copy changed. Compare it with the saved version again before reviewing or exporting evidence."
+            "The working copy changed. Compare it with the saved version again."
     }
 
     private func createVersionArchive() {
@@ -3397,7 +3397,7 @@ struct PDFVersionHistoryView: View {
               changeReportTask == nil
         else {
             comparisonError =
-                "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+                "Comparison stopped. Start again when PaperPath is active."
             return
         }
         comparisonGeneration &+= 1
@@ -6135,7 +6135,7 @@ struct PDFComparisonProofView: View {
         else {
             failedPairingRequest = request
             pairingError =
-                "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+                "Comparison stopped. Start again when PaperPath is active."
             pairingErrorFeedback += 1
             return
         }
@@ -6259,7 +6259,7 @@ struct PDFComparisonProofView: View {
         guard isRecomputingPairing else { return }
         stopPairingRecomputation()
         pairingError =
-            "Comparison stopped to protect your documents. Start it again when PaperPath is active."
+            "Comparison stopped. Start again when PaperPath is active."
         pairingErrorFeedback += 1
     }
 
@@ -7173,7 +7173,7 @@ private struct PDFVectorEvidenceDetailView: View {
 
     private var scopeNotice: some View {
         Label(
-            "Vector boundaries mark changed drawing objects near visible differences; they do not identify object type or meaning."
+            "Vector bounds show changed drawings, not their type or meaning."
                 .localizedUI,
             systemImage: "info.circle"
         )

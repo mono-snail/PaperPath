@@ -376,7 +376,7 @@ struct DocumentWorkspaceView: View {
                     initialPageIndex,
                     message: "Opened at match",
                     recordsHistory: false,
-                    showsNotice: initialQuickTask == nil
+                    showsNotice: false
                 )
             }
             if !didHandleInitialQuickTask,
@@ -486,29 +486,6 @@ struct DocumentWorkspaceView: View {
                 PPCanvas()
 
                 VStack(spacing: 0) {
-                    if !isImmersiveReading,
-                       horizontalSizeClass == .regular,
-                       !dynamicTypeSize.isAccessibilitySize,
-                       !recentDocuments.isEmpty {
-                        recentDocumentTabs(
-                            current: record,
-                            recent: recentDocuments
-                        )
-                    }
-
-                if !isImmersiveReading, toolMode != .read {
-                    workspaceContextStrip(record)
-                        .frame(
-                            maxWidth: horizontalSizeClass == .regular
-                                ? 1_080
-                                : .infinity
-                        )
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, PPSpacing.regular)
-                        .padding(.top, PPSpacing.small)
-                        .padding(.bottom, PPSpacing.small)
-                }
-
                 if record.profile.isLocked,
                    isSessionUnlocked,
                    let unlockCopyIssue {
@@ -521,18 +498,6 @@ struct DocumentWorkspaceView: View {
                         .frame(maxWidth: .infinity)
                         .padding(.horizontal, PPSpacing.regular)
                         .padding(.bottom, PPSpacing.small)
-                }
-
-                if !isImmersiveReading,
-                   toolMode == .read || horizontalSizeClass == .compact,
-                   let prioritySignal =
-                        workspaceCommandSignals(record).first {
-                    compactWorkspaceSignal(
-                        prioritySignal,
-                        record: record
-                    )
-                    .padding(.horizontal, PPSpacing.regular)
-                    .padding(.bottom, PPSpacing.small)
                 }
 
                 PDFDocumentView(
@@ -719,7 +684,10 @@ struct DocumentWorkspaceView: View {
                     privacyScanAvailabilityHint(for: record)
                 )
                 .accessibilityIdentifier("privacyScanButton")
-                .sheet(isPresented: $isPrivacyScanPresented) {
+                .sheet(
+                    isPresented: $isPrivacyScanPresented,
+                    onDismiss: handleWorkspacePresentationDismissal
+                ) {
                     PrivacyScanWorkspaceSheet(
                         reviewModel: privacyScanReviewModel,
                         recordID: recordID,
@@ -734,6 +702,10 @@ struct DocumentWorkspaceView: View {
                                 contentRevisionID:
                                     record.contentRevisionID
                             )
+                        },
+                        onOpenDocument: { route in
+                            queueWorkspaceHandoff(.openDocument(route))
+                            isPrivacyScanPresented = false
                         }
                     )
                     .presentationDetents([.large])
@@ -745,25 +717,27 @@ struct DocumentWorkspaceView: View {
                 )
             }
                 ToolbarItem(placement: .principal) {
-                    VStack(spacing: 1) {
-                        Text(record.displayName)
-                            .font(PPType.document)
-                            .foregroundStyle(PPColor.textPrimary)
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.82)
-                        if horizontalSizeClass == .regular,
-                           !dynamicTypeSize.ppPrefersExpandedLayout {
-                            Text(record.subtitle)
-                                .font(.caption2)
-                                .monospacedDigit()
-                                .foregroundStyle(PPColor.textSecondary)
-                                .lineLimit(1)
+                    if hasDocumentRelationship(record) {
+                        Menu {
+                            Section(record.displayName) {
+                                documentRelationshipMenuCommands(record)
+                                Button {
+                                    presentedSheet = .deliveryHistory
+                                } label: {
+                                    Label(
+                                        "Delivery history",
+                                        systemImage: "clock.badge.checkmark"
+                                    )
+                                }
+                            }
+                        } label: {
+                            workspaceTitle(record, showsRelationship: true)
                         }
+                        .accessibilityIdentifier("workspaceRelatedDocumentsMenu")
+                        .disabled(hasBlockingWorkspaceControlTask)
+                    } else {
+                        workspaceTitle(record, showsRelationship: false)
                     }
-                    .accessibilityElement(children: .ignore)
-                    .accessibilityLabel(record.displayName)
-                    .accessibilityValue(record.subtitle.localizedUI)
-                    .accessibilityIdentifier("workspaceDocumentTitle")
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -963,6 +937,9 @@ struct DocumentWorkspaceView: View {
                     }
                     .accessibilityLabel(
                         "Reading and navigation".localizedUI
+                    )
+                    .accessibilityIdentifier(
+                        "workspaceNavigationMenu"
                     )
                     .disabled(hasBlockingWorkspaceControlTask)
                 }
@@ -1716,8 +1693,8 @@ struct DocumentWorkspaceView: View {
                                     Text(
                                         (
                                             continuesVerifiedOutputAfterUnlock
-                                                ? "After unlocking, PaperPath creates a separate editable private copy and continues verification. The encrypted original stays unchanged."
-                                                : "The password is kept only while this document is open and PaperPath is active."
+                                                ? "Unlocks into a separate copy. The encrypted original stays unchanged."
+                                                : "The password is kept only while this PDF is open."
                                         ).localizedUI
                                     )
                                 }
@@ -2108,7 +2085,7 @@ struct DocumentWorkspaceView: View {
         else { return }
         guard let url = model.url(for: recordID) else {
             unlockErrorMessage =
-                "The private working copy is unavailable. Close this view and reopen the document."
+                "Working copy unavailable. Close and reopen the document."
             unlockAttemptFeedback += 1
             return
         }
@@ -2162,7 +2139,7 @@ struct DocumentWorkspaceView: View {
             case .unavailable:
                 isApplyingSessionUnlock = false
                 unlockErrorMessage =
-                    "The private working copy is unavailable. Close this view and reopen the document."
+                    "Working copy unavailable. Close and reopen the document."
                 unlockAttemptFeedback += 1
             }
         }
@@ -2322,94 +2299,99 @@ struct DocumentWorkspaceView: View {
         )
     }
 
-    private func recentDocumentTabs(
-        current: DocumentRecord,
-        recent: [DocumentRecord]
+    private func hasDocumentRelationship(
+        _ record: DocumentRecord
+    ) -> Bool {
+        record.isDeliveryArtifact
+            || !model.deliveryHistoryOutputs(for: record.id).isEmpty
+    }
+
+    private func documentRelationshipRoleTitle(
+        _ record: DocumentRecord
+    ) -> String {
+        record.isDeliveryArtifact ? "Result copy" : "Working copy"
+    }
+
+    private func workspaceTitle(
+        _ record: DocumentRecord,
+        showsRelationship: Bool
     ) -> some View {
-        let records = [current] + recent.prefix(3)
+        VStack(spacing: 2) {
+            Text(record.displayName)
+                .font(PPType.document)
+                .foregroundStyle(PPColor.textPrimary)
+                .lineLimit(1)
+                .accessibilityIdentifier("workspaceDocumentTitle")
+            if showsRelationship {
+                HStack(spacing: 4) {
+                    Text(documentRelationshipRoleTitle(record).localizedUI)
+                        .accessibilityIdentifier("documentRelationshipRole")
+                    Image(systemName: "chevron.down")
+                        .accessibilityHidden(true)
+                }
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(documentRelationshipTint(record))
+                .lineLimit(1)
+            } else if horizontalSizeClass == .regular {
+                Text(record.subtitle)
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(PPColor.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+        .frame(minHeight: PPDeskLayout.touchTarget)
+    }
 
-        return ScrollView(.horizontal) {
-            HStack(spacing: PPSpacing.xSmall) {
-                ForEach(records) { record in
-                    let isCurrent = record.id == current.id
-                    Button {
-                        guard !isCurrent else { return }
-                        openRecentDocument(record)
-                    } label: {
-                        HStack(spacing: PPSpacing.small) {
-                            Image(
-                                systemName: isCurrent
-                                    ? "doc.fill"
-                                    : "doc"
-                            )
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(
-                                isCurrent
-                                    ? PPColor.accent
-                                    : PPColor.textSecondary
-                            )
+    private func documentRelationshipTint(
+        _ record: DocumentRecord
+    ) -> Color {
+        record.isDeliveryArtifact ? PPColor.mint : PPColor.cyan
+    }
 
-                            VStack(
-                                alignment: .leading,
-                                spacing: 1
-                            ) {
-                                Text(record.displayName)
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(
-                                        PPColor.textPrimary
-                                    )
-                                    .lineLimit(1)
-                                Text(
-                                    "p\((isCurrent ? currentPageIndex : record.lastPageIndex) + 1)"
-                                )
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(
-                                        PPColor.textSecondary
-                                    )
-                            }
-                        }
-                        .padding(.horizontal, PPSpacing.small)
-                        .frame(minWidth: 108, maxWidth: 168)
-                        .frame(minHeight: 44)
-                        .padding(.leading, 5)
-                        .overlay(alignment: .leading) {
-                            Rectangle()
-                                .fill(
-                                    isCurrent
-                                        ? PPColor.accent
-                                        : PPColor.border.opacity(0.55)
-                                )
-                                .frame(width: isCurrent ? 2 : 0.6)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .hoverEffect(.highlight)
-                    .disabled(
-                        isCurrent
-                            || hasBlockingWorkspaceControlTask
-                    )
-                    .accessibilityLabel(
-                        isCurrent
-                            ? AppLocalization.format(
-                                "%@, current document",
-                                record.displayName
-                            )
-                            : AppLocalization.format(
-                                "Open %@ at page %lld",
-                                record.displayName,
-                                record.lastPageIndex + 1
-                            )
+    @ViewBuilder
+    private func documentRelationshipMenuCommands(
+        _ record: DocumentRecord
+    ) -> some View {
+        if record.isDeliveryArtifact {
+            if let source = model.sourceRecord(for: record) {
+                Button {
+                    openRecentDocument(source)
+                } label: {
+                    Label(
+                        AppLocalization.format(
+                            "Open source: %@",
+                            source.displayName
+                        ),
+                        systemImage: "arrow.left"
                     )
                 }
+                .accessibilityIdentifier(
+                    "documentRelationshipOpenSource"
+                )
+            } else {
+                Label(
+                    "Source unavailable".localizedUI,
+                    systemImage: "exclamationmark.triangle"
+                )
             }
-            .padding(.horizontal, PPSpacing.regular)
-            .padding(.top, PPSpacing.xSmall)
-            .scrollTargetLayout()
+        } else if let latest = model.deliveryHistoryOutputs(
+            for: record.id
+        ).first {
+            Button {
+                openRecentDocument(latest)
+            } label: {
+                Label(
+                    AppLocalization.format(
+                        "Open latest result: %@",
+                        latest.displayName
+                    ),
+                    systemImage: "arrow.right"
+                )
+            }
+            .accessibilityIdentifier(
+                "documentRelationshipOpenLatestResult"
+            )
         }
-        .scrollTargetBehavior(.viewAligned)
-        .scrollIndicators(.hidden)
-        .background(PPColor.canvas)
-        .accessibilityIdentifier("recentDocumentTabs")
     }
 
     private func workspaceContextStrip(
@@ -2782,9 +2764,6 @@ struct DocumentWorkspaceView: View {
         ) {
             isImmersiveReading = isEnabled
         }
-        model[noticeFor: paperPathSceneID] = isEnabled
-            ? "Immersive reading on".localizedUI
-            : "Immersive reading off".localizedUI
     }
 
     private func toggleImmersiveReading() {
@@ -3097,8 +3076,6 @@ struct DocumentWorkspaceView: View {
     }
 
     private func actionBar(record: DocumentRecord) -> some View {
-        let commandSignals = workspaceCommandSignals(record)
-
         return VStack(spacing: 0) {
             if let shareProgress {
                 HStack(spacing: PPSpacing.small) {
@@ -3143,18 +3120,6 @@ struct DocumentWorkspaceView: View {
                     .frame(height: 0.6)
             }
 
-            if horizontalSizeClass == .regular, toolMode == .deliver,
-               !commandSignals.isEmpty {
-                workspaceCommandRail(
-                    commandSignals,
-                    record: record
-                )
-
-                Rectangle()
-                    .fill(PPColor.border.opacity(0.5))
-                    .frame(height: 0.6)
-            }
-
             if record.profile.pageCount > 1
                 || !pageBackHistory.isEmpty
                 || !pageForwardHistory.isEmpty {
@@ -3165,57 +3130,19 @@ struct DocumentWorkspaceView: View {
                     .frame(height: 0.6)
             }
 
-            Group {
-                if toolMode == .read, !isRedactionMode {
-                    HStack(spacing: PPSpacing.small) {
-                        toolModeMenu
-                        Spacer(minLength: 0)
-                        workspaceToolButton(.find, record: record)
-                            .accessibilityIdentifier("workspaceFindAction")
-                        Menu {
-                            Button("Bookmarks", systemImage: "bookmark") { presentedSheet = .bookmarks }
-                                .accessibilityIdentifier("readingBookmarks")
-                            Button("Reader", systemImage: "book") { presentedSheet = .reader }
-                                .accessibilityIdentifier("readingFocusReader")
-                            Button("Reading", systemImage: "textformat.size") { presentedSheet = .reading }
-                                .accessibilityIdentifier("readingSettings")
-                            Divider()
-                            Toggle("Show tool names".localizedUI, isOn: $showToolNames)
-                        } label: {
-                            Image(systemName: "textformat")
-                                .font(.system(size: 18))
-                                .frame(width: 44, height: 44)
-                        }
-                        .accessibilityLabel("Reading options".localizedUI)
-                        .accessibilityIdentifier("readingOptions")
-                        DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right") {
-                            toggleImmersiveReading()
-                        }
-                        .accessibilityIdentifier("enterFocusReading")
-                    }
-                    .environment(\.deskToolNamesVisible, false)
-                    .padding(.vertical, PPSpacing.xSmall)
-                } else if !isRedactionMode,
-                          verticalSizeClass == .compact
-                            || (horizontalSizeClass == .compact
-                                && !dynamicTypeSize.ppPrefersExpandedLayout) {
-                    HStack(spacing: PPSpacing.medium) {
-                        toolModeMenu
-                            .fixedSize(horizontal: true, vertical: false)
-                        workspaceToolRow(record)
-                    }
-                    .padding(.vertical, PPSpacing.small)
-                } else {
-                    VStack(spacing: PPSpacing.small) {
-                        if !isRedactionMode {
-                            toolModePicker
-                        }
-                        workspaceToolRow(record)
-                    }
-                    .padding(.vertical, PPSpacing.small)
+            HStack(alignment: .top, spacing: PPSpacing.small) {
+                if !isRedactionMode {
+                    toolModeMenu
+                        .fixedSize(
+                            horizontal: true,
+                            vertical: false
+                        )
                 }
+                workspaceToolRow(record)
+                    .layoutPriority(1)
             }
             .padding(.horizontal, PPSpacing.regular)
+            .padding(.vertical, PPSpacing.small)
             .disabled(hasBlockingWorkspaceControlTask)
             .opacity(
                 hasBlockingWorkspaceControlTask ? 0.46 : 1
@@ -3232,14 +3159,17 @@ struct DocumentWorkspaceView: View {
 
     private func workspaceToolRow(_ record: DocumentRecord) -> some View {
         ScrollView(.horizontal) {
-            HStack(alignment: .top, spacing: PPSpacing.medium) {
+            HStack(alignment: .top, spacing: PPSpacing.small) {
                 actionBarCommands(record)
             }
+            .scrollTargetLayout()
         }
+        .scrollTargetBehavior(.viewAligned)
         .scrollIndicators(.hidden)
         .accessibilityIdentifier("workspaceToolRow")
         .fixedSize(horizontal: false, vertical: true)
         .environment(\.deskToolNamesVisible, showToolNames && verticalSizeClass != .compact)
+        .environment(\.deskToolLabelWidth, horizontalSizeClass == .compact ? 64 : 88)
         .frame(minHeight: PPDeskLayout.touchTarget)
     }
 
@@ -3539,6 +3469,7 @@ struct DocumentWorkspaceView: View {
         DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right", tint: toolMode.tint) {
             toggleImmersiveReading()
         }
+        .accessibilityIdentifier("enterFocusReading")
         recentToolButton(record: record)
     }
 
@@ -3547,10 +3478,10 @@ struct DocumentWorkspaceView: View {
         _ record: DocumentRecord
     ) -> some View {
         workspaceToolButton(.highlight, record: record)
-        workspaceToolButton(.underline, record: record)
         workspaceToolButton(.ink, record: record)
         workspaceToolButton(.note, record: record)
         workspaceToolButton(.sign, record: record)
+        workspaceToolButton(.underline, record: record)
         markUpMenu
             .disabled(record.profile.isLocked)
     }
@@ -3614,52 +3545,27 @@ struct DocumentWorkspaceView: View {
         ToolMode(rawValue: savedToolMode) ?? .read
     }
 
-    private var toolModePicker: some View {
-        HStack(spacing: PPSpacing.small) {
-            Group {
-                if dynamicTypeSize.ppPrefersExpandedLayout {
-                    toolModeMenu
-                } else {
-                    Picker("Workspace tools".localizedUI, selection: $savedToolMode) {
-                        ForEach(ToolMode.allCases) { mode in
-                            Text(mode.title.localizedUI).tag(mode.rawValue)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                }
-            }
-            Menu {
-                Toggle("Show tool names".localizedUI, isOn: $showToolNames)
-            } label: {
-                Image(systemName: "text.below.photo")
-                    .font(.system(size: 18))
-                    .frame(width: 44, height: 44)
-            }
-            .accessibilityLabel("Tool appearance".localizedUI)
-            .help("Tool appearance".localizedUI)
-        }
-        .frame(maxWidth: 580, minHeight: PPDeskLayout.touchTarget)
-        .tint(toolMode.tint)
-        .disabled(hasBlockingWorkspaceControlTask)
-        .accessibilityIdentifier("workspaceToolModes")
-    }
-
     private var toolModeMenu: some View {
         Button {
             isSelectingToolMode = true
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: toolMode.symbol)
-                    .font(.caption.weight(.semibold))
-                Text(toolMode.title.localizedUI)
-                    .font(PPType.document)
-                    .lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.caption2.weight(.semibold))
+            VStack(spacing: PPSpacing.xSmall) {
+                HStack(spacing: 3) {
+                    Image(systemName: toolMode.symbol)
+                        .font(.system(size: 18, weight: .semibold))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .bold))
+                }
+                .frame(height: PPDeskLayout.touchTarget)
+                if showToolNames && verticalSizeClass != .compact {
+                    Text(toolMode.title.localizedUI)
+                        .font(.caption2.weight(.semibold))
+                        .lineLimit(2)
+                        .frame(minHeight: 30, alignment: .top)
+                }
             }
             .foregroundStyle(toolMode.tint)
-            .padding(.horizontal, PPSpacing.medium)
-            .frame(minHeight: PPDeskLayout.touchTarget)
+            .frame(width: horizontalSizeClass == .compact ? 64 : 88)
             .background(PPColor.surfaceMuted, in: RoundedRectangle(cornerRadius: PPRadius.control))
         }
         .buttonStyle(PPPressButtonStyle())
@@ -3992,7 +3898,7 @@ struct DocumentWorkspaceView: View {
                 .keyboardShortcut("[", modifiers: .command)
                 .accessibilityLabel("Previous page".localizedUI)
 
-                VStack(spacing: pageCount > 5 ? 0 : 2) {
+                HStack(spacing: PPSpacing.small) {
                     Button {
                         pageJumpInput = "\(displayedPage + 1)"
                         isJumpingToPage = true
@@ -4056,7 +3962,8 @@ struct DocumentWorkspaceView: View {
                         }
                     }
 
-                    if pageCount > 5 {
+                    if horizontalSizeClass == .regular,
+                       pageCount > 5 {
                         Slider(
                             value: Binding(
                                 get: {
@@ -5496,6 +5403,7 @@ struct DocumentWorkspaceView: View {
 
     private var hasActiveWorkspacePresentation: Bool {
         presentedSheet != nil
+            || isPrivacyScanPresented
             || isPresentingSignature
             || isPresentingPencil
             || isPresentingContentEditor

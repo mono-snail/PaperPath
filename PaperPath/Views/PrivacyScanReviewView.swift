@@ -70,15 +70,18 @@ struct PrivacyRedactionSelection: Sendable {
 
 final class PrivacyRedactionOutcome: Sendable {
     let outputURL: URL
+    let createdRecordID: UUID?
     let verifiedFindingCount: Int
     let affectedPageCount: Int
 
     init(
         outputURL: URL,
+        createdRecordID: UUID? = nil,
         verifiedFindingCount: Int,
         affectedPageCount: Int
     ) {
         self.outputURL = outputURL
+        self.createdRecordID = createdRecordID
         self.verifiedFindingCount = verifiedFindingCount
         self.affectedPageCount = affectedPageCount
     }
@@ -113,6 +116,7 @@ final class PrivacyRedactionOutcome: Sendable {
         }
         let outcome = PrivacyRedactionOutcome(
             outputURL: outputURL,
+            createdRecordID: createdRecord.id,
             verifiedFindingCount: selection.findingCount,
             affectedPageCount: selection.affectedPageCount
         )
@@ -719,6 +723,7 @@ struct PrivacyScanReviewView: View {
     let onRedact: @MainActor (
         PrivacyRedactionSelection
     ) async throws -> PrivacyRedactionOutcome
+    let onOpenCreatedCopy: @MainActor (UUID) -> Void
 
     init(
         model: PrivacyScanReviewModel,
@@ -731,7 +736,8 @@ struct PrivacyScanReviewView: View {
         onLocate: @escaping @MainActor (PrivacyFinding) -> Void,
         onRedact: @escaping @MainActor (
             PrivacyRedactionSelection
-        ) async throws -> PrivacyRedactionOutcome
+        ) async throws -> PrivacyRedactionOutcome,
+        onOpenCreatedCopy: @escaping @MainActor (UUID) -> Void = { _ in }
     ) {
         self.model = model
         self.documentName = documentName
@@ -744,6 +750,7 @@ struct PrivacyScanReviewView: View {
         self.documentRevisionID = documentRevisionID
         self.onLocate = onLocate
         self.onRedact = onRedact
+        self.onOpenCreatedCopy = onOpenCreatedCopy
     }
 
     init(
@@ -758,7 +765,8 @@ struct PrivacyScanReviewView: View {
         onLocate: @escaping @MainActor (PrivacyFinding) -> Void,
         onRedact: @escaping @MainActor (
             PrivacyRedactionSelection
-        ) async throws -> PrivacyRedactionOutcome
+        ) async throws -> PrivacyRedactionOutcome,
+        onOpenCreatedCopy: @escaping @MainActor (UUID) -> Void = { _ in }
     ) {
         self.model = model
         self.documentName = documentName
@@ -771,6 +779,7 @@ struct PrivacyScanReviewView: View {
         self.documentRevisionID = documentRevisionID
         self.onLocate = onLocate
         self.onRedact = onRedact
+        self.onOpenCreatedCopy = onOpenCreatedCopy
     }
 
     var body: some View {
@@ -1010,7 +1019,7 @@ struct PrivacyScanReviewView: View {
                 .accessibilityIdentifier("privacyScanStop")
             } footer: {
                 Text(
-                    "Stopping does not change the PDF. You can scan again."
+                    "Stop anytime. The PDF stays unchanged."
                         .localizedUI
                 )
             }
@@ -1306,7 +1315,7 @@ struct PrivacyScanReviewView: View {
             }
         } footer: {
             Text(
-                "Detection stays on this device. Review every result."
+                "On-device detection can miss details."
                     .localizedUI
             )
         }
@@ -1648,7 +1657,7 @@ struct PrivacyScanReviewView: View {
                 "No supported private details found".localizedUI,
                 systemImage: "doc.text.magnifyingglass",
                 description: Text(
-                    "Automatic detection can miss content. Review the PDF before sharing."
+                    "Review the PDF before sharing."
                         .localizedUI
                 )
             )
@@ -1659,7 +1668,7 @@ struct PrivacyScanReviewView: View {
         Section {
             Label(
                 AppLocalization.format(
-                    "%lld OCR candidates have no page position and were not selected for automatic redaction.",
+                    "%lld OCR candidates need manual redaction.",
                     model.unlocatableCount
                 ),
                 systemImage: "exclamationmark.triangle"
@@ -1667,7 +1676,7 @@ struct PrivacyScanReviewView: View {
             .foregroundStyle(.secondary)
         } footer: {
             Text(
-                "Return to the PDF to mark those areas manually."
+                "Mark them in the PDF."
                     .localizedUI
             )
         }
@@ -1843,10 +1852,10 @@ struct PrivacyScanReviewView: View {
             .frame(width: 72, height: 72)
             .accessibilityElement(children: .ignore)
             .accessibilityLabel(
-                "Permanently removing selected content".localizedUI
+                "Removing selected content".localizedUI
             )
             .accessibilityIdentifier("privacyRedactionProgress")
-            Text("Permanently removing selected content".localizedUI)
+            Text("Removing selected content".localizedUI)
                 .font(.title3.weight(.semibold))
                 .multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
@@ -1855,7 +1864,7 @@ struct PrivacyScanReviewView: View {
                 .monospacedDigit()
                 .multilineTextAlignment(.center)
             Text(
-                "Sharing remains unavailable until output verification finishes."
+                "Verifying before sharing."
                     .localizedUI
             )
                 .font(.subheadline)
@@ -1888,7 +1897,7 @@ struct PrivacyScanReviewView: View {
                             Image(systemName: "checkmark.shield.fill")
                                 .font(.system(size: 38, weight: .medium))
                                 .foregroundStyle(PPColor.inkAccent)
-                            Text("Underlying content removal verified".localizedUI)
+                            Text("Redaction verified".localizedUI)
                                 .font(PPType.display)
                                 .foregroundStyle(PPColor.onInk)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -1909,7 +1918,7 @@ struct PrivacyScanReviewView: View {
                             .accessibilityHidden(true)
                         }
                     }
-                    Text("The verified copy is ready. The original PDF is unchanged.".localizedUI)
+                    Text("Copy ready. Original unchanged.".localizedUI)
                         .font(.subheadline)
                         .foregroundStyle(PPColor.onInkSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1938,6 +1947,25 @@ struct PrivacyScanReviewView: View {
                     .font(.subheadline)
                     .monospacedDigit()
                     .ppCard()
+                    if let createdRecordID = outcome.createdRecordID {
+                        Button {
+                            openCreatedCopy(createdRecordID)
+                        } label: {
+                            Label(
+                                "Open Redacted Copy".localizedUI,
+                                systemImage: "doc.text.magnifyingglass"
+                            )
+                            .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(PPPrimaryButtonStyle())
+                        .accessibilityHint(
+                            "Opens the saved result copy."
+                                .localizedUI
+                        )
+                        .accessibilityIdentifier(
+                            "privacyOpenCreatedCopy"
+                        )
+                    }
                     ShareLink(item: outcome.outputURL) {
                         Label(
                             "Share Verified Copy".localizedUI,
@@ -1945,7 +1973,9 @@ struct PrivacyScanReviewView: View {
                         )
                         .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(PPPrimaryButtonStyle())
+                    .buttonStyle(
+                        PPQuietButtonStyle(tint: PPColor.accent)
+                    )
                     .accessibilityIdentifier("privacyShareVerifiedCopy")
                 }
             }
@@ -2059,15 +2089,11 @@ struct PrivacyScanReviewView: View {
     }
 
     private var confirmationMessage: String {
-        let scope = AppLocalization.format(
-            "%@ across %@ will be removed using %@. PaperPath creates a verified copy and keeps the original unchanged.",
+        AppLocalization.format(
+            "Removes %@ on %@ permanently. Cannot be undone. Original unchanged.",
             regionCountText(model.selectedRegionCount),
-            pageCountText(model.selectedPageCount),
-            model.appearance.title
+            pageCountText(model.selectedPageCount)
         )
-        return scope + " "
-            + "Removed content cannot be restored in the verified copy."
-                .localizedUI
     }
 
     private func candidateCountText(_ count: Int) -> String {
@@ -2156,6 +2182,13 @@ struct PrivacyScanReviewView: View {
         model.reset()
         dismiss()
     }
+
+    private func openCreatedCopy(_ recordID: UUID) {
+        redactionTask?.cancel()
+        redactionTask = nil
+        model.reset()
+        onOpenCreatedCopy(recordID)
+    }
 }
 
 private enum PrivacyScanReviewError: LocalizedError {
@@ -2183,7 +2216,7 @@ private enum PrivacyScanReviewError: LocalizedError {
             "The redacted copy was created, but its managed file is unavailable."
                 .localizedUI
         case .sharePreparationFailed:
-            "The redacted copy is saved in the Library, but its sharing copy could not be prepared. Open the saved copy to share it."
+            "Copy saved in the Library. Open it there to share."
                 .localizedUI
         }
     }
@@ -2201,6 +2234,7 @@ struct PrivacyScanWorkspaceSheet: View {
     let documentName: String
     let textIndex: DocumentTextIndex?
     let onLocate: @MainActor (PrivacyFinding) -> Void
+    let onOpenDocument: @MainActor (DocumentRoute) -> Void
 
     var body: some View {
         Group {
@@ -2223,7 +2257,12 @@ struct PrivacyScanWorkspaceSheet: View {
                         onLocate(finding)
                         dismiss()
                     },
-                    onRedact: redact
+                    onRedact: redact,
+                    onOpenCreatedCopy: { createdRecordID in
+                        onOpenDocument(
+                            DocumentRoute(recordID: createdRecordID)
+                        )
+                    }
                 )
             }
         }

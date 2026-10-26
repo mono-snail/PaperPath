@@ -549,7 +549,7 @@ struct PDFTextReplacementView: View {
 
                 OperationBoundaryNotice(
                     title: "Edited pages are rebuilt",
-                    detail: "The selected pages use a rebuilt appearance and searchable text layer. Embedded files, bookmarks, and custom page labels may not be preserved.",
+                    detail: "Embedded files, bookmarks, or custom page labels may be lost.",
                     identifier: "textReplacementStructureBoundary"
                 )
 

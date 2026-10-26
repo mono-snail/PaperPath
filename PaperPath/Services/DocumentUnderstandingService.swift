@@ -768,7 +768,10 @@ struct DocumentUnderstandingService: Sendable {
         hasText: Bool
     ) -> String {
         guard hasText else {
-            return "A \(profile.pageCount)-page image-based document. Recognize text to reveal facts and make it searchable."
+            return AppLocalization.format(
+                "Image-based document with %lld pages. Run Recognize Text to search it.",
+                profile.pageCount
+            )
         }
         let factCount = entities.count
         if category == .general {

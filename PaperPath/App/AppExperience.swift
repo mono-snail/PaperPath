@@ -273,11 +273,11 @@ enum FullUnlockContext: Equatable {
     var detail: String {
         switch self {
         case .settings:
-            return "Your first real Verified Output is free. Unlock unlimited use when PaperPath has proved useful."
+            return "First Verified Output is free. Unlock unlimited copies anytime."
         case .singleVerifiedOutput:
             return "Your free Verified Output has been used. One purchase unlocks unlimited verified copies."
         case .batchVerifiedOutput:
-            return "Batch Verified Output is included with lifetime access. Reading and editing remain available."
+            return "Lifetime access includes batch Verified Output. Reading and editing stay available."
         }
     }
 }

@@ -3317,7 +3317,7 @@ struct PDFOutputService: @unchecked Sendable {
               trimmed.count <= 16_000
         else {
             return blockedTextReplacement(
-                "Reflow no more than 96 lines, sixteen text boxes, four pages, or 16,000 characters at a time.",
+                "Limit each edit to 96 lines, 16 text boxes, 4 pages, and 16,000 characters.",
                 fontStyle: fontStyle,
                 alignment: alignment
             )
@@ -3447,7 +3447,14 @@ struct PDFOutputService: @unchecked Sendable {
             if layoutAttempt.splitWordAtRegionBoundary {
                 detail = "A word would split between selected text boxes. Widen a box or shorten that word."
             } else if remaining > 0 {
-                detail = "The selected flow is short by \(remaining) characters at the safe minimum of \(String(format: "%.1f", Double(layoutAttempt.minimumFontSize))) pt. Shorten the text or select more neighboring lines."
+                detail = AppLocalization.format(
+                    "Remove %lld characters or select more lines at %@ pt.",
+                    remaining,
+                    String(
+                        format: "%.1f",
+                        Double(layoutAttempt.minimumFontSize)
+                    )
+                )
             } else {
                 detail = "The text cannot flow through the selected boxes without clipping."
             }
@@ -3489,7 +3496,11 @@ struct PDFOutputService: @unchecked Sendable {
             targetBounds.count - usedRegionCount
         )
         let clearedDetail = clearedRegionCount > 0
-            ? " \(clearedRegionCount) trailing selected text box\(clearedRegionCount == 1 ? "" : "es") will be cleared."
+            ? AppLocalization.format(
+                " %lld trailing box%@ cleared.",
+                clearedRegionCount,
+                clearedRegionCount == 1 ? "" : "es"
+            )
             : ""
         return PDFTextReplacementAssessment(
             status: .ready,
@@ -3501,9 +3512,9 @@ struct PDFOutputService: @unchecked Sendable {
                         : "Ready to replace"
                 ),
             detail: selection.isCrossPage
-                ? "\(layoutDetail) Flows through \(usedRegionCount) of \(targetBounds.count) text boxes across \(pageIndices.count) pages.\(clearedDetail)"
+                ? "\(layoutDetail) Uses \(usedRegionCount)/\(targetBounds.count) boxes across \(pageIndices.count) pages.\(clearedDetail)"
                 : targetBounds.count > 1
-                    ? "\(layoutDetail) Flows through \(usedRegionCount) of \(targetBounds.count) text boxes on page \(selection.pageIndex + 1).\(clearedDetail)"
+                    ? "\(layoutDetail) Uses \(usedRegionCount)/\(targetBounds.count) boxes on page \(selection.pageIndex + 1).\(clearedDetail)"
                     : "\(layoutDetail) Only page \(selection.pageIndex + 1) will be rebuilt.",
             resolvedFontName: layout.font.fontName,
             resolvedFontSize: layout.font.pointSize,

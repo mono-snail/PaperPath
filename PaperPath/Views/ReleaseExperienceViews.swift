@@ -54,7 +54,7 @@ struct FirstRunExperienceView: View {
                     introPage(
                         eyebrow: "YOUR PDF, YOUR DEVICE",
                         title: "Finish important PDFs privately.",
-                        detail: "Fill, sign, or remove sensitive information. Keep your original and check the copy before sharing.",
+                        detail: "Fill, sign, or redact. Your original stays unchanged.",
                         illustration: .workspace,
                         tint: PPColor.accent
                     )
@@ -63,7 +63,7 @@ struct FirstRunExperienceView: View {
                     introPage(
                         eyebrow: "WORK ON A COPY",
                         title: "Choose a PDF when you’re ready.",
-                        detail: "PaperPath creates a private working copy. Your imported original stays untouched.",
+                        detail: "PaperPath works on a private copy.",
                         illustration: .intake,
                         tint: PPColor.cyan
                     )
@@ -72,7 +72,7 @@ struct FirstRunExperienceView: View {
                     introPage(
                         eyebrow: "CHECK BEFORE SHARING",
                         title: "Finish with confidence.",
-                        detail: "PaperPath reopens the finished copy, checks it, and keeps a local receipt.",
+                        detail: "PaperPath checks the copy and keeps a receipt.",
                         illustration: .processing,
                         tint: PPColor.mint
                     )
@@ -648,7 +648,7 @@ struct AppSettingsView: View {
             }
         } message: {
             Text(
-                "Working copies, OCR text, receipts, versions, signatures, and Trash will be permanently removed. Original files stay untouched."
+                "Deletes all PaperPath copies and data. Originals in Files stay unchanged."
             )
         }
         .alert(
@@ -661,7 +661,7 @@ struct AppSettingsView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text(
-                "This turns off metadata sync and removes PaperPath metadata from iCloud. Local PDFs and original files stay untouched."
+                "Turns off sync and deletes iCloud metadata. Local files stay unchanged."
             )
         }
         .task {
@@ -2074,8 +2074,8 @@ struct FullUnlockView: View {
                purchase.status == .pending || purchase.product == nil {
                 Text(
                     (purchase.status == .pending
-                        ? "Approval may take time. You can close this screen and keep using PaperPath; access updates when the App Store approves the purchase."
-                        : "Connect to the App Store to load the price. Your PDFs, reading, and editing remain available.")
+                        ? "Waiting for App Store approval. You can close this screen."
+                        : "Connect to the App Store to load the price.")
                     .localizedUI
                 )
                 .font(.caption)
@@ -2107,7 +2107,7 @@ struct FullUnlockView: View {
 
     private var purchaseInformation: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
-            Text("A one-time purchase is charged to your Apple Account after confirmation. Restore it with the same Apple Account on another device. There is no recurring charge.".localizedUI)
+            Text("One-time purchase. Restore with the same Apple Account.".localizedUI)
                 .font(.caption)
                 .foregroundStyle(PPColor.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -2182,22 +2182,22 @@ struct WhatsNewView: View {
                         }
                         change(
                             "Pick up where you left off",
-                            detail: "A clearer home screen keeps your next document and import actions close.",
+                            detail: "Your next document and import actions stay close.",
                             symbol: "arrow.right.circle"
                         )
                         change(
                             "Review scans and recognized text",
-                            detail: "Keep the page in view, adjust only what you need, and review uncertain words first.",
+                            detail: "Keep the page visible and review uncertain words first.",
                             symbol: "viewfinder"
                         )
                         change(
                             "Review private details",
-                            detail: "Select candidates, check their position in the PDF, and create a redacted copy while keeping the original.",
+                            detail: "Check candidates, then create a separate redacted copy.",
                             symbol: "hand.raised"
                         )
                         change(
                             "Check the copy you share",
-                            detail: "See the result and any warnings first, then share the checked PDF with its receipt if needed.",
+                            detail: "Review warnings, then share the checked PDF.",
                             symbol: "checkmark.shield"
                         )
                     }

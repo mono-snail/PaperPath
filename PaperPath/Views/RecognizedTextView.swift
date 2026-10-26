@@ -1704,7 +1704,7 @@ struct OCRConfigurationSheet: View {
             }
             Button("Cancel", role: .cancel) { pendingConfiguration = nil }
         } message: {
-            Text("Saved page progress will be replaced. Existing PDFs and completed text results stay unchanged.")
+            Text("Replaces saved progress. PDFs and completed results stay unchanged.")
         }
         .task(id: recoveryRequest) {
             let request = recoveryRequest

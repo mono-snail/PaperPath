@@ -88,7 +88,7 @@ enum ExternalPDFInboxError: LocalizedError, Sendable {
             )
         case .inboxFull:
             return ExternalPDFInbox.localized(
-                "PaperPath’s shared import queue is full. Open the app to finish pending imports, then try again."
+                "Shared import queue is full. Finish pending imports, then retry."
             )
         case .insufficientStorage:
             return ExternalPDFInbox.localized(

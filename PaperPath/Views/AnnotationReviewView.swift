@@ -334,7 +334,7 @@ struct AnnotationReviewView: View {
                     PPEmptyState(
                         kind: .tools,
                         title: "No annotations",
-                        message: "Highlights, notes, drawings, stamps, signatures, and generated page marks will appear here."
+                        message: "Highlights, notes, drawings, stamps, and signatures appear here."
                     )
                     .padding(PPSpacing.regular)
                 } else {
@@ -563,7 +563,7 @@ struct AnnotationReviewView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text(
-                    "Only the selected removable annotations change. One-step recovery will be available."
+                    "Removes only the selection. One-step recovery is available."
                 )
             }
             .onChange(of: scenePhase) { _, phase in
@@ -755,7 +755,7 @@ struct AnnotationReviewView: View {
     private var inventoryLimitNotice: some View {
         Label(
             AppLocalization.format(
-                "Showing the first %lld annotations. Search and selection apply to this bounded list.",
+                "Showing the first %lld annotations. Search applies to this list.",
                 displayLimit
             ),
             systemImage: "exclamationmark.triangle"

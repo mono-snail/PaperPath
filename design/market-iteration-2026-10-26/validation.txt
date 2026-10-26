@@ -1,0 +1,12 @@
+Selected regression evidence. iPhone 17 Pro, iOS 26.0 Simulator.
+Test Case '-[PaperPathTests.PaperPathTests testCombineAndExtractPreservePageOrder]' passed (0.014 seconds).
+Test Case '-[PaperPathTests.PaperPathTests testCompressionCreatesSeparateSmallerReadablePDF]' passed (0.031 seconds).
+Test Case '-[PaperPathTests.PaperPathTests testCompressionDoesNotPublishCopyLargerThanSource]' passed (0.021 seconds).
+Test Case '-[PaperPathTests.PaperPathTests testCompressionEstimateIdentifiesAlreadySmallerOriginal]' passed (0.005 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry]' passed (48.674 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testLocalPDFHomeShortcutsOpenWorkflows]' passed (47.875 seconds).
+Test Case '-[PaperPathUITests.PaperPathUITests testRecognizeTextQuickJourneyProducesResultAfterCancelAndReentry]' passed (47.759 seconds).
+Final selected test run: TEST SUCCEEDED.
+Automation coverage contract: passed.
+Strings plist: passed.
+git diff --check: passed.

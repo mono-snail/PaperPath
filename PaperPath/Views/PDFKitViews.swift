@@ -932,7 +932,7 @@ struct PDFDocumentView: UIViewRepresentable {
             )
             guard let reopened = PDFDocument(url: stagingURL) else {
                 deliverCommandMessage(
-                    "The saved annotation could not be verified. Your existing PDF was not changed."
+                    "Annotation verification failed. The PDF was not changed."
                 )
                 return false
             }
@@ -942,14 +942,14 @@ struct PDFDocumentView: UIViewRepresentable {
                       reopened.unlock(withPassword: unlockPassword)
                 else {
                     deliverCommandMessage(
-                        "The saved annotation could not be verified. Your existing PDF was not changed."
+                        "Annotation verification failed. The PDF was not changed."
                     )
                     return false
                 }
             }
             guard reopened.pageCount == document.pageCount else {
                 deliverCommandMessage(
-                    "The saved annotation could not be verified. Your existing PDF was not changed."
+                    "Annotation verification failed. The PDF was not changed."
                 )
                 return false
             }
@@ -962,7 +962,7 @@ struct PDFDocumentView: UIViewRepresentable {
                       }).count == expectedCount
                 else {
                     deliverCommandMessage(
-                        "The saved annotation could not be verified. Your existing PDF was not changed."
+                        "Annotation verification failed. The PDF was not changed."
                     )
                     return false
                 }

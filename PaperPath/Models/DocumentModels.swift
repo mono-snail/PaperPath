@@ -1135,7 +1135,7 @@ struct PDFOfficeExportFailure: Hashable, Sendable {
         PDFOfficeExportFailure(
             format: format,
             kind: .unavailableArtifact,
-            detail: "The retained file expired or belongs to an older source revision. Rebuild to create a current copy."
+            detail: "Saved file expired or is outdated. Rebuild it."
         )
     }
 
@@ -1227,17 +1227,17 @@ struct PDFOfficeContentNotice: Codable, Hashable, Sendable, Identifiable {
         var detail: String {
             switch self {
             case .wordReconstruction:
-                return "Check paragraph order and numbering. Number labels remain text; headers and footers are ordinary paragraphs. Images, when included, are page references rather than editable objects."
+                return "Check paragraph order and numbering. Images are page references, not editable objects."
             case .spreadsheetTextOnly:
-                return "Charts, images and conditional formatting are not included. Formulas and pivot-table relationships are not recovered. Check headers and values against the source PDF."
+                return "Charts, images, formulas, and pivot tables are omitted. Check values against the PDF."
             case .slideImages:
-                return "Page appearance is preserved as images, not editable shapes or tables. Extracted text is stored separately; search and re-export support varies by Office app."
+                return "Slides use page images, not editable shapes. Search support varies by Office app."
             case .pagesWithoutText:
-                return "These source pages produced no text cells. Their worksheets are empty; check the source PDF for images or other content."
+                return "These pages produced no text cells. Check the source PDF."
             case .missingVisualReferences:
-                return "Reference images could not be included within the rendering or storage limit. Check these pages in the source PDF."
+                return "Reference images were omitted by rendering or storage limits. Check the PDF."
             case .inferredTableLayout:
-                return "Some cell positions were inferred without reliable table boundaries. Check empty cells, merged headers and right-aligned values."
+                return "Some cell positions were inferred. Check blanks, merged headers, and aligned values."
             }
         }
     }

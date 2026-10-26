@@ -797,7 +797,6 @@ struct InkCaptureView: View {
     private func pencilSurface(
         availableSize: CGSize
     ) -> some View {
-        let pageSize = fittedPageSize(in: availableSize)
         return ZStack {
             PPColor.canvas
 
@@ -821,9 +820,10 @@ struct InkCaptureView: View {
                 }
             )
             .allowsHitTesting(isPagePreviewVerified)
-            .frame(width: pageSize.width, height: pageSize.height)
-            .clipped()
-            .shadow(color: .black.opacity(0.12), radius: 14, y: 6)
+            .frame(
+                width: max(1, availableSize.width),
+                height: max(1, availableSize.height)
+            )
             .overlay {
                 if isLoadingPagePreview {
                     pagePreviewLoadingState
@@ -868,7 +868,7 @@ struct InkCaptureView: View {
                     .buttonStyle(PPPressButtonStyle())
                     .accessibilityLabel("Move and zoom page")
                     .accessibilityHint(
-                        "Use one finger to move the page and two fingers to zoom. Choose a drawing tool to continue marking."
+                        "One finger moves the page. Two fingers zoom."
                     )
                     .accessibilityAddTraits(
                         isPencilViewportMode ? .isSelected : []
@@ -1182,7 +1182,7 @@ struct InkCaptureView: View {
 
             OperationBoundaryNotice(
                 title: "Visual signature only",
-                detail: "This places a handwritten mark in the PDF. It does not verify identity or create a certificate-backed digital signature.",
+                detail: "Adds handwriting only. It does not verify identity.",
                 identifier: "visualSignatureBoundary",
                 symbol: "signature"
             )
@@ -1903,7 +1903,7 @@ struct InkCaptureView: View {
         }
         var totalPointCount = 0
         for stroke in drawing.strokes {
-            guard stroke.path.count >= 2 else {
+            guard !stroke.path.isEmpty else {
                 inkValidationMessage =
                     "A stroke cannot be exported completely. The PDF has not been changed."
                 return
@@ -2266,10 +2266,6 @@ private final class PencilShapeSelectionView:
         target: self,
         action: #selector(handleMove(_:))
     )
-    private lazy var scaleGesture = UIPinchGestureRecognizer(
-        target: self,
-        action: #selector(handleScale(_:))
-    )
     private lazy var resizeGesture = UIPanGestureRecognizer(
         target: self,
         action: #selector(handleResize(_:))
@@ -2298,10 +2294,10 @@ private final class PencilShapeSelectionView:
         addSubview(resizeHandle)
 
         moveGesture.delegate = self
-        scaleGesture.delegate = self
         resizeGesture.delegate = self
+        moveGesture.maximumNumberOfTouches = 1
+        resizeGesture.maximumNumberOfTouches = 1
         addGestureRecognizer(moveGesture)
-        addGestureRecognizer(scaleGesture)
         resizeHandle.addGestureRecognizer(resizeGesture)
     }
 
@@ -2326,7 +2322,6 @@ private final class PencilShapeSelectionView:
 
     func prioritizeGestures(over canvas: PKCanvasView) {
         canvas.drawingGestureRecognizer.require(toFail: moveGesture)
-        canvas.drawingGestureRecognizer.require(toFail: scaleGesture)
         canvas.drawingGestureRecognizer.require(toFail: resizeGesture)
     }
 
@@ -2353,16 +2348,6 @@ private final class PencilShapeSelectionView:
                     width: translation.x,
                     height: translation.y
                 )
-            )
-        )
-    }
-
-    @objc private func handleScale(_ gesture: UIPinchGestureRecognizer) {
-        handle(
-            gesture.state,
-            adjustment: .scale(
-                gesture.scale,
-                anchor: .center
             )
         )
     }
@@ -2404,7 +2389,9 @@ private final class PencilShapeSelectionView:
     }
 }
 
-private final class PencilCanvasHostView: UIView {
+private final class PencilCanvasHostView:
+    UIView,
+    UIGestureRecognizerDelegate {
     let viewport = UIScrollView()
     let contentView = UIView()
     let backgroundImageView = UIImageView()
@@ -2418,6 +2405,14 @@ private final class PencilCanvasHostView: UIView {
     private var initialSize: CGSize?
     private var configuredLogicalSize: CGSize = .zero
     private var configuredViewportSize: CGSize = .zero
+    private lazy var drawingPinchGesture = UIPinchGestureRecognizer(
+        target: self,
+        action: #selector(handleDrawingPinch(_:))
+    )
+    private var drawingPinchStartZoomScale: CGFloat = 1
+    private var drawingPinchAnchorInContent: CGPoint = .zero
+    private var drawingPinchAnchorInViewport: CGPoint = .zero
+    private var restoresDrawingGestureAfterPinch = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -2427,6 +2422,11 @@ private final class PencilCanvasHostView: UIView {
         viewport.showsVerticalScrollIndicator = true
         viewport.showsHorizontalScrollIndicator = true
         viewport.contentInsetAdjustmentBehavior = .never
+        viewport.accessibilityIdentifier = "inkViewport"
+        contentView.layer.shadowColor = UIColor.black.cgColor
+        contentView.layer.shadowOpacity = 0.12
+        contentView.layer.shadowRadius = 18
+        contentView.layer.shadowOffset = CGSize(width: 0, height: 6)
         backgroundImageView.contentMode = .scaleAspectFit
         backgroundImageView.backgroundColor = .white
         backgroundImageView.isUserInteractionEnabled = false
@@ -2434,6 +2434,10 @@ private final class PencilCanvasHostView: UIView {
         contentView.addSubview(canvas)
         viewport.addSubview(contentView)
         addSubview(viewport)
+        drawingPinchGesture.delegate = self
+        drawingPinchGesture.cancelsTouchesInView = false
+        drawingPinchGesture.isEnabled = false
+        addGestureRecognizer(drawingPinchGesture)
     }
 
     required init?(coder: NSCoder) {
@@ -2464,6 +2468,9 @@ private final class PencilCanvasHostView: UIView {
             viewport.maximumZoomScale = 100
             viewport.setZoomScale(1, animated: false)
             contentView.frame = CGRect(origin: .zero, size: logicalSize)
+            contentView.layer.shadowPath = UIBezierPath(
+                rect: contentView.bounds
+            ).cgPath
             backgroundImageView.frame = contentView.bounds
             canvas.frame = contentView.bounds
             canvas.contentSize = logicalSize
@@ -2485,9 +2492,99 @@ private final class PencilCanvasHostView: UIView {
     }
 
     func setViewportGesturesEnabled(_ enabled: Bool) {
-        viewport.isScrollEnabled = enabled
-        viewport.panGestureRecognizer.isEnabled = enabled
+        viewport.isScrollEnabled = true
+        viewport.panGestureRecognizer.isEnabled = true
+        viewport.panGestureRecognizer.minimumNumberOfTouches = enabled ? 1 : 2
         viewport.pinchGestureRecognizer?.isEnabled = enabled
+        drawingPinchGesture.isEnabled = !enabled
+    }
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer:
+            UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === drawingPinchGesture
+            || otherGestureRecognizer === drawingPinchGesture
+    }
+
+    @objc private func handleDrawingPinch(
+        _ gesture: UIPinchGestureRecognizer
+    ) {
+        switch gesture.state {
+        case .began:
+            drawingPinchStartZoomScale = viewport.zoomScale
+            drawingPinchAnchorInContent = gesture.location(
+                in: contentView
+            )
+            drawingPinchAnchorInViewport = gesture.location(
+                in: viewport
+            )
+            restoresDrawingGestureAfterPinch =
+                canvas.drawingGestureRecognizer.isEnabled
+            canvas.drawingGestureRecognizer.isEnabled = false
+        case .changed:
+            applyDrawingPinchScale(gesture.scale)
+        case .ended:
+            applyDrawingPinchScale(gesture.scale)
+            restoreDrawingGestureAfterPinch()
+        case .cancelled, .failed:
+            restoreDrawingGestureAfterPinch()
+        case .possible:
+            break
+        @unknown default:
+            restoreDrawingGestureAfterPinch()
+        }
+    }
+
+    private func applyDrawingPinchScale(_ scale: CGFloat) {
+        guard scale.isFinite else { return }
+        let targetScale = min(
+            max(
+                drawingPinchStartZoomScale * scale,
+                viewport.minimumZoomScale
+            ),
+            viewport.maximumZoomScale
+        )
+        viewport.setZoomScale(targetScale, animated: false)
+        updateContentInsets()
+
+        let requestedOffset = CGPoint(
+            x: drawingPinchAnchorInContent.x * targetScale
+                - drawingPinchAnchorInViewport.x,
+            y: drawingPinchAnchorInContent.y * targetScale
+                - drawingPinchAnchorInViewport.y
+        )
+        viewport.setContentOffset(
+            CGPoint(
+                x: min(
+                    max(requestedOffset.x, -viewport.contentInset.left),
+                    max(
+                        -viewport.contentInset.left,
+                        viewport.contentSize.width
+                            - viewport.bounds.width
+                            + viewport.contentInset.right
+                    )
+                ),
+                y: min(
+                    max(requestedOffset.y, -viewport.contentInset.top),
+                    max(
+                        -viewport.contentInset.top,
+                        viewport.contentSize.height
+                            - viewport.bounds.height
+                            + viewport.contentInset.bottom
+                    )
+                )
+            ),
+            animated: false
+        )
+    }
+
+    private func restoreDrawingGestureAfterPinch() {
+        canvas.drawingGestureRecognizer.isEnabled =
+            restoresDrawingGestureAfterPinch
+                && drawingPinchGesture.isEnabled
+        restoresDrawingGestureAfterPinch = false
     }
 
     func fitPage(animated: Bool) {

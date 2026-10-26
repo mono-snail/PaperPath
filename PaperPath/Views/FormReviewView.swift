@@ -424,7 +424,7 @@ struct FormReviewView: View {
                         description: Text(
                             report.hasXFA
                                 ? "XFA content is preserved for another compatible reader."
-                                : "Add text, checkbox, radio, choice, or signature fields to this working copy."
+                                : "Add text, choice, checkbox, or signature fields."
                         )
                     )
                 }

@@ -259,8 +259,8 @@ struct BatchCompressionView: View {
                 .fixedSize(horizontal: false, vertical: true)
 
             OperationBoundaryNotice(
-                title: "Image-based compressed copies",
-                detail: "Searchable text, links, forms, and editable annotations are removed from every compressed copy.",
+                title: "Compressed copies are image-based",
+                detail: "Removes search, links, forms, and editable notes.",
                 identifier: "batchCompressionOutputBoundary"
             )
         }
@@ -1237,8 +1237,8 @@ struct CompressionSheet: View {
                                 )
 
                             OperationBoundaryNotice(
-                                title: "The whole copy becomes image-based",
-                                detail: "Searchable text, links, forms, and editable annotations are removed from the compressed copy.",
+                                title: "Compressed copy is image-based",
+                                detail: "Removes search, links, forms, and editable notes.",
                                 identifier: "compressionOutputBoundary"
                             )
 
@@ -1427,7 +1427,7 @@ struct CompressionSheet: View {
 
                 Text(
                     AppLocalization.format(
-                        "At this quality, rebuilding the PDF is estimated at %@ instead of %@. PaperPath will keep the smaller original.",
+                        "Estimated rebuild: %@ versus %@. The smaller original will be kept.",
                         estimate.formattedSize,
                         estimate.formattedSourceSize
                     )
@@ -1744,7 +1744,7 @@ struct ProtectionSheet: View {
                                 .accessibilityIdentifier("protectionValidation")
                             }
                             Text(
-                                "PaperPath does not store this password. Losing it can make the new copy inaccessible."
+                                "PaperPath does not store this password. If lost, the copy may not open."
                             )
                                 .font(.caption)
                                 .foregroundStyle(PPColor.textSecondary)
@@ -1778,8 +1778,8 @@ struct ProtectionSheet: View {
                         .accessibilityIdentifier("protectionPermissionDetails")
 
                         OperationBoundaryNotice(
-                            title: "Opening and permissions are enforced differently",
-                            detail: "The open password encrypts access. Other restrictions depend on the receiving PDF reader honoring standard permission flags; accessibility text remains available.",
+                            title: "Password and permissions differ",
+                            detail: "The password locks the file. Other restrictions depend on the PDF reader.",
                             identifier: "protectionPermissionBoundary",
                             symbol: "lock.trianglebadge.exclamationmark"
                         )
@@ -1942,7 +1942,7 @@ struct ProtectionSheet: View {
             sourceContentRevisionID = newRevisionID
             requiresUpdatedPDFConfirmation = newRevisionID != nil
             operationErrorMessage =
-                "The PDF changed. Confirm these settings for the updated PDF before creating a copy."
+                "The PDF changed. Review these settings before creating a copy."
                     .localizedUI
             errorFeedback += 1
         }
@@ -2142,7 +2142,7 @@ struct ProtectionSheet: View {
                 .localizedUI
         }
         if requiresUpdatedPDFConfirmation {
-            return "Confirms these password settings for the updated PDF without creating a copy yet."
+            return "Reviews these settings without creating a copy."
                 .localizedUI
         }
         if let validationMessage {
@@ -2250,7 +2250,7 @@ struct ProtectionSheet: View {
             guard let created else {
                 if !Task.isCancelled {
                     operationErrorMessage =
-                        "The protected copy could not be created. Your password and permissions are unchanged."
+                        "Protected copy failed. Password and permissions are unchanged."
                             .localizedUI
                     errorFeedback += 1
                 }
@@ -2364,8 +2364,8 @@ struct RedactionReviewSheet: View {
                         )
 
                         OperationBoundaryNotice(
-                            title: "The whole copy becomes image-based",
-                            detail: "Marked content is removed securely. Search, selection, links, forms, and editable annotations are removed from every page.",
+                            title: "Redaction makes an image-based copy",
+                            detail: "Removes marked content, search, links, forms, and editable notes.",
                             identifier: "redactionOutputBoundary",
                             symbol: "eye.slash.fill"
                         )
@@ -2375,8 +2375,7 @@ struct RedactionReviewSheet: View {
                                 PPEmptyState(
                                     kind: .workspace,
                                     title: "No marked areas",
-                                    message:
-                                        "Return to the PDF and mark at least one area before creating a redacted copy."
+                                    message: "Mark at least one area in the PDF."
                                 )
                                 Button {
                                     dismiss()
@@ -2650,7 +2649,7 @@ struct RedactionReviewSheet: View {
             sourceWasUpdated = true
             marks.removeAll(keepingCapacity: false)
             operationErrorMessage =
-                "The PDF changed. Mark the updated pages again before creating a redacted copy."
+                "The PDF changed. Mark the updated pages again."
                     .localizedUI
             errorFeedback += 1
         }
@@ -2987,7 +2986,7 @@ private struct BookletPreparationSheet: View {
             eyebrow: "BOOKLET IMPOSITION",
             title: "Arrange pages for folding",
             detail:
-                "Every front, back, page slot, and inserted blank stays visible before export.",
+                "Every sheet and inserted blank is shown before export.",
             symbol: "book.pages.fill",
             tint: PPColor.amber,
             metrics: [
@@ -4150,7 +4149,7 @@ private struct PrintPreparationSheet: View {
             eyebrow: "PRINT PREPARATION",
             title: "Standardize a separate copy",
             detail:
-                "Review physical page consequences before creating a verified print-ready PDF.",
+                "Review page size changes before creating the print-ready PDF.",
             symbol: "printer.fill",
             tint: PPColor.cyan,
             metrics: [
@@ -4538,7 +4537,7 @@ private struct PrintPreparationSheet: View {
         case .fill:
             return "Pages fill the printable frame; highlighted pages lose outer content."
         case .actual:
-            return "Content remains at 100%; oversized pages are clipped by the printable frame."
+            return "Oversized pages are clipped at 100% scale."
         }
     }
 
@@ -5492,7 +5491,7 @@ struct DocumentExportSheet: View {
             }
             Button("Keep working".localizedUI, role: .cancel) {}
         } message: {
-            Text("This output has not been saved to local history. The source PDF will stay unchanged.".localizedUI)
+            Text("Not saved to History. Source PDF unchanged.".localizedUI)
         }
     }
 
@@ -5736,8 +5735,8 @@ struct DocumentExportSheet: View {
            model.record(id: recordID)?
             .hasCurrentDeliveryReceipt != true {
             OperationBoundaryNotice(
-                title: "Verification checks a new image-based copy",
-                detail: "PaperPath reopens every page and records a fingerprint. Search, links, forms, and editable layers are removed; this is not legal or standards certification.",
+                title: "Verification uses an image-based copy",
+                detail: "Checks every page and fingerprints the file. Not a legal certification.",
                 identifier: "safeShareOutputBoundary",
                 symbol: "checkmark.seal.fill",
                 tint: PPColor.mint
@@ -6808,7 +6807,7 @@ struct DocumentExportSheet: View {
                         ? nil : "A completed output was kept in local history."
                 }
             } else if exportIsCurrent(generation) {
-                officeResultNotice = "The output is still available here. Free local storage, retry saving, or share it before closing."
+                officeResultNotice = "Output still available. Free space, retry, or share before closing."
             }
         }
     }
@@ -7310,7 +7309,7 @@ struct DocumentExportSheet: View {
                             .foregroundStyle(verifiedAccessTint)
                     }
                     Text(
-                        "Creates an image-based copy, reopens every page, and saves a fingerprinted receipt."
+                        "Creates an image-based copy, checks every page, and saves a receipt."
                     )
                     .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
@@ -7423,7 +7422,7 @@ struct DocumentExportSheet: View {
             return "Resolve the check error or retry before creating a verified copy"
         }
         if currentPreflight?.status == .review {
-            return "Creates a checked copy and keeps remaining warnings in the delivery receipt"
+            return "Creates a checked copy and records remaining warnings"
         }
         if currentPreflight?.status == .blocked {
             return "Review the blocking item before creating an output"
@@ -8352,7 +8351,7 @@ struct DocumentExportSheet: View {
             }
             if !canReconstruct {
                 Label(
-                    "This PDF blocks editable reconstruction. Open an unlocked private copy before converting."
+                    "This PDF blocks editable conversion. Open an unlocked copy."
                         .localizedUI,
                     systemImage:
                         "lock.trianglebadge.exclamationmark"
@@ -8544,11 +8543,11 @@ struct DocumentExportSheet: View {
     ) -> String {
         switch format {
         case .wordDocument:
-            return "DOCX structure is rebuilt locally; Word or Pages may reflow complex layouts."
+            return "DOCX is rebuilt locally; complex layouts may reflow."
         case .excelWorkbook:
-            return "XLSX rows are inferred from PDF spacing; review complex tables after opening."
+            return "XLSX layout is inferred; review complex tables."
         case .powerPointPresentation:
-            return "PPTX preserves page appearance with searchable text; slide content is not fully editable."
+            return "PPTX keeps page appearance; slide content is not fully editable."
         case .richText:
             return "RTF keeps basic text styling without the original page layout."
         case .markdown, .plainText:
@@ -11499,7 +11498,7 @@ struct DocumentExportSheet: View {
                 if retained == nil {
                     temporaryOfficeResultURL = artifact.url
                     officeResultNotice = currentContentRevisionID == revision
-                        ? "The output is still available here. Free local storage, retry saving, or share it before closing."
+                        ? "Output still available. Free space, retry, or share before closing."
                         : "The source PDF changed. This output belongs to the earlier revision."
                 }
             } catch is CancellationError {
@@ -14735,7 +14734,7 @@ struct SourceLocationView: View {
             )
             sourceStatus
             Label(
-                "PaperPath never changes the original in Files. Export or import an updated source as a separate private copy.",
+                "Originals in Files stay unchanged. Export or import a new copy.",
                 systemImage: "lock.doc"
             )
             .font(.caption)

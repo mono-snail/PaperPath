@@ -5378,10 +5378,10 @@ final class PaperPathModel: ObservableObject {
             if result.isCloudAvailable {
                 detail = result.eligibleDocumentCount == 0
                     ? "No matching document metadata is ready to sync."
-                    : "Page position, bookmarks, tags, status, and receipt summaries are current. PDF files and extracted text stay local."
+                    : "Bookmarks, tags, status, and receipts are synced. PDFs and text stay local."
             } else {
                 detail =
-                    "Sign in to iCloud and enable PaperPath iCloud access to sync metadata. PDF files and extracted text stay local."
+                    "Sign in to iCloud and enable PaperPath sync. PDFs and text stay local."
             }
             metadataSyncStatus = PDFMetadataSyncStatus(
                 state: result.isCloudAvailable
@@ -7298,7 +7298,7 @@ final class PaperPathModel: ObservableObject {
         }
         guard !isProcessing(recordID) else {
             throw PaperPathError.insufficientSelection(
-                "Another operation is already using this PDF. Wait for it to finish or stop it before trying again."
+                "This PDF is busy. Wait for the current task to finish or stop it."
             )
         }
         return try await performTrackedComparison(
@@ -13703,7 +13703,7 @@ final class PaperPathModel: ObservableObject {
             !isProcessing($0)
         }) else {
             throw PaperPathError.insufficientSelection(
-                "Another operation is already using one of these PDFs. Wait for it to finish or stop it before trying again."
+                "A selected PDF is busy. Wait for its task to finish or stop it."
             )
         }
         return try await performTrackedComparison(
@@ -14842,7 +14842,7 @@ final class PaperPathModel: ObservableObject {
               !isUpdatingVersionStorage
         else {
             throw PaperPathError.insufficientSelection(
-                "Another operation is already using this PDF. Wait for it to finish or stop it before trying again."
+                "This PDF is busy. Wait for the current task to finish or stop it."
             )
         }
         let token = UUID()
@@ -15503,7 +15503,7 @@ final class PaperPathModel: ObservableObject {
         let sceneID = resolvedFeedbackTarget(sceneID)
         clearActionNotice(for: sceneID)
         setPresentationError(
-            "Camera access is off. You can continue by importing PDFs, or enable Camera in Settings to scan paper."
+            "Camera access is off. Import a PDF or enable Camera in Settings."
                 .localizedUI,
             offersSettings: true,
             targetSceneID: sceneID

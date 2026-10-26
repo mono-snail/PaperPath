@@ -1835,7 +1835,7 @@ struct PageOrganizerView: View {
             }
             if !succeeded {
                 presentPageMutationError(
-                    "The page update could not be completed. Review the selection and try again."
+                    "Page update failed. Review the selection and try again."
                         .localizedUI
                 )
             }
@@ -3022,7 +3022,7 @@ private struct PageReplacementSheet: View {
                 message: sourceMode == .library
                     ? "Import another unlocked PDF before replacing this page."
                     : sourceMode == .files
-                        ? "Choose a PDF from Files. It stays temporary and is removed after replacement."
+                        ? "Choose a PDF from Files. It is removed after replacement."
                         : sourceMode == .photos
                             ? "Choose a photo. It becomes one temporary protected PDF page."
                             : "Scan one or more paper pages, then choose the replacement page."
@@ -3967,8 +3967,7 @@ private struct PageRuleWorkbench: View {
         WorkflowCommandHeader(
             eyebrow: "DETERMINISTIC RULES",
             title: "Select and arrange pages",
-            detail:
-                "Every match is visible before selection. Reordering always keeps every page.",
+            detail: "Review every match before selection. Reordering keeps all pages.",
             symbol: "line.3.horizontal.decrease",
             tint: PPColor.mint,
             metrics: [
@@ -4470,7 +4469,7 @@ private struct PageRuleWorkbench: View {
             analysisTask = nil
             if loaded == nil {
                 assessmentErrorMessage =
-                    "Page geometry could not be inspected. Number rules still work; retry before using orientation or paper rules."
+                    "Page size check failed. Retry before using orientation or paper rules."
                 assessmentErrorFeedback += 1
             }
             scheduleMatchCalculation()
@@ -5624,8 +5623,8 @@ private struct PageCropEditorView: View {
         ScrollView {
             VStack(spacing: PPSpacing.small) {
                 OperationBoundaryNotice(
-                    title: "Cropping changes visibility, not the source content",
-                    detail: "Other PDF tools may reveal content outside the crop box. Use Redact when information must be permanently removed.",
+                    title: "Cropping only hides content",
+                    detail: "Use Redact to remove information permanently.",
                     identifier: "pageCropBoundary",
                     symbol: "rectangle.dashed.badge.record"
                 )

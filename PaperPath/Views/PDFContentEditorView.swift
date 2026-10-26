@@ -673,8 +673,8 @@ struct PDFContentEditorView: View {
             }
 
             OperationBoundaryNotice(
-                title: "Document extras may not carry into the copy",
-                detail: "Embedded files, bookmarks, and custom page labels may not be preserved. The source PDF stays unchanged.",
+                title: "Some document extras may be lost",
+                detail: "Embedded files, bookmarks, or custom page labels may not carry over.",
                 identifier: "addContentStructureBoundary"
             )
 
@@ -2650,7 +2650,7 @@ struct PDFImageReplacementView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text(
-                    "This PDF reuses one image object in several places. The new private copy will update every reference together."
+                    "This image appears in several places. All uses will be replaced."
                 )
             }
             .confirmationDialog(
