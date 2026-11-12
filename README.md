@@ -1,4 +1,4 @@
-# PaperPath: Local PDF Editor
+# PaperPath: Local PDF Flow
 
 PaperPath is an iPhone and iPad app for reviewing private details and checking
 the actual PDF copy before sharing it. MonoWare develops and maintains this
