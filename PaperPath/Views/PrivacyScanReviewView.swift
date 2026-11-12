@@ -1085,6 +1085,7 @@ struct PrivacyScanReviewView: View {
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
+                    .accessibilityIdentifier("privacySelectedScopeSummary")
                     selectionMenu
                 }
                 .dynamicTypeSize(.accessibility1)
@@ -1370,6 +1371,9 @@ struct PrivacyScanReviewView: View {
         let selectionState = model.selectionState(for: category)
         let selectedCount = model.selectedCount(in: category)
         let locatableCount = model.locatableCount(in: category)
+        let labelLayout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 8))
+            : AnyLayout(HStackLayout(spacing: 10))
         return HStack(spacing: 10) {
             Button {
                 model.toggle(category: category)
@@ -1407,7 +1411,7 @@ struct PrivacyScanReviewView: View {
                     model.expandedCategories.remove(category)
                 }
             } label: {
-                HStack(spacing: 10) {
+                labelLayout {
                     Image(systemName: category.systemImage)
                         .foregroundStyle(PPColor.accent)
                     VStack(alignment: .leading, spacing: 2) {
@@ -1424,20 +1428,22 @@ struct PrivacyScanReviewView: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                     }
-                    Spacer()
-                    Text("\(count)")
+                    if !dynamicTypeSize.ppPrefersExpandedLayout { Spacer() }
+                    HStack(spacing: 10) {
+                        Text("\(count)")
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                        Image(
+                            systemName:
+                                model.expandedCategories.contains(category)
+                                ? "chevron.up"
+                                : "chevron.down"
+                        )
+                        .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
-                        .monospacedDigit()
-                    Image(
-                        systemName:
-                            model.expandedCategories.contains(category)
-                            ? "chevron.up"
-                            : "chevron.down"
-                    )
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    }
                 }
-                .frame(minHeight: 44)
+                .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
@@ -1918,7 +1924,7 @@ struct PrivacyScanReviewView: View {
                             .accessibilityHidden(true)
                         }
                     }
-                    Text("Copy ready. Original unchanged.".localizedUI)
+                    Text("Saved redactions. The previous version is in History.".localizedUI)
                         .font(.subheadline)
                         .foregroundStyle(PPColor.onInkSecondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1952,14 +1958,14 @@ struct PrivacyScanReviewView: View {
                             openCreatedCopy(createdRecordID)
                         } label: {
                             Label(
-                                "Open Redacted Copy".localizedUI,
+                                "Open Redacted Document".localizedUI,
                                 systemImage: "doc.text.magnifyingglass"
                             )
                             .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(PPPrimaryButtonStyle())
                         .accessibilityHint(
-                            "Opens the saved result copy."
+                            "Opens this document with the saved redactions."
                                 .localizedUI
                         )
                         .accessibilityIdentifier(
@@ -2090,7 +2096,7 @@ struct PrivacyScanReviewView: View {
 
     private var confirmationMessage: String {
         AppLocalization.format(
-            "Removes %@ on %@ permanently. Cannot be undone. Original unchanged.",
+            "Removes %@ on %@ from this document. The previous version remains in History and may contain the removed content.",
             regionCountText(model.selectedRegionCount),
             pageCountText(model.selectedPageCount)
         )
@@ -2210,13 +2216,13 @@ private enum PrivacyScanReviewError: LocalizedError {
             "The selected findings have no regions that can be safely redacted."
                 .localizedUI
         case .outputFailed:
-            "The redacted copy was not completed. Review the notice and try again."
+            "Redaction was not completed. Review the notice and try again."
                 .localizedUI
         case .managedOutputUnavailable:
-            "The redacted copy was created, but its managed file is unavailable."
+            "The redactions were saved, but the document file is unavailable."
                 .localizedUI
         case .sharePreparationFailed:
-            "Copy saved in the Library. Open it there to share."
+            "Changes saved in the Library. Open the document there to share."
                 .localizedUI
         }
     }
@@ -2239,7 +2245,9 @@ struct PrivacyScanWorkspaceSheet: View {
     var body: some View {
         Group {
             if model.record(id: recordID)?.contentRevisionID
-                != contentRevisionID {
+                != contentRevisionID,
+               reviewModel.phase != .redacting,
+               reviewModel.phase != .completed {
                 unavailableView(
                     message: PrivacyScanReviewError.sourceChanged
                         .localizedDescription
@@ -2253,10 +2261,7 @@ struct PrivacyScanWorkspaceSheet: View {
                     textIndex: textIndex,
                     ocrResult: model.ocrResults[recordID],
                     documentRevisionID: contentRevisionID,
-                    onLocate: { finding in
-                        onLocate(finding)
-                        dismiss()
-                    },
+                    onLocate: onLocate,
                     onRedact: redact,
                     onOpenCreatedCopy: { createdRecordID in
                         onOpenDocument(

@@ -919,7 +919,10 @@ struct PDFDocumentView: UIViewRepresentable {
             try? fileManager.removeItem(at: stagingURL)
         }
 
-        guard document.write(to: stagingURL) else {
+        do {
+            try PDFContentPreservingWriter.write(document, to: stagingURL, sourceURLs: [url],
+                password: document.isEncrypted ? unlockPassword : nil, sourcePassword: unlockPassword)
+        } catch {
             deliverCommandMessage(
                 "The annotation could not be saved. Your existing PDF was not changed."
             )
@@ -1053,8 +1056,18 @@ struct PDFDocumentView: UIViewRepresentable {
             : nil
         coordinator.resetSelectionSnapshot()
         resetTextSelection(in: view)
+        if let previous = view.document {
+            coordinator.retiredDocuments.append((previous, coordinator.documentBackingData))
+            if coordinator.retiredDocuments.count > 2 { coordinator.retiredDocuments.removeFirst() }
+        }
         view.document = nil
-        let document = PDFDocument(url: url)
+        // Give the viewer its own provider, separate from background audits and
+        // thumbnails. Keep recent providers alive while UIKit retires AX nodes.
+        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        let backing = size > 0 && size <= 32 * 1_024 * 1_024
+            ? try? Data(contentsOf: url, options: .alwaysMapped) : nil
+        coordinator.documentBackingData = backing
+        let document = backing.flatMap(PDFDocument.init(data:)) ?? PDFDocument(url: url)
         if let document,
            let unlockPassword,
            !unlockPassword.isEmpty {
@@ -1062,7 +1075,9 @@ struct PDFDocumentView: UIViewRepresentable {
                 || document.unlock(withPassword: unlockPassword)
             deliverUnlock(didUnlock)
         }
-        view.document = document
+        // PDFKit's accessibility layout is unsafe for a still-locked document.
+        // The workspace presents its unlock UI; attach pages only after unlock.
+        view.document = document?.isLocked == false ? document : nil
         view.autoScales = true
         restoreTextSelectionInteraction(in: view)
         viewport?.restore(in: view)
@@ -1490,6 +1505,8 @@ struct PDFDocumentView: UIViewRepresentable {
         var readingPreferences: PDFReadingPreferences?
         fileprivate var fileRevision: PDFFileRevision?
         var skipsNextSelfMutationReload = false
+        var documentBackingData: Data?
+        var retiredDocuments: [(PDFDocument, Data?)] = []
         var evidenceOverlay: PDFEvidenceOverlay?
         var searchHighlight: PDFTextSearchHighlight?
         var evidenceAnnotations: [PDFAnnotation] = []
@@ -2480,9 +2497,10 @@ struct ShareSheet: UIViewControllerRepresentable {
 struct FileExportPicker: UIViewControllerRepresentable {
     let url: URL
     let onCompletion: () -> Void
+    var onExported: ([URL]) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onCompletion: onCompletion)
+        Coordinator(onCompletion: onCompletion, onExported: onExported)
     }
 
     func makeUIViewController(
@@ -2506,11 +2524,13 @@ struct FileExportPicker: UIViewControllerRepresentable {
     @MainActor
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
         private let onCompletion: () -> Void
+        private let onExported: ([URL]) -> Void
         private let shareLease = ManagedShareLease()
         private var hasCompleted = false
 
-        init(onCompletion: @escaping () -> Void) {
+        init(onCompletion: @escaping () -> Void, onExported: @escaping ([URL]) -> Void) {
             self.onCompletion = onCompletion
+            self.onExported = onExported
         }
 
         func beginShareLease(for url: URL) {
@@ -2521,6 +2541,8 @@ struct FileExportPicker: UIViewControllerRepresentable {
             _ controller: UIDocumentPickerViewController,
             didPickDocumentsAt urls: [URL]
         ) {
+            guard !hasCompleted else { return }
+            if !urls.isEmpty { onExported(urls) }
             complete()
         }
 

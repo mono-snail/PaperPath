@@ -45,7 +45,7 @@ struct DocumentBriefView: View {
                 PPCanvas()
                 if model.record(id: recordID) == nil {
                     ContentUnavailableView(
-                        "Working copy unavailable",
+                        "Document unavailable",
                         systemImage: "doc.badge.ellipsis",
                         description: Text(
                             "This private working copy is no longer available."
@@ -1095,7 +1095,7 @@ struct DocumentBriefView: View {
                 )
                 ProfileMetric(
                     value: record.profile.formattedSize,
-                    label: "Working copy",
+                    label: "Document",
                     symbol: "internaldrive"
                 )
                 ProfileMetric(

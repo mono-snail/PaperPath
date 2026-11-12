@@ -13,3 +13,30 @@ debug-*.md
 __pycache__/
 
 .wrangler/
+
+# Downloaded, hash-pinned PDF release corpus (test bundle only).
+PaperPathTests/Fixtures/RealPDFCorpus/*.pdf
+
+# Local artifacts and separately maintained projects.
+/output/
+/tmp/
+/.codex/
+/design/
+/website/
+/Android/
+
+# Internal planning and submission records stay local.
+/docs/*
+!/docs/public/
+!/docs/AUTOMATION_COVERAGE.json
+!/docs/RELEASE_TESTING_ZH.md
+!/docs/TECHNICAL_NOTES_PDFKIT_VISIONKIT.md
+
+# Signing credentials and machine-local configuration.
+*.p8
+*.p12
+*.mobileprovision
+*.xcarchive/
+.env
+.env.*
+!.env.example

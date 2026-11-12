@@ -1,204 +1,326 @@
 {
   "schemaVersion": 2,
-  "requiredJourneyEvidence": ["operationResult", "cancelReentry", "stateIsolation", "processSurvival"],
+  "requiredJourneyEvidence": [
+    "operationResult",
+    "cancelReentry",
+    "stateIsolation",
+    "processSurvival"
+  ],
   "quickTasks": {
     "scanToPDF": {
-      "logicTests": ["testScanRendererProducesImageDominantPages", "testScanManualCropAndPerPageRenderingUseSharedOptions_BitsUT"],
+      "logicTests": [
+        "testScanRendererProducesImageDominantPages",
+        "testScanManualCropAndPerPageRenderingUseSharedOptions_BitsUT"
+      ],
       "journeyTest": "testScanToPDFJourneyCreatesReviewedTwoPageDocument",
       "deviceRequired": true
     },
     "imagesToPDF": {
-      "logicTests": ["testScanRendererProducesImageDominantPages", "testModel_concurrentImageImportsKeepOperationOwnership_BitsUT"],
+      "logicTests": [
+        "testScanRendererProducesImageDominantPages",
+        "testModel_concurrentImageImportsKeepOperationOwnership_BitsUT"
+      ],
       "journeyTest": "testImagesToPDFJourneyCreatesReviewedTwoPageDocument",
       "deviceRequired": false
     },
     "mergePDFs": {
-      "logicTests": ["testCombineAndExtractPreservePageOrder"],
+      "logicTests": [
+        "testCombineAndExtractPreservePageOrder"
+      ],
       "journeyTest": "testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "splitPDF": {
-      "logicTests": ["testCompositionExtraction_deduplicatesAndRejectsInvalidPages_BitsUT", "testLongDocumentExtractionPreservesSelectedOrder"],
+      "logicTests": [
+        "testCompositionExtraction_deduplicatesAndRejectsInvalidPages_BitsUT",
+        "testLongDocumentExtractionPreservesSelectedOrder"
+      ],
       "journeyTest": "testSplitPDFQuickJourneyCreatesCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "organizePages": {
-      "logicTests": ["testPageMutationRotateMoveAndDelete", "testPageMutationUndoRestoresPagesAndBookmarks"],
+      "logicTests": [
+        "testPageMutationRotateMoveAndDelete",
+        "testPageMutationUndoRestoresPagesAndBookmarks"
+      ],
       "journeyTest": "testOrganizePagesQuickJourneyCreatesCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "compressPDF": {
-      "logicTests": ["testCompressionCreatesSeparateSmallerReadablePDF", "testCompressionDoesNotPublishCopyLargerThanSource"],
+      "logicTests": [
+        "testCompressionCreatesSeparateSmallerReadablePDF",
+        "testCompressionDoesNotPublishCopyLargerThanSource"
+      ],
       "journeyTest": "testCompressPDFQuickJourneyKeepsAlreadySmallerOriginal",
       "deviceRequired": false
     },
     "fillForms": {
-      "logicTests": ["testFormFieldCreationAndCompatibilityReport", "testRadioGroupAndChoiceFieldRoundTrip"],
+      "logicTests": [
+        "testFormFieldCreationAndCompatibilityReport",
+        "testRadioGroupAndChoiceFieldRoundTrip"
+      ],
       "journeyTest": "testFillFormsQuickJourneyAddsFieldAfterCancelAndReentry",
       "deviceRequired": false
     },
     "signPDF": {
-      "logicTests": ["testSignaturePlacementRespectsSelectedPositionAndSize", "testVisualSignatureCompletesOnlyItsOverlappingFormField"],
+      "logicTests": [
+        "testSignaturePlacementRespectsSelectedPositionAndSize",
+        "testVisualSignatureCompletesOnlyItsOverlappingFormField"
+      ],
       "journeyTest": "testSignPDFQuickJourneyPlacesSignatureAfterCancelAndReentry",
       "deviceRequired": true
     },
     "redactPDF": {
-      "logicTests": ["testSecureRedactionRemovesUnderlyingTextLayer", "testSecureRedactionRejectsUnlocatedFinding"],
+      "logicTests": [
+        "testSecureRedactionRemovesUnderlyingTextLayer",
+        "testSecureRedactionRejectsUnlocatedFinding"
+      ],
       "journeyTest": "testRedactPDFQuickJourneyCreatesSecureCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "protectPDF": {
-      "logicTests": ["testProtectedCopyRequiresPassword", "testProtectedCopyRejectsShortPassword"],
+      "logicTests": [
+        "testProtectedCopyRequiresPassword",
+        "testProtectedCopyRejectsShortPassword"
+      ],
       "journeyTest": "testProtectPDFJourneyCreatesCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "safeShare": {
-      "logicTests": ["testSafeShareAuditVerifiesEveryPageAndFingerprint", "testDeliveryAuditRejectsMissingOutputPage"],
+      "logicTests": [
+        "testSafeShareAuditVerifiesEveryPageAndFingerprint",
+        "testDeliveryAuditRejectsMissingOutputPage"
+      ],
       "journeyTest": "testSafeShareQuickJourneyCreatesVerifiedCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "recognizeText": {
-      "logicTests": ["testSearchableCopyContainsVisionTextLayer", "testOCRAppliesLanguageConfigurationAndKeepsLegacyResults"],
+      "logicTests": [
+        "testSearchableCopyContainsVisionTextLayer",
+        "testOCRAppliesLanguageConfigurationAndKeepsLegacyResults"
+      ],
       "journeyTest": "testRecognizeTextQuickJourneyProducesResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "exportText": {
-      "logicTests": ["testTextExportUsesOCRIndexWhenPDFHasNoTextLayer", "testExcelWorkbookPreservesPageTablesAndOCRFallback", "testPowerPointExportCreatesOneSearchableSlidePerPage"],
+      "logicTests": [
+        "testTextExportUsesOCRIndexWhenPDFHasNoTextLayer",
+        "testExcelWorkbookPreservesPageTablesAndOCRFallback",
+        "testPowerPointExportCreatesOneSearchableSlidePerPage"
+      ],
       "journeyTest": "testExportTextQuickJourneyProducesResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "exportImages": {
-      "logicTests": ["testPageImageExport_allPresetsProduceStablePageSet_BitsUT"],
+      "logicTests": [
+        "testPageImageExport_allPresetsProduceStablePageSet_BitsUT"
+      ],
       "journeyTest": "testExportImagesJourneyProducesShareablePageFilesAfterReentry",
       "deviceRequired": false
     }
   },
   "documentTools": {
     "brief": {
-      "logicTests": ["testDocumentUnderstandingExtractsInvoiceFactsAndSteps"],
+      "logicTests": [
+        "testDocumentUnderstandingExtractsInvoiceFactsAndSteps"
+      ],
       "journeyTest": "testBriefJourneyLoadsResultAfterCloseAndReentry",
       "deviceRequired": false
     },
     "find": {
-      "logicTests": ["testTextIndexFindsMatchingPage", "testDocumentTextIndex_segmentsAndBoundsSearchResults_BitsUT"],
+      "logicTests": [
+        "testTextIndexFindsMatchingPage",
+        "testDocumentTextIndex_segmentsAndBoundsSearchResults_BitsUT"
+      ],
       "journeyTest": "testFindJourneyReturnsResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "recognize": {
-      "logicTests": ["testSearchableCopyContainsVisionTextLayer", "testOCRResult_duplicatePagePrefersCorrectedAndQualityText_BitsUT"],
+      "logicTests": [
+        "testSearchableCopyContainsVisionTextLayer",
+        "testOCRResult_duplicatePagePrefersCorrectedAndQualityText_BitsUT"
+      ],
       "journeyTest": "testOCRJourneyProducesSearchableResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "highlight": {
-      "logicTests": ["testAnnotationPropertiesRebuildAppearanceAndVerify"],
+      "logicTests": [
+        "testAnnotationPropertiesRebuildAppearanceAndVerify"
+      ],
       "journeyTest": "testHighlightJourneyWritesMarkupAfterCancelAndReentry",
       "deviceRequired": false
     },
     "underline": {
-      "logicTests": ["testAnnotationPropertiesRebuildAppearanceAndVerify"],
+      "logicTests": [
+        "testAnnotationPropertiesRebuildAppearanceAndVerify"
+      ],
       "journeyTest": "testUnderlineJourneyWritesMarkupAfterCancelAndReentry",
       "deviceRequired": false
     },
     "strikeOut": {
-      "logicTests": ["testAnnotationPropertiesRebuildAppearanceAndVerify"],
+      "logicTests": [
+        "testAnnotationPropertiesRebuildAppearanceAndVerify"
+      ],
       "journeyTest": "testStrikeoutJourneyWritesMarkupAfterCancelAndReentry",
       "deviceRequired": false
     },
     "ink": {
-      "logicTests": ["testInkAnnotationPersistsAsPDFAnnotation"],
+      "logicTests": [
+        "testInkAnnotationPersistsAsPDFAnnotation"
+      ],
       "journeyTest": "testInkJourneyWritesDrawingAfterCancelAndReentry",
       "deviceRequired": true
     },
     "note": {
-      "logicTests": ["testAnnotationPropertiesRebuildAppearanceAndVerify", "testFreeTextEditPreservesIndependentFontColor"],
+      "logicTests": [
+        "testAnnotationPropertiesRebuildAppearanceAndVerify",
+        "testFreeTextEditPreservesIndependentFontColor"
+      ],
       "journeyTest": "testNoteJourneyWritesCommentAfterCancelAndReentry",
       "deviceRequired": false
     },
     "stamp": {
-      "logicTests": ["testStandardStampPersistsAsInteroperableAnnotation"],
+      "logicTests": [
+        "testStandardStampPersistsAsInteroperableAnnotation"
+      ],
       "journeyTest": "testStampJourneyAddsEditableAnnotationAfterCancelAndReentry",
       "deviceRequired": false
     },
     "watermark": {
-      "logicTests": ["testGeneratedPageMarks_roundTripAndRemoveIndependently_BitsUT"],
+      "logicTests": [
+        "testGeneratedPageMarks_roundTripAndRemoveIndependently_BitsUT"
+      ],
       "journeyTest": "testWatermarkJourneyWritesAnnotationsAfterCancelAndReentry",
       "deviceRequired": false
     },
     "bates": {
-      "logicTests": ["testBatesFormattingPlanAndReceiptContracts_BitsUT", "testBatesBatchTransactionReceiptMatchingAndRemoval_BitsUT"],
+      "logicTests": [
+        "testBatesFormattingPlanAndReceiptContracts_BitsUT",
+        "testBatesBatchTransactionReceiptMatchingAndRemoval_BitsUT"
+      ],
       "journeyTest": "testBatesJourneyWritesPageIDsAfterCancelAndReentry",
       "deviceRequired": false
     },
     "content": {
-      "logicTests": ["testImageObjectReplacementRemovesOriginalJPEGBytes", "testCrossPageTextFlowRebuildsAndVerifiesBothPages", "testTextReplacementAndContentValidationSafetyMatrix_BitsUT"],
+      "logicTests": [
+        "testImageObjectReplacementRemovesOriginalJPEGBytes",
+        "testCrossPageTextFlowRebuildsAndVerifiesBothPages",
+        "testTextReplacementAndContentValidationSafetyMatrix_BitsUT"
+      ],
       "journeyTest": "testContentJourneyCreatesEditedCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "links": {
-      "logicTests": ["testExistingLinkCanChangeTargetAndBeRemoved"],
+      "logicTests": [
+        "testExistingLinkCanChangeTargetAndBeRemoved"
+      ],
       "journeyTest": "testLinksJourneyCreatesEditedCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "annotations": {
-      "logicTests": ["testAnnotationInventoryAndBatchRemovalFailClosed_BitsUT"],
+      "logicTests": [
+        "testAnnotationInventoryAndBatchRemovalFailClosed_BitsUT"
+      ],
       "journeyTest": "testAnnotationsJourneyReloadsInventoryAfterCloseAndReentry",
       "deviceRequired": false
     },
     "attachments": {
-      "logicTests": ["testDocumentStructure_attachmentLabelsAndReviewRoundTrip_BitsUT", "testExtractAttachments_invalidSelectionLeavesNoOutput_BitsUT"],
+      "logicTests": [
+        "testDocumentStructure_attachmentLabelsAndReviewRoundTrip_BitsUT",
+        "testExtractAttachments_invalidSelectionLeavesNoOutput_BitsUT"
+      ],
       "journeyTest": "testAttachmentsJourneyReloadsInspectionAfterCloseAndReentry",
       "deviceRequired": false
     },
     "compare": {
-      "logicTests": ["testCompareVersionsFindsTextAndVisiblePageChange", "testCompareVersionsReportsAddedPage"],
+      "logicTests": [
+        "testCompareVersionsFindsTextAndVisiblePageChange",
+        "testCompareVersionsReportsAddedPage"
+      ],
       "journeyTest": "testCompareJourneyLoadsResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "sign": {
-      "logicTests": ["testSignaturePlacementRespectsSelectedPositionAndSize", "testTaskCheckpointPersistsExactSignatureResume"],
+      "logicTests": [
+        "testSignaturePlacementRespectsSelectedPositionAndSize",
+        "testTaskCheckpointPersistsExactSignatureResume"
+      ],
       "journeyTest": "testSignJourneyPlacesSignatureAfterCancelAndReentry",
       "deviceRequired": true
     },
     "redact": {
-      "logicTests": ["testSecureRedactionRemovesUnderlyingTextLayer"],
+      "logicTests": [
+        "testSecureRedactionRemovesUnderlyingTextLayer"
+      ],
       "journeyTest": "testRedactJourneyCreatesSecureCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "fillForm": {
-      "logicTests": ["testFormFieldCreationAndCompatibilityReport", "testFormFieldCreationRejectsDuplicateName"],
+      "logicTests": [
+        "testFormFieldCreationAndCompatibilityReport",
+        "testFormFieldCreationRejectsDuplicateName"
+      ],
       "journeyTest": "testFillFormJourneyAddsFieldAfterCancelAndReentry",
       "deviceRequired": false
     },
     "bookmarks": {
-      "logicTests": ["testBookmarksPersistAndDiscardInvalidPages", "testOutputAddedContentAndEmbeddedBookmarksRoundTrip_BitsUT"],
+      "logicTests": [
+        "testBookmarksPersistAndDiscardInvalidPages",
+        "testOutputAddedContentAndEmbeddedBookmarksRoundTrip_BitsUT"
+      ],
       "journeyTest": "testBookmarksJourneyPersistsResultAfterCancelAndReentry",
       "deviceRequired": false
     },
     "organize": {
-      "logicTests": ["testPageMutationRotateMoveAndDelete", "testMutation_invalidReorderLeavesSourceUnchanged_BitsUT"],
+      "logicTests": [
+        "testPageMutationRotateMoveAndDelete",
+        "testMutation_invalidReorderLeavesSourceUnchanged_BitsUT"
+      ],
       "journeyTest": "testOrganizeJourneyCreatesCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "compress": {
-      "logicTests": ["testCompressionDoesNotPublishCopyLargerThanSource", "testCompressionEstimateIdentifiesAlreadySmallerOriginal"],
+      "logicTests": [
+        "testCompressionDoesNotPublishCopyLargerThanSource",
+        "testCompressionEstimateIdentifiesAlreadySmallerOriginal"
+      ],
       "journeyTest": "testCompressJourneyExplainsAlreadySmallerOriginalAfterReentry",
       "deviceRequired": false
     },
     "protect": {
-      "logicTests": ["testProtectedCopyRequiresPassword", "testProtect_permissionMatrixRoundTrips_BitsUT"],
+      "logicTests": [
+        "testProtectedCopyRequiresPassword",
+        "testProtect_permissionMatrixRoundTrips_BitsUT"
+      ],
       "journeyTest": "testDocumentProtectJourneyCreatesCopyAfterCancelAndReentry",
       "deviceRequired": false
     },
     "export": {
-      "logicTests": ["testPageImageExport_allPresetsProduceStablePageSet_BitsUT", "testOfficeExports_mixedGeometryPassesCRCXMLAndRels_BitsUT"],
+      "logicTests": [
+        "testPageImageExport_allPresetsProduceStablePageSet_BitsUT",
+        "testOfficeExports_mixedGeometryPassesCRCXMLAndRels_BitsUT"
+      ],
       "journeyTest": "testExportJourneyProducesPageFilesAfterCancelAndReentry",
       "deviceRequired": false
     }
   },
   "workflows": {
     "privacyScan": {
-      "logicTests": ["testReviewModelScansManagedURL", "testReviewSelectionSupportsItemCategoryAndAll", "testResetClearsCachedReviewBeforeDocumentRevisionChanges", "testSecureRedactionFlattensAndRemovesSearchableText", "testCancelledRedactionCannotPublishLateOutcome"],
+      "logicTests": [
+        "testReviewModelScansManagedURL",
+        "testReviewSelectionSupportsItemCategoryAndAll",
+        "testResetClearsCachedReviewBeforeDocumentRevisionChanges",
+        "testSecureRedactionFlattensAndRemovesSearchableText",
+        "testCancelledRedactionCannotPublishLateOutcome"
+      ],
       "journeyTest": "testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry",
+      "deviceRequired": false
+    },
+    "sharingCheckStart": {
+      "logicTests": [
+        "testSharingSampleNeverReusesOrChangesAnExistingDocument"
+      ],
+      "journeyTest": "testShareCheckJourneyCompletesFictionalSampleAfterCancelAndReentry",
       "deviceRequired": false
     }
   }

@@ -13,6 +13,7 @@ struct CombineDocumentsView: View {
 
     let onCreated: (UUID) -> Void
 
+    @State private var workflowFeedbackID = UUID()
     @State private var selectedIDs: [UUID] = []
     @State private var isLibraryExpanded = true
     @State private var draggedID: UUID?
@@ -28,6 +29,7 @@ struct CombineDocumentsView: View {
     @State private var createdID: UUID?
     @State private var createdSourceCount = 0
     @State private var isStopRequested = false
+    @State private var confirmsClearOrder = false
 
     var body: some View {
         NavigationStack {
@@ -113,7 +115,7 @@ struct CombineDocumentsView: View {
                 }
             case .failure(let error):
                 if !Self.isFileImportCancellation(error) {
-                    model.present(error, in: paperPathSceneID)
+                    model.present(error, in: workflowFeedbackID)
                 }
                 return
             }
@@ -123,7 +125,7 @@ struct CombineDocumentsView: View {
             importGeneration = generation
             isStopRequested = false
             importTask = Task { @MainActor in
-                let imported = await model.withFeedbackTarget(paperPathSceneID) {
+                let imported = await model.withFeedbackTarget(workflowFeedbackID) {
                     await model.importPDFs(
                         from: urls,
                         progressID: generation
@@ -147,11 +149,33 @@ struct CombineDocumentsView: View {
                         PaperPathError.insufficientSelection(
                             "Merge limit reached. Extra PDFs remain in the Library."
                         ),
-                        in: paperPathSceneID
+                        in: workflowFeedbackID
                     )
                 }
                 importTask = nil
             }
+        }
+        .alert(
+            "Couldn’t complete that".localizedUI,
+            isPresented: Binding(
+                get: { model.presentationError(for: workflowFeedbackID) != nil },
+                set: { if !$0 { model.clearError(from: workflowFeedbackID) } }
+            )
+        ) {
+            if model.presentationError(for: workflowFeedbackID)?.offersSettings == true {
+                Button("Open Settings".localizedUI) {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                    model.clearError(from: workflowFeedbackID)
+                }
+            }
+            Button((model.presentationError(for: workflowFeedbackID)?.offersSettings == true
+                    ? "Not Now" : "OK").localizedUI, role: .cancel) {
+                model.clearError(from: workflowFeedbackID)
+            }
+        } message: {
+            Text((model.presentationError(for: workflowFeedbackID)?.message ?? "").localizedUI)
         }
         .interactiveDismissDisabled(hasActiveTask)
         .accessibilityAction(.escape) {
@@ -164,6 +188,9 @@ struct CombineDocumentsView: View {
         .onDisappear {
             cancelImport()
             cancelOperation(invalidateResult: true)
+            model.releasePresentationErrorTarget(for: workflowFeedbackID)
+            model.releaseTransientNoticeTarget(for: workflowFeedbackID)
+            model.releaseActionNoticeTarget(for: workflowFeedbackID)
         }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .background else { return }
@@ -191,9 +218,8 @@ struct CombineDocumentsView: View {
         .onAppear {
             reconcileSelection()
         }
-        .onChange(of: selectedIDs.count) { oldCount, newCount in
+        .onChange(of: selectedIDs.count) { _, newCount in
             if newCount < 2 { isLibraryExpanded = true }
-            else if oldCount < 2 { isLibraryExpanded = false }
         }
         .sensoryFeedback(.selection, trigger: selectedIDs.count)
         .sensoryFeedback(.success, trigger: createdID)
@@ -228,8 +254,9 @@ struct CombineDocumentsView: View {
                     Text("From your library".localizedUI)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
+                        .accessibilityIdentifier("mergeLibraryDisclosure")
+                        .accessibilityValue((isLibraryExpanded ? "Expanded" : "Collapsed").localizedUI)
                 }
-                .accessibilityIdentifier("mergeLibraryDisclosure")
             }
             Label("Originals stay unchanged".localizedUI, systemImage: "doc")
                 .font(.caption)
@@ -240,6 +267,7 @@ struct CombineDocumentsView: View {
     private var librarySources: some View {
         VStack(alignment: .leading, spacing: PPSpacing.medium) {
             TextField("Search PDFs to merge".localizedUI, text: $sourceQuery)
+                .accessibilityIdentifier("mergeLibrarySearch")
                 .textFieldStyle(.roundedBorder)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -352,7 +380,7 @@ struct CombineDocumentsView: View {
                 .accessibilityLabel("Arrange merge order".localizedUI)
                 .help("Arrange merge order".localizedUI)
                 Button {
-                    selectedIDs.removeAll(keepingCapacity: false)
+                    confirmsClearOrder = true
                 } label: {
                     Image(systemName: "xmark.circle")
                         .frame(width: 44, height: 44)
@@ -361,9 +389,27 @@ struct CombineDocumentsView: View {
                 .foregroundStyle(PPColor.textSecondary)
                 .disabled(hasActiveTask)
                 .accessibilityLabel("Clear merge order".localizedUI)
+                .accessibilityIdentifier("mergeClearSelection")
+                .alert(
+                    "Clear merge order?".localizedUI,
+                    isPresented: $confirmsClearOrder
+                ) {
+                    Button("Clear merge order".localizedUI, role: .destructive) {
+                        guard !hasActiveTask else { return }
+                        selectedIDs.removeAll(keepingCapacity: false)
+                        draggedID = nil
+                    }
+                    .accessibilityIdentifier("mergeConfirmClearSelection")
+                    Button("Cancel".localizedUI, role: .cancel) { }
+                } message: {
+                    Text("Your PDFs stay in the Library.".localizedUI)
+                }
             }
 
-            LazyVStack(spacing: 0) {
+            // The merge order is capped at 64 PDFs. Measure every selected row
+            // so large-text row heights and drag targets do not depend on lazy
+            // estimates that change as a source moves out of the library.
+            VStack(spacing: 0) {
                 ForEach(Array(selectedRecords.enumerated()), id: \.element.id) {
                     index,
                     record in
@@ -378,7 +424,9 @@ struct CombineDocumentsView: View {
                 }
             }
             .coordinateSpace(name: "mergeOrder")
-            .onPreferenceChange(MergeOrderFramePreference.self) { mergeRowFrames = $0 }
+            .onPreferenceChange(MergeOrderFramePreference.self) { frames in
+                if mergeRowFrames != frames { mergeRowFrames = frames }
+            }
             .overlay(alignment: .top) {
                 Rectangle()
                     .fill(PPColor.border.opacity(0.62))
@@ -628,6 +676,7 @@ struct CombineDocumentsView: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(PPColor.accent)
                     .disabled(hasActiveTask)
+                    .accessibilityIdentifier("mergeAddAll")
                     .accessibilityHint(
                         "Adds matching unlocked PDFs within the merge limits."
                             .localizedUI
@@ -659,7 +708,10 @@ struct CombineDocumentsView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, PPSpacing.large)
             } else {
-                LazyVStack(spacing: 0) {
+                // Adding a source grows the selected order above this list.
+                // Lazy height estimates can oscillate while a row is removed
+                // and the whole list shifts past the viewport at large text.
+                VStack(spacing: 0) {
                     ForEach(
                         Array(availableRecords.enumerated()),
                         id: \.element.id
@@ -938,7 +990,7 @@ struct CombineDocumentsView: View {
                             }
                         }
                         let created = await model.withFeedbackTarget(
-                            paperPathSceneID
+                            workflowFeedbackID
                         ) {
                             await model.combineDocuments(
                                 recordIDs: sourceIDs,

@@ -4,6 +4,382 @@ import PDFKit
 import QuickLookThumbnailing
 import UIKit
 import XCTest
+import zlib
+
+/// Downloaded originals, never rewritten before exercising the service.
+/// FetchRealPDFCorpus.py pins bytes; missing files fail rather than skip.
+final class RealPDFReleaseTests: XCTestCase {
+    private struct Manifest: Decodable { let documents: [Sample] }
+    private struct Sample: Decodable { let file: String; let sha256: String }
+    private var directory: URL!
+    private var rows: [[String: String]] = []
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("RealPDF-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    override func tearDownWithError() throws {
+        let data = try JSONSerialization.data(withJSONObject: rows, options: [.prettyPrinted, .sortedKeys])
+        let attachment = XCTAttachment(data: data, uniformTypeIdentifier: "public.json")
+        attachment.name = "real-pdf-\(name.components(separatedBy: " ").last ?? "results").json"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        try? FileManager.default.removeItem(at: directory)
+    }
+    private func samples() throws -> [URL] {
+        let root = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "RealPDFCorpus", withExtension: nil))
+        let manifest = try JSONDecoder().decode(Manifest.self, from: Data(contentsOf: root.appendingPathComponent("manifest.json")))
+        XCTAssertGreaterThanOrEqual(manifest.documents.count, 8)
+        return try manifest.documents.map { sample in
+            let url = root.appendingPathComponent(sample.file)
+            let bytes = try Data(contentsOf: url)
+            XCTAssertEqual(SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined(), sample.sha256)
+            return url
+        }
+    }
+    private func output(_ source: URL, _ action: String) -> URL {
+        directory.appendingPathComponent("\(source.deletingPathExtension().lastPathComponent)-\(action).pdf")
+    }
+    private func attach(_ url: URL) throws {
+        let item = XCTAttachment(data: try Data(contentsOf: url), uniformTypeIdentifier: "com.adobe.pdf")
+        item.name = url.lastPathComponent
+        item.lifetime = .keepAlways
+        add(item)
+    }
+    private func verify(_ url: URL, against source: URL, indices: [Int]? = nil, text: Bool = true) throws {
+        let before = try XCTUnwrap(PDFDocument(url: source))
+        let after = try XCTUnwrap(PDFDocument(url: url))
+        let expected = indices ?? Array(0..<before.pageCount)
+        XCTAssertEqual(after.pageCount, expected.count)
+        for (destinationIndex, sourceIndex) in expected.enumerated() {
+            let lhs = try XCTUnwrap(before.page(at: sourceIndex)), rhs = try XCTUnwrap(after.page(at: destinationIndex))
+            if text { XCTAssertEqual(lhs.bounds(for: .mediaBox), rhs.bounds(for: .mediaBox)) }
+            else {
+                let size = lhs.bounds(for: .cropBox).size
+                let rotated = ((lhs.rotation % 360) + 360) % 360
+                let expectedSize = rotated == 90 || rotated == 270 ? CGSize(width: size.height, height: size.width) : size
+                XCTAssertEqual(expectedSize.width, rhs.bounds(for: .mediaBox).width, accuracy: 0.01)
+                XCTAssertEqual(expectedSize.height, rhs.bounds(for: .mediaBox).height, accuracy: 0.01)
+            }
+            if text { XCTAssertTrue(normalizedText(lhs.string) == normalizedText(rhs.string), "Searchable text changed on page \(sourceIndex + 1)") }
+            XCTAssertNotNil(rhs.thumbnail(of: CGSize(width: 160, height: 200), for: .mediaBox).cgImage)
+        }
+    }
+    private func normalizedText(_ value: String?) -> String {
+        (value ?? "").precomposedStringWithCompatibilityMapping
+            .components(separatedBy: CharacterSet.whitespacesAndNewlines.union(.controlCharacters).union(CharacterSet(charactersIn: "\u{fffc}"))).joined()
+    }
+    private func run(_ source: URL, _ feature: String, _ operation: () throws -> URL) {
+        autoreleasepool {
+            let before = (try? Data(contentsOf: source)) ?? Data()
+            let failuresBefore = testRun?.failureCount ?? 0
+            do {
+                let result = try operation()
+                let size = (try? Data(contentsOf: result).count) ?? 0
+                let status = (testRun?.failureCount ?? 0) == failuresBefore ? "passed" : "failed"
+                rows.append(["file": source.lastPathComponent, "feature": feature, "status": status, "input": "\(before.count)", "output": "\(size)"])
+                print("REAL_PDF \(source.lastPathComponent) \(feature) \(before.count) -> \(size)")
+            } catch let error as PaperPathError {
+                if case .compressionNotBeneficial = error {
+                    rows.append(["file": source.lastPathComponent, "feature": feature, "status": "unchanged", "input": "\(before.count)", "reason": error.localizedDescription])
+                    print("REAL_PDF \(source.lastPathComponent) \(feature) UNCHANGED \(error.localizedDescription)")
+                } else if source.lastPathComponent == "irs-w4.pdf",
+                          ["preserveContent", "optimizedImages"].contains(feature),
+                          case .insufficientSelection(let reason) = error,
+                          reason.contains("digital signature"),
+                          reason.contains("Recompression would invalidate it") {
+                    XCTAssertNotNil(before.range(of: Data("/ByteRange".utf8)), "Blocked corpus must actually contain a signature byte range")
+                    XCTAssertFalse(FileManager.default.fileExists(atPath: output(source, feature).path), "Rejected signature recompression must not publish an output")
+                    rows.append(["file": source.lastPathComponent, "feature": feature, "status": "blocked-signature", "reason": reason])
+                    print("REAL_PDF \(source.lastPathComponent) \(feature) BLOCKED_SIGNATURE")
+                } else {
+                    rows.append(["file": source.lastPathComponent, "feature": feature, "status": "failed", "reason": error.localizedDescription])
+                    XCTFail("REAL_PDF \(source.lastPathComponent) \(feature): \(error)")
+                }
+            } catch {
+                rows.append(["file": source.lastPathComponent, "feature": feature, "status": "failed", "reason": "\(error)"])
+                XCTFail("REAL_PDF \(source.lastPathComponent) \(feature): \(error)")
+            }
+            XCTAssertEqual(try? Data(contentsOf: source), before, "Downloaded source must never change")
+        }
+    }
+    func testRealCompressionCorpus() throws {
+        for source in try samples() {
+            for mode in PDFCompressionMode.allCases {
+                run(source, mode.rawValue) {
+                    let destination = output(source, mode.rawValue)
+                    try PDFOutputService().compress(sourceURL: source, destination: destination, quality: .readable, mode: mode)
+                    try verify(destination, against: source, text: mode != .imageCopy)
+                    let original = try XCTUnwrap(PDFDocument(url: source)), compressed = try XCTUnwrap(PDFDocument(url: destination))
+                    for index in 0..<original.pageCount {
+                        let before = try thumbnailPixels(try XCTUnwrap(original.page(at: index)))
+                        let after = try thumbnailPixels(try XCTUnwrap(compressed.page(at: index)))
+                        let error = zip(before, after).enumerated().filter { $0.offset % 4 != 3 }
+                            .reduce(0.0) { $0 + Double(abs(Int($1.element.0) - Int($1.element.1))) } / Double(160 * 200 * 3)
+                        XCTAssertLessThan(error, mode == .preserveContent ? 1 : 28, "\(source.lastPathComponent) page \(index): compression changed page colors/appearance")
+                    }
+                    XCTAssertLessThan(try Data(contentsOf: destination).count, try Data(contentsOf: source).count)
+                    try attach(destination)
+                    return destination
+                }
+            }
+        }
+    }
+    private func thumbnailPixels(_ page: PDFPage) throws -> [UInt8] {
+        let image = try XCTUnwrap(page.thumbnail(of: CGSize(width: 160, height: 200), for: .mediaBox).cgImage)
+        var bytes = [UInt8](repeating: 255, count: 160 * 200 * 4)
+        try bytes.withUnsafeMutableBytes { raw in
+            let context = try XCTUnwrap(CGContext(data: raw.baseAddress, width: 160, height: 200, bitsPerComponent: 8,
+                bytesPerRow: 160 * 4, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            context.draw(image, in: CGRect(x: 0, y: 0, width: 160, height: 200))
+        }
+        return bytes
+    }
+    func testRealCompositionAndPageEditingCorpus() throws {
+        let sources = try samples()
+        for source in sources {
+            let original = try XCTUnwrap(PDFDocument(url: source))
+            run(source, "extract-and-split") {
+                for index in 0..<original.pageCount {
+                    try autoreleasepool {
+                        let destination = output(source, "page-\(index)")
+                        try PDFCompositionService().extractPages(from: source, indices: [index], to: destination)
+                        try verify(destination, against: source, indices: [index])
+                        try attach(destination)
+                    }
+                }
+                return output(source, "page-0")
+            }
+            run(source, "merge") {
+                let second = sources.first { $0 != source }!
+                let destination = output(source, "merge")
+                try PDFCompositionService().combine(urls: [source, second], to: destination)
+                let merged = try XCTUnwrap(PDFDocument(url: destination))
+                let other = try XCTUnwrap(PDFDocument(url: second))
+                XCTAssertEqual(merged.pageCount, original.pageCount + other.pageCount)
+                for i in 0..<merged.pageCount {
+                    let expected = i < original.pageCount ? original.page(at: i) : other.page(at: i - original.pageCount)
+                    XCTAssertEqual(normalizedText(merged.page(at: i)?.string), normalizedText(expected?.string))
+                }
+                try attach(destination)
+                return destination
+            }
+            run(source, "page-operations") {
+                let destination = output(source, "pages")
+                try FileManager.default.copyItem(at: source, to: destination)
+                let mutation = PDFMutationService()
+                try mutation.rotatePage(at: 0, in: destination)
+                XCTAssertEqual(PDFDocument(url: destination)?.page(at: 0)?.rotation, ((original.page(at: 0)?.rotation ?? 0) + 90) % 360)
+                try mutation.duplicatePage(at: 0, in: destination)
+                XCTAssertEqual(PDFDocument(url: destination)?.pageCount, original.pageCount + 1)
+                try mutation.deletePage(at: 1, in: destination)
+                XCTAssertEqual(PDFDocument(url: destination)?.pageCount, original.pageCount)
+                try mutation.cropPage(at: 0, insetFraction: 0.05, in: destination)
+                XCTAssertLessThan(try XCTUnwrap(PDFDocument(url: destination)?.page(at: 0)?.bounds(for: .cropBox).width),
+                                  try XCTUnwrap(PDFDocument(url: destination)?.page(at: 0)?.bounds(for: .mediaBox).width))
+                if original.pageCount > 1 {
+                    try mutation.reorderPages(order: Array((0..<original.pageCount).reversed()), in: destination)
+                    XCTAssertEqual(normalizedText(PDFDocument(url: destination)?.page(at: 0)?.string), normalizedText(original.page(at: original.pageCount - 1)?.string))
+                }
+                try attach(destination)
+                return destination
+            }
+        }
+    }
+
+    func testRealProtectionFlatteningAndRedactionCorpus() throws {
+        for source in try samples() {
+            run(source, "protect-unlock") {
+                let protected = output(source, "protected"), unlocked = output(source, "unlocked")
+                let service = PDFOutputService()
+                try service.protect(sourceURL: source, destination: protected, password: "ReleaseTest-2026", permissions: .init(allowsPrinting: true, allowsCopying: true, allowsCommenting: true, allowsFormFilling: true, allowsPageChanges: true))
+                let locked = try XCTUnwrap(PDFDocument(url: protected))
+                XCTAssertTrue(locked.isLocked)
+                XCTAssertFalse(locked.unlock(withPassword: "incorrect-password"))
+                XCTAssertTrue(locked.unlock(withPassword: "ReleaseTest-2026"))
+                try attach(protected)
+                try service.removePassword(sourceURL: protected, destination: unlocked, password: "ReleaseTest-2026")
+                XCTAssertFalse(try XCTUnwrap(PDFDocument(url: unlocked)).isEncrypted)
+                try verify(unlocked, against: source)
+                try attach(unlocked)
+                return unlocked
+            }
+            for action in ["flatten", "safe-share", "redact"] {
+                run(source, action) {
+                    let destination = output(source, action), service = PDFOutputService()
+                    switch action {
+                    case "flatten": try service.flatten(sourceURL: source, destination: destination)
+                    case "safe-share": try service.safeShare(sourceURL: source, destination: destination)
+                    default:
+                        try service.secureRedact(sourceURL: source, destination: destination,
+                            marks: [.init(pageIndex: 0, normalizedX: 0, normalizedY: 0, normalizedWidth: 1, normalizedHeight: 1)])
+                    }
+                    try verify(destination, against: source, text: false)
+                    let document = try XCTUnwrap(PDFDocument(url: destination))
+                    XCTAssertTrue(document.page(at: 0)?.string?.isEmpty != false, "Raster export must not leave hidden source text")
+                    XCTAssertEqual(document.page(at: 0)?.annotations.count, 0)
+                    try attach(destination)
+                    return destination
+                }
+            }
+        }
+    }
+
+    func testRealAnnotationsFormsBookmarksAndContentCorpus() throws {
+        for source in try samples() {
+            run(source, "stamp-number-watermark-bates-signature") {
+                let destination = output(source, "annotations")
+                try FileManager.default.copyItem(at: source, to: destination)
+                let mutation = PDFMutationService()
+                let originalCount = try XCTUnwrap(PDFDocument(url: destination)?.page(at: 0)?.annotations.count)
+                try mutation.addStamp(.approved, toPageAt: 0, in: destination)
+                try mutation.applyPageNumbers(.init(pageIndices: [0], startNumber: 1, format: .pageOfTotal, position: .bottomCenter), in: destination)
+                XCTAssertEqual(try mutation.removeGeneratedPageNumbers(in: destination), 1)
+                try mutation.applyBatesNumbers(.init(pageIndices: [0], startNumber: 1, digitCount: 6, prefix: "QA-", suffix: "", position: .bottomRight), in: destination)
+                XCTAssertEqual(try mutation.removeGeneratedBatesNumbers(in: destination), 1)
+                try mutation.applyWatermark(.init(pageIndices: [0], text: "REAL PDF RELEASE TEST", layout: .diagonal, tone: .red, intensity: .standard), in: destination)
+                XCTAssertEqual(try mutation.removeGeneratedWatermarks(in: destination), 1)
+                try mutation.addInk(.init(pageIndex: 0,
+                    strokes: [.init(points: [.init(x: 0.1, y: 0.4), .init(x: 0.5, y: 0.6), .init(x: 0.9, y: 0.2)])], placement: .signature), in: destination)
+                XCTAssertTrue(try mutation.containsSignature(in: destination))
+                XCTAssertGreaterThan(try XCTUnwrap(PDFDocument(url: destination)?.page(at: 0)?.annotations.count), originalCount)
+                try attach(destination)
+                return destination
+            }
+            run(source, "form-add-fill") {
+                let destination = output(source, "new-form"), filled = output(source, "filled")
+                try FileManager.default.copyItem(at: source, to: destination)
+                try PDFMutationService().addFormField(.init(pageIndex: 0, kind: .text,
+                    name: "RealPDFReleaseField", normalizedBounds: .init(x: 0.1, y: 0.2, width: 0.4, height: 0.6),
+                    isRequired: false, isMultiline: false, maximumLength: 64), in: destination)
+                try PDFOutputService().applyFormFieldValues(sourceURL: destination, destination: filled, values: ["RealPDFReleaseField": "Verified 2026"])
+                XCTAssertTrue(try PDFFormInspectionService().fields(in: filled).contains { $0.name == "RealPDFReleaseField" && $0.value == "Verified 2026" })
+                try attach(filled)
+                return filled
+            }
+            run(source, "bookmarks") {
+                let destination = output(source, "bookmarks")
+                try PDFOutputService().embedBookmarks(sourceURL: source, destination: destination, pageIndices: [0])
+                XCTAssertGreaterThan(try XCTUnwrap(PDFDocument(url: destination)?.outlineRoot?.numberOfChildren), 0)
+                try verify(destination, against: source)
+                try attach(destination)
+                return destination
+            }
+            run(source, "add-text-image-link") {
+                let destination = output(source, "content")
+                try PDFOutputService().addContent(sourceURL: source, destination: destination, overlays: [
+                    .text(pageIndex: 0, bounds: .init(x: 0.05, y: 0.9, width: 0.8, height: 0.08), text: "Real PDF QA", fontSize: 12, color: .init(red: 0, green: 0, blue: 0, alpha: 1)),
+                    .image(pageIndex: 0, bounds: .init(x: 0.8, y: 0.8, width: 0.1, height: 0.1), data: PDFTestFixtureFactory.makeSignaturePNG()),
+                    .link(pageIndex: 0, bounds: .init(x: 0.1, y: 0.05, width: 0.4, height: 0.08), title: "QA link", url: URL(string: "https://example.com/qa")!)])
+                let page = try XCTUnwrap(PDFDocument(url: destination)?.page(at: 0))
+                XCTAssertTrue(page.annotations.contains { $0.contents == "Real PDF QA" })
+                XCTAssertTrue(page.annotations.contains { $0.url?.absoluteString == "https://example.com/qa" })
+                try attach(destination)
+                return destination
+            }
+        }
+    }
+
+    func testRealConversionPrintAndInspectionCorpus() throws {
+        for source in try samples() {
+            let document = try XCTUnwrap(PDFDocument(url: source))
+            let nativeTextBeforeRendering = (0..<document.pageCount).map { document.page(at: $0)?.string ?? "" }
+            let firstNativeText = nativeTextBeforeRendering.first { !normalizedText($0).isEmpty }
+            run(source, "inspect-search-privacy") {
+                let profile = try PDFInspectionService().inspect(url: source)
+                XCTAssertEqual(profile.pageCount, document.pageCount)
+                let index = try PDFTextIndexService().extractNativeText(from: source)
+                let text = document.page(at: 0)?.string ?? ""
+                if let word = text.split(whereSeparator: { !$0.isLetter }).first(where: { $0.count >= 5 }) {
+                    XCTAssertNotNil(index.firstMatchingPage(for: String(word)))
+                }
+                _ = try PDFDocumentStructureService().technicalInspection(in: source, profile: profile, source: nil)
+                _ = try PrivacyScanService().scan(document: document, performsOCRFallback: false)
+                return source
+            }
+            for format in PDFTextExportFormat.allCases {
+                // Office exports can preserve scanned page imagery. Plain text
+                // needs native text; image-only cases are covered by OCR below.
+                if [.plainText, .markdown, .richText].contains(format), firstNativeText == nil {
+                    rows.append(["file": source.lastPathComponent, "feature": "export-\(format.rawValue)", "status": "requires-ocr"])
+                    continue
+                }
+                run(source, "export-\(format.rawValue)") {
+                    let destination = output(source, format.rawValue).deletingPathExtension().appendingPathExtension(format.fileExtension)
+                    let evidence = try PDFOutputService().exportText(sourceURL: source, destination: destination, title: "Real PDF QA", format: format)
+                    XCTAssertGreaterThan(try Data(contentsOf: destination).count, 0)
+                    if [.wordDocument, .excelWorkbook, .powerPointPresentation].contains(format) { XCTAssertNotNil(evidence) }
+                    else if format == .plainText {
+                        let exported = try String(contentsOf: destination, encoding: .utf8)
+                        XCTAssertTrue(normalizedText(exported).contains(normalizedText(firstNativeText)), "Native source text must survive plain-text export")
+                    }
+                    let attachment = XCTAttachment(data: try Data(contentsOf: destination), uniformTypeIdentifier: "public.data")
+                    attachment.name = destination.lastPathComponent; attachment.lifetime = .keepAlways; add(attachment)
+                    return destination
+                }
+            }
+            run(source, "page-images-and-images-to-pdf") {
+                let images = try PDFOutputService().exportPageImages(sourceURL: source, directory: directory.appendingPathComponent(source.lastPathComponent + "-png"), preset: .png)
+                XCTAssertEqual(images.count, document.pageCount)
+                let selected = try images.prefix(2).map { try XCTUnwrap(UIImage(contentsOfFile: $0.path)) }
+                let destination = output(source, "images-to-pdf")
+                try ScanPDFRenderer().render(images: selected, to: destination)
+                XCTAssertEqual(PDFDocument(url: destination)?.pageCount, selected.count)
+                try attach(destination)
+                return destination
+            }
+            run(source, "print-and-booklet") {
+                let printURL = output(source, "print"), bookletURL = output(source, "booklet")
+                try PDFOutputService().prepareForPrint(sourceURL: source, destination: printURL, options: .standard)
+                XCTAssertEqual(PDFDocument(url: printURL)?.pageCount, document.pageCount)
+                try PDFOutputService().prepareBooklet(sourceURL: source, destination: bookletURL, options: .init(paperTarget: .a4, bindingEdge: .left, outerMarginPoints: 24, gutterPoints: 12, showsFoldMarks: true, signatureSheetLimit: 0, creepCompensationPoints: 0))
+                XCTAssertEqual(PDFDocument(url: bookletURL)?.pageCount, ((document.pageCount + 3) / 4) * 2)
+                try attach(printURL); try attach(bookletURL)
+                return bookletURL
+            }
+        }
+    }
+
+    func testRealScannedOCRAndSearchableOutput() async throws {
+        let source = try XCTUnwrap(try samples().first { $0.lastPathComponent == "ocr-multipage.pdf" })
+        let result = try await VisionOCRService().recognize(url: source)
+        XCTAssertEqual(result.pages.count, 6)
+        let text = result.pages.map(\.text).joined(separator: " ").lowercased()
+        XCTAssertTrue(text.contains("watson"), "Compare with the actual scanned book page")
+        let destination = output(source, "searchable")
+        try SearchablePDFService().createSearchableCopy(sourceURL: source, ocrResult: result, destination: destination)
+        XCTAssertEqual(PDFDocument(url: destination)?.pageCount, 6)
+        XCTAssertTrue((PDFDocument(url: destination)?.string ?? "").lowercased().contains("watson"))
+        let textURL = output(source, "ocr-text").deletingPathExtension().appendingPathExtension("txt")
+        _ = try PDFOutputService().exportText(sourceURL: destination, destination: textURL, title: "Scanned book", format: .plainText)
+        XCTAssertTrue(try String(contentsOf: textURL, encoding: .utf8).lowercased().contains("watson"))
+        try attach(destination)
+        rows.append(["file": source.lastPathComponent, "feature": "ocr-searchable", "status": "passed", "pages": "6"])
+    }
+
+    func testSearchableOverlayPreservesExistingNativeTextAndPagePixels() throws {
+        let source = try XCTUnwrap(try samples().first { $0.lastPathComponent == "ocr-multipage.pdf" })
+        let original = try XCTUnwrap(PDFDocument(url: source))
+        let existing = normalizedText(original.page(at: 3)?.string)
+        XCTAssertFalse(existing.isEmpty, "The mixed scan must include an existing native text layer")
+        let text = "Native map regression"
+        let block = OCRTextBlock(text: text, confidence: 1,
+            normalizedX: 0.05, normalizedY: 0.05, normalizedWidth: 0.8, normalizedHeight: 0.05)
+        let result = OCRResult(pages: [OCRPageResult(pageIndex: 3, text: text, confidence: 1, blocks: [block])])
+        let destination = output(source, "native-map-regression")
+        try SearchablePDFService().createSearchableCopy(sourceURL: source, ocrResult: result, destination: destination)
+        let saved = try XCTUnwrap(PDFDocument(url: destination))
+        XCTAssertEqual(saved.pageCount, original.pageCount)
+        let savedText = normalizedText(saved.page(at: 3)?.string)
+        XCTAssertTrue(savedText.contains(existing), "Appending OCR must preserve existing native character maps")
+        XCTAssertTrue(savedText.contains(normalizedText(text)))
+        for index in 0..<original.pageCount {
+            XCTAssertEqual(try thumbnailPixels(XCTUnwrap(original.page(at: index))),
+                           try thumbnailPixels(XCTUnwrap(saved.page(at: index))),
+                           "An invisible OCR layer must not change page pixels")
+        }
+        try attach(destination)
+    }
+}
 
 @testable import PaperPath
 
@@ -1326,7 +1702,8 @@ final class PDFCoreServiceRegressionTests: XCTestCase {
         let estimate = try PDFOutputService()
             .estimateCompression(
                 sourceURL: source,
-                quality: .balanced
+                quality: .balanced,
+                mode: .imageCopy
             )
 
         XCTAssertEqual(estimate.sampledPageCount, 3)
@@ -1650,6 +2027,27 @@ final class PDFBoundaryBehaviorTests: XCTestCase {
         try? FileManager.default.removeItem(
             at: temporaryDirectory
         )
+    }
+
+    func testOverlongAnnotationEditPreservesOriginalPDFBytes_BitsUT() throws {
+        let url = temporaryDirectory.appendingPathComponent("long-note.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(at: url, pageCount: 1)
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let note = PDFAnnotation(bounds: CGRect(x: 50, y: 100, width: 24, height: 24),
+            forType: .text, withProperties: nil)
+        note.contents = "Original note must survive"
+        page.addAnnotation(note)
+        XCTAssertTrue(document.write(to: url))
+        let original = try Data(contentsOf: url)
+        XCTAssertThrowsError(try PDFMutationService().editAnnotation(
+            PDFAnnotationEditPayload(pageIndex: 0, annotationIndex: 0,
+                expectedType: "Text", contents: String(repeating: "n", count: 2001),
+                color: PDFInkColor(red: 0, green: 0, blue: 0, alpha: 1), lineWidth: 1),
+            in: url))
+        XCTAssertEqual(try Data(contentsOf: url), original)
+        XCTAssertEqual(PDFDocument(url: url)?.page(at: 0)?.annotations.first?.contents,
+            "Original note must survive")
     }
 
     func testEditAnnotation_outOfRangeColorUsesNormalizedComponents_BitsUT()
@@ -3094,6 +3492,79 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         )
     }
 
+    func testProtectionRejectsOverlongPasswordsInsteadOfMatchingTruncatedPrefixes_BitsUT() {
+        let prefix = String(repeating: "p", count: 128)
+        XCTAssertNil(PDFProtectionPasswordValidation.message(password: prefix, confirmation: prefix))
+        XCTAssertNotNil(PDFProtectionPasswordValidation.message(password: prefix + "A", confirmation: prefix + "B"))
+        XCTAssertNotNil(PDFProtectionPasswordValidation.message(password: prefix + "A", confirmation: prefix + "A"))
+        XCTAssertNotNil(PDFProtectionPasswordValidation.message(password: prefix, confirmation: prefix + "A"))
+        XCTAssertNotNil(PDFProtectionPasswordValidation.message(password: "1234567", confirmation: "1234567"))
+        XCTAssertNil(PDFProtectionPasswordValidation.message(password: "12345678", confirmation: "12345678"))
+        XCTAssertNotNil(PDFProtectionPasswordValidation.message(password: "12345678", confirmation: "12345679"))
+        XCTAssertNotNil(PDFProtectionPasswordValidation.message(password: " password", confirmation: "password"))
+    }
+
+    func testBatchCompressionDoesNotDescribeFailuresAsUnchanged_BitsUT() {
+        let failed = PDFCompressionBatchOutputState(successfulCount: 0, unchangedCount: 0, failedCount: 2)
+        XCTAssertEqual(failed, .unavailable)
+        XCTAssertEqual(failed.placeholder, "No compressed output")
+        let unchanged = PDFCompressionBatchOutputState(successfulCount: 0, unchangedCount: 2, failedCount: 0)
+        XCTAssertEqual(unchanged, .unchanged)
+        XCTAssertEqual(unchanged.placeholder, "No change needed")
+        XCTAssertEqual(PDFCompressionBatchOutputState(successfulCount: 0, unchangedCount: 1, failedCount: 1), .unavailable)
+        XCTAssertEqual(PDFCompressionBatchOutputState(successfulCount: 1, unchangedCount: 1, failedCount: 1), .compressed)
+        XCTAssertNil(PDFCompressionBatchOutputState.compressed.placeholder)
+        XCTAssertEqual(PDFCompressionBatchOutputState(successfulCount: 0, unchangedCount: 0, failedCount: 0), .unavailable)
+    }
+
+    func testPageJumpAcceptsLocalizedDigitsWithoutReinterpretingInvalidInput_BitsUT() {
+        for value in ["12", "１２", "١٢", "۱۲", " 12\n"] {
+            XCTAssertEqual(PDFPageNumberInput.pageIndex(value, pageCount: 20), 11)
+        }
+        for value in ["", "0", "21", "1-3", "1,3", "1 3", "-3", "+3", "½", "²", "Ⅻ", "1️⃣", "1000000"] {
+            XCTAssertNil(PDFPageNumberInput.pageIndex(value, pageCount: 20), value)
+        }
+        XCTAssertEqual(PDFPageNumberInput.pageIndex("100000", pageCount: 100000), 99999)
+        XCTAssertEqual(PDFPageNumberInput.pageIndex("000012", pageCount: 20), 11)
+        XCTAssertNil(PDFPageNumberInput.pageIndex("1", pageCount: 0))
+        XCTAssertNil(PDFPageNumberInput.pageIndex("1", pageCount: -1))
+    }
+
+    func testOCRPhraseSearchUsesDocumentNormalizationWithoutChangingPhraseSemantics_BitsUT() {
+        let search = DocumentPhraseSearch(query: " payment cafe ")
+        XCTAssertTrue(search.matches("Earlier PAY\u{00ad}MENT Café details"))
+        XCTAssertTrue(search.matches("Earlier ＰＡＹＭＥＮＴ Café details"))
+        XCTAssertTrue(DocumentPhraseSearch(query: "pay\u{00ad}ment").matches("Payment"))
+        XCTAssertFalse(search.matches("cafe payment"))
+        XCTAssertFalse(search.matches("payment invoice cafe"))
+        XCTAssertFalse(search.matches("payment\ncafe"))
+        XCTAssertFalse(DocumentPhraseSearch(query: "cooperate").matches("co-operate"))
+        for query in ["", " \n ", "\u{00ad}"] {
+            XCTAssertFalse(DocumentPhraseSearch(query: query).matches("Payment café"))
+        }
+    }
+
+    func testDocumentSearchFindsWordsContainingDiscretionaryHyphens_BitsUT() throws {
+        let original = String(repeating: "Earlier context ", count: 20)
+            + "PAY\u{00ad}MENT Café invoice co-operate"
+        let index = DocumentTextIndex(
+            source: .native,
+            pages: [IndexedPageText(pageIndex: 3, text: original)],
+            indexedAt: Date()
+        )
+        let match = try XCTUnwrap(index.firstMatch(for: "payment cafe"))
+        XCTAssertEqual(match.pageIndex, 3)
+        XCTAssertTrue(match.excerpt.contains("PAYMENT Café"))
+        XCTAssertFalse(match.excerpt.contains("\u{00ad}"))
+        XCTAssertEqual(index.pages.first?.text, original)
+        XCTAssertEqual(index.matches(for: "pay\u{00ad}ment").count, 1)
+        XCTAssertTrue(try index.containsEveryTerm(["payment", "cafe"]))
+        XCTAssertEqual(try index.cancellableMatches(for: "payment").count, 1)
+        XCTAssertTrue(index.matches(for: "cooperate").isEmpty)
+        XCTAssertEqual(index.matches(for: "co-operate").count, 1)
+        XCTAssertTrue(index.matches(for: "\u{00ad}").isEmpty)
+    }
+
     func testDocumentTextIndex_segmentsAndBoundsSearchResults_BitsUT() {
         let index = DocumentTextIndex(
             source: .vision,
@@ -4153,12 +4624,12 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
         let created = [results.0, results.1].compactMap { $0 }
 
         XCTAssertEqual(created.count, 1)
-        XCTAssertEqual(
-            model.documents.filter {
-                $0.sourceDocumentID == imported.id
-            }.count,
-            1
-        )
+        XCTAssertEqual(created.first?.id, imported.id)
+        XCTAssertEqual(model.documents.map(\.id), [imported.id])
+        XCTAssertNotEqual(model.record(id: imported.id)?.contentRevisionID, imported.contentRevisionID)
+        let versions = try await store.versions(for: imported.id)
+        XCTAssertEqual(versions.count, 1, "Only one operation may save a new version")
+        XCTAssertEqual(versions.first?.contentRevisionID, imported.contentRevisionID)
         XCTAssertFalse(model.isProcessing(imported.id))
     }
 
@@ -5423,6 +5894,74 @@ final class PDFCriticalFeatureContractTests: XCTestCase {
                 "Locked source".localizedUI
             )
         )
+    }
+
+    func testWatermarkDiagonalAppearanceSurvivesLanguageChangesAndEditing() throws {
+        let url = temporaryDirectory.appendingPathComponent("watermark-angle.pdf")
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792))
+        try renderer.pdfData { $0.beginPage() }.write(to: url)
+        let service = PDFMutationService()
+
+        func checkAppearance(diagonal: Bool) throws {
+            let document = try XCTUnwrap(PDFDocument(url: url))
+            let page = try XCTUnwrap(document.page(at: 0))
+            defer { withExtendedLifetime(document) {} }
+            XCTAssertEqual(page.annotations.count, 1)
+            XCTAssertTrue(try XCTUnwrap(page.annotations.first).hasAppearanceStream)
+            let image = page.thumbnail(of: CGSize(width: 612, height: 792), for: .cropBox)
+            let attachment = XCTAttachment(image: image)
+            attachment.name = "watermark-\(page.annotations.first?.contents ?? "")-\(diagonal)"
+            attachment.lifetime = .keepAlways
+            add(attachment)
+            let cgImage = try XCTUnwrap(image.cgImage)
+            let width = cgImage.width, height = cgImage.height
+            var pixels = [UInt8](repeating: 255, count: width * height * 4)
+            let context = try XCTUnwrap(CGContext(data: &pixels, width: width, height: height,
+                bitsPerComponent: 8, bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+            context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
+            var points: [(Double, Double)] = []
+            for y in 0..<height {
+                for x in 0..<width {
+                    let i = (y * width + x) * 4
+                    if Int(pixels[i]) - Int(pixels[i + 1]) > 20 {
+                        points.append((Double(x), Double(y)))
+                    }
+                }
+            }
+            XCTAssertGreaterThan(points.count, 100, "Watermark must be visible")
+            guard !points.isEmpty else { return }
+            let count = Double(points.count)
+            let meanX = points.reduce(0) { $0 + $1.0 } / count
+            let meanY = points.reduce(0) { $0 + $1.1 } / count
+            let xx = points.reduce(0) { $0 + pow($1.0 - meanX, 2) }
+            let yy = points.reduce(0) { $0 + pow($1.1 - meanY, 2) }
+            let xy = points.reduce(0) { $0 + ($1.0 - meanX) * ($1.1 - meanY) }
+            if diagonal {
+                // Bitmap rows run downward: a negative slope rises to the right.
+                XCTAssertLessThan(xy / sqrt(xx * yy), -0.8, "Saved text must rise from bottom left to top right")
+                XCTAssertEqual(xx / yy, 1, accuracy: 0.25)
+            } else {
+                XCTAssertGreaterThan(xx / yy, 4, "Centered text must stay horizontal")
+            }
+        }
+
+        for text in ["CUSTOM WATERMARK", "自定义中文水印", "ENGLISH AGAIN"] {
+            try service.applyWatermark(.init(pageIndices: [0], text: text, layout: .diagonal,
+                tone: .red, intensity: .standard), in: url)
+            try checkAppearance(diagonal: true)
+        }
+        for text in ["再次编辑中文水印", "EDITED ENGLISH"] {
+            let watermark = try XCTUnwrap(service.annotations(in: url).first)
+            try service.editAnnotation(.init(pageIndex: 0, annotationIndex: 0, expectedType: "FreeText",
+                contents: text, color: watermark.color,
+                lineWidth: nil), in: url)
+            try checkAppearance(diagonal: true)
+        }
+        try service.applyWatermark(.init(pageIndices: [0], text: "中文居中 WATERMARK", layout: .centered,
+            tone: .red, intensity: .standard), in: url)
+        try checkAppearance(diagonal: false)
+        XCTAssertEqual(try service.removeGeneratedWatermarks(in: url), 1)
     }
 
     func testGeneratedPageMarks_roundTripAndRemoveIndependently_BitsUT()
@@ -13058,5 +13597,1054 @@ private final class CriticalMetadataKeyValueStore:
 
     func synchronize() -> Bool {
         synchronizeResult
+    }
+}
+
+final class PDFCompressionDepthTests: XCTestCase {
+    private var directory: URL!
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("CompressionDepth-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    override func tearDownWithError() throws { try? FileManager.default.removeItem(at: directory) }
+    private func url(_ name: String) -> URL { directory.appendingPathComponent(name) }
+
+    func testRecompressesExistingFlateWithIndirectLengthAndPredictorsLosslessly() throws {
+        for predictor in [1, 2, 15] {
+            let source = url("flate-\(predictor).pdf"), output = url("out-\(predictor).pdf")
+            let edge = 512
+            var pixels = Data()
+            for _ in 0..<edge {
+                if predictor == 15 { pixels.append(0) } // PNG row filter: None.
+                pixels.append(Data(repeating: 42, count: edge * 3))
+            }
+            var encoded = Data(count: Int(compressBound(uLong(pixels.count))))
+            var count = uLongf(encoded.count)
+            let status = encoded.withUnsafeMutableBytes { target in
+                pixels.withUnsafeBytes { input in
+                    compress2(target.bindMemory(to: Bytef.self).baseAddress!, &count,
+                        input.bindMemory(to: Bytef.self).baseAddress!, uLong(pixels.count), 1)
+                }
+            }
+            XCTAssertEqual(status, Z_OK)
+            encoded.count = Int(count)
+            let commands = Data("q 200 0 0 200 0 0 cm /Im Do Q\n".utf8)
+            try PDFTestFixtureFactory.writeClassicPDF(objects: [
+                .init(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+                .init(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+                .init(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>"),
+                .init(4, "<< /Length \(commands.count) >>", stream: commands),
+                .init(5, "<< /Type /XObject /Subtype /Image /Width \(edge) /Height \(edge) /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 6 0 R /Filter /FlateDecode /DecodeParms << /Predictor \(predictor) /Colors 3 /Columns \(edge) /BitsPerComponent 8 >> >>", stream: encoded),
+                .init(6, "\(encoded.count)")
+            ], rootObjectNumber: 1, to: source)
+            try PDFOutputService().compress(sourceURL: source, destination: output, quality: .readable)
+            XCTAssertLessThan(try Data(contentsOf: output).count, try Data(contentsOf: source).count)
+            print("FLATE_RECOMPRESSION predictor=\(predictor) source=\(try Data(contentsOf: source).count) output=\(try Data(contentsOf: output).count)")
+            try assertImagePayloadsEqual(source: source, output: output, pages: 1)
+        }
+    }
+
+    func testIndirectJPEGLengthIsOptimizedOnlyInExplicitLossyMode() throws {
+        let original = url("jpeg-direct.pdf"), source = url("jpeg-indirect.pdf"), output = url("out.pdf")
+        try makeImagePDF(at: original, pages: 1, edge: 2_400, jpeg: true)
+        let document = try XCTUnwrap(CGPDFDocument(original as CFURL))
+        let page = try XCTUnwrap(document.page(at: 1)?.dictionary)
+        var resources: CGPDFDictionaryRef?, images: CGPDFDictionaryRef?, image: CGPDFStreamRef?
+        XCTAssertTrue(CGPDFDictionaryGetDictionary(page, "Resources", &resources))
+        XCTAssertTrue(CGPDFDictionaryGetDictionary(try XCTUnwrap(resources), "XObject", &images))
+        XCTAssertTrue(CGPDFDictionaryGetStream(try XCTUnwrap(images), "Im", &image))
+        var format = CGPDFDataFormat.raw
+        let jpeg = try XCTUnwrap(CGPDFStreamCopyData(try XCTUnwrap(image), &format)) as Data
+        XCTAssertEqual(format, .jpegEncoded)
+        let commands = Data("q 200 0 0 200 0 0 cm /Im Do Q\n".utf8)
+        try PDFTestFixtureFactory.writeClassicPDF(objects: [
+            .init(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            .init(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            .init(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Im 5 0 R >> >> /Contents 4 0 R >>"),
+            .init(4, "<< /Length \(commands.count) >>", stream: commands),
+            .init(5, "<< /Type /XObject /Subtype /Image /Width 2400 /Height 2400 /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length 6 0 R /Filter /DCTDecode >>", stream: jpeg),
+            .init(6, "\(jpeg.count)")
+        ], rootObjectNumber: 1, to: source)
+        XCTAssertThrowsError(try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact)) { error in
+            guard case PaperPathError.compressionNotBeneficial = error else {
+                return XCTFail("Expected a valid PDF with no lossless savings; received \(error)")
+            }
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact, mode: .optimizedImages)
+        XCTAssertLessThan(try Data(contentsOf: output).count, try Data(contentsOf: source).count)
+        XCTAssertEqual(PDFDocument(url: output)?.pageCount, 1)
+    }
+
+    @MainActor
+    func testIncrementalPDFCompressionPreservesLatestRevisionAndOriginal() async throws {
+        let source = url("incremental.pdf")
+        try makeImagePDF(at: source, pages: 1, edge: 200)
+        var bytes = try Data(contentsOf: source)
+        let marker = try XCTUnwrap(bytes.range(of: Data("startxref".utf8), options: .backwards))
+        let previous = try XCTUnwrap(String(decoding: bytes[marker.upperBound...], as: UTF8.self)
+            .split(whereSeparator: \.isWhitespace).first.flatMap { Int($0) })
+        let objectOffset = bytes.count
+        bytes.append(Data("1 0 obj\n<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> >>\nendobj\n".utf8))
+        let xrefOffset = bytes.count
+        bytes.append(Data(String(format: "xref\n1 1\n%010d 00000 n \n", objectOffset).utf8))
+        bytes.append(Data("trailer\n<< /Size 9 /Root 1 0 R /Prev \(previous) >>\nstartxref\n\(xrefOffset)\n%%EOF\n".utf8))
+        try bytes.write(to: source)
+        XCTAssertEqual(PDFDocument(url: source)?.pageCount, 1)
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("Store"))
+        let imported = try await store.importPDF(from: source)
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        var issue: PDFBatchDeliveryIssue?
+        let result = await model.createCompressedCopy(recordID: imported.id, quality: .readable,
+            expectedContentRevisionID: imported.contentRevisionID, presentsFeedback: false) { issue = $0 }
+        XCTAssertNotNil(result)
+        XCTAssertNil(issue)
+        XCTAssertEqual(result?.id, imported.id)
+        XCTAssertEqual(try Data(contentsOf: source), bytes)
+        let saved = try XCTUnwrap(model.url(for: imported.id))
+        XCTAssertLessThan(try Data(contentsOf: saved).count, bytes.count)
+        XCTAssertEqual(PDFDocument(url: saved)?.page(at: 0)?.string, PDFDocument(url: source)?.page(at: 0)?.string)
+    }
+
+    func testPreservesTextLinksFormsAndPageGeometry() throws {
+        let source = url("mixed.pdf"), output = url("output.pdf")
+        try makeImagePDF(at: source, pages: 2, edge: 900)
+        let original = try XCTUnwrap(PDFDocument(url: source))
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced)
+        let compressed = try XCTUnwrap(PDFDocument(url: output))
+        XCTAssertEqual(compressed.pageCount, 2)
+        for index in 0..<2 {
+            let before = try XCTUnwrap(original.page(at: index))
+            let after = try XCTUnwrap(compressed.page(at: index))
+            XCTAssertEqual(after.string, before.string)
+            XCTAssertTrue(after.string?.contains("Compression contract") == true)
+            XCTAssertEqual(after.rotation, before.rotation)
+            XCTAssertEqual(after.bounds(for: .cropBox), before.bounds(for: .cropBox))
+            XCTAssertEqual(after.annotations.count, 2)
+            XCTAssertEqual(after.annotations.first?.url?.absoluteString, "https://example.com/")
+            XCTAssertEqual(after.annotations.last?.widgetStringValue, "Keep this value")
+        }
+        let receipt = try PDFDeliveryAuditService().audit(sourceURL: source, outputURL: output,
+            operation: .compressed, compressionPreservesContent: true)
+        XCTAssertFalse(receipt.checks.contains { $0.status == .failed })
+        XCTAssertEqual(receipt.checks.first { $0.id == "text-layer" }?.status, .passed)
+        XCTAssertEqual(receipt.checks.first { $0.id == "annotations" }?.status, .passed)
+    }
+
+    func testLargeImagePDFMemoryTimeAndRatio() throws {
+        let source = url("large.pdf"), output = url("output.pdf")
+        // Real embedded RGB pixels, rather than a small PDF with padding.
+        try autoreleasepool { try makeImagePDF(at: source, pages: 24, edge: 1_600) }
+        let baseline = testResidentMemory(), sampler = TestProcessMemorySampler()
+        sampler.start()
+        let start = ContinuousClock.now
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced) { fraction in
+            if fraction == 0.01 || fraction == 0.88 || fraction == 1 {
+                print("COMPRESSION_PHASE fraction=\(fraction) rss=\(testResidentMemory())")
+            }
+        }
+        let elapsed = start.duration(to: .now)
+        let peak = sampler.stop().saturatingSubtracting(baseline)
+        let sourceBytes = try XCTUnwrap(source.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        let outputBytes = try XCTUnwrap(output.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        print("COMPRESSION_BENCHMARK source=\(sourceBytes) output=\(outputBytes) pages=24 elapsed=\(elapsed) peakRSSDelta=\(peak)")
+        XCTAssertGreaterThan(sourceBytes, 175 * 1_024 * 1_024)
+        XCTAssertLessThan(outputBytes, sourceBytes / 3)
+        XCTAssertEqual(PDFDocument(url: output)?.pageCount, 24)
+        XCTAssertLessThan(elapsed, .seconds(90))
+        XCTAssertLessThan(peak, UInt64(128 * 1_024 * 1_024))
+    }
+
+    func testHalfGigabytePDFDoesNotScaleResidentMemoryWithInputSize() throws {
+        let source = url("half-gigabyte.pdf"), output = url("output.pdf")
+        try autoreleasepool { try makeImagePDF(at: source, pages: 64, edge: 1_600) }
+        let baseline = testResidentMemory(), sampler = TestProcessMemorySampler()
+        sampler.start()
+        let start = ContinuousClock.now
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced)
+        let elapsed = start.duration(to: .now)
+        let peak = sampler.stop().saturatingSubtracting(baseline)
+        let sourceBytes = try XCTUnwrap(source.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        let outputBytes = try XCTUnwrap(output.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        print("COMPRESSION_HALF_GB source=\(sourceBytes) output=\(outputBytes) pages=64 elapsed=\(elapsed) peakRSSDelta=\(peak)")
+        XCTAssertGreaterThan(sourceBytes, 450 * 1_024 * 1_024)
+        XCTAssertLessThan(outputBytes, sourceBytes / 3)
+        XCTAssertEqual(PDFDocument(url: output)?.pageCount, 64)
+        XCTAssertLessThan(peak, UInt64(128 * 1_024 * 1_024))
+        XCTAssertLessThan(elapsed, .seconds(90))
+        try assertImagePayloadsEqual(source: source, output: output, pages: 64)
+    }
+
+    func testCancellationCleansStagingAndLeavesSourceUnchanged() async throws {
+        let source = url("cancel.pdf"), output = url("output.pdf")
+        try makeImagePDF(at: source, pages: 8, edge: 900)
+        let hash = try Data(contentsOf: source)
+        let latch = CompressionCancellationLatch()
+        let worker = Task.detached {
+            try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact) { value in
+                if value > 0.02 { latch.pauseAtCheckpoint() }
+            }
+        }
+        await Task.detached { latch.waitForCheckpoint() }.value
+        worker.cancel()
+        latch.resume()
+        do { try await worker.value; XCTFail("Expected cancellation") } catch is CancellationError {} catch { XCTFail("\(error)") }
+        XCTAssertEqual(try Data(contentsOf: source), hash)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: directory.path).contains { $0.hasPrefix(".compression-") })
+        // The shared admission gate must also be released after cancellation.
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact)
+        XCTAssertNotNil(PDFDocument(url: output))
+    }
+
+    func testAlreadyOptimizedNeverReplacesDestination() throws {
+        let source = url("source.pdf"), output = url("output.pdf")
+        try makeImagePDF(at: source, pages: 1, edge: 700)
+        let sentinel = Data("existing output".utf8)
+        try sentinel.write(to: output)
+        XCTAssertThrowsError(try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced))
+        XCTAssertEqual(try Data(contentsOf: output), sentinel)
+    }
+
+    func testPreservesAttachmentsOutlinesAndPageLabels() throws {
+        let source = url("structure.pdf"), output = url("output.pdf")
+        try PDFTestFixtureFactory.makeStructurePDF(at: source, attachment: .init(
+            fileName: "notes.txt", data: Data(repeating: 65, count: 128 * 1_024)))
+        let padding = try FileHandle(forWritingTo: source)
+        try padding.seekToEnd()
+        try padding.write(contentsOf: Data(repeating: 0, count: 512 * 1_024))
+        try padding.close()
+        let service = PDFDocumentStructureService()
+        let before = try service.preservationSignature(in: source, includePageLabels: true)
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced)
+        XCTAssertEqual(try service.preservationSignature(in: output, includePageLabels: true), before)
+    }
+
+    func testImageModeRemovesTextOnlyWhenExplicitlySelected() throws {
+        let source = url("source.pdf"), output = url("output.pdf")
+        try makeImagePDF(at: source, pages: 1, edge: 900)
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact, mode: .imageCopy)
+        XCTAssertTrue(PDFDocument(url: output)?.page(at: 0)?.string?.isEmpty ?? true)
+    }
+
+    func testEstimateIsNeutralForContentModeAndSamplesImageMode() throws {
+        let source = url("source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(at: source, pageCount: 60)
+        let content = try PDFOutputService().estimateCompression(sourceURL: source, quality: .balanced)
+        XCTAssertEqual(content.sampledPageCount, 0)
+        XCTAssertEqual(content.estimatedByteCount, content.sourceByteCount)
+        let image = try PDFOutputService().estimateCompression(sourceURL: source, quality: .balanced, mode: .imageCopy)
+        XCTAssertEqual(image.sampledPageCount, 3)
+        XCTAssertGreaterThan(image.estimatedByteCount, 0)
+    }
+
+    func testSignedPDFIsRefusedWithoutPublishing() throws {
+        let source = url("signed.pdf"), output = url("output.pdf")
+        let commands = Data(repeating: 32, count: 2_048)
+        try PDFTestFixtureFactory.writeClassicPDF(objects: [
+            .init(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            .init(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            .init(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>"),
+            .init(4, "<< /Length \(commands.count) >>", stream: commands),
+            .init(5, "<< /Type /Sig /ByteRange [0 1 2 3] /Contents <1234> >>")
+        ], rootObjectNumber: 1, to: source)
+        XCTAssertThrowsError(try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced)) { error in
+            XCTAssertTrue(String(describing: error).contains("signature"))
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: output.path))
+    }
+
+    func testDictionaryParserRecognizesNamesWithoutLookingInsideStrings() throws {
+        let data = Data("<< /Type /EmbeddedFile /Note (not /Filter /DCTDecode) /Filter /FlateDecode /Length 123 >>".utf8)
+        let dictionary = try XCTUnwrap(pdfFirstDictionaryRange(in: data))
+        let type = try XCTUnwrap(pdfTopLevelValueRange(for: "Type", in: data, dictionaryRange: dictionary))
+        let filter = try XCTUnwrap(pdfTopLevelValueRange(for: "Filter", in: data, dictionaryRange: dictionary))
+        XCTAssertEqual(String(decoding: data[type], as: UTF8.self), "/EmbeddedFile")
+        XCTAssertEqual(String(decoding: data[filter], as: UTF8.self), "/FlateDecode")
+    }
+
+    @MainActor
+    func testModelCompressionKeepsMainActorResponsiveThroughAuditAndSave() async throws {
+        let source = url("responsive.pdf")
+        try makeImagePDF(at: source, pages: 12, edge: 1_200)
+        let store = DocumentStore(rootURL: url("ModelStore"))
+        let imported = try await store.importPDF(from: source, preserveSourceLocation: false)
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        var finished = false
+        let operation = Task { @MainActor in
+            let created = await model.createCompressedCopy(recordID: imported.id, quality: .balanced,
+                expectedContentRevisionID: imported.contentRevisionID, presentsFeedback: false)
+            finished = true
+            return created
+        }
+        var ticks = 0
+        var maxDelay: Duration = .zero
+        while !finished {
+            let tick = ContinuousClock.now
+            try await Task.sleep(for: .milliseconds(20))
+            maxDelay = max(maxDelay, tick.duration(to: .now))
+            ticks += 1
+        }
+        let result = await operation.value
+        XCTAssertNotNil(result, "Compression failed")
+        XCTAssertGreaterThan(ticks, 1)
+        XCTAssertLessThan(maxDelay, .milliseconds(500), "Main actor stalled during compression/audit/save")
+        XCTAssertFalse(model.isProcessing(imported.id))
+        print("COMPRESSION_RESPONSIVENESS ticks=\(ticks) longestHeartbeatInterval=\(maxDelay)")
+    }
+
+    func testLosslessPreservesExistingJPEGBytesAtEveryQuality() throws {
+        let source = url("original-jpeg.pdf")
+        try makeImagePDF(at: source, pages: 2, edge: 2_400, jpeg: true)
+        try appendPadding(to: source)
+        for quality in PDFCompressionQuality.allCases {
+            let output = url("lossless-\(quality.rawValue).pdf")
+            try PDFOutputService().compress(sourceURL: source, destination: output, quality: quality)
+            try assertImagePayloadsEqual(source: source, output: output, pages: 2)
+            XCTAssertNotNil(try Data(contentsOf: output).range(of: Data("/Width 2400".utf8)))
+        }
+    }
+
+    func testLosslessKeepsHighEntropyImagePixelsInsteadOfReducingQuality() throws {
+        let source = url("noise.pdf"), output = url("lossless-noise.pdf")
+        try makeImagePDF(at: source, pages: 1, edge: 900, noisy: true)
+        try appendPadding(to: source)
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact)
+        try assertImagePayloadsEqual(source: source, output: output, pages: 1)
+        let bytes = try XCTUnwrap(output.resourceValues(forKeys: [.fileSizeKey]).fileSize)
+        XCTAssertGreaterThan(bytes, 900 * 900 * 3 - 1_024,
+            "High-entropy pixels cannot be shrunk dramatically without changing them")
+    }
+
+    private func appendPadding(to file: URL) throws {
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(repeating: 0, count: 1_024 * 1_024))
+    }
+
+    /// Independent PDF decoder: compare every original sample byte (or every
+    /// existing JPEG byte), rather than low-resolution rendered thumbnails.
+    private func assertImagePayloadsEqual(source: URL, output: URL, pages: Int) throws {
+        let before = try XCTUnwrap(CGPDFDocument(source as CFURL))
+        let after = try XCTUnwrap(CGPDFDocument(output as CFURL))
+        func payload(_ document: CGPDFDocument, page: Int) throws -> (Data, CGPDFDataFormat, Int, Int) {
+            let dictionary = try XCTUnwrap(document.page(at: page)?.dictionary)
+            var resources: CGPDFDictionaryRef?, images: CGPDFDictionaryRef?, stream: CGPDFStreamRef?
+            XCTAssertTrue(CGPDFDictionaryGetDictionary(dictionary, "Resources", &resources))
+            XCTAssertTrue(CGPDFDictionaryGetDictionary(try XCTUnwrap(resources), "XObject", &images))
+            XCTAssertTrue(CGPDFDictionaryGetStream(try XCTUnwrap(images), "Im", &stream))
+            let image = try XCTUnwrap(stream)
+            let metadata = try XCTUnwrap(CGPDFStreamGetDictionary(image))
+            var width = 0, height = 0
+            XCTAssertTrue(CGPDFDictionaryGetInteger(metadata, "Width", &width))
+            XCTAssertTrue(CGPDFDictionaryGetInteger(metadata, "Height", &height))
+            var format = CGPDFDataFormat.raw
+            let bytes = try XCTUnwrap(CGPDFStreamCopyData(image, &format)) as Data
+            return (bytes, format, width, height)
+        }
+        for page in 1...pages {
+            try autoreleasepool {
+                let lhs = try payload(before, page: page), rhs = try payload(after, page: page)
+                XCTAssertTrue(lhs.0 == rhs.0, "Image data differs on page \(page)")
+                XCTAssertEqual(lhs.1, rhs.1)
+                XCTAssertEqual(lhs.2, rhs.2)
+                XCTAssertEqual(lhs.3, rhs.3)
+            }
+        }
+        print("LOSSLESS_PIXEL_CHECK pages=\(pages) identical_payloads=\(pages)")
+    }
+
+    func testCompressionAcceptsUnusedAppleZeroOffsetPlaceholder() throws {
+        let source = url("placeholder.pdf"), output = url("output.pdf")
+        let commands = Data(("BT /F 12 Tf 20 50 Td (Placeholder test) Tj ET\n" + String(repeating: " ", count: 2_048)).utf8)
+        try PDFTestFixtureFactory.writeClassicPDF(objects: [
+            .init(1, "<< /Type /Catalog /Pages 2 0 R >>"),
+            .init(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>"),
+            .init(3, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F 6 0 R >> >> /Contents 4 0 R >>"),
+            .init(4, "<< /Length \(commands.count) >>", stream: commands),
+            .init(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        ], rootObjectNumber: 1, to: source)
+        var data = try Data(contentsOf: source)
+        let marker = try XCTUnwrap(data.range(of: Data("0000000000 00000 f".utf8)))
+        data.replaceSubrange(marker, with: Data("0000000000 00000 n".utf8))
+        try data.write(to: source)
+        XCTAssertThrowsError(try PDFClassicXRefDocument(data: data), "Other mutation paths remain strict")
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .readable)
+        XCTAssertEqual(PDFDocument(url: output)?.page(at: 0)?.string, PDFDocument(url: source)?.page(at: 0)?.string)
+        XCTAssertTrue(PDFDocument(url: output)?.page(at: 0)?.string?.contains("Placeholder test") == true)
+    }
+
+    func testJPEGDownsamplingPreservesSearchableText() throws {
+        let source = url("jpeg.pdf"), output = url("output.pdf")
+        try makeImagePDF(at: source, pages: 2, edge: 2_400, jpeg: true)
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .compact, mode: .optimizedImages)
+        XCTAssertEqual(PDFDocument(url: output)?.page(at: 1)?.string, PDFDocument(url: source)?.page(at: 1)?.string)
+        XCTAssertLessThan(try XCTUnwrap(output.resourceValues(forKeys: [.fileSizeKey]).fileSize),
+            try XCTUnwrap(source.resourceValues(forKeys: [.fileSizeKey]).fileSize))
+        let bytes = try Data(contentsOf: output)
+        XCTAssertNotNil(bytes.range(of: Data("/Width 1200".utf8)))
+    }
+
+    func testCrossReferenceAndObjectStreamsRetainTextAndTrailerID() throws {
+        let classic = url("classic.pdf"), source = url("xref-stream.pdf"), output = url("output.pdf")
+        try makeImagePDF(at: classic, pages: 1, edge: 900)
+        let data = try Data(contentsOf: classic)
+        let parsed = try PDFClassicXRefDocument(data: data)
+        let references = parsed.allObjects()
+        let marker = try XCTUnwrap(data.range(of: Data("startxref".utf8), options: .backwards))
+        let start = try XCTUnwrap(Int(String(decoding: data[marker.upperBound...], as: UTF8.self).split(whereSeparator: { !$0.isNumber }).first ?? ""))
+        var body = Data(data[..<start])
+        let objectStreamNumber = (references.map(\.number).max() ?? 0) + 1
+        let xrefNumber = objectStreamNumber + 1
+        let fontPayload = Data("3 0 << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".utf8)
+        let objectStreamOffset = body.count
+        body.append(Data("\(objectStreamNumber) 0 obj\n<< /Type /ObjStm /N 1 /First 4 /Length \(fontPayload.count) >>\nstream\n".utf8))
+        body.append(fontPayload)
+        body.append(Data("\nendstream\nendobj\n".utf8))
+        let xrefOffset = body.count
+        var entries = Data()
+        func entry(_ type: UInt8, _ first: UInt64, _ second: UInt32) {
+            entries.append(type)
+            for shift in stride(from: 56, through: 0, by: -8) { entries.append(UInt8(truncatingIfNeeded: first >> shift)) }
+            for shift in stride(from: 24, through: 0, by: -8) { entries.append(UInt8(truncatingIfNeeded: second >> shift)) }
+        }
+        for number in 0...xrefNumber {
+            if number == 0 { entry(0, 0, 65_535) }
+            else if number == 3 { entry(2, UInt64(objectStreamNumber), 0) }
+            else if number == objectStreamNumber { entry(1, UInt64(objectStreamOffset), 0) }
+            else if number == xrefNumber { entry(1, UInt64(xrefOffset), 0) }
+            else { entry(1, UInt64(try XCTUnwrap(references.first { $0.number == number }?.offset)), 0) }
+        }
+        let compressed = try XCTUnwrap(PDFXRefStreamDocument.deflateZlib(entries))
+        body.append(Data("\(xrefNumber) 0 obj\n<< /Type /XRef /Size \(xrefNumber + 1) /Root 1 0 R /W [1 8 4] /Filter /FlateDecode /Length \(compressed.count) /ID [<12345678> <12345678>] >>\nstream\n".utf8))
+        body.append(compressed)
+        body.append(Data("\nendstream\nendobj\nstartxref\n\(xrefOffset)\n%%EOF\n".utf8))
+        try body.write(to: source)
+        XCTAssertTrue(PDFDocument(url: source)?.page(at: 0)?.string?.contains("Compression contract") == true)
+        try PDFOutputService().compress(sourceURL: source, destination: output, quality: .balanced)
+        XCTAssertEqual(PDFDocument(url: output)?.page(at: 0)?.string, PDFDocument(url: source)?.page(at: 0)?.string)
+        XCTAssertNotNil(try Data(contentsOf: output).range(of: Data("/ID [<12345678> <12345678>]".utf8)))
+    }
+
+    /// Uses a different image object per page and writes directly to disk.
+    private func makeImagePDF(at url: URL, pages: Int, edge: Int, jpeg: Bool = false, noisy: Bool = false) throws {
+        XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        var offsets: [UInt64] = [0]
+        func append(_ text: String) throws { try handle.write(contentsOf: Data(text.utf8)) }
+        func object(_ number: Int, _ dictionary: String, stream: Data? = nil) throws {
+            XCTAssertEqual(offsets.count, number)
+            offsets.append(try handle.offset())
+            try append("\(number) 0 obj\n\(dictionary)\n")
+            if let stream { try append("stream\n"); try handle.write(contentsOf: stream); try append("\nendstream\n") }
+            try append("endobj\n")
+        }
+        try append("%PDF-1.7\n")
+        try object(1, "<< /Type /Catalog /Pages 2 0 R /AcroForm << /Fields [7 0 R] >> >>")
+        let kids = (0..<pages).map { "\(4 + $0 * 5) 0 R" }.joined(separator: " ")
+        try object(2, "<< /Type /Pages /Count \(pages) /Kids [\(kids)] >>")
+        try object(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+        for index in 0..<pages {
+            try autoreleasepool {
+                let page = 4 + index * 5
+                try object(page, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /CropBox [0 0 600 780] /Rotate \(index.isMultiple(of: 2) ? 0 : 90) /Resources << /Font << /F1 3 0 R >> /XObject << /Im \(page + 2) 0 R >> >> /Contents \(page + 1) 0 R /Annots [\(page + 4) 0 R \(page + 3) 0 R] >>")
+                let commands = Data("q 500 0 0 500 50 150 cm /Im Do Q\nBT /F1 16 Tf 50 700 Td (Compression contract \(index)) Tj ET\n".utf8)
+                try object(page + 1, "<< /Length \(commands.count) >>", stream: commands)
+                var pixels = Data(count: edge * edge * 3)
+                pixels.withUnsafeMutableBytes { (raw: UnsafeMutableRawBufferPointer) in
+                    let bytes = raw.bindMemory(to: UInt8.self)
+                    var random: UInt32 = UInt32(index + 1)
+                    for y in 0..<edge { for x in 0..<edge {
+                        let offset = (y * edge + x) * 3
+                        if noisy {
+                            for channel in 0..<3 {
+                                random = random &* 1_664_525 &+ 1_013_904_223
+                                bytes[offset + channel] = UInt8(truncatingIfNeeded: random >> 16)
+                            }
+                            continue
+                        }
+                        bytes[offset] = UInt8((x / 8 + index) % 256)
+                        bytes[offset + 1] = UInt8((y / 8 + index) % 256)
+                        bytes[offset + 2] = UInt8(((x + y) / 16) % 256)
+                    }}
+                }
+                let filter: String
+                if jpeg {
+                    let provider = try XCTUnwrap(CGDataProvider(data: pixels as CFData))
+                    let image = try XCTUnwrap(CGImage(width: edge, height: edge, bitsPerComponent: 8, bitsPerPixel: 24,
+                        bytesPerRow: edge * 3, space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGBitmapInfo(rawValue: 0),
+                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent))
+                    pixels = try XCTUnwrap(UIImage(cgImage: image).jpegData(compressionQuality: 0.98))
+                    filter = "/Filter /DCTDecode"
+                } else { filter = "" }
+                try object(page + 2, "<< /Type /XObject /Subtype /Image /Width \(edge) /Height \(edge) /BitsPerComponent 8 /ColorSpace /DeviceRGB /Length \(pixels.count) \(filter) >>", stream: pixels)
+                try object(page + 3, "<< /Type /Annot /Subtype /Widget /FT /Tx /T (Input\(index)) /V (Keep this value) /Rect [50 60 200 100] >>")
+                try object(page + 4, "<< /Type /Annot /Subtype /Link /Rect [50 710 200 740] /A << /S /URI /URI (https://example.com/) >> >>")
+            }
+        }
+        let xref = try handle.offset()
+        try append("xref\n0 \(offsets.count)\n0000000000 65535 f \n")
+        for offset in offsets.dropFirst() { try append(String(format: "%010llu 00000 n \n", offset)) }
+        try append("trailer\n<< /Size \(offsets.count) /Root 1 0 R /ID [<12345678> <12345678>] >>\nstartxref\n\(xref)\n%%EOF\n")
+    }
+}
+
+private final class CompressionCancellationLatch: @unchecked Sendable {
+    private let reached = DispatchSemaphore(value: 0)
+    private let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var didPause = false
+    func pauseAtCheckpoint() {
+        lock.lock()
+        if didPause { lock.unlock(); return }
+        didPause = true
+        lock.unlock()
+        reached.signal()
+        _ = release.wait(timeout: .now() + 10)
+    }
+    func waitForCheckpoint() { _ = reached.wait(timeout: .now() + 15) }
+    func resume() { release.signal() }
+}
+
+/// Product contract: ordinary actions advance one Library document. Historical
+/// bytes are recoverable, while only an explicit duplicate adds a document.
+final class PDFDocumentLifecycleTests: XCTestCase {
+    private var directory: URL!
+    override func setUpWithError() throws {
+        directory = FileManager.default.temporaryDirectory.appendingPathComponent("DocumentLifecycle-\(UUID())")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: directory)
+    }
+    private func source(_ name: String = "Contract.pdf") throws -> URL {
+        let url = directory.appendingPathComponent(name)
+        try PDFTestFixtureFactory.makeTextPDF(at: url, pageCount: 2)
+        let handle = try FileHandle(forWritingTo: url)
+        try handle.seekToEnd()
+        try handle.write(contentsOf: Data(repeating: 0, count: 2 * 1_024 * 1_024))
+        try handle.close()
+        return url
+    }
+    private var overlay: PDFContentOverlay {
+        .text(pageIndex: 0, bounds: PDFNormalizedRect(x: 0.1, y: 0.6, width: 0.7, height: 0.1),
+              text: "Added information", fontSize: 16,
+              color: PDFInkColor(red: 0, green: 0, blue: 0, alpha: 1))
+    }
+
+    func testLargeHistoryThresholdUsesBytesNotPageCount() {
+        XCTAssertFalse(PDFHistoryStoragePolicy.usesCompactHistory(byteCount: 100 * 1_024 * 1_024 - 1))
+        XCTAssertTrue(PDFHistoryStoragePolicy.usesCompactHistory(byteCount: 100 * 1_024 * 1_024))
+    }
+
+    func testCompactHistoryKeepsOriginalAcrossEditsAndRestart() async throws {
+        let root = directory.appendingPathComponent("CompactStore")
+        // Exercise production retention with small offline fixtures.
+        let store = DocumentStore(rootURL: root, largeFileHistoryThreshold: 1)
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        let originalBytes = try Data(contentsOf: liveURL)
+        let original = try await store.createVersionSnapshot(for: record, label: "First edit", automatic: true)
+        XCTAssertTrue(original.isProtectedOriginal)
+        for _ in 0..<4 {
+            try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+            record = try await store.refresh(record)
+            let recovery = try await store.createVersionSnapshot(for: record, label: "Another edit", automatic: true)
+            XCTAssertEqual(recovery.id, original.id)
+        }
+        // Persisted compact mode survives even when the current PDF shrinks below the threshold.
+        let reopened = DocumentStore(rootURL: root, largeFileHistoryThreshold: Int64.max)
+        let reused = try await reopened.createVersionSnapshot(for: record, label: "After restart", automatic: true)
+        XCTAssertEqual(reused.id, original.id)
+        let versions = try await reopened.versions(for: record.id)
+        XCTAssertEqual(versions.count, 1)
+        let originalURL = try await reopened.versionFileURL(snapshotID: original.id, recordID: record.id)
+        XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
+        XCTAssertNotEqual(try Data(contentsOf: liveURL), originalBytes)
+    }
+
+    func testCleanupKeepsStartingAndCurrentBytesAndRemovesPinnedIntermediate() async throws {
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("CleanupStore"))
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        let originalBytes = try Data(contentsOf: liveURL)
+        let original = try await store.createVersionSnapshot(for: record, label: "First edit", automatic: true)
+        var pinnedID: UUID?
+        for index in 0..<14 {
+            try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+            record = try await store.refresh(record)
+            let snapshot = try await store.createVersionSnapshot(for: record, label: "Edit", automatic: true)
+            if index == 1 {
+                pinnedID = snapshot.id
+                _ = try await store.updateVersionMilestone(snapshotID: snapshot.id, recordID: record.id,
+                    name: "Important", pinned: true, linkedDeliveryReceiptID: nil)
+            }
+        }
+        let before = try await store.versions(for: record.id)
+        XCTAssertTrue(before.contains { $0.id == original.id }, "Retention must preserve the original past 12 edits")
+        let latestBytes = try Data(contentsOf: liveURL)
+        let removed = try await store.clearIntermediateVersions()
+        XCTAssertEqual(removed, before.count - 1)
+        let after = try await store.versions(for: record.id)
+        XCTAssertEqual(after.map(\.id), [original.id])
+        XCTAssertFalse(after.contains { $0.id == pinnedID })
+        XCTAssertEqual(try Data(contentsOf: liveURL), latestBytes)
+        let originalURL = try await store.versionFileURL(snapshotID: original.id, recordID: record.id)
+        XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
+        let repeated = try await store.clearIntermediateVersions()
+        XCTAssertEqual(repeated, 0)
+    }
+
+    func testCompactHistoryPreservesExplicitMilestonesUntilConfirmedCleanup() async throws {
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("PinnedCompactStore"), largeFileHistoryThreshold: 1)
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        let original = try await store.createVersionSnapshot(for: record, label: "First", automatic: true)
+        try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+        record = try await store.refresh(record)
+        let explicit = try await store.createVersionSnapshot(for: record, label: "Explicit milestone")
+        _ = try await store.updateVersionMilestone(snapshotID: explicit.id, recordID: record.id,
+            name: "Keep", pinned: true, linkedDeliveryReceiptID: nil)
+        try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+        record = try await store.refresh(record)
+        _ = try await store.createVersionSnapshot(for: record, label: "Next", automatic: true)
+        let versions = try await store.versions(for: record.id)
+        XCTAssertEqual(Set(versions.map(\.id)), Set([original.id, explicit.id]))
+        _ = try await store.clearIntermediateVersions()
+        let cleared = try await store.versions(for: record.id)
+        XCTAssertEqual(cleared.map(\.id), [original.id])
+    }
+
+    func testLegacyCleanupRetainsEarliestAvailableAndDecodesMissingPolicyFields() async throws {
+        let root = directory.appendingPathComponent("LegacyHistoryStore")
+        let store = DocumentStore(rootURL: root)
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        let earliest = try await store.createVersionSnapshot(for: record, label: "Oldest available")
+        try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+        record = try await store.refresh(record)
+        _ = try await store.createVersionSnapshot(for: record, label: "Intermediate")
+        let indexURL = root.appendingPathComponent("versions.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as? [[String: Any]])
+        for index in rows.indices {
+            rows[index].removeValue(forKey: "isOriginalRecoveryPoint")
+            rows[index].removeValue(forKey: "compactHistoryEnabled")
+            // Distinct legacy timestamps are intentional here; rapid snapshots
+            // otherwise round to the same second on a fast physical device.
+            rows[index]["createdAt"] = rows[index]["id"] as? String == earliest.id.uuidString
+                ? "2026-01-01T00:00:00Z" : "2026-01-01T00:01:00Z"
+        }
+        try JSONSerialization.data(withJSONObject: rows).write(to: indexURL)
+        let reopened = DocumentStore(rootURL: root)
+        let removed = try await reopened.clearIntermediateVersions()
+        XCTAssertEqual(removed, 1)
+        let remaining = try await reopened.versions(for: record.id)
+        XCTAssertEqual(remaining.map(\.id), [earliest.id])
+        XCTAssertTrue(try XCTUnwrap(remaining.first).isProtectedOriginal)
+    }
+
+    func testLegacyCleanupPreservesAmbiguousEarliestVersionsAndTheirBytes() async throws {
+        let root = directory.appendingPathComponent("AmbiguousLegacyHistoryStore")
+        let store = DocumentStore(rootURL: root)
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        var snapshots: [PDFVersionSnapshot] = []
+        var bytes: [UUID: Data] = [:]
+        for index in 0..<3 {
+            if index > 0 {
+                try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+                record = try await store.refresh(record)
+            }
+            let snapshot = try await store.createVersionSnapshot(for: record, label: "Legacy \(index)")
+            snapshots.append(snapshot)
+            bytes[snapshot.id] = try Data(contentsOf: await store.versionFileURL(snapshotID: snapshot.id, recordID: record.id))
+        }
+        let liveBytes = try Data(contentsOf: liveURL)
+        let indexURL = root.appendingPathComponent("versions.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as? [[String: Any]])
+        for index in rows.indices {
+            rows[index].removeValue(forKey: "isOriginalRecoveryPoint")
+            rows[index].removeValue(forKey: "compactHistoryEnabled")
+            rows[index]["createdAt"] = rows[index]["id"] as? String == snapshots[2].id.uuidString
+                ? "2026-01-01T00:01:00Z" : "2026-01-01T00:00:00Z"
+        }
+        try JSONSerialization.data(withJSONObject: rows).write(to: indexURL)
+        let reopened = DocumentStore(rootURL: root)
+        let removed = try await reopened.clearIntermediateVersions()
+        XCTAssertEqual(removed, 1)
+        let remaining = try await reopened.versions(for: record.id)
+        XCTAssertEqual(Set(remaining.map(\.id)), Set(snapshots.prefix(2).map(\.id)))
+        XCTAssertTrue(remaining.allSatisfy(\.isProtectedOriginal))
+        for snapshot in remaining {
+            let url = try await reopened.versionFileURL(snapshotID: snapshot.id, recordID: record.id)
+            XCTAssertEqual(try Data(contentsOf: url), bytes[snapshot.id])
+        }
+        let repeatedRemoval = try await reopened.clearIntermediateVersions()
+        XCTAssertEqual(repeatedRemoval, 0)
+        XCTAssertEqual(try Data(contentsOf: liveURL), liveBytes)
+    }
+
+    private func ambiguousLegacyFixture(_ name: String) async throws -> (
+        root: URL, record: DocumentRecord, snapshots: [PDFVersionSnapshot], bytes: [UUID: Data], liveURL: URL
+    ) {
+        let root = directory.appendingPathComponent(name)
+        let store = DocumentStore(rootURL: root)
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        var snapshots: [PDFVersionSnapshot] = []
+        var bytes: [UUID: Data] = [:]
+        for index in 0..<3 {
+            if index > 0 {
+                try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+                record = try await store.refresh(record)
+            }
+            let snapshot = try await store.createVersionSnapshot(for: record, label: "Legacy \(index)")
+            snapshots.append(snapshot)
+            bytes[snapshot.id] = try Data(contentsOf: await store.versionFileURL(snapshotID: snapshot.id, recordID: record.id))
+        }
+        let indexURL = root.appendingPathComponent("versions.json")
+        var rows = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: indexURL)) as? [[String: Any]])
+        for index in rows.indices {
+            rows[index].removeValue(forKey: "isOriginalRecoveryPoint")
+            rows[index].removeValue(forKey: "compactHistoryEnabled")
+            rows[index]["createdAt"] = rows[index]["id"] as? String == snapshots[2].id.uuidString
+                ? "2026-01-01T00:01:00Z" : "2026-01-01T00:00:00Z"
+        }
+        try JSONSerialization.data(withJSONObject: rows).write(to: indexURL)
+        return (root, record, snapshots, bytes, liveURL)
+    }
+
+    func testAutomaticCompactHistoryPreservesAmbiguousLegacyOriginalBytesAcrossRestart() async throws {
+        let fixture = try await ambiguousLegacyFixture("LegacyAutomaticCompact")
+        let liveBytes = try Data(contentsOf: fixture.liveURL)
+        let store = DocumentStore(rootURL: fixture.root, largeFileHistoryThreshold: 1)
+        _ = try await store.createVersionSnapshot(for: fixture.record, label: "Automatic edit", automatic: true)
+        let expected = Set(fixture.snapshots.prefix(2).map(\.id))
+        let retained = try await store.versions(for: fixture.record.id)
+        XCTAssertEqual(Set(retained.map(\.id)), expected)
+        XCTAssertTrue(retained.allSatisfy { $0.isProtectedOriginal && $0.compactHistoryEnabled == true })
+        let reopened = DocumentStore(rootURL: fixture.root, largeFileHistoryThreshold: Int64.max)
+        _ = try await reopened.createVersionSnapshot(for: fixture.record, label: "After restart", automatic: true)
+        let afterRestart = try await reopened.versions(for: fixture.record.id)
+        XCTAssertEqual(Set(afterRestart.map(\.id)), expected)
+        for snapshot in afterRestart {
+            let url = try await reopened.versionFileURL(snapshotID: snapshot.id, recordID: fixture.record.id)
+            XCTAssertEqual(try Data(contentsOf: url), fixture.bytes[snapshot.id])
+        }
+        XCTAssertEqual(try Data(contentsOf: fixture.liveURL), liveBytes)
+    }
+
+    func testOrdinaryHistoryRetentionPreservesAmbiguousLegacyOriginalBytesPastItsLimit() async throws {
+        let fixture = try await ambiguousLegacyFixture("LegacyOrdinaryRetention")
+        let store = DocumentStore(rootURL: fixture.root)
+        var record = fixture.record
+        for index in 0..<14 {
+            try PDFMutationService().addStamp(.draft, toPageAt: 0, in: fixture.liveURL)
+            record = try await store.refresh(record)
+            let liveBytes = try Data(contentsOf: fixture.liveURL)
+            _ = try await store.createVersionSnapshot(for: record, label: "Later edit \(index)")
+            XCTAssertEqual(try Data(contentsOf: fixture.liveURL), liveBytes)
+        }
+        let retained = try await store.versions(for: record.id)
+        XCTAssertEqual(retained.count, 12)
+        for original in fixture.snapshots.prefix(2) {
+            XCTAssertTrue(retained.contains { $0.id == original.id && $0.isProtectedOriginal })
+            let url = try await store.versionFileURL(snapshotID: original.id, recordID: record.id)
+            XCTAssertEqual(try Data(contentsOf: url), fixture.bytes[original.id])
+        }
+    }
+
+    func testAutomaticCompactionRejectsAnyDamagedAmbiguousOriginalBeforeDeletingHistory() async throws {
+        let fixture = try await ambiguousLegacyFixture("LegacyDamagedAutomaticCompact")
+        let store = DocumentStore(rootURL: fixture.root, largeFileHistoryThreshold: 1)
+        let damaged = fixture.snapshots[1]
+        let damagedURL = try await store.versionFileURL(snapshotID: damaged.id, recordID: fixture.record.id)
+        var bytes = try Data(contentsOf: damagedURL)
+        bytes[0] ^= 1
+        try bytes.write(to: damagedURL)
+        let indexURL = fixture.root.appendingPathComponent("versions.json")
+        let originalIndex = try Data(contentsOf: indexURL)
+        let liveBytes = try Data(contentsOf: fixture.liveURL)
+        do {
+            _ = try await store.createVersionSnapshot(for: fixture.record, label: "Unsafe cleanup", automatic: true)
+            XCTFail("A damaged candidate must prevent destructive automatic cleanup")
+        } catch PaperPathError.outputVerificationFailed { }
+        XCTAssertEqual(try Data(contentsOf: indexURL), originalIndex)
+        XCTAssertEqual(try Data(contentsOf: fixture.liveURL), liveBytes)
+        let later = fixture.snapshots[2]
+        let laterURL = try await store.versionFileURL(snapshotID: later.id, recordID: fixture.record.id)
+        XCTAssertEqual(try Data(contentsOf: laterURL), fixture.bytes[later.id])
+    }
+
+    func testCleanupRejectsDamagedStartingPointBeforeDeletingHistory() async throws {
+        let root = directory.appendingPathComponent("DamagedStartingPointStore")
+        let store = DocumentStore(rootURL: root)
+        var record = try await store.importPDF(from: source())
+        let liveURL = await store.url(for: record)
+        let original = try await store.createVersionSnapshot(for: record, label: "Starting")
+        try PDFMutationService().addStamp(.draft, toPageAt: 0, in: liveURL)
+        record = try await store.refresh(record)
+        let middle = try await store.createVersionSnapshot(for: record, label: "Middle")
+        let originalURL = try await store.versionFileURL(snapshotID: original.id, recordID: record.id)
+        var damaged = try Data(contentsOf: originalURL)
+        damaged[0] ^= 1
+        try damaged.write(to: originalURL)
+        let current = try Data(contentsOf: liveURL)
+        do {
+            _ = try await store.clearIntermediateVersions()
+            XCTFail("Damaged starting point must prevent destructive cleanup")
+        } catch PaperPathError.outputVerificationFailed { }
+        let retained = try await store.versions(for: record.id)
+        XCTAssertTrue(retained.contains { $0.id == middle.id })
+        XCTAssertEqual(try Data(contentsOf: liveURL), current)
+    }
+
+    func testLargeFileCapacityRetainsReserveAndRejectsUnknownCapacity() async throws {
+        let sparse = directory.appendingPathComponent("large-capacity-fixture.pdf")
+        XCTAssertTrue(FileManager.default.createFile(atPath: sparse.path, contents: nil))
+        let handle = try FileHandle(forWritingTo: sparse)
+        try handle.truncate(atOffset: UInt64(PDFHistoryStoragePolicy.largeFileThreshold))
+        try handle.close()
+        let low = DocumentStore(rootURL: directory.appendingPathComponent("LowCapacity"),
+            availableCapacity: { _ in 355 * 1_024 * 1_024 })
+        do {
+            try await low.ensureTemporaryWorkingCapacity(for: [sparse], copyMultiplier: 1, reserveBytes: 0)
+            XCTFail("Large operations must leave the safety reserve")
+        } catch PaperPathError.insufficientStorage { }
+        let enough = DocumentStore(rootURL: directory.appendingPathComponent("EnoughCapacity"),
+            availableCapacity: { _ in 356 * 1_024 * 1_024 })
+        try await enough.ensureTemporaryWorkingCapacity(for: [sparse], copyMultiplier: 1, reserveBytes: 0)
+        let unknown = DocumentStore(rootURL: directory.appendingPathComponent("UnknownCapacity"),
+            availableCapacity: { _ in nil })
+        do {
+            try await unknown.ensureTemporaryWorkingCapacity(for: [sparse], copyMultiplier: 1)
+            XCTFail("Unknown capacity must not authorize large working files")
+        } catch PaperPathError.storageFailure { }
+    }
+
+    @MainActor
+    func testCompressThenEditRetainsIdentityAndRestoresOriginal() async throws {
+        let external = try source()
+        let originalBytes = try Data(contentsOf: external)
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("Store"))
+        let imported = try await store.importPDF(from: external)
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let originalURL = try XCTUnwrap(model.url(for: imported.id))
+        let compressedResult = await model.createCompressedCopy(recordID: imported.id, quality: .readable,
+            expectedContentRevisionID: imported.contentRevisionID, presentsFeedback: false)
+        let compressed = try XCTUnwrap(compressedResult)
+        XCTAssertEqual(compressed.id, imported.id)
+        XCTAssertEqual(compressed.displayName, imported.displayName)
+        XCTAssertEqual(model.url(for: compressed.id), originalURL)
+        XCTAssertLessThan(compressed.profile.byteCount, imported.profile.byteCount)
+        XCTAssertTrue(compressed.hasCurrentDeliveryReceipt)
+        let noBenefit = await model.createCompressedCopy(recordID: compressed.id, quality: .readable,
+            expectedContentRevisionID: compressed.contentRevisionID, presentsFeedback: false)
+        XCTAssertNil(noBenefit)
+        XCTAssertEqual(model.record(id: imported.id)?.contentRevisionID, compressed.contentRevisionID)
+        let unchangedHistory = try await store.versions(for: imported.id)
+        XCTAssertEqual(unchangedHistory.count, 1)
+        let editedResult = await model.createEditedCopy(recordID: compressed.id, overlays: [overlay],
+            expectedContentRevisionID: compressed.contentRevisionID)
+        let edited = try XCTUnwrap(editedResult)
+        XCTAssertEqual(edited.id, imported.id)
+        XCTAssertEqual(model.workingDocuments.map(\.id), [imported.id])
+        XCTAssertTrue(model.deliveryOutputs.isEmpty)
+        XCTAssertTrue(PDFDocument(url: originalURL)?.page(at: 0)?.annotations.contains {
+            $0.contents == "Added information"
+        } == true)
+        XCTAssertEqual(try Data(contentsOf: external), originalBytes)
+        let versions = try await store.versions(for: imported.id)
+        XCTAssertEqual(versions.count, 2)
+        let initial = try XCTUnwrap(versions.first { $0.contentRevisionID == imported.contentRevisionID })
+        let restored = await model.restoreVersion(recordID: imported.id, snapshotID: initial.id)
+        XCTAssertTrue(restored)
+        XCTAssertEqual(model.workingDocuments.count, 1)
+        XCTAssertEqual(try Data(contentsOf: originalURL), originalBytes)
+        let reloaded = try await DocumentStore(rootURL: directory.appendingPathComponent("Store")).load()
+        XCTAssertEqual(reloaded.count, 1)
+        XCTAssertEqual(reloaded.first?.displayName, imported.displayName)
+        let duplicated = await model.duplicate(recordID: imported.id)
+        XCTAssertNotEqual(duplicated?.id, imported.id)
+        XCTAssertEqual(model.workingDocuments.count, 2, "Only explicit Save as New Document branches")
+    }
+
+    @MainActor
+    func testPasswordRoundTripAndEncryptedHistoryRestoreUseOneDocument() async throws {
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("Store"))
+        let imported = try await store.importPDF(from: source())
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let protectedResult = await model.createProtectedCopy(recordID: imported.id, password: "local-secret",
+            expectedContentRevisionID: imported.contentRevisionID)
+        let protected = try XCTUnwrap(protectedResult)
+        XCTAssertEqual(protected.id, imported.id)
+        XCTAssertTrue(protected.profile.isLocked)
+        var unlockIssue: PDFBatchDeliveryIssue?
+        let unlockedResult = await model.createUnlockedCopy(recordID: protected.id, password: "local-secret",
+            expectedContentRevisionID: protected.contentRevisionID, presentsFeedback: false,
+            onFailure: { unlockIssue = $0 })
+        let unlocked = try XCTUnwrap(unlockedResult, "\(unlockIssue?.code ?? "") \(unlockIssue?.message ?? "")")
+        XCTAssertEqual(unlocked.id, imported.id)
+        XCTAssertFalse(unlocked.profile.isLocked)
+        let versions = try await store.versions(for: imported.id)
+        let encrypted = try XCTUnwrap(versions.first { $0.contentRevisionID == protected.contentRevisionID })
+        let restored = await model.restoreVersion(recordID: imported.id, snapshotID: encrypted.id)
+        XCTAssertTrue(restored)
+        XCTAssertTrue(model.record(id: imported.id)?.profile.isLocked == true)
+        XCTAssertEqual(model.workingDocuments.count, 1)
+        let initial = try XCTUnwrap(versions.first { $0.contentRevisionID == imported.contentRevisionID })
+        let restoredPlain = await model.restoreVersion(recordID: imported.id, snapshotID: initial.id)
+        XCTAssertTrue(restoredPlain, "History works while the current document is password protected")
+        XCTAssertFalse(model.record(id: imported.id)?.profile.isLocked == true)
+        XCTAssertTrue(model.deliveryOutputs.isEmpty)
+    }
+
+    func testStaleAndCancelledUpdatesCannotPublishOrAddDocuments() async throws {
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("Store"))
+        let imported = try await store.importPDF(from: source())
+        let prepared = try source("Prepared.pdf")
+        let updated = try await store.saveProcessedDocument(imported, from: prepared,
+            label: "Save changes", revisionID: UUID())
+        do {
+            _ = try await store.saveProcessedDocument(imported, from: prepared,
+                label: "Stale", revisionID: UUID())
+            XCTFail("Stale revision committed")
+        } catch { }
+        let cancelled = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await store.saveProcessedDocument(updated, from: prepared,
+                label: "Cancelled", revisionID: UUID())
+        }
+        do { _ = try await cancelled.value; XCTFail("Cancelled revision committed") }
+        catch is CancellationError { }
+        let records = try await store.load()
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.contentRevisionID, updated.contentRevisionID)
+        let versions = try await store.versions(for: imported.id)
+        XCTAssertEqual(versions.count, 1)
+    }
+
+    @MainActor
+    func testExplicitExportKeepsEditableDocumentAndDoesNotCreateWorkingDocument() async throws {
+        let store = DocumentStore(rootURL: directory.appendingPathComponent("Store"))
+        let imported = try await store.importPDF(from: source())
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let exportedResult = await model.createSafeShareCopy(recordID: imported.id,
+            expectedContentRevisionID: imported.contentRevisionID)
+        let exported = try XCTUnwrap(exportedResult)
+        XCTAssertNotEqual(exported.id, imported.id)
+        XCTAssertEqual(exported.sourceDocumentID, imported.id)
+        XCTAssertEqual(model.workingDocuments.map(\.id), [imported.id])
+        XCTAssertEqual(model.record(id: imported.id)?.contentRevisionID, imported.contentRevisionID)
+        XCTAssertEqual(model.deliveryHistoryOutputs(for: imported.id).map(\.id), [exported.id])
+        let secondExportResult = await model.createSafeShareCopy(recordID: exported.id,
+            expectedContentRevisionID: exported.contentRevisionID)
+        let secondExport = try XCTUnwrap(secondExportResult)
+        XCTAssertEqual(model.sourceRecord(for: secondExport)?.id, exported.id,
+            "Verification keeps the immediate source")
+        XCTAssertEqual(model.originalDocument(for: secondExport)?.id, imported.id,
+            "Navigation jumps straight through an old-style output chain")
+        XCTAssertEqual(model.workingDocuments.count, 1)
+    }
+}
+
+extension PDFCoreServiceRegressionTests {
+    private func makeMergeNoteSource() throws -> URL {
+        let source = temporaryDirectory.appendingPathComponent("nonstandard-note.pdf")
+        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792))
+        let document = try XCTUnwrap(PDFDocument(data: renderer.pdfData { context in context.beginPage() }))
+        let note = PDFAnnotation(bounds: CGRect(x: 50, y: 200, width: 30, height: 30),
+            forType: .text, withProperties: nil)
+        note.contents = "Preserve original note geometry"
+        document.page(at: 0)?.addAnnotation(note)
+        XCTAssertTrue(document.write(to: source))
+        return source
+    }
+
+    private func rawNoteRect(in url: URL, page number: Int) throws -> CGRect {
+        let document = try XCTUnwrap(CGPDFDocument(url as CFURL))
+        let page = try XCTUnwrap(document.page(at: number))
+        let dictionary = try XCTUnwrap(page.dictionary)
+        var annotations: CGPDFArrayRef?
+        XCTAssertTrue(CGPDFDictionaryGetArray(dictionary, "Annots", &annotations))
+        let array = try XCTUnwrap(annotations)
+        for index in 0..<CGPDFArrayGetCount(array) {
+            var annotation: CGPDFDictionaryRef?
+            guard CGPDFArrayGetDictionary(array, index, &annotation), let annotation else { continue }
+            var subtype: UnsafePointer<CChar>?
+            guard CGPDFDictionaryGetName(annotation, "Subtype", &subtype), let subtype,
+                  String(cString: subtype) == "Text" else { continue }
+            var bounds: CGPDFArrayRef?
+            XCTAssertTrue(CGPDFDictionaryGetArray(annotation, "Rect", &bounds))
+            let rect = try XCTUnwrap(bounds)
+            var values = [CGPDFReal](repeating: 0, count: 4)
+            for component in 0..<4 { XCTAssertTrue(CGPDFArrayGetNumber(rect, component, &values[component])) }
+            return CGRect(x: values[0], y: values[1], width: values[2] - values[0], height: values[3] - values[1])
+        }
+        XCTFail("Saved note annotation disappeared")
+        throw PaperPathError.invalidPage
+    }
+
+    func testMergePreservesNonstandardNoteRectangle() throws {
+        let source = try makeMergeNoteSource()
+        let original = try Data(contentsOf: source)
+        let output = temporaryDirectory.appendingPathComponent("merged-notes.pdf")
+        try PDFCompositionService().combine(urls: [source, source], to: output)
+        let expected = try rawNoteRect(in: source, page: 1)
+        XCTAssertEqual(expected.width, 30)
+        XCTAssertEqual(try rawNoteRect(in: output, page: 1), expected)
+        XCTAssertEqual(try rawNoteRect(in: output, page: 2), expected)
+        XCTAssertEqual(try Data(contentsOf: source), original)
+    }
+
+    func testExtractionPreservesNonstandardNoteRectangle() throws {
+        let source = try makeMergeNoteSource()
+        let output = temporaryDirectory.appendingPathComponent("extracted-note.pdf")
+        try PDFCompositionService().extractPages(from: source, indices: [0], to: output)
+        XCTAssertEqual(try rawNoteRect(in: output, page: 1), try rawNoteRect(in: source, page: 1))
+    }
+}
+
+extension RealPDFReleaseTests {
+    func testCoreTextFormSavePreservesPagesAndOtherFields() throws {
+        let source = directory.appendingPathComponent("core-form.pdf")
+        try DemoPDFBuilder.create(at: source)
+        let before = try XCTUnwrap(PDFDocument(url: source))
+        let text = (0..<before.pageCount).map { before.page(at: $0)?.string }
+        let report = try PDFFormInspectionService().inspect(url: source)
+        let field = try XCTUnwrap(report.fields.first { $0.name == "Recipient name" })
+        try PDFMutationService().setTextFormValue("Core Verified 2026", field: field, in: source)
+        let saved = try PDFFormInspectionService().inspect(url: source)
+        XCTAssertEqual(saved.fields.first { $0.name == field.name }?.value, "Core Verified 2026")
+        XCTAssertEqual(saved.fields.filter { $0.name != field.name }.map(\.value),
+            report.fields.filter { $0.name != field.name }.map(\.value))
+        let after = try XCTUnwrap(PDFDocument(url: source))
+        XCTAssertEqual(after.pageCount, before.pageCount)
+        XCTAssertEqual((0..<after.pageCount).map { after.page(at: $0)?.string }, text)
+    }
+
+    func testCoreTextFormRejectsOversizedAndReadOnlyValuesWithoutChangingFile() throws {
+        let source = directory.appendingPathComponent("core-form-invalid.pdf")
+        try DemoPDFBuilder.create(at: source)
+        let report = try PDFFormInspectionService().inspect(url: source)
+        let field = try XCTUnwrap(report.fields.first { $0.name == "Recipient name" })
+        let original = try Data(contentsOf: source)
+        XCTAssertThrowsError(try PDFMutationService().setTextFormValue(String(repeating: "x", count: 257), field: field, in: source))
+        XCTAssertEqual(try Data(contentsOf: source), original)
+        let document = try XCTUnwrap(PDFDocument(url: source))
+        let annotation = try XCTUnwrap(document.page(at: field.pageIndex)?.annotations[field.annotationIndex])
+        annotation.isReadOnly = true
+        XCTAssertTrue(document.write(to: source))
+        let protectedBytes = try Data(contentsOf: source)
+        // An old editable snapshot must not bypass the current PDF's read-only flag.
+        XCTAssertThrowsError(try PDFMutationService().setTextFormValue("Must not save", field: field, in: source))
+        XCTAssertEqual(try Data(contentsOf: source), protectedBytes)
     }
 }

@@ -718,11 +718,12 @@ struct RecognizedTextView: View {
         do {
             try await Task.sleep(for: .milliseconds(160))
             let pages = model.ocrResults[recordID]?.pages ?? []
+            let search = DocumentPhraseSearch(query: request.query)
             let worker = Task.detached(priority: .userInitiated) {
                 var matches: Set<Int> = []
                 for page in pages {
                     try Task.checkCancellation()
-                    if page.text.localizedStandardContains(request.query) {
+                    if search.matches(page.text) {
                         matches.insert(page.pageIndex)
                     }
                 }
@@ -1008,14 +1009,14 @@ struct RecognizedTextView: View {
                         .frame(maxWidth: .infinity)
                         .accessibilityElement(children: .ignore)
                         .accessibilityLabel(
-                            "Creating searchable copy".localizedUI
+                            "Saving searchable text".localizedUI
                         )
                         .accessibilityValue(
                             searchableCreationProgressValue
                         )
                 } else {
                     Label(
-                        "Create Searchable Copy",
+                        "Save Searchable Text",
                         systemImage: "doc.text.magnifyingglass"
                     )
                     .frame(maxWidth: .infinity)
@@ -1068,14 +1069,14 @@ struct RecognizedTextView: View {
             if wasStopped {
                 model[noticeFor: paperPathSceneID] = (
                     created == nil
-                        ? "Copy creation stopped"
-                        : "Copy finished before stopping · copy kept in Library"
+                        ? "Changes stopped"
+                        : "Document saved before stopping"
                 ).localizedUI
                 return
             }
             guard let created else {
                 creationErrorMessage =
-                    "The searchable copy could not be created. Try again."
+                    "Searchable text could not be saved. Try again."
                         .localizedUI
                 creationErrorFeedback += 1
                 return
@@ -1146,6 +1147,7 @@ private struct OCRTextCorrectionSheet: View {
                         .disabled(isSaving)
                         .focused($isTextFocused)
                         .accessibilityLabel("Recognized line")
+                        .accessibilityIdentifier("ocrCorrectionText")
                     HStack {
                         if saveStopRequested {
                             Label(
@@ -1187,7 +1189,7 @@ private struct OCRTextCorrectionSheet: View {
                             guard let value = values.first else {
                                 return
                             }
-                            text = String(value.prefix(500))
+                            text = value
                         }
                         .labelStyle(.iconOnly)
                         .frame(minWidth: 44, minHeight: 44)
@@ -1205,9 +1207,15 @@ private struct OCRTextCorrectionSheet: View {
                                 "Page %lld · Vision confidence %lld%% · %lld/500",
                                 pageIndex + 1,
                                 Int(block.confidence * 100),
-                                text.count
+                                correctionValue.count
                             )
                         )
+                        if correctionValue.count > 500 {
+                            Text("Use up to 500 characters. Your full text is kept here.".localizedUI)
+                                .foregroundStyle(PPColor.rose)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityIdentifier("ocrCorrectionLengthWarning")
+                        }
                         Text(
                             "The correction stays on this device."
                                 .localizedUI
@@ -1240,7 +1248,9 @@ private struct OCRTextCorrectionSheet: View {
                 }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        guard scenePhase == .active,
+                        guard !isSaving, !correctionValue.isEmpty,
+                              correctionValue.count <= 500, hasCorrectionChanges,
+                              scenePhase == .active,
                               UIApplication.shared
                                 .isProtectedDataAvailable
                         else { return }
@@ -1286,15 +1296,14 @@ private struct OCRTextCorrectionSheet: View {
                     .disabled(
                         isSaving
                             || correctionValue.isEmpty
+                            || correctionValue.count > 500
                             || !hasCorrectionChanges
                     )
                     .keyboardShortcut(.defaultAction)
+                    .accessibilityIdentifier("saveOCRCorrection")
                 }
             }
-            .onChange(of: text) { _, value in
-                if value.count > 500 {
-                    text = String(value.prefix(500))
-                }
+            .onChange(of: text) { _, _ in
                 saveErrorMessage = nil
                 if correctionValue != committedText {
                     saveStatusMessage = nil

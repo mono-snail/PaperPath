@@ -3,9 +3,9 @@
 
 No retries or test filters are accepted: a green result must mean the whole
 suite ran. Real-device/distribution evidence remains a separate release gate.
+Use --report-quality-only to report historical quality-percentage targets separately.
 """
 import argparse
-from concurrent.futures import ThreadPoolExecutor
 import datetime
 import hashlib
 import json
@@ -16,15 +16,12 @@ import shutil
 import subprocess
 import sys
 import threading
+from swift_test_inventory import inventory as swift_inventory
 
 ROOT = Path(__file__).resolve().parents[1]
-COMMERCE_TESTS = [
-    "testPendingPurchaseSurvivesRecheckAndReopenThenApproves",
-    "testRestoreWithoutPurchaseShowsRecoverableFailure",
-    "testPurchasePersistsAcrossProcessRelaunchAndRefundRevokesAccess",
-]
 DEVICE_ONLY = "PaperPathTests/testStoreAppliesCompleteFileProtection()"
 IPAD_ONLY = {"PaperPathUITests/testIPadDocumentToolsInspectorOpensCompression()"}
+DARK_MODE_TESTS = {"ReleaseReadinessUITests/testSupportInDarkMode()"}
 
 
 def source_fingerprint():
@@ -42,7 +39,12 @@ def source_fingerprint():
                                        "PaperPathTests/", "PaperPathUITests/", "PaperPath.xcodeproj/"))
         relevant |= relative in {"project.yml", "docs/AUTOMATION_COVERAGE.json",
                                  "tools/RunReleaseChecks.py", "tools/test_release_checks.py",
-                                 "tools/CheckAutomationCoverage.mjs", "tools/CheckCodeCoverage.mjs"}
+                                 "tools/CheckAutomationCoverage.mjs", "tools/CheckCodeCoverage.mjs",
+                                 "tools/swift_test_inventory.py", "docs/TEST_QUALITY_CONTRACT.json",
+                                 "tools/CheckTestQuality.py", "tools/RunOutputOracleChecks.py",
+                                 "tools/AuditMergeOutputs.py", "tools/test_merge_output_audit.py",
+                                 "tools/StageCachedUIInputs.py",
+                                 "tools/test_test_quality.py"}
         relevant |= relative.endswith(".xctestplan")
         if not relevant:
             continue
@@ -61,17 +63,7 @@ def test_cases(tree):
 
 def test_inventory(directory):
     """XCTest's source declarations, independent of a scheme's selected tests."""
-    identifiers = set()
-    for path in (ROOT / directory).glob("*.swift"):
-        current_class = None
-        for line in path.read_text().splitlines():
-            match = re.match(r"(?:final )?class (\w+): XCTestCase", line)
-            if match:
-                current_class = match[1]
-            match = re.match(r"    func (test\w+)\(", line)
-            if match and current_class:
-                identifiers.add(f"{current_class}/{match[1]}()")
-    return identifiers
+    return set(swift_inventory(ROOT / directory))
 
 
 def validate_results(summary, tree, *, minimum, allowed_skips=(), expected_tests=None):
@@ -114,43 +106,100 @@ def partition_tests(tests, workers):
     return [ordered[index::workers] for index in range(workers) if ordered[index::workers]]
 
 
+
+def simulator_test_jobs():
+    """Observe active Xcode test jobs across chats before touching a device."""
+    processes = subprocess.check_output(["ps", "-axo", "pid=,command="], text=True)
+    active = []
+    for line in processes.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or Path(fields[1]).name != "xcodebuild":
+            continue
+        if any(argument in {"test", "test-without-building"} for argument in fields[2:]):
+            active.append(int(fields[0]))
+    return active
+
+
+def require_idle_simulator_tests():
+    active = simulator_test_jobs()
+    if active:
+        raise RuntimeError(f"Simulator testing is busy (Xcode PIDs {active}); wait and reuse the recorded devices")
+
+
+
+def registered_session(family, iphone=None, ipad=None, pool=None):
+    """Select one registered slot; reject old mixed-device invocations."""
+    pool = pool or json.loads((Path.home() / '.codex/simulators/pool.json').read_text())
+    if family not in {'iphone', 'ipad'}: raise ValueError('Choose one device family')
+    if (iphone and ipad) or (family == 'iphone' and ipad) or (family == 'ipad' and iphone):
+        raise ValueError('One device family per leased foreground run; mixed-device execution is prohibited')
+    slot = 'ios26-phone' if family == 'iphone' else 'ios26-ipad'
+    approved = pool['slots'][slot]['udid']
+    if (iphone or ipad) and (iphone or ipad) != approved:
+        raise ValueError('Use the registered existing device; no fallback or provisioning')
+    return slot, approved
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--iphone", required=True, help="Available iPhone simulator UDID")
-    parser.add_argument("--ipad", required=True, help="Available iPad simulator UDID")
+    parser.add_argument("--family", choices=["iphone", "ipad"], default="iphone", help="One registered device family per run")
+    parser.add_argument("--leased", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--iphone", help="Optional registered iPhone UDID; incompatible with --ipad")
+    parser.add_argument("--ipad", help="Optional registered iPad UDID; requires --family ipad")
     parser.add_argument("--node", default=os.environ.get("NODE_BINARY") or shutil.which("node"))
     parser.add_argument("--output", type=Path, help="New evidence directory; never overwritten")
     parser.add_argument("--system-diagnostics", action="store_true",
                         help="Also collect verbose simulator sysdiagnose on failure (can take ten minutes)")
-    parser.add_argument("--ui-workers", type=int, choices=[1, 2], default=2,
-                        help="Isolated workers per device family (default: 2; use 1 to reduce resource use)")
+    parser.add_argument("--ui-workers", type=int, choices=[1], default=1,
+                        help="One serial worker; existing simulators are reused and never created")
+    parser.add_argument("--quality-evidence", type=Path, action="append", default=[],
+                        help="Additional current-source specialist runs for quality coverage")
+    parser.add_argument("--report-quality-only", action="store_true",
+                        help="Report historical quality-percentage targets separately from test execution")
+    parser.add_argument("--analysis-python", type=Path,
+                        default=Path.home() / '.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3',
+                        help="Existing offline Python with pypdf/Pillow for validator fault controls")
     args = parser.parse_args()
+    try: slot, selected_device = registered_session(args.family, args.iphone, args.ipad)
+    except ValueError as error: parser.error(str(error))
+    guard = Path.home() / '.codex/simulators/guard.py'
+    if not args.leased:
+        subprocess.run([sys.executable, str(guard), 'status'], check=True)
+        return subprocess.call([sys.executable, str(guard), 'run', '--slot', slot,
+            '--owner', 'PaperPath/full release checks/' + args.family, '--', sys.executable,
+            str(Path(__file__).resolve()), '--leased', *sys.argv[1:]], cwd=ROOT)
+    if os.environ.get('CODEX_SIMULATOR_UDID') != selected_device:
+        raise RuntimeError('Release runtime requires the registered foreground simulator lease')
     if not args.node:
         parser.error("Node is required; supply --node /absolute/path/to/node")
     devices = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"]))
     available = {d["udid"]: d for group in devices["devices"].values() for d in group}
-    runtimes = {d["udid"]: runtime for runtime, group in devices["devices"].items() for d in group}
-    for udid, kind in [(args.iphone, "iPhone"), (args.ipad, "iPad")]:
+    for udid, kind in [(selected_device, "iPhone" if args.family == "iphone" else "iPad")]:
         if udid not in available or kind not in (
             available[udid].get("deviceTypeIdentifier", "") + available[udid]["name"]
         ):
             parser.error(f"{udid} must identify an available {kind} simulator")
+    if available[selected_device]["state"] != "Shutdown":
+        raise RuntimeError("Assigned device is already booted; investigate ownership before running")
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output = (args.output or ROOT / ".artifacts" / f"release-{stamp}").resolve()
     output.mkdir(parents=True, exist_ok=False)
+    from CheckTestQuality import runtime_sources
     report = {"status": "RUNNING", "startedAt": stamp,
+              "qualityTargetsRequired": not args.report_quality_only,
+              "runtimeSourceHashes": runtime_sources(ROOT),
               "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
               "sourceFingerprint": source_fingerprint(), "stages": [],
               "manualGates": ["Physical camera capture and permission deny/allow",
                               "Physical-device file protection, biometrics and background privacy",
-                              "Sandbox purchase/restore/refund on a distribution build",
+                              "Paid-download installation and offline tool access on a distribution build",
                               "Real-account iCloud metadata sync/delete/conflict recovery across two devices",
                               "Minimum supported iOS and current iOS on iPhone/iPad",
                               "Large scanned PDFs: memory, cancellation and OCR quality",
                               "Signed archive, external sharing, App Store metadata and privacy URLs"]}
 
     report_lock = threading.RLock()
-    owned_simulators = []
+    booted_by_run = set()
 
     def save():
         with report_lock:
@@ -178,12 +227,16 @@ def main():
         return json.loads(result.stdout)
 
     def suite(name, scheme, udid, selection, minimum, expected_tests, allowed_skips=(), xctestrun=None):
+        require_idle_simulator_tests()
         bundle = output / f"{name}.xcresult"
         invocation = (["xcodebuild", "test-without-building", "-xctestrun", str(xctestrun)] if xctestrun else
                       ["xcodebuild", "test", "-project", "PaperPath.xcodeproj", "-scheme", scheme,
                        "-derivedDataPath", str(output / "DerivedData")])
         stage = run(name, [*invocation, "-destination", f"platform=iOS Simulator,id={udid}",
-                           "-parallel-testing-enabled", "NO", "-enableCodeCoverage", "YES",
+                           "-parallel-testing-enabled", "NO",
+                           "-maximum-concurrent-test-simulator-destinations", "1",
+                           "-maximum-parallel-testing-workers", "1", "-test-timeouts-enabled", "YES",
+                           "-default-test-execution-time-allowance", "240", "-maximum-test-execution-time-allowance", "900", "-enableCodeCoverage", "YES",
                            "-collect-test-diagnostics", "on-failure" if args.system_diagnostics else "never",
                            "-resultBundlePath", str(bundle), *selection])
         try:
@@ -205,30 +258,38 @@ def main():
         return bundle
 
     def preboot(udid, label):
+        require_idle_simulator_tests()
         current = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "-j"]))
         state = next(d["state"] for group in current["devices"].values() for d in group if d["udid"] == udid)
         if state != "Booted":
             if not run(f"boot-{label}", ["xcrun", "simctl", "boot", udid])["passed"]:
                 raise RuntimeError(f"Could not boot {label}")
+            booted_by_run.add(udid)
         if not run(f"ready-{label}", ["xcrun", "simctl", "bootstatus", udid, "-b"])["passed"]:
             raise RuntimeError(f"Simulator {label} did not become ready")
+        # New simulators otherwise put the system's swipe-typing tutorial over
+        # the first keyboard. This is host setup, not an application result.
+        if not run(f"keyboard-ready-{label}", ["xcrun", "simctl", "spawn", udid, "defaults", "write",
+                                               "com.apple.keyboard", "CPDidDiscover", "-bool", "true"])["passed"]:
+            raise RuntimeError(f"Simulator {label} keyboard setup failed")
 
     save()
     try:
         run("gate-tests", [sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_release_checks.py"])
+        run("quality-metric-tests", [sys.executable, "-m", "unittest", "discover", "-s", "tools", "-p", "test_test_quality.py"])
         run("feature-contract", [args.node, "tools/CheckAutomationCoverage.mjs"])
         unit_tests = test_inventory("PaperPathTests")
-        commerce_tests = {f"ReleaseReadinessUITests/{test}()" for test in COMMERCE_TESTS}
-        ui_tests = test_inventory("PaperPathUITests") - commerce_tests
+        ui_tests = test_inventory("PaperPathUITests")
         build = run("test-build", ["xcodebuild", "build-for-testing", "-project", "PaperPath.xcodeproj",
-                                   "-scheme", "PaperPath", "-destination", f"platform=iOS Simulator,id={args.iphone}",
+                                   "-scheme", "PaperPath", "-destination", f"platform=iOS Simulator,id={selected_device}",
+                                   "SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG PAPERPATH_REVIEW_BUILD",
                                    "-enableCodeCoverage", "YES", "-derivedDataPath", str(output / "DerivedData")])
         test_runs = list((output / "DerivedData/Build/Products").glob("PaperPath_*.xctestrun"))
         if not build["passed"] or len(test_runs) != 1:
             raise RuntimeError("Test build did not produce exactly one runnable test configuration")
         test_run = test_runs[0]
-        preboot(args.iphone, "unit-iphone")
-        units = suite("unit", "PaperPath", args.iphone, ["-only-testing:PaperPathTests"],
+        preboot(selected_device, "unit-" + args.family)
+        units = suite("unit", "PaperPath", selected_device, ["-only-testing:PaperPathTests"],
                       len(unit_tests) - 1, unit_tests, [DEVICE_ONLY], xctestrun=test_run)
         # Coverage is checked independently of test success. Neither substitutes for the other.
         try:
@@ -237,42 +298,65 @@ def main():
         except (subprocess.CalledProcessError, ValueError) as error:
             report["stages"].append({"name": "coverage-contract", "passed": False, "error": str(error)})
         jobs = []
-        for family, seed, tests in [("iphone", args.iphone, ui_tests - IPAD_ONLY), ("ipad", args.ipad, ui_tests)]:
+        for family, seed, tests in [(args.family, selected_device, ui_tests - IPAD_ONLY if args.family == "iphone" else ui_tests)]:
             for index, expected in enumerate(partition_tests(tests, args.ui_workers)):
                 device = seed
-                if index:
-                    device = subprocess.check_output(
-                        ["xcrun", "simctl", "create", f"PaperPath Release {family} {stamp}-{index}",
-                         available[seed]["deviceTypeIdentifier"], runtimes[seed]], text=True).strip()
-                    owned_simulators.append(device)
                 name = f"ui-{family}-{index + 1}"
-                # Finish each boot before beginning the next one. Simultaneous
-                # first boots can stall simulator application launches.
-                preboot(device, name)
                 selection = [f"-only-testing:PaperPathUITests/{test.removesuffix('()')}" for test in expected]
                 jobs.append((name, device, selection, expected))
-        report["temporarySimulators"] = owned_simulators[:]
+        report["reusedSimulators"] = [selected_device]
+        report["deviceFamily"] = args.family
+        report["scope"] = "One device family only; other families require a separate deliberate run"
         save()
-        with ThreadPoolExecutor(max_workers=args.ui_workers * 2) as pool:
-            futures = [pool.submit(suite, name, "PaperPath", device, selection, len(expected), expected,
-                                   xctestrun=test_run) for name, device, selection, expected in jobs]
-            for future in futures:
-                future.result()
-        suite("commerce", "PaperPathCommerce", args.iphone, [], len(commerce_tests), commerce_tests)
+        for name, device, selection, expected in jobs:
+            preboot(device, name)
+            if not run(name + "-offline-inputs", [sys.executable, "tools/StageCachedUIInputs.py",
+                    str(ROOT), str(output / (name + "-offline-inputs.json"))])["passed"]:
+                raise RuntimeError("Cached offline UI inputs could not be prepared")
+            dark_tests = set(expected) & DARK_MODE_TESTS
+            normal_tests = set(expected) - dark_tests
+            selection = [f"-only-testing:PaperPathUITests/{test.removesuffix('()')}" for test in sorted(normal_tests)]
+            suite(name, "PaperPath", device, selection, len(normal_tests), normal_tests, xctestrun=test_run)
+            if dark_tests:
+                require_idle_simulator_tests()
+                previous = subprocess.check_output(["xcrun", "simctl", "ui", device, "appearance"], text=True).strip()
+                if previous not in {"light", "dark"}:
+                    raise RuntimeError(f"Cannot verify dark appearance on {device}: {previous}")
+                try:
+                    if not run(name + "-dark-appearance", ["xcrun", "simctl", "ui", device, "appearance", "dark"])["passed"]:
+                        raise RuntimeError("Could not apply dark appearance")
+                    selection = [f"-only-testing:PaperPathUITests/{test.removesuffix('()')}" for test in sorted(dark_tests)]
+                    suite(name + "-dark", "PaperPath", device, selection, len(dark_tests), dark_tests, xctestrun=test_run)
+                finally:
+                    run(name + "-restore-appearance", ["xcrun", "simctl", "ui", device, "appearance", previous])
         run("release-build", ["xcodebuild", "build", "-project", "PaperPath.xcodeproj", "-scheme", "PaperPath",
-                              "-configuration", "Release", "-destination", f"platform=iOS Simulator,id={args.iphone}",
+                              "-configuration", "Release", "-destination", "generic/platform=iOS", "CODE_SIGNING_ALLOWED=NO",
                               "-derivedDataPath", str(output / "DerivedData")])
         unchanged = source_fingerprint() == report["sourceFingerprint"]
         report["sourceUnchangedDuringRun"] = unchanged
+        if unchanged and all(s.get("passed") for s in report["stages"]):
+            report["status"] = "CHECKING_QUALITY"
+            save()
+            run("output-oracle-controls", [str(args.analysis_python), "tools/RunOutputOracleChecks.py",
+                                          "--output", str(output / "oracle-controls.json")])
+            quality = [sys.executable, "tools/CheckTestQuality.py",
+                       "--evidence", str(output), "--oracle-evidence", str(output / "oracle-controls.json"),
+                       "--output", str(output / "test-quality.json")]
+            if not args.report_quality_only:
+                quality.append("--gate")
+            for evidence in args.quality_evidence:
+                quality += ["--evidence", str(evidence.resolve())]
+            run("test-quality", quality)
         report["status"] = ("AUTOMATION_PASSED_MANUAL_REQUIRED" if unchanged and
                             all(s.get("passed") for s in report["stages"]) else "FAILED")
     except (Exception, KeyboardInterrupt) as error:
         report["status"] = "INTERRUPTED" if isinstance(error, KeyboardInterrupt) else "FAILED"
         report["error"] = str(error)
     finally:
-        for device in owned_simulators:
-            subprocess.run(["xcrun", "simctl", "shutdown", device], capture_output=True)
-            subprocess.run(["xcrun", "simctl", "delete", device], capture_output=True)
+        # Preserve device data and all caches; shut down only devices this run booted.
+        if not simulator_test_jobs():
+            for udid in sorted(booted_by_run):
+                subprocess.run(["xcrun", "simctl", "shutdown", udid], capture_output=True)
         save()
         print(f"{report['status']}: {output / 'report.json'}", flush=True)
     return 0 if report["status"] == "AUTOMATION_PASSED_MANUAL_REQUIRED" else 1

@@ -437,6 +437,7 @@ private struct LibraryDeliveryBoardSnapshot {
 
 private enum LibraryContentSection: Int, Identifiable {
     case deskHeader
+    case shareCheck
     case deskResume
     case deskStatus
     case hero
@@ -586,7 +587,6 @@ struct LibraryView: View {
     }
 
     @EnvironmentObject private var model: PaperPathModel
-    @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
@@ -595,6 +595,7 @@ struct LibraryView: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.paperPathSceneID) private var paperPathSceneID
 
+    @Binding private var requestedPDFImport: UUID?
     @State private var isImportingFile = false
     @State private var fileImportKind = FileImportKind.pdf
     @AppStorage("workspace.showToolNames") private var showToolNames = true
@@ -602,6 +603,8 @@ struct LibraryView: View {
     @State private var isPresentingCombine = false
     @State private var isPresentingCompressionBatch = false
     @State private var isPresentingBatchDelivery = false
+    @State private var isPresentingShareCheck = false
+    @State private var isPresentingPDFAssistant = false
     @State private var batchDeliveryInitialRecordIDs: Set<UUID>?
     @State private var isPresentingBatchBatesNumbers = false
     @State private var batchBatesInitialRecordIDs: [UUID] = []
@@ -681,6 +684,7 @@ struct LibraryView: View {
         PDFDeliveryPackageVerificationFailure?
     @State private var libraryShareURL: URL?
     @State private var isSharingLibraryCopy = false
+    @State private var savesLibraryCopyToFiles = false
     @State private var libraryShareTask: Task<Void, Never>?
     @State private var libraryShareGeneration = UUID()
     @State private var libraryShareProgress: PDFOperationProgress?
@@ -695,6 +699,10 @@ struct LibraryView: View {
     @State private var shouldPresentBatchDeliveryAfterDismissal =
         false
     @State private var isPresentingBatchTagEditor = false
+    @State private var renameEditorRecord: DocumentRecord?
+    @State private var isRenamingDocument = false
+    @State private var proposedDocumentName = ""
+    @State private var isSavingDocumentName = false
     @State private var tagEditorRecord: DocumentRecord?
     @State private var scheduleEditorRecord: DocumentRecord?
     @State private var noteEditorRecord: DocumentRecord?
@@ -708,7 +716,7 @@ struct LibraryView: View {
     @State private var isLibrarySearchSuspended = false
     @State private var isLibrarySearchPresented = false
     @State private var isLibrarySearchFocused = false
-    @State private var librarySearchHistory: [String] = []
+    @Binding private var librarySearchHistory: [String]
     @AppStorage("library.quickTools") private var savedQuickTools = ""
     @AppStorage("library.sort")
     private var defaultLibrarySort =
@@ -725,6 +733,9 @@ struct LibraryView: View {
     private var savedLibraryDensity = ""
     @SceneStorage("library.sceneViewMode")
     private var savedLibraryViewMode = ""
+#if DEBUG
+    @State private var didInitializeUITestViewMode = false
+#endif
     @SceneStorage("library.workspaceLane")
     private var savedWorkspaceLane =
         LibraryWorkspaceLane.work.rawValue
@@ -754,10 +765,12 @@ struct LibraryView: View {
     let onOpen: (DocumentRoute) -> Void
 
     init(
+        requestedPDFImport: Binding<UUID?> = .constant(nil),
         selectedRecordID: UUID? = nil,
         isWorkspaceSidebar: Bool = false,
         searchText: Binding<String>,
         appliedSearchText: Binding<String>,
+        searchHistory: Binding<[String]>,
         searchScope: Binding<LibrarySearchScope>,
         statusFilter: Binding<DocumentWorkflowStatus?>,
         categoryFilter: Binding<DocumentCategory?>,
@@ -767,11 +780,13 @@ struct LibraryView: View {
         selectedDocumentIDs: Binding<Set<UUID>>,
         onOpen: @escaping (DocumentRoute) -> Void
     ) {
+        _requestedPDFImport = requestedPDFImport
         self.selectedRecordID = selectedRecordID
         self.isWorkspaceSidebar = isWorkspaceSidebar
         self.onOpen = onOpen
         _searchText = searchText
         _appliedSearchText = appliedSearchText
+        _librarySearchHistory = searchHistory
         _searchScope = searchScope
         _statusFilter = statusFilter
         _categoryFilter = categoryFilter
@@ -840,6 +855,17 @@ struct LibraryView: View {
                 .accessibilityLabel(AppBrand.title)
                 .accessibilityIdentifier("libraryBrandTitle")
             }
+            #if DEBUG && !PAPERPATH_REVIEW_BUILD
+            ToolbarItem(placement: .topBarLeading) {
+                Button { isPresentingPDFAssistant = true } label: {
+                    Label("PDF Assistant".localizedUI, systemImage: "text.bubble")
+                        .labelStyle(.titleAndIcon)
+                }
+                .accessibilityLabel("PDF Assistant".localizedUI)
+                .accessibilityIdentifier("assistantOpen")
+                .disabled(isShowingProcessingOverlay || isLibraryHandoffActive || isSelectingDocuments)
+            }
+            #endif
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
                     isPresentingSettings = true
@@ -1100,7 +1126,16 @@ struct LibraryView: View {
             onDismiss: cleanupLibraryShareCopy
         ) {
             if let libraryShareURL {
-                ShareSheet(items: [libraryShareURL])
+                if savesLibraryCopyToFiles {
+                    FileExportPicker(url: libraryShareURL, onCompletion: {
+                        isSharingLibraryCopy = false
+                    }, onExported: { _ in
+                        model[noticeFor: paperPathSceneID] = "PDF saved to Files".localizedUI
+                    })
+                    .ignoresSafeArea()
+                } else {
+                    ShareSheet(items: [libraryShareURL])
+                }
             }
         }
         .photosPicker(
@@ -1141,6 +1176,14 @@ struct LibraryView: View {
         .eraseLibraryViewType()
 
         let workflowPresentation = importPresentation
+        .sheet(isPresented: $isPresentingShareCheck) {
+            ShareCheckStartView()
+        }
+        .sheet(isPresented: $isPresentingPDFAssistant) {
+            #if DEBUG && !PAPERPATH_REVIEW_BUILD
+            PDFAssistantView()
+            #endif
+        }
         .sheet(
             isPresented: $isPresentingCombine,
             onDismiss: completePendingLibraryOpen
@@ -1347,6 +1390,30 @@ struct LibraryView: View {
         .eraseLibraryViewType()
 
         let confirmedPresentation = editorPresentation
+        .alert(
+            "Rename document".localizedUI,
+            isPresented: $isRenamingDocument,
+            presenting: renameEditorRecord
+        ) { record in
+            TextField("Document name".localizedUI, text: $proposedDocumentName)
+                .submitLabel(.done)
+                .onSubmit { saveDocumentName(record) }
+            Button("Cancel".localizedUI, role: .cancel) {}
+            Button("Save".localizedUI) { saveDocumentName(record) }
+                .disabled(
+                    isSavingDocumentName
+                        || proposedDocumentName
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                            .isEmpty
+                )
+        } message: { _ in
+            Text("This name is also used when you share or save the PDF to Files. The original file is unchanged.".localizedUI)
+        }
+        .onChange(of: proposedDocumentName) { _, name in
+            if name.count > 80 {
+                proposedDocumentName = String(name.prefix(80))
+            }
+        }
         .confirmationDialog(
             AppLocalization.format(
                 "Move %lld private copies to Trash?",
@@ -1529,6 +1596,12 @@ struct LibraryView: View {
         return ZStack {
             lifecycleContent
         }
+        .onChange(of: requestedPDFImport, initial: true) { _, _ in
+            consumeRequestedPDFImport()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { consumeRequestedPDFImport() }
+        }
         .fileImporter(
             isPresented: $isImportingFile,
             allowedContentTypes: fileImportKind == .pdf ? [.pdf] : [.zip],
@@ -1687,20 +1760,38 @@ struct LibraryView: View {
         canUseDeskPreview && deskShowsPreview
     }
 
+    private var shareCheckEntry: some View {
+        Button { isPresentingShareCheck = true } label: {
+            HStack(alignment: .center, spacing: 14) {
+                Image(systemName: "checkmark.shield").font(.title2)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Check before sharing".localizedUI).font(.headline)
+                    Text("Review privacy and check your output".localizedUI)
+                        .font(.subheadline).foregroundStyle(PPColor.textSecondary)
+                }.fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 4)
+                Image(systemName: "chevron.right").font(.subheadline.weight(.semibold))
+            }
+            .padding(16).frame(maxWidth: .infinity, minHeight: 64, alignment: .leading)
+            .background(PPColor.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: PPRadius.control))
+        }
+        .buttonStyle(.plain).foregroundStyle(PPColor.accent)
+        .disabled(isShowingProcessingOverlay || isLibraryHandoffActive || isSelectingDocuments)
+        .accessibilityIdentifier("shareCheckOpen")
+    }
+
     private var deskHeader: some View {
         ViewThatFits(in: .horizontal) {
             HStack(alignment: .center, spacing: PPSpacing.regular) {
                 if horizontalSizeClass == .regular { deskIdentity }
-                Spacer(minLength: 0)
+                if horizontalSizeClass == .regular { Spacer(minLength: 0) }
                 deskCreationCommands
-                if horizontalSizeClass != .regular { Spacer(minLength: 0) }
             }
             VStack(alignment: .leading, spacing: PPSpacing.medium) {
                 if horizontalSizeClass == .regular { deskIdentity }
                 deskCreationCommands
             }
         }
-        .dynamicTypeSize(...DynamicTypeSize.accessibility1)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("documentDeskHeader")
     }
@@ -1733,15 +1824,19 @@ struct LibraryView: View {
     }
 
     private var deskCreationCommands: some View {
-        HStack(alignment: .top, spacing: PPSpacing.small) {
+        let layout = dynamicTypeSize.ppPrefersExpandedLayout
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: PPSpacing.small))
+            : AnyLayout(HStackLayout(alignment: .center, spacing: PPSpacing.small))
+        return layout {
             Button {
                 requestFileImport(.pdf)
             } label: {
                 Label("Import".localizedUI, systemImage: "square.and.arrow.down")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(PPColor.onAccent)
-                    .fixedSize(horizontal: true, vertical: false)
+                    .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, PPSpacing.medium)
+                    .frame(maxWidth: horizontalSizeClass == .compact || dynamicTypeSize.ppPrefersExpandedLayout ? .infinity : nil)
                     .frame(minHeight: PPDeskLayout.touchTarget)
                     .background(PPColor.accent, in: RoundedRectangle(cornerRadius: PPRadius.control))
             }
@@ -1755,9 +1850,11 @@ struct LibraryView: View {
                 Label("Scan".localizedUI, systemImage: "viewfinder")
                     .font(.subheadline.weight(.semibold))
                     .foregroundStyle(PPColor.accent)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .padding(.horizontal, PPSpacing.small)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, PPSpacing.medium)
+                    .frame(maxWidth: dynamicTypeSize.ppPrefersExpandedLayout ? .infinity : nil)
                     .frame(minHeight: PPDeskLayout.touchTarget)
+                    .background(PPColor.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: PPRadius.control))
                     .contentShape(Rectangle())
             }
             .buttonStyle(PPPressButtonStyle())
@@ -1781,7 +1878,19 @@ struct LibraryView: View {
                     Label("Merge PDFs", systemImage: "square.stack.3d.up")
                 }
             } label: {
-                DeskToolLabel(title: "Create a PDF", symbol: "plus")
+                Group {
+                    if dynamicTypeSize.ppPrefersExpandedLayout {
+                        Label("Create a PDF".localizedUI, systemImage: "plus")
+                            .font(.subheadline.weight(.semibold))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.horizontal, PPSpacing.medium)
+                            .frame(minHeight: PPDeskLayout.touchTarget)
+                    } else {
+                        DeskToolLabel(title: "Create a PDF", symbol: "plus")
+                    }
+                }
+                .background(PPColor.accent.opacity(0.07), in: RoundedRectangle(cornerRadius: PPRadius.control))
             }
             .help("Create a PDF".localizedUI)
             .accessibilityLabel("Create a PDF".localizedUI)
@@ -1837,10 +1946,32 @@ struct LibraryView: View {
                 deskResumeDocument(record)
             }
         }
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("deskRecentDocuments")
     }
 
+    private func libraryShareButton(
+        _ record: DocumentRecord,
+        identifierPrefix: String = "librarySharePDF"
+    ) -> some View {
+        Button {
+            prepareLibraryShareCopy(recordID: record.id)
+        } label: {
+            Image(systemName: "square.and.arrow.up")
+                .font(.system(size: 19))
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(PPColor.accent)
+        .disabled(libraryShareTask != nil || model.isProcessing(record.id) || model.url(for: record.id) == nil)
+        .accessibilityLabel(AppLocalization.format("Share %@", record.displayName))
+        .help("Share PDF".localizedUI)
+        .accessibilityIdentifier("\(identifierPrefix)-\(record.id.uuidString)")
+    }
+
     private func deskResumeDocument(_ record: DocumentRecord) -> some View {
+        HStack(spacing: PPSpacing.small) {
         Button {
             onOpen(continueRoute(for: record))
         } label: {
@@ -1870,6 +2001,8 @@ struct LibraryView: View {
         .hoverEffect(.highlight)
         .help("Continue working".localizedUI)
         .contextMenu { documentActions(for: record) }
+        libraryShareButton(record, identifierPrefix: "resumeSharePDF")
+        }
     }
 
     private var deskStatus: some View {
@@ -1959,6 +2092,7 @@ struct LibraryView: View {
     }
 
     private func activateLibraryRoute(_ route: DocumentRoute) {
+        recordLibrarySearch(appliedSearchText)
         if canUseDeskPreview, let record = model.record(id: route.recordID) {
             focusDeskRecord(record, pageIndex: route.pageIndex)
         } else {
@@ -2081,6 +2215,15 @@ struct LibraryView: View {
                 .buttonStyle(PPPrimaryButtonStyle())
                 .keyboardShortcut(.return, modifiers: [])
                 .accessibilityIdentifier("deskOpenDocument")
+                Button {
+                    prepareLibraryShareCopy(recordID: record.id)
+                } label: {
+                    Label("Share PDF".localizedUI, systemImage: "square.and.arrow.up")
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                }
+                .buttonStyle(PPQuietButtonStyle(tint: PPColor.accent))
+                .disabled(libraryShareTask != nil || model.isProcessing(record.id))
+                .accessibilityIdentifier("deskSharePDF")
             }
             .disabled(isSelectingDocuments)
             .onChange(of: [record.id, record.contentRevisionID], initial: true) { _, _ in
@@ -2186,7 +2329,7 @@ struct LibraryView: View {
         if record.isDeliveryArtifact {
             if let source = model.sourceRecord(for: record) {
                 deskRelationshipButton(
-                    title: "Result copy",
+                    title: "Exported PDF",
                     detail: AppLocalization.format(
                         "Source: %@",
                         source.displayName
@@ -2207,7 +2350,7 @@ struct LibraryView: View {
             for: record.id
         ).first {
             deskRelationshipButton(
-                title: "Working copy",
+                title: "Document",
                 detail: AppLocalization.format(
                     "Latest: %@",
                     latest.displayName
@@ -2324,12 +2467,15 @@ struct LibraryView: View {
         switch workspaceLane {
         case .work:
             if model.workingDocuments.isEmpty {
+                sections.append(.shareCheck)
                 sections.append(.library)
                 sections.append(.homeGoals)
             } else if isWorkspaceSidebar {
+                sections.append(.shareCheck)
                 sections.append(.library)
             } else {
                 sections.append(.deskHeader)
+                if !hasActiveFilters && !isSelectingDocuments { sections.append(.shareCheck) }
                 if !hasActiveFilters && !isSelectingDocuments {
                     sections.append(.homeGoals)
                 }
@@ -2375,6 +2521,8 @@ struct LibraryView: View {
         _ section: LibraryContentSection
     ) -> some View {
         switch section {
+        case .shareCheck:
+            shareCheckEntry
         case .deskHeader:
             deskHeader
         case .deskResume:
@@ -3048,9 +3196,7 @@ struct LibraryView: View {
         ) {
             commandCenterSecondaryButton(
                 "Batch verify",
-                detail: purchase.isUnlocked
-                    ? "\(summary.batchEligibleCount) PDFs"
-                    : "Lifetime lane",
+                detail: "\(summary.batchEligibleCount) PDFs",
                 symbol: "checklist",
                 tint: PPColor.mint,
                 disabled: summary.batchEligibleCount < 2
@@ -3085,7 +3231,6 @@ struct LibraryView: View {
             if workspaceLane != .deliver {
                 commandCenterSecondaryButton(
                     "Storage",
-                    detail: "Local files",
                     symbol: "internaldrive",
                     tint: PPColor.accent
                 ) {
@@ -3094,7 +3239,6 @@ struct LibraryView: View {
 
                 commandCenterSecondaryButton(
                     "All tools",
-                    detail: "Search commands",
                     symbol: "slider.horizontal.3",
                     tint: PPColor.cyan
                 ) {
@@ -3258,7 +3402,7 @@ struct LibraryView: View {
 
     private func commandCenterSecondaryButton(
         _ title: String,
-        detail: String,
+        detail: String? = nil,
         symbol: String,
         tint: Color,
         disabled: Bool = false,
@@ -3277,12 +3421,14 @@ struct LibraryView: View {
                         .lineLimit(
                             dynamicTypeSize.isAccessibilitySize ? nil : 1
                         )
-                    Text(detail.localizedUI)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(
-                            dynamicTypeSize.isAccessibilitySize ? nil : 1
-                        )
+                    if let detail {
+                        Text(detail.localizedUI)
+                            .font(.caption2.monospacedDigit())
+                            .foregroundStyle(PPColor.textSecondary)
+                            .lineLimit(
+                                dynamicTypeSize.isAccessibilitySize ? nil : 1
+                            )
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -3479,9 +3625,10 @@ struct LibraryView: View {
         cleanupLibraryShareCopy()
     }
 
-    private func prepareLibraryShareCopy(recordID: UUID) {
+    private func prepareLibraryShareCopy(recordID: UUID, toFiles: Bool = false, officeReceiptID: UUID? = nil) {
         guard libraryShareTask == nil else { return }
         cleanupLibraryShareCopy()
+        savesLibraryCopyToFiles = toFiles
         let generation = UUID()
         libraryShareGeneration = generation
         libraryShareRateWindow.reset()
@@ -3494,9 +3641,7 @@ struct LibraryView: View {
             let url = await model.withFeedbackTarget(
                 paperPathSceneID
             ) {
-                await model.makeFilesExportCopy(
-                    recordID: recordID
-                ) { update in
+                let progress: @MainActor @Sendable (PDFByteProgressUpdate) -> Void = { update in
                     guard libraryShareGeneration == generation else {
                         return
                     }
@@ -3509,10 +3654,16 @@ struct LibraryView: View {
                         libraryShareProgress = progress
                     }
                 }
+                if let officeReceiptID {
+                    return await model.prepareReusableOfficeExportShareCopy(
+                        recordID: recordID, receiptID: officeReceiptID, progress: progress
+                    )
+                }
+                return await model.makeFilesExportCopy(recordID: recordID, progress: progress)
             }
             guard libraryShareGeneration == generation else {
                 if let url {
-                    await model.discardFilesExportCopy(at: url)
+                    await model.discardTemporaryExportCopies(at: [url])
                 }
                 return
             }
@@ -3521,7 +3672,7 @@ struct LibraryView: View {
             libraryShareRateWindow.reset()
             guard !Task.isCancelled, let url else {
                 if let url {
-                    await model.discardFilesExportCopy(at: url)
+                    await model.discardTemporaryExportCopies(at: [url])
                 }
                 return
             }
@@ -3543,7 +3694,7 @@ struct LibraryView: View {
         libraryShareURL = nil
         guard let url else { return }
         Task {
-            await model.discardFilesExportCopy(at: url)
+            await model.discardTemporaryExportCopies(at: [url])
         }
     }
 
@@ -3976,7 +4127,6 @@ struct LibraryView: View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "CREATE A RESULT",
-                detail: "Choose what you need, then choose a PDF.",
                 symbol: "checkmark.shield",
                 tint: PPColor.mint
             )
@@ -4117,6 +4267,7 @@ struct LibraryView: View {
                 }
             }
             ForEach(recentOfficeResults) { result in
+                HStack(spacing: PPSpacing.small) {
                 Button {
                     selectedOfficeResult = result
                 } label: {
@@ -4175,6 +4326,24 @@ struct LibraryView: View {
                 .buttonStyle(.plain)
                 .hoverEffect(.highlight)
                 .accessibilityIdentifier("officeResult-\(result.id.uuidString)")
+                Button {
+                    if let record = model.record(id: result.recordID),
+                       result.receipt.artifactAvailability(for: record.contentRevisionID) == .reusable {
+                        prepareLibraryShareCopy(recordID: result.recordID, officeReceiptID: result.receipt.id)
+                    } else {
+                        selectedOfficeResult = result
+                    }
+                } label: {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 19))
+                        .frame(width: 44, height: 44)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(PPColor.accent)
+                .disabled(libraryShareTask != nil || model.isProcessing(result.recordID))
+                .accessibilityLabel(AppLocalization.format("Share %@", result.receipt.fileName))
+                .accessibilityIdentifier("officeResultShare-\(result.id.uuidString)")
+                }
                 Divider()
             }
             if matchingOfficeResults.count > officeResultLimit {
@@ -4550,39 +4719,21 @@ struct LibraryView: View {
                 )
             )
 
-            if lane == .verified,
-               model.url(for: record.id) != nil {
+            if model.url(for: record.id) != nil {
                 HStack(spacing: PPSpacing.small) {
-                    Button {
-                        deliveryReceiptRecord = record
-                    } label: {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 19))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
+                    if lane == .verified {
+                        Button {
+                            deliveryReceiptRecord = record
+                        } label: {
+                            Image(systemName: "doc.text.magnifyingglass")
+                                .font(.system(size: 19))
+                                .frame(width: 44, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                        .accessibilityLabel("Delivery receipt".localizedUI)
+                        .accessibilityIdentifier("resultReceipt-\(record.id)")
                     }
-                    .accessibilityLabel("Delivery receipt".localizedUI)
-                    .help("Delivery receipt".localizedUI)
-                    .accessibilityIdentifier("resultReceipt-\(record.id)")
-                    Button {
-                        prepareLibraryShareCopy(recordID: record.id)
-                    } label: {
-                        Image(systemName: libraryShareTask == nil
-                            ? "square.and.arrow.up"
-                            : "hourglass")
-                            .font(.system(size: 19))
-                            .frame(width: 44, height: 44)
-                            .contentShape(Rectangle())
-                    }
-                    .disabled(libraryShareTask != nil)
-                    .accessibilityLabel(
-                        AppLocalization.format(
-                            "Share verified %@",
-                            record.displayName
-                        )
-                    )
-                    .help("Share".localizedUI)
-                    .accessibilityIdentifier("resultShare-\(record.id)")
+                    libraryShareButton(record, identifierPrefix: "resultShare")
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(PPColor.accent)
@@ -4858,16 +5009,6 @@ struct LibraryView: View {
                             : "Finish & Share"
                     )
                     .font(.headline)
-                    Text(
-                        model.workingDocuments.isEmpty
-                            ? "Your original stays untouched"
-                            : "Reopen and check the final copy"
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(
-                        PPColor.onAccent.opacity(0.8)
-                    )
-                    .lineLimit(1)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "arrow.right")
@@ -4998,16 +5139,18 @@ struct LibraryView: View {
         Button { start(task) } label: {
             VStack(spacing: PPSpacing.small) {
                 Image(systemName: task.symbol)
-                    .font(.system(size: 21, weight: .medium))
+                    .font(.system(size: 19, weight: .regular))
+                    .foregroundStyle(PPColor.accent)
                     .frame(height: 26)
                 Text(homeGoalShortTitle(task).localizedUI)
-                    .font(.caption.weight(.semibold))
+                    .font(.caption.weight(.medium))
                     .fixedSize(horizontal: false, vertical: true)
                     .multilineTextAlignment(.center)
             }
-            .foregroundStyle(PPColor.accent)
-            .frame(maxWidth: .infinity, minHeight: 68)
-            .padding(.vertical, PPSpacing.xSmall)
+            .foregroundStyle(PPColor.textPrimary)
+            .frame(maxWidth: .infinity, minHeight: 68, alignment: .top)
+            .padding(.top, PPSpacing.medium)
+            .padding(.bottom, PPSpacing.xSmall)
             .contentShape(Rectangle())
         }
         .buttonStyle(PPPressButtonStyle())
@@ -5021,7 +5164,7 @@ struct LibraryView: View {
         case .mergePDFs: return "Merge"
         case .splitPDF: return "Split"
         case .compressPDF: return "Compress"
-        case .recognizeText: return "OCR"
+        case .recognizeText: return "Extract text"
         default: return task.title
         }
     }
@@ -5034,7 +5177,7 @@ struct LibraryView: View {
         case .fillForms: return "Fill a form"
         case .mergePDFs: return "Merge PDFs"
         case .compressPDF: return "Compress PDF"
-        case .recognizeText: return "Local OCR"
+        case .recognizeText: return "Recognize text (OCR)"
         default: return task.title
         }
     }
@@ -6284,7 +6427,7 @@ struct LibraryView: View {
         Button {
             start(task)
         } label: {
-            HStack(alignment: .top, spacing: PPSpacing.small) {
+            HStack(alignment: .center, spacing: PPSpacing.small) {
                 ToolSymbolPlate(
                     symbol: task.symbol,
                     tint: quickToolTint(task.group),
@@ -6300,23 +6443,13 @@ struct LibraryView: View {
                             horizontal: false,
                             vertical: true
                         )
-                    Text(task.detail.localizedUI)
-                        .font(.caption2)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(
-                            dynamicTypeSize.isAccessibilitySize ? 3 : 2
-                        )
-                        .fixedSize(
-                            horizontal: false,
-                            vertical: true
-                        )
                 }
                 Spacer(minLength: 0)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(
                 minHeight:
-                    dynamicTypeSize.isAccessibilitySize ? 86 : 70
+                    dynamicTypeSize.isAccessibilitySize ? 64 : 52
             )
             .padding(.horizontal, PPSpacing.small)
             .padding(.vertical, 6)
@@ -6674,9 +6807,6 @@ struct LibraryView: View {
                                     .font(.title3.bold())
                                     .fontDesign(.serif)
                                     .foregroundStyle(PPColor.textPrimary)
-                                Text(package.detail.localizedUI)
-                                    .font(.subheadline)
-                                    .foregroundStyle(PPColor.textSecondary)
                                 Label(
                                     AppLocalization.format(
                                         "%lld compatible PDF%@",
@@ -7155,6 +7285,17 @@ struct LibraryView: View {
                 )
             }
         }
+    }
+
+    private func consumeRequestedPDFImport() {
+        guard requestedPDFImport != nil, !isWorkspaceSidebar,
+              scenePhase == .active,
+              UIApplication.shared.isProtectedDataAvailable
+        else { return }
+        requestedPDFImport = nil
+        selectWorkspaceLane(.work)
+        pendingImportTask = nil
+        requestFileImport(.pdf)
     }
 
     private func requestFileImport(_ kind: FileImportKind) {
@@ -8058,9 +8199,10 @@ struct LibraryView: View {
                         SectionEyebrow(text: "MATCHING PDFS")
                     }
                     Text(libraryTitle.localizedUI)
-                        .font(.headline)
+                        .font(PPType.display)
                         .foregroundStyle(PPColor.textPrimary)
                         .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityAddTraits(.isHeader)
                     if !isWorkspaceSidebar, !isSearching,
                        !dynamicTypeSize.isAccessibilitySize {
                         Text(librarySort.title.localizedUI)
@@ -8648,6 +8790,8 @@ struct LibraryView: View {
                             : PPColor.textSecondary
                     )
                 } else {
+                    VStack(spacing: 0) {
+                    libraryShareButton(record, identifierPrefix: "boardSharePDF")
                     Menu {
                         documentActions(for: record)
                     } label: {
@@ -8659,6 +8803,7 @@ struct LibraryView: View {
                     .accessibilityLabel(
                         AppLocalization.format("More actions for %@", record.displayName)
                     )
+                    }
                 }
             }
 
@@ -8934,6 +9079,9 @@ struct LibraryView: View {
                     .padding(PPSpacing.small)
                     .accessibilityHidden(true)
                 } else {
+                    HStack(spacing: 0) {
+                    libraryShareButton(record, identifierPrefix: "gridSharePDF")
+                        .background(.thinMaterial, in: Circle())
                     Menu {
                         documentActions(for: record)
                     } label: {
@@ -8953,6 +9101,7 @@ struct LibraryView: View {
                             record.displayName
                         )
                     )
+                    }
                 }
             }
         }
@@ -9075,6 +9224,8 @@ struct LibraryView: View {
                             .padding(.trailing, 2)
                             .accessibilityHidden(true)
                         } else {
+                            libraryShareButton(record)
+                                .padding(.top, PPSpacing.xSmall)
                             Menu {
                                 documentActions(for: record)
                             } label: {
@@ -9159,11 +9310,11 @@ struct LibraryView: View {
                 }
             }
         }
-        .background(PPColor.surface)
-        .clipShape(RoundedRectangle(cornerRadius: PPRadius.surface))
+        .background(horizontalSizeClass == .regular ? PPColor.surface : PPColor.canvas)
+        .clipShape(RoundedRectangle(cornerRadius: horizontalSizeClass == .regular ? PPRadius.surface : 0))
         .overlay {
             RoundedRectangle(cornerRadius: PPRadius.surface)
-                .strokeBorder(PPColor.border.opacity(0.5), lineWidth: 0.6)
+                .strokeBorder(PPColor.border.opacity(horizontalSizeClass == .regular ? 0.5 : 0), lineWidth: 0.6)
         }
     }
 
@@ -9187,7 +9338,7 @@ struct LibraryView: View {
                                 .foregroundStyle(PPColor.accent)
                         }
                         Text(record.displayName)
-                            .font(.subheadline.weight(.semibold))
+                            .font(.body.weight(.medium))
                             .foregroundStyle(PPColor.textPrimary)
                             .lineLimit(2)
                             .multilineTextAlignment(.leading)
@@ -9633,10 +9784,56 @@ struct LibraryView: View {
         }
     }
 
+    private func saveDocumentName(_ record: DocumentRecord) {
+        let requestedName = proposedDocumentName
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isSavingDocumentName,
+              !model.isProcessing(record.id),
+              !requestedName.isEmpty else { return }
+        isRenamingDocument = false
+        isSavingDocumentName = true
+        Task { @MainActor in
+            _ = await model.withFeedbackTarget(paperPathSceneID) {
+                await model.rename(
+                    recordID: record.id,
+                    to: requestedName,
+                    expectedName: record.displayName
+                )
+            }
+            isSavingDocumentName = false
+        }
+    }
+
     @ViewBuilder
     private func documentActions(
         for record: DocumentRecord
     ) -> some View {
+        Button {
+            renameEditorRecord = record
+            proposedDocumentName = record.displayName
+            isRenamingDocument = true
+        } label: {
+            Label("Rename".localizedUI, systemImage: "pencil")
+        }
+        .disabled(isSavingDocumentName || model.isProcessing(record.id))
+        .accessibilityIdentifier("libraryRenameDocument")
+
+        Button {
+            prepareLibraryShareCopy(recordID: record.id, toFiles: true)
+        } label: {
+            Label("Save PDF to Files".localizedUI, systemImage: "folder")
+        }
+        .disabled(libraryShareTask != nil || model.isProcessing(record.id))
+        .accessibilityIdentifier("librarySavePDFToFiles")
+
+        Button {
+            prepareLibraryShareCopy(recordID: record.id)
+        } label: {
+            Label("Share PDF".localizedUI, systemImage: "square.and.arrow.up")
+        }
+        .disabled(libraryShareTask != nil || model.isProcessing(record.id))
+        .accessibilityIdentifier("libraryShareCurrentPDF")
+
         Button {
             onOpen(
                 DocumentRoute(
@@ -9744,7 +9941,7 @@ struct LibraryView: View {
             }
         } label: {
             Label(
-                "Duplicate Working Copy",
+                "Save as New Document",
                 systemImage: "plus.square.on.square"
             )
         }
@@ -10338,6 +10535,22 @@ struct LibraryView: View {
     }
 
     private func initializeLibraryPresentationIfNeeded() {
+#if DEBUG
+        let arguments = ProcessInfo.processInfo.arguments
+        if !didInitializeUITestViewMode,
+           arguments.contains(where: { $0.hasPrefix("UITEST_") }) {
+            // Scene restoration otherwise overrides the next isolated test's
+            // launch preference after a grid/board journey.
+            didInitializeUITestViewMode = true
+            if let option = arguments.lastIndex(of: "-library.viewMode"),
+               arguments.indices.contains(option + 1),
+               let mode = LibraryViewMode(rawValue: arguments[option + 1]) {
+                savedLibraryViewMode = mode.rawValue
+            } else {
+                savedLibraryViewMode = LibraryViewMode.list.rawValue
+            }
+        }
+#endif
         if LibrarySort(rawValue: savedLibrarySort) == nil {
             savedLibrarySort = LibrarySort(
                 rawValue: defaultLibrarySort
@@ -16935,8 +17148,8 @@ private struct PaperTemplateCreatorView: View {
             if wasStopped {
                 model[noticeFor: paperPathSceneID] = (
                     record == nil
-                        ? "Copy creation stopped"
-                        : "Copy finished before stopping · copy kept in Library"
+                        ? "Changes stopped"
+                        : "Document saved before stopping"
                 ).localizedUI
                 return
             }
@@ -17104,6 +17317,7 @@ private struct StorageCenterView: View {
     @State private var isConfirmingUnpinAllVersionMilestones = false
     @State private var versionMilestonePendingUnpin:
         PDFVersionSnapshot?
+    @State private var isConfirmingClearIntermediateVersions = false
     @State private var isConfirmingClearPageMatches = false
     @State private var storageSort = StorageSort.size
     @State private var pinnedVersionMilestones:
@@ -17215,6 +17429,7 @@ private struct StorageCenterView: View {
                         if snapshot != nil {
                             storageHero
                             breakdown
+                            historyCleanup
                             savedPageMatchSection
                             versionArchiveIntegritySection
                             changeReportIntegritySection
@@ -17344,6 +17559,18 @@ private struct StorageCenterView: View {
             }
         } message: { milestone in
             Text(versionMilestoneUnpinMessage(milestone))
+        }
+        .confirmationDialog(
+            "Clear intermediate versions?",
+            isPresented: $isConfirmingClearIntermediateVersions,
+            titleVisibility: .visible
+        ) {
+            Button("Clear Intermediate Versions", role: .destructive) {
+                clearIntermediateVersions()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Keeps each document’s starting version and current saved PDF. All other recovery versions, including pinned milestones and their receipt links, are deleted. For older documents, only the earliest available history can be kept. This cannot be undone. Small PDFs will continue saving editing history after cleanup.")
         }
         .confirmationDialog(
             "Clear all saved page matches?",
@@ -17778,11 +18005,25 @@ private struct StorageCenterView: View {
         .fixedSize(horizontal: false, vertical: true)
     }
 
+    private var historyCleanup: some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            Button("Clear Intermediate Versions", role: .destructive) {
+                isConfirmingClearIntermediateVersions = true
+            }
+            .disabled(hasActiveStorageTask || model.hasActiveLocalDataOperations
+                || (snapshot?.versionStorageHealth.indexedVersionCount ?? 0) == 0)
+            .accessibilityIdentifier("clearIntermediateVersions")
+            Text("Keep the starting version and latest saved PDF. PDFs of 100 MiB or more do not accumulate automatic editing history. Starting versions use additional space outside the 1 GiB intermediate-history budget.")
+                .font(.footnote)
+                .foregroundStyle(PPColor.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
     private var breakdown: some View {
         VStack(alignment: .leading, spacing: 0) {
             StudioSectionRule(
                 title: "CAPACITY LEDGER",
-                detail: "Category · size · share · retention",
                 symbol: "chart.bar.doc.horizontal",
                 count: 9,
                 tint: PPColor.accent
@@ -17866,7 +18107,6 @@ private struct StorageCenterView: View {
         return VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "SAVED PAGE MATCHES",
-                detail: "Local corrections · bounded storage",
                 symbol: "rectangle.2.swap",
                 count: summary.correctionCount,
                 tint: tint
@@ -18040,7 +18280,7 @@ private struct StorageCenterView: View {
         let items = [
             StorageLedgerItem(
                 id: "pdf",
-                title: "PDF working copies",
+                title: "PDF documents",
                 bytes: snapshot?.pdfBytes ?? 0,
                 symbol: "doc.on.doc",
                 tint: PPColor.accent,
@@ -18855,7 +19095,6 @@ private struct StorageCenterView: View {
         return VStack(alignment: .leading, spacing: 0) {
             StudioSectionRule(
                 title: "SIGNED REPORT VAULT",
-                detail: "Private · reverified before sharing",
                 symbol: "lock.doc.fill",
                 count: retainedChangeReports.count,
                 tint: summary.isNearCapacity
@@ -20342,7 +20581,7 @@ private struct StorageCenterView: View {
                             }
                         } label: {
                             Label(
-                                "Duplicate Working Copy",
+                                "Save as New Document",
                                 systemImage: "plus.square.on.square"
                             )
                         }
@@ -20700,6 +20939,18 @@ private struct StorageCenterView: View {
                 return
             }
             officeGovernanceTask = nil
+            await refresh()
+        }
+    }
+
+    private func clearIntermediateVersions() {
+        guard versionGovernanceTask == nil else { return }
+        let generation = UUID()
+        versionGovernanceGeneration = generation
+        versionGovernanceTask = Task { @MainActor in
+            await model.clearIntermediateVersions()
+            guard versionGovernanceGeneration == generation else { return }
+            versionGovernanceTask = nil
             await refresh()
         }
     }
@@ -25896,15 +26147,10 @@ struct PrivacyCenterView: View {
 
     private var privacyHeroCopy: some View {
         VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
-            SectionEyebrow(text: "PRIVACY")
             Text("Your privacy controls".localizedUI)
                 .font(.title2.bold())
                 .fontDesign(.serif)
                 .foregroundStyle(PPColor.textPrimary)
-            Text("Choose access, previews, and optional sync.".localizedUI)
-                .font(.subheadline)
-                .foregroundStyle(PPColor.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -25922,7 +26168,7 @@ struct PrivacyCenterView: View {
         ) {
             privacyMetric(
                 value: "\(model.documents.count)",
-                label: "Working copies",
+                label: "Documents",
                 symbol: "internaldrive"
             )
             privacyMetric(
@@ -25947,7 +26193,6 @@ struct PrivacyCenterView: View {
         VStack(alignment: .leading, spacing: 0) {
             StudioSectionRule(
                 title: "PROCESSING LEDGER",
-                detail: "Data object · location · lifetime · boundary",
                 symbol: "tablecells",
                 count: visibleBoundaryCount,
                 tint: PPColor.mint
@@ -25980,7 +26225,7 @@ struct PrivacyCenterView: View {
             privacyLedgerHeader
             if boundaryFocus == .all || boundaryFocus == .local {
                 privacyLedgerRow(
-                    object: "PDF working copies",
+                    object: "PDF documents",
                     detail: AppLocalization.format(
                         "Active files: %lld",
                         model.documents.count
@@ -26216,7 +26461,7 @@ struct PrivacyCenterView: View {
     private var localBoundary: some View {
         privacySection(title: "STAYS ON THIS DEVICE") {
             privacyRow(
-                title: "PDF working copies",
+                title: "PDF documents",
                 detail: AppLocalization.format(
                     "Files with complete protection: %lld",
                     model.documents.count

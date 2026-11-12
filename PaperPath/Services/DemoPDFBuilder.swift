@@ -3,6 +3,27 @@ import PDFKit
 import UIKit
 
 enum DemoPDFBuilder {
+    static func createSharingSample(at url: URL) throws {
+        let page = CGRect(x: 0, y: 0, width: 612, height: 792)
+        try UIGraphicsPDFRenderer(bounds: page).writePDF(to: url) { context in
+            context.beginPage()
+            drawTitle("Fictional sharing sample".localizedUI, in: page)
+            drawParagraph("This is fictional sample data. It is not a real invoice or contract.", y: 130, in: page)
+            drawParagraph("Project: Northstar sample\nContact: billing@example.com\nPhone: +1 202 555 0147", y: 230, in: page)
+            drawParagraph("Review the detected private details, choose what to remove, then inspect the generated copy before sharing.", y: 410, in: page)
+        }
+    }
+
+    static func createHandoffMaterial(at url: URL, title: String, reference: String) throws {
+        let page = CGRect(x: 0, y: 0, width: 612, height: 792)
+        try UIGraphicsPDFRenderer(bounds: page).writePDF(to: url) { context in
+            context.beginPage()
+            drawTitle(title, in: page)
+            drawParagraph("Project ID: \(reference)\nClient: Northstar Studio\nAmount: USD 1,280.00", y: 156, in: page)
+            drawParagraph("Fictional sample for checking related documents. Review the project reference before handing these materials off.", y: 360, in: page)
+        }
+    }
+
     static func create(at url: URL) throws {
         let page = CGRect(x: 0, y: 0, width: 612, height: 792)
         let renderer = UIGraphicsPDFRenderer(bounds: page)

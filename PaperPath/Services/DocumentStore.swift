@@ -54,6 +54,12 @@ struct PreparedPDFWorkingCopy: Sendable {
     let restoresNavigationState: Bool
     let expectedFingerprint: String?
     let expectedPageCount: Int?
+    // Only the explicit document-version workflow may replace an exported or
+    // encrypted document. Page mutations keep their stricter existing contract.
+    let updatesCurrentDocument: Bool
+    let allowsLockedDocument: Bool
+    let versionReceipt: PDFDeliveryReceipt?
+    let versionRevisionID: UUID?
 
     init(
         recordID: UUID,
@@ -65,7 +71,11 @@ struct PreparedPDFWorkingCopy: Sendable {
         restoredTaskCheckpoint: DocumentTaskCheckpoint? = nil,
         restoresNavigationState: Bool = false,
         expectedFingerprint: String? = nil,
-        expectedPageCount: Int? = nil
+        expectedPageCount: Int? = nil,
+        updatesCurrentDocument: Bool = false,
+        allowsLockedDocument: Bool = false,
+        versionReceipt: PDFDeliveryReceipt? = nil,
+        versionRevisionID: UUID? = nil
     ) {
         self.recordID = recordID
         self.sourceRevisionID = sourceRevisionID
@@ -77,6 +87,10 @@ struct PreparedPDFWorkingCopy: Sendable {
         self.restoresNavigationState = restoresNavigationState
         self.expectedFingerprint = expectedFingerprint
         self.expectedPageCount = expectedPageCount
+        self.updatesCurrentDocument = updatesCurrentDocument
+        self.allowsLockedDocument = allowsLockedDocument
+        self.versionReceipt = versionReceipt
+        self.versionRevisionID = versionRevisionID
     }
 }
 
@@ -235,6 +249,7 @@ actor DocumentStore {
     private let protectedDataTransactionJournalURL: URL
     private let fileManager: FileManager
     private let inspector: PDFInspectionService
+    private let largeFileHistoryThreshold: Int64
     private let availableCapacity: @Sendable (URL) -> Int64?
     private let signingPrivateKeyProvider:
         (@Sendable () throws -> Curve25519.Signing.PrivateKey)?
@@ -258,8 +273,10 @@ actor DocumentStore {
         },
         signingPrivateKeyProvider:
             (@Sendable () throws -> Curve25519.Signing.PrivateKey)? = nil,
-        officeTimeAnchor: PDFOfficeTimeAnchor = .process
+        officeTimeAnchor: PDFOfficeTimeAnchor = .process,
+        largeFileHistoryThreshold: Int64 = PDFHistoryStoragePolicy.largeFileThreshold
     ) {
+        self.largeFileHistoryThreshold = max(1, largeFileHistoryThreshold)
         self.fileManager = fileManager
         self.inspector = inspector
         self.availableCapacity = availableCapacity
@@ -1762,6 +1779,55 @@ actor DocumentStore {
         return updated
     }
 
+    /// Keeps the document's identity, name, location and user metadata. The old
+    /// bytes become a bounded history entry, not another Library document.
+    func saveProcessedDocument(
+        _ record: DocumentRecord,
+        from preparedURL: URL,
+        label: String,
+        revisionID: UUID,
+        receipt: PDFDeliveryReceipt? = nil
+    ) throws -> DocumentRecord {
+        try Task.checkCancellation()
+        if let receipt {
+            guard receipt.isVerified,
+                  receipt.sourceRevisionID == record.contentRevisionID,
+                  receipt.outputRevisionID == revisionID,
+                  try fileFingerprint(at: preparedURL) == receipt.sha256
+            else {
+                throw PaperPathError.outputVerificationFailed(
+                    "the document update did not match its verification"
+                )
+            }
+        }
+        _ = try createVersionSnapshot(
+            for: record,
+            label: label,
+            allowsDeliveryArtifact: true,
+            allowsLockedDocument: true,
+            automatic: true
+        )
+        try Task.checkCancellation()
+        let committed = try replaceWorkingCopies(
+            with: [PreparedPDFWorkingCopy(
+                recordID: record.id,
+                sourceRevisionID: record.contentRevisionID,
+                preparedURL: preparedURL,
+                expectedFingerprint: receipt?.sha256,
+                expectedPageCount: receipt?.outputPageCount,
+                updatesCurrentDocument: true,
+                allowsLockedDocument: receipt?.operation == .protected,
+                versionReceipt: receipt,
+                versionRevisionID: revisionID
+            )],
+            invalidateAnalysis: true
+        )
+        guard let updated = committed.first else {
+            throw PaperPathError.storageFailure("The document update did not commit.")
+        }
+        return updated
+    }
+
     func replaceWorkingCopies(
         with preparedCopies: [PreparedPDFWorkingCopy],
         invalidateAnalysis: Bool = false,
@@ -1866,7 +1932,7 @@ actor DocumentStore {
             let stored = records[recordIndex]
             let destination = url(for: stored)
             guard stored.deletedAt == nil,
-                  stored.isWorkingCopy,
+                  (stored.isWorkingCopy || prepared.updatesCurrentDocument),
                   stored.contentRevisionID
                     == prepared.sourceRevisionID,
                   fileManager.fileExists(atPath: destination.path),
@@ -1881,7 +1947,7 @@ actor DocumentStore {
             let profile = try inspector.inspect(
                 url: prepared.preparedURL
             )
-            guard !profile.isLocked,
+            guard (!profile.isLocked || prepared.allowsLockedDocument),
                   !requiresMatchingPageCount
                     || profile.pageCount == stored.profile.pageCount
             else {
@@ -1910,8 +1976,14 @@ actor DocumentStore {
             var updated = stored
             updated.profile = profile
             updated.modifiedAt = now
-            updated.contentRevisionID = UUID()
+            updated.contentRevisionID = prepared.versionRevisionID ?? UUID()
             updated.contentFingerprint = fingerprint
+            if prepared.updatesCurrentDocument {
+                updated.sourceDocumentID = nil
+                updated.deliveryReceipt = prepared.versionReceipt
+                updated.completedActions = []
+                updated.workflowStatus = .inbox
+            }
             updated.lastPageIndex = min(
                 max(updated.lastPageIndex, 0),
                 max(0, profile.pageCount - 1)
@@ -4663,6 +4735,37 @@ actor DocumentStore {
                 "The batch recovery state could not be saved."
             )
         }
+    }
+
+    func loadHandoffWorkspace() throws -> HandoffWorkspace {
+        try prepareDirectories()
+        let url = rootURL.appendingPathComponent("handoff-workspace.json")
+        guard fileManager.fileExists(atPath: url.path) else { return HandoffWorkspace() }
+        try requireProtectedRegularFile(at: url)
+        guard logicalFileSize(url) <= 16 * 1_024 * 1_024 else {
+            throw PaperPathError.storageFailure("The handoff workspace is too large to read.")
+        }
+        let workspace = try JSONDecoder().decode(HandoffWorkspace.self, from: Data(contentsOf: url))
+        guard workspace.isValid else {
+            throw PaperPathError.storageFailure("The handoff workspace could not be read. Existing data has been preserved.")
+        }
+        return workspace
+    }
+
+    func saveHandoffWorkspace(_ proposed: HandoffWorkspace) throws -> HandoffWorkspace {
+        let current = try loadHandoffWorkspace()
+        guard current.revision == proposed.revision else {
+            throw PaperPathError.storageFailure("The handoff workspace changed in another window. Review it and try again.")
+        }
+        guard proposed.isValid, proposed.revision < Int.max - 1 else {
+            throw PaperPathError.storageFailure("The handoff workspace contains invalid or too many items.")
+        }
+        var saved = proposed
+        saved.revision += 1
+        let data = try JSONEncoder().encode(saved)
+        guard data.count <= 16 * 1_024 * 1_024 else { throw PaperPathError.fileTooLarge }
+        try writeProtectedData(data, to: rootURL.appendingPathComponent("handoff-workspace.json"))
+        return saved
     }
 
     func clearBatchDeliveryRun() {
@@ -7588,7 +7691,9 @@ actor DocumentStore {
         for record: DocumentRecord,
         label: String,
         preservingVersionID: UUID? = nil,
-        allowsDeliveryArtifact: Bool = false
+        allowsDeliveryArtifact: Bool = false,
+        allowsLockedDocument: Bool = false,
+        automatic: Bool = false
     ) throws -> PDFVersionSnapshot {
         try Task.checkCancellation()
         try prepareDirectories()
@@ -7614,13 +7719,47 @@ actor DocumentStore {
         }
         let fingerprint = try fileFingerprint(at: sourceURL)
         let sourceProfile = try inspector.inspect(url: sourceURL)
-        guard !sourceProfile.isLocked else {
+        guard !sourceProfile.isLocked || allowsLockedDocument else {
             throw PaperPathError.lockedPDF
         }
         let allExisting = try loadVersionIndex()
         let existing = allExisting
             .filter { $0.documentID == stored.id }
             .sorted(by: versionSortsBefore)
+        let compactHistory = logicalFileSize(sourceURL) >= largeFileHistoryThreshold
+            || existing.contains(where: { $0.compactHistoryEnabled == true })
+        if automatic && compactHistory {
+            // Direct annotations also need room for staging and rollback, even
+            // when the starting point already exists and no new history is written.
+            try ensureTemporaryWorkingCapacity(
+                for: [sourceURL], copyMultiplier: existing.isEmpty ? 4 : 3
+            )
+        }
+        // A large PDF keeps one immutable starting point and its live file.
+        // Explicit milestones/restoration remain intentional history operations.
+        let recoveryCandidates = originalRecoveryCandidates(in: existing)
+        if automatic, compactHistory, !recoveryCandidates.isEmpty {
+            let originals = try recoveryCandidates.map { snapshot -> PDFVersionSnapshot in
+                _ = try versionFileURL(snapshotID: snapshot.id, recordID: stored.id)
+                var original = snapshot
+                original.isOriginalRecoveryPoint = true
+                original.compactHistoryEnabled = true
+                return original
+            }
+            let originalIDs = Set(originals.map(\.id))
+            let removed = existing.filter {
+                !originalIDs.contains($0.id) && !$0.isPinnedMilestone
+            }
+            let removedIDs = Set(removed.map(\.id))
+            try Task.checkCancellation()
+            try saveVersionIndex(allExisting.filter {
+                !originalIDs.contains($0.id) && !removedIDs.contains($0.id)
+            } + originals)
+            for snapshot in removed {
+                try fileManager.removeItem(at: versionURL(for: snapshot))
+            }
+            return originals[0]
+        }
         if let latest = existing.first,
            latest.contentFingerprint == fingerprint,
            latest.contentRevisionID == stored.contentRevisionID,
@@ -7639,7 +7778,8 @@ actor DocumentStore {
         }
         let protectedExisting = allExisting.compactMap {
             snapshot -> PDFVersionSnapshot? in
-            guard snapshot.isPinnedMilestone
+            guard !snapshot.isProtectedOriginal,
+                  snapshot.isPinnedMilestone
                     || snapshot.id == preservingVersionID
             else { return nil }
             return measuredVersionSnapshot(snapshot)
@@ -7649,7 +7789,7 @@ actor DocumentStore {
         }
         guard saturatingAdd(
             protectedBytes,
-            measuredSourceBytes
+            existing.isEmpty ? 0 : measuredSourceBytes
         ) <= Self.maximumVersionBytes else {
             throw PaperPathError.insufficientSelection(
                 "Unpin or archive older milestones before creating another recovery version."
@@ -7719,7 +7859,10 @@ actor DocumentStore {
                 milestoneName: nil,
                 isPinned: nil,
                 linkedDeliveryReceiptID: nil,
-                linkedDeliveryReceipt: nil
+                linkedDeliveryReceipt: nil,
+                isOriginalRecoveryPoint: existing.isEmpty ? true : nil,
+                compactHistoryEnabled: automatic && measuredSourceBytes >= largeFileHistoryThreshold
+                    ? true : nil
             )
             let allVersions = try loadVersionIndex() + [snapshot]
             var preservedIDs: Set<UUID> = [snapshot.id]
@@ -8025,6 +8168,33 @@ actor DocumentStore {
         return pinnedCount
     }
 
+    /// Explicit, confirmed cleanup: retain each starting point and the live PDF.
+    /// Older installations retain the earliest available history, never invent an original.
+    func clearIntermediateVersions() throws -> Int {
+        try prepareDirectories()
+        let snapshots = try loadVersionIndex()
+        var kept: [PDFVersionSnapshot] = []
+        for versions in Dictionary(grouping: snapshots, by: \.documentID).values {
+            let sorted = versions.sorted(by: versionSortsBefore)
+            let originals = originalRecoveryCandidates(in: sorted)
+            for var original in originals {
+                _ = try versionFileURL(snapshotID: original.id, recordID: original.documentID)
+                original.isOriginalRecoveryPoint = true
+                kept.append(original)
+            }
+        }
+        let keptIDs = Set(kept.map(\.id))
+        let removed = snapshots.filter { !keptIDs.contains($0.id) }
+        try Task.checkCancellation()
+        try saveVersionIndex(kept)
+        // Failed deletions stay visible on disk and reconciliation retries them.
+        for snapshot in removed {
+            try fileManager.removeItem(at: versionURL(for: snapshot))
+        }
+        removeEmptyVersionDirectories()
+        return removed.count
+    }
+
     func enforceVersionRetention(
         preserving snapshotID: UUID? = nil
     ) throws {
@@ -8096,7 +8266,8 @@ actor DocumentStore {
                     restoredLastPageIndex: snapshot.lastPageIndex,
                     restoresNavigationState: true,
                     expectedFingerprint: snapshot.contentFingerprint,
-                    expectedPageCount: snapshot.pageCount
+                    expectedPageCount: snapshot.pageCount,
+                    allowsLockedDocument: true
                 )
             ],
             invalidateAnalysis: true,
@@ -8455,10 +8626,15 @@ actor DocumentStore {
             sourceBytes.multipliedReportingOverflow(
                 by: Int64(copyMultiplier)
             )
+        let effectiveReserve = sourceBytes >= PDFHistoryStoragePolicy.largeFileThreshold
+            ? max(reserveBytes, 256 * 1_024 * 1_024) : reserveBytes
         let requiredBytes = didOverflow
             ? Int64.max
-            : saturatingAdd(workingBytes, reserveBytes)
+            : saturatingAdd(workingBytes, effectiveReserve)
         guard let available = availableCapacity(rootURL) else {
+            if sourceBytes >= PDFHistoryStoragePolicy.largeFileThreshold {
+                throw PaperPathError.storageFailure("Available storage could not be measured. Try again before editing this large PDF.")
+            }
             return
         }
         guard available >= requiredBytes else {
@@ -10755,6 +10931,16 @@ actor DocumentStore {
         }
     }
 
+    private func originalRecoveryCandidates(
+        in snapshots: [PDFVersionSnapshot]
+    ) -> [PDFVersionSnapshot] {
+        let protected = snapshots.filter(\.isProtectedOriginal)
+        if !protected.isEmpty { return protected }
+        // Legacy JSON dates have second precision; UUID order cannot resolve a tie.
+        guard let earliest = snapshots.map(\.createdAt).min() else { return [] }
+        return snapshots.filter { $0.createdAt == earliest }
+    }
+
     private func retainedVersions(
         from snapshots: [PDFVersionSnapshot],
         preserving snapshotIDs: Set<UUID>
@@ -10762,11 +10948,18 @@ actor DocumentStore {
         kept: [PDFVersionSnapshot],
         removed: [PDFVersionSnapshot]
     ) {
-        let availableSnapshots = snapshots.filter(
-            isAvailableVersionSnapshot
-        )
+        let available = snapshots.filter(isAvailableVersionSnapshot)
+        let originalIDs = Set(Dictionary(grouping: available, by: \.documentID)
+            .values.flatMap { originalRecoveryCandidates(in: $0).map(\.id) })
+        let availableSnapshots = available.map { snapshot -> PDFVersionSnapshot in
+            var snapshot = snapshot
+            if originalIDs.contains(snapshot.id) { snapshot.isOriginalRecoveryPoint = true }
+            return snapshot
+        }
         let protectedIDs = snapshotIDs.union(
-            availableSnapshots.filter(\.isPinnedMilestone).map(\.id)
+            availableSnapshots.filter {
+                $0.isPinnedMilestone || $0.isProtectedOriginal
+            }.map(\.id)
         )
         var kept = Dictionary(
             grouping: availableSnapshots,
@@ -10790,7 +10983,8 @@ actor DocumentStore {
             }
             return selected
         }
-        var totalBytes = kept.reduce(Int64(0)) {
+        // Starting files are document data; the 1 GiB budget covers additional history.
+        var totalBytes = kept.filter { !$0.isProtectedOriginal }.reduce(Int64(0)) {
             saturatingAdd($0, max(0, $1.byteCount))
         }
         while totalBytes > Self.maximumVersionBytes {
@@ -11006,7 +11200,9 @@ actor DocumentStore {
             milestoneName: milestoneName,
             isPinned: isPinned ? true : nil,
             linkedDeliveryReceiptID: linkedReceiptID,
-            linkedDeliveryReceipt: linkedReceipt
+            linkedDeliveryReceipt: linkedReceipt,
+            isOriginalRecoveryPoint: snapshot.isOriginalRecoveryPoint == true ? true : nil,
+            compactHistoryEnabled: snapshot.compactHistoryEnabled == true ? true : nil
         )
     }
 
@@ -11978,8 +12174,14 @@ actor DocumentStore {
         guard fileSize <= 1_073_741_824 else {
             throw PaperPathError.fileTooLarge
         }
-        guard let available = availableCapacity(rootURL) else { return }
-        let reserve = Int64(16 * 1_024 * 1_024)
+        guard let available = availableCapacity(rootURL) else {
+            if fileSize >= PDFHistoryStoragePolicy.largeFileThreshold {
+                throw PaperPathError.storageFailure("Available storage could not be measured. Try again before editing this large PDF.")
+            }
+            return
+        }
+        let reserve = fileSize >= PDFHistoryStoragePolicy.largeFileThreshold
+            ? Int64(256 * 1_024 * 1_024) : Int64(16 * 1_024 * 1_024)
         guard available >= fileSize + reserve else {
             throw PaperPathError.insufficientStorage
         }

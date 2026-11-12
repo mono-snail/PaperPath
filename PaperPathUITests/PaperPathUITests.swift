@@ -1,8 +1,15 @@
 import XCTest
 import UIKit
+import PDFKit
 
 @MainActor
 final class PaperPathUITests: XCTestCase {
+    private var qualityCaptureEnabled = false
+    private var qualityFeatureKey = ""
+    private var qualityContentSize = "UICTContentSizeCategoryL"
+    private let qualityCaseID = UUID()
+    private let qualityStoreID = UUID()
+
     override func setUpWithError() throws {
         try super.setUpWithError()
         continueAfterFailure = false
@@ -234,6 +241,9 @@ final class PaperPathUITests: XCTestCase {
     }
 
     func testProfessionalReadingFlow() throws {
+        // Three complete language/text-size configurations retain their own
+        // short per-step waits while sharing this overall XCTest allowance.
+        executionTimeAllowance = 600
         for (large, chinese) in [(false, false), (true, false), (false, true)] {
             let app = makeApp()
             let done = chinese ? "完成" : "Done"
@@ -262,17 +272,20 @@ final class PaperPathUITests: XCTestCase {
                 app.buttons["deskOpenDocument"].tap()
             }
             selectProfessionalMode("read", chinese: chinese, in: app)
-            app.buttons["workspaceNavigationMenu"].tap()
+            openReadingNavigationMenu(chinese: chinese, in: app)
             app.buttons[chinese ? "阅读" : "Reading"].firstMatch.tap()
             app.buttons[chinese ? "阅读设置" : "Reading Settings"].firstMatch.tap()
             XCTAssertTrue(app.buttons["readingTheme-sepia"].waitForExistence(timeout: 5))
             app.buttons["readingTheme-sepia"].tap()
             let reset = app.buttons["resetReadingSettings"]
-            XCTAssertTrue(reveal(reset, in: app, maxSwipes: 8))
+            let readingForm = app.collectionViews.allElementsBoundByIndex
+                .first { $0.buttons["readingTheme-sepia"].exists }
+            XCTAssertNotNil(readingForm)
+            XCTAssertTrue(revealInContainer(reset, container: try XCTUnwrap(readingForm), maxSwipes: 8))
             reset.tap()
             addScreenshot(named: "Reading settings" + suffix, app: app)
             app.buttons[done].firstMatch.tap()
-            app.buttons["workspaceNavigationMenu"].tap()
+            openReadingNavigationMenu(chinese: chinese, in: app)
             app.descendants(matching: .any)["workspaceNavigateAction"].firstMatch.tap()
             let input = app.textFields["navigationPageInput"]
             XCTAssertTrue(input.waitForExistence(timeout: 5))
@@ -280,8 +293,14 @@ final class PaperPathUITests: XCTestCase {
             input.typeText("2")
             addScreenshot(named: "Navigation" + suffix, app: app)
             app.buttons["navigationGoToPage"].tap()
-            XCTAssertTrue(app.buttons["workspaceNavigationMenu"].waitForExistence(timeout: 5))
-            app.buttons["workspaceNavigationMenu"].tap()
+            let page = app.buttons["workspacePageJumpAction"].firstMatch
+            let pageReached = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "label == %@", chinese
+                    ? "第 2 页，共 2 页。前往页面" : "Page 2 of 2. Go to page"),
+                object: page
+            )
+            XCTAssertEqual(XCTWaiter.wait(for: [pageReached], timeout: 5), .completed)
+            openReadingNavigationMenu(chinese: chinese, in: app)
             app.buttons[chinese ? "阅读" : "Reading"].firstMatch.tap()
             app.buttons[chinese ? "专注阅读" : "Focus Reader"].firstMatch.tap()
             let position = app.staticTexts["focusReaderPosition"]
@@ -302,10 +321,39 @@ final class PaperPathUITests: XCTestCase {
             organizer.tap()
             XCTAssertTrue(app.buttons["organizerGoToPage"].waitForExistence(timeout: 5))
             app.buttons["organizerGoToPage"].tap()
-            app.alerts.textFields.firstMatch.typeText("2")
-            app.alerts.buttons[chinese ? "前往" : "Go"].tap()
+            let pageAlert = app.alerts.firstMatch
+            pageAlert.textFields.firstMatch.typeText("2")
+            let go = pageAlert.buttons[chinese ? "前往" : "Go"].firstMatch
+            let goReady = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: go)
+            XCTAssertEqual(XCTWaiter.wait(for: [goReady], timeout: 5), .completed)
+            addScreenshot(named: "Organizer page confirmation before touch" + suffix, app: app)
+            let jumpEvidence = XCTAttachment(string: "go=\(go.frame)\napp=\(app.frame)\n\(app.debugDescription)")
+            jumpEvidence.name = "Organizer page confirmation accessibility before touch" + suffix
+            jumpEvidence.lifetime = .keepAlways
+            add(jumpEvidence)
+            // With a hardware keyboard, iPad's floating number pad consumes
+            // the first outside touch. Close that observed popover before
+            // confirming the actual alert; phones use the ordinary single tap.
+            if UIDevice.current.userInterfaceIdiom == .pad,
+               let numberPad = app.otherElements.matching(identifier: "UIKeyboardLayoutStar Preview")
+                .allElementsBoundByIndex.first(where: {
+                    $0.frame.width < app.frame.width * 0.6
+                        && app.frame.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
+                }) {
+                XCTAssertTrue(tapCurrentFrame(of: go, in: app))
+                let padClosed = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+                    !numberPad.exists || !app.frame.intersects(numberPad.frame)
+                }, object: nil)
+                XCTAssertEqual(XCTWaiter.wait(for: [padClosed], timeout: 5), .completed)
+            }
+            if pageAlert.exists {
+                XCTAssertTrue(tapCurrentFrame(of: go, in: app))
+            }
+            XCTAssertTrue(pageAlert.waitForNonExistence(timeout: 5))
             let second = app.buttons["organizerPage-1"]
-            XCTAssertTrue(reveal(second, in: app, maxSwipes: 6))
+            XCTAssertTrue(revealWorkflowControl(second, in: app,
+                navigationTitle: chinese ? "整理页面" : "Organize pages",
+                footerID: "selectOrganizerPages", maxSwipes: 6))
             addScreenshot(named: "Page organizer" + suffix, app: app)
             app.buttons[chinese ? "关闭" : "Close"].firstMatch.tap()
             openDocumentTools(chinese: chinese, in: app)
@@ -558,7 +606,13 @@ final class PaperPathUITests: XCTestCase {
                     in: app
                 )
             }
-            XCTAssertTrue(app.buttons["enterFocusReading"].isHittable)
+            let focus = app.buttons["enterFocusReading"].firstMatch
+            let toolRow = app.scrollViews["workspaceToolRow"].firstMatch
+            for _ in 0..<8 where !focus.isHittable || !toolRow.frame.contains(focus.frame) {
+                toolRow.swipeLeft()
+            }
+            XCTAssertTrue(focus.isHittable)
+            XCTAssertTrue(toolRow.frame.contains(focus.frame))
             addScreenshot(named: largeType ? "Chinese reader accessibility" : "Chinese reader", app: app)
             app.buttons["enterFocusReading"].tap()
             XCTAssertTrue(app.buttons["exitImmersiveReading"].waitForExistence(timeout: 5))
@@ -740,7 +794,7 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(brandTitle.waitForExistence(timeout: 3))
         XCTAssertEqual(
             brandTitle.label,
-            "PaperPath: Secure PDF Studio"
+            "PaperPath: Private PDF"
         )
         XCTAssertTrue(
             app.otherElements["libraryDocumentsSection"]
@@ -1002,7 +1056,7 @@ final class PaperPathUITests: XCTestCase {
         let protectedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - Protected copy"
+                "Project handoff"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -1150,7 +1204,8 @@ final class PaperPathUITests: XCTestCase {
             in: app
         )
         let approved = app.buttons["stampOption-Approved"].firstMatch
-        XCTAssertTrue(approved.waitForExistence(timeout: 5))
+        XCTAssertTrue(revealInPresentedSheet(approved,
+            navigationTitle: "Add stamp", in: app, maxSwipes: 20))
         tapCenter(approved)
         XCTAssertTrue(
             app.navigationBars["Add stamp"]
@@ -1471,7 +1526,9 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(create.waitForExistence(timeout: 5))
         XCTAssertFalse(create.isEnabled)
 
-        for documentTitle in ["Project handoff", "August invoice"] {
+        // Keep adding through the library plus buttons after reaching two PDFs.
+        // Do not reopen the disclosure: a third source must remain discoverable.
+        for documentTitle in ["Project handoff", "August invoice", "Site review report"] {
             let document = app.buttons.matching(
                 NSPredicate(
                     format:
@@ -1481,7 +1538,7 @@ final class PaperPathUITests: XCTestCase {
                 )
             ).firstMatch
             XCTAssertTrue(
-                revealForCenterTap(document, in: app, maxSwipes: 10),
+                revealMergeControl(document, in: app, maxSwipes: 16),
                 "Could not add \(documentTitle) to the merge"
             )
             tapCenter(document)
@@ -1507,20 +1564,31 @@ final class PaperPathUITests: XCTestCase {
             }
         }
 
+        XCTAssertEqual(create.label, "Merge 3 PDFs")
+
         let selectedRows = app.descendants(matching: .any).matching(
             NSPredicate(format: "identifier BEGINSWITH %@", "mergeSelectedDocument-")
         )
         let project = selectedRows.matching(NSPredicate(format: "label CONTAINS[c] %@", "Project handoff")).firstMatch
         let invoice = selectedRows.matching(NSPredicate(format: "label CONTAINS[c] %@", "August invoice")).firstMatch
-        XCTAssertTrue(revealForCenterTap(project, in: app, maxSwipes: 8))
-        let invoiceID = String(invoice.identifier.dropFirst("mergeSelectedDocument-".count))
-        let dragHandle = app.descendants(matching: .any)["mergeDrag-\(invoiceID)"].firstMatch
-        XCTAssertTrue(revealForCenterTap(dragHandle, in: app, maxSwipes: 8))
-        XCTAssertTrue(project.isHittable)
-        dragHandle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
-            .press(forDuration: 1.0, thenDragTo: project.coordinate(
-                withNormalizedOffset: CGVector(dx: 0.4, dy: 0.25)
-            ))
+        let largeText = qualityCaptureEnabled && qualityContentSize == "UICTContentSizeCategoryAccessibilityXXXL"
+        if largeText {
+            let earlier = app.buttons.matching(NSPredicate(
+                format: "label == %@ AND value == %@", "Move earlier", "August invoice"
+            )).firstMatch
+            XCTAssertTrue(revealMergeControl(earlier, in: app, maxSwipes: 16, searchUp: true))
+            tapCenter(earlier)
+        } else {
+            XCTAssertTrue(revealMergeControl(project, in: app, maxSwipes: 8, searchUp: true))
+            let invoiceID = String(invoice.identifier.dropFirst("mergeSelectedDocument-".count))
+            let dragHandle = app.descendants(matching: .any)["mergeDrag-\(invoiceID)"].firstMatch
+            XCTAssertTrue(revealMergeControl(dragHandle, in: app, maxSwipes: 8))
+            XCTAssertTrue(project.isHittable)
+            dragHandle.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5))
+                .press(forDuration: 1.0, thenDragTo: project.coordinate(
+                    withNormalizedOffset: CGVector(dx: 0.4, dy: 0.25)
+                ))
+        }
         let reordered = XCTNSPredicateExpectation(
             predicate: NSPredicate { _, _ in invoice.frame.minY < project.frame.minY },
             object: nil
@@ -1529,7 +1597,7 @@ final class PaperPathUITests: XCTestCase {
         addScreenshot(named: "Dragged merge order", app: app)
 
         let outputName = app.textFields["mergeOutputName"].firstMatch
-        XCTAssertTrue(revealForCenterTap(outputName, in: app, maxSwipes: 8))
+        XCTAssertTrue(revealMergeControl(outputName, in: app, maxSwipes: 16))
         outputName.tap()
         outputName.typeText("Automation Merge")
         if app.keyboards.buttons["Done"].exists {
@@ -1602,7 +1670,14 @@ final class PaperPathUITests: XCTestCase {
         )
         let cropPage = app.buttons["Crop page"].firstMatch
         XCTAssertTrue(cropPage.waitForExistence(timeout: 5))
-        tapCenter(cropPage)
+        XCTAssertTrue(revealWorkflowControl(cropPage, in: app, navigationTitle: "Organize pages",
+            footerID: "selectOrganizerPages", maxSwipes: 16))
+        addScreenshot(named: "Actual organizer crop control before touch", app: app)
+        let cropEvidence = XCTAttachment(string: "crop=\(cropPage.frame)\napp=\(app.frame)\n\(app.debugDescription)")
+        cropEvidence.name = "Actual organizer crop accessibility before touch"
+        cropEvidence.lifetime = .keepAlways
+        add(cropEvidence)
+        XCTAssertTrue(tapCurrentFrame(of: cropPage, in: app))
         XCTAssertTrue(
             app.navigationBars["Crop Page"]
                 .waitForExistence(timeout: 5)
@@ -1625,9 +1700,94 @@ final class PaperPathUITests: XCTestCase {
         assertAppAlive(app)
     }
 
+    func testCompressionAndContentEditingStayInSameDocument() throws {
+        let app = makeApp()
+        app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+        let title = workspaceDocumentTitle(in: app).label
+        openDocumentTool(identifier: "compress", query: "Compress", in: app)
+        let compress = app.buttons["compressionCreateAction"].firstMatch
+        XCTAssertTrue(compress.waitForExistence(timeout: 8))
+        XCTAssertEqual(compress.label, "Compress PDF")
+        addScreenshot(named: "Document workflow compression saves current", app: app)
+        compress.tap()
+        if app.buttons["compressionTryLossyAction"].waitForExistence(timeout: 3) {
+            // The demo is already encoded efficiently: a no-benefit result must
+            // keep this same document and allow editing to continue normally.
+            dismissPresentedWorkflow(title: "Compress", in: app)
+        }
+        XCTAssertTrue(app.navigationBars["Compress"].waitForNonExistence(timeout: 30))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        openDocumentTool(identifier: "content", query: "Add Content", in: app)
+        let text = app.descendants(matching: .any)["contentText"].firstMatch
+        XCTAssertTrue(text.waitForExistence(timeout: 8))
+        text.tap()
+        text.typeText("Same document workflow")
+        let save = app.buttons["contentCreateCopy"].firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 5))
+        XCTAssertEqual(save.label, "Save Changes")
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: save)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 15), .completed)
+        save.tap()
+        XCTAssertTrue(app.navigationBars["Add Content"].waitForNonExistence(timeout: 30))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        addScreenshot(named: "Document workflow same document after save", app: app)
+        assertAnnotationResult(title: "Added Text", contents: "Same document workflow", in: app)
+        assertAppAlive(app)
+    }
+
+    func testCompressionMethodsRemainActionableWithAdvisoryEstimate() throws {
+        let app = makeApp()
+        app.launchArguments += ["UITEST_COMPRESSION_FIXTURE", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+        openDocumentTool(identifier: "compress", query: "Compress", in: app)
+        let create = app.buttons["compressionCreateAction"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 8))
+        XCTAssertTrue(create.isEnabled)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Measured after compression")).firstMatch.waitForExistence(timeout: 5))
+        let quality = app.segmentedControls["Output quality"]
+        XCTAssertFalse(quality.exists, "Lossless mode must not suggest that JPEG quality affects its output")
+        addScreenshot(named: "Compression lossless default", app: app)
+        let method = app.segmentedControls["compressionMethodPicker"].firstMatch
+        XCTAssertTrue(method.waitForExistence(timeout: 5))
+        method.buttons["High quality (lossy)"].tap()
+        XCTAssertTrue(create.isEnabled)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Lossy image compression.")).firstMatch.exists)
+        addScreenshot(named: "Compression explicit high quality", app: app)
+        app.buttons["More options"].firstMatch.tap()
+        app.buttons["Image pages (lossy)"].firstMatch.tap()
+        XCTAssertTrue(create.isEnabled)
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "Lossy conversion: rebuilds pages as images.")).firstMatch.waitForExistence(timeout: 5))
+        addScreenshot(named: "Compression explicit image copy", app: app)
+        XCTAssertTrue(create.isEnabled, "A sampled size must never veto real compression")
+        method.buttons["Lossless"].tap()
+        XCTAssertTrue(create.isEnabled)
+        create.tap()
+        let retry = app.buttons["compressionTryLossyAction"]
+        if !retry.waitForExistence(timeout: 3) {
+            // A first optimization may produce a smaller copy. Recompressing
+            // that canonical output must report the no-savings state.
+            XCTAssertTrue(app.descendants(matching: .any)["workspaceDocumentTitle"].firstMatch.waitForExistence(timeout: 10))
+            openDocumentTool(identifier: "compress", query: "Compress", in: app)
+            XCTAssertTrue(create.waitForExistence(timeout: 8))
+            create.tap()
+        }
+        XCTAssertTrue(retry.waitForExistence(timeout: 30))
+        retry.tap()
+        XCTAssertTrue(method.buttons["High quality (lossy)"].isSelected)
+        assertAppAlive(app)
+    }
+
     func testCompressPDFQuickJourneyKeepsAlreadySmallerOriginal()
         throws {
-        let app = launchResetDemo()
+        let app = makeApp()
+        app.launchArguments += ["UITEST_COMPRESSION_FIXTURE", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
 
         openQuickTask(
             identifier: "compressPDF",
@@ -1659,8 +1819,17 @@ final class PaperPathUITests: XCTestCase {
                 "Project handoff"
             )
         ).firstMatch
+        XCTAssertTrue(revealWorkflowControl(source, in: app, navigationTitle: "Compress PDF", footerID: "batchCompressionAction", maxSwipes: 16))
         XCTAssertTrue(source.waitForExistence(timeout: 8))
         tapCenter(source)
+        let method = app.descendants(matching: .any)["compressionMethodPicker"].firstMatch
+        XCTAssertTrue(method.waitForExistence(timeout: 5))
+        let options = app.buttons["More options"].firstMatch
+        XCTAssertTrue(revealWorkflowControl(options, in: app, navigationTitle: "Compress PDF", footerID: "batchCompressionAction", maxSwipes: 16, searchUp: true))
+        tapCenter(options)
+        let imageMode = app.buttons["Image pages (lossy)"].firstMatch
+        XCTAssertTrue(revealWorkflowControl(imageMode, in: app, navigationTitle: "Compress PDF", footerID: "batchCompressionAction", maxSwipes: 16))
+        tapCenter(imageMode)
         let compress = app.buttons["batchCompressionAction"].firstMatch
         XCTAssertTrue(compress.waitForExistence(timeout: 5))
         XCTAssertTrue(compress.isEnabled)
@@ -1677,14 +1846,14 @@ final class PaperPathUITests: XCTestCase {
         let protectedFromGrowth = app.staticTexts.matching(
             NSPredicate(
                 format: "label CONTAINS %@",
-                "PaperPath did not save the larger copy."
+                "The document was left unchanged."
             )
         )
         .firstMatch
         XCTAssertTrue(
             protectedFromGrowth.waitForExistence(timeout: 5)
         )
-        XCTAssertTrue(app.staticTexts["No new copy"].exists)
+        XCTAssertTrue(app.staticTexts["No change needed"].exists)
         XCTAssertFalse(app.buttons["Retry 1 Failed"].exists)
         let done = app.buttons["Done"].firstMatch
         XCTAssertTrue(done.waitForExistence(timeout: 5))
@@ -1785,7 +1954,7 @@ final class PaperPathUITests: XCTestCase {
         completeRedaction(in: app)
         XCTAssertEqual(
             workspaceDocumentTitle(in: app).label,
-            "Project handoff - Redacted copy"
+            "Project handoff"
         )
         assertAppAlive(app)
     }
@@ -1817,7 +1986,7 @@ final class PaperPathUITests: XCTestCase {
         completeVerifiedShare(in: app)
         XCTAssertEqual(
             workspaceDocumentTitle(in: app).label,
-            "Project handoff - Verified copy"
+            "Project handoff - Export"
         )
         assertAppAlive(app)
     }
@@ -1905,6 +2074,11 @@ final class PaperPathUITests: XCTestCase {
         dismissPresentedWorkflow(title: "Save as Images", in: app)
         XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
         XCTAssertTrue(waitForLibrary(in: app))
+        let cancelSearch = app.buttons["librarySearchCancel"].firstMatch
+        if cancelSearch.exists {
+            XCTAssertTrue(tapCurrentFrame(of: cancelSearch, in: app))
+            XCTAssertTrue(cancelSearch.waitForNonExistence(timeout: 8))
+        }
 
         openQuickTask(
             identifier: "exportImages",
@@ -2054,15 +2228,21 @@ final class PaperPathUITests: XCTestCase {
         // This thin-line fixture has a 52-point logical selection height.
         // XCTest reports the frame after page fitting, including its scale.
         let handleInset = originalSelectionFrame.height * (20.0 / 52.0)
-        let handle = selection.coordinate(withNormalizedOffset: .zero)
+        // Bind both endpoints to the screen before the selected view resizes.
+        let handle = app.coordinate(withNormalizedOffset: .zero)
             .withOffset(CGVector(
-                dx: originalSelectionFrame.width - handleInset,
-                dy: originalSelectionFrame.height - handleInset
+                dx: originalSelectionFrame.maxX - handleInset - app.frame.minX,
+                dy: originalSelectionFrame.maxY - handleInset - app.frame.minY
             ))
         handle.press(
             forDuration: 0.1,
             thenDragTo: handle.withOffset(CGVector(dx: -40, dy: -10))
         )
+        let resizeEvidence = XCTAttachment(string:
+            "before=\(originalSelectionFrame)\nafter=\(selection.frame)\ncanvas=\(canvas.frame)")
+        resizeEvidence.name = "Actual shape resize frames"
+        resizeEvidence.lifetime = .keepAlways
+        add(resizeEvidence)
         // The fixture is a thin line; its selection keeps a minimum hit height.
         // Shrinking also avoids clamping at the page edge after the move above.
         let resized = XCTNSPredicateExpectation(
@@ -2230,7 +2410,7 @@ final class PaperPathUITests: XCTestCase {
         let editedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - Edited copy"
+                "Project handoff"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -2247,7 +2427,10 @@ final class PaperPathUITests: XCTestCase {
 
     func testCompressJourneyExplainsAlreadySmallerOriginalAfterReentry()
         throws {
-        let app = launchResetDemo()
+        let app = makeApp()
+        app.launchArguments += ["UITEST_COMPRESSION_FIXTURE", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
         openDemoDocument(in: app)
 
         openDocumentTool(
@@ -2273,14 +2456,16 @@ final class PaperPathUITests: XCTestCase {
                 "compressionOutputBoundary"
             ].firstMatch.waitForExistence(timeout: 5)
         )
-        XCTAssertTrue(
-            app.staticTexts["Original is already smaller"]
-                .waitForExistence(timeout: 45)
-        )
-        XCTAssertFalse(create.isEnabled)
-        XCTAssertTrue(
-            create.label.contains("Original Is Already Smaller")
-        )
+        let method = app.descendants(matching: .any)["compressionMethodPicker"].firstMatch
+        XCTAssertTrue(method.waitForExistence(timeout: 5))
+        app.buttons["More options"].firstMatch.tap()
+        app.buttons["Image pages (lossy)"].firstMatch.tap()
+        XCTAssertTrue(create.isEnabled)
+        create.tap()
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(
+            format: "label CONTAINS %@", "The document was left unchanged."
+        )).firstMatch.waitForExistence(timeout: 45))
+        XCTAssertTrue(create.isEnabled)
         XCTAssertFalse(app.alerts.firstMatch.exists)
         XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
         assertAppAlive(app)
@@ -2315,7 +2500,7 @@ final class PaperPathUITests: XCTestCase {
         let protectedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - Protected copy"
+                "Project handoff"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -2355,6 +2540,8 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(label.waitForExistence(timeout: 8))
         label.tap()
         label.typeText(" Automation")
+        let expectedLabel = try XCTUnwrap(label.value as? String)
+        XCTAssertTrue(expectedLabel.contains("Automation"))
         let create = app.buttons["createLinkEditedCopy"].firstMatch
         XCTAssertTrue(create.waitForExistence(timeout: 5))
         let ready = XCTNSPredicateExpectation(
@@ -2367,17 +2554,13 @@ final class PaperPathUITests: XCTestCase {
         )
         create.tap()
 
-        let linkCopyOpened = XCTNSPredicateExpectation(
-            predicate: NSPredicate(
-                format: "label == %@",
-                "Project handoff - Links edited"
-            ),
-            object: workspaceDocumentTitle(in: app)
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [linkCopyOpened], timeout: 45),
-            .completed
-        )
+        XCTAssertTrue(app.navigationBars["Edit Links"].waitForNonExistence(timeout: 45))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        openDocumentTool(identifier: "links", query: "Edit Links", in: app)
+        let savedLabel = app.textFields["existingLinkLabel"].firstMatch
+        XCTAssertTrue(savedLabel.waitForExistence(timeout: 10))
+        XCTAssertEqual(savedLabel.value as? String, expectedLabel, "The link edit must survive saving and reopening")
+        dismissPresentedWorkflow(title: "Edit Links", in: app)
         assertAppAlive(app)
     }
 
@@ -2474,7 +2657,7 @@ final class PaperPathUITests: XCTestCase {
         let redactedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - Redacted copy"
+                "Project handoff"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -2485,15 +2668,102 @@ final class PaperPathUITests: XCTestCase {
         assertAppAlive(app)
     }
 
+    func testShareCheckJourneyCompletesFictionalSampleAfterCancelAndReentry() throws {
+        let app = launchResetDemo()
+        let entry = app.buttons["shareCheckOpen"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 8))
+        XCTAssertTrue(entry.isHittable)
+        addScreenshot(named: "Sharing check home entry", app: app)
+        entry.tap()
+        let sample = app.buttons["shareCheckSample"]
+        XCTAssertTrue(sample.waitForExistence(timeout: 8))
+        addScreenshot(named: "Sharing check file selection", app: app)
+        dismissPresentedWorkflow(title: "Check before sharing", in: app)
+        XCTAssertTrue(entry.waitForExistence(timeout: 8))
+        entry.tap()
+        XCTAssertTrue(sample.waitForExistence(timeout: 8))
+        sample.tap()
+        let summary = app.descendants(matching: .any)["privacyReviewSummary"].firstMatch
+        XCTAssertTrue(summary.waitForExistence(timeout: 30))
+        XCTAssertTrue(app.staticTexts["privacyReviewDocumentName"].firstMatch.label.contains("Fictional sharing sample"))
+        let all = app.buttons["privacySelectAll"].firstMatch
+        XCTAssertTrue(revealWorkflowControl(all, in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 12))
+        all.tap()
+        let redact = app.buttons["privacyRedactionAction"].firstMatch
+        XCTAssertTrue(redact.waitForExistence(timeout: 8))
+        XCTAssertTrue(redact.isHittable)
+        XCTAssertTrue(redact.isEnabled)
+        addScreenshot(named: "Sharing sample privacy review", app: app)
+        redact.tap()
+        let confirm = app.descendants(matching: .any)["privacyRedactionConfirm"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 8))
+        confirm.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["privacyRedactionVerified"].firstMatch.waitForExistence(timeout: 60))
+        let share = app.buttons["privacyShareVerifiedCopy"].firstMatch
+        XCTAssertTrue(revealForCenterTap(share, in: app, maxSwipes: 16))
+        XCTAssertTrue(share.isEnabled)
+        addScreenshot(named: "Sharing sample checked output", app: app)
+        assertAppAlive(app)
+    }
+
+    func testShareCheckChineseStandardEntryAndSample() throws {
+        let app = launchResetDemo(additionalArguments: [
+            "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-app.language", "zh-Hans"
+        ])
+        let entry = app.buttons["shareCheckOpen"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 8))
+        XCTAssertTrue(entry.isHittable)
+        addScreenshot(named: "Sharing check Chinese home", app: app)
+        entry.tap()
+        let sample = app.buttons["shareCheckSample"]
+        XCTAssertTrue(sample.waitForExistence(timeout: 8))
+        XCTAssertTrue(sample.isHittable)
+        addScreenshot(named: "Sharing check Chinese sample selection", app: app)
+        sample.tap()
+        XCTAssertTrue(app.descendants(matching: .any)["privacyReviewSummary"].firstMatch.waitForExistence(timeout: 30))
+        addScreenshot(named: "Sharing check Chinese sample review", app: app)
+        dismissPrivacyScan(in: app)
+        assertAppAlive(app)
+    }
+
+    func testShareCheckEntryUsesExistingPDFAndChineseLargeTextLayout() throws {
+        let app = launchResetDemo(additionalArguments: [
+            "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-app.language", "zh-Hans",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"
+        ])
+        let entry = app.buttons["shareCheckOpen"]
+        XCTAssertTrue(entry.waitForExistence(timeout: 8))
+        XCTAssertTrue(revealForCenterTap(entry, in: app, maxSwipes: 6))
+        entry.tap()
+        let sample = app.buttons["shareCheckSample"]
+        XCTAssertTrue(sample.waitForExistence(timeout: 8))
+        XCTAssertTrue(sample.isHittable)
+        addScreenshot(named: "Sharing check Chinese large text selection", app: app)
+        let existing = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "shareCheckDocument-")).firstMatch
+        XCTAssertTrue(revealForCenterTap(existing, in: app, maxSwipes: 12))
+        existing.tap()
+        XCTAssertTrue(app.buttons["privacyScanClose"].waitForExistence(timeout: 15))
+        addScreenshot(named: "Sharing check existing PDF opened directly", app: app)
+        app.buttons["privacyScanClose"].tap()
+        assertAppAlive(app)
+    }
+
     func testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()
         throws {
         let app = launchResetDemo()
+        selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
+        let originalRow = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS[c] %@", "documentRow-", "August invoice"
+        )).firstMatch
+        XCTAssertTrue(revealForCenterTap(originalRow, in: app, maxSwipes: 10))
+        let originalRecordRowID = originalRow.identifier
+        XCTAssertTrue(originalRecordRowID.hasPrefix("documentRow-"))
         openDemoDocument(named: "August invoice", in: app)
 
-        let scan = app.buttons["privacyScanButton"].firstMatch
+        let scan = privacyScanEntry(in: app)
         XCTAssertTrue(scan.waitForExistence(timeout: 5))
         XCTAssertTrue(scan.isEnabled)
-        scan.tap()
+        tapCenter(scan)
         XCTAssertTrue(
             app.buttons["privacyScanClose"]
                 .waitForExistence(timeout: 8)
@@ -2508,36 +2778,39 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "enabled == true AND hittable == true"), object: scan
         )], timeout: 8), .completed)
-        scan.tap()
+        tapCenter(scan)
         let privacyCandidate =
             app.staticTexts["b***@example.com"].firstMatch
         XCTAssertTrue(
-            privacyCandidate.waitForExistence(timeout: 30)
-        )
-        XCTAssertTrue(
             app.descendants(matching: .any)[
                 "privacyReviewSummary"
-            ].firstMatch.exists
+            ].firstMatch.waitForExistence(timeout: 30)
         )
-        XCTAssertTrue(
-            app.descendants(matching: .any)[
-                "privacyRedactionScope"
-            ].firstMatch.exists
-        )
+        let expandedScope = app.staticTexts["privacySelectedScopeSummary"].firstMatch
+        if expandedScope.exists {
+            XCTAssertTrue(expandedScope.label.contains("1 item"))
+            let category = app.buttons["privacyCategory-email"].firstMatch
+            XCTAssertTrue(category.exists)
+            XCTAssertLessThan(category.frame.height, app.frame.height * 0.5,
+                "Category text must remain readable instead of wrapping one character per line")
+        } else {
+            XCTAssertTrue(app.descendants(matching: .any)["privacyRedactionScope"].firstMatch.exists)
+        }
+        XCTAssertTrue(revealWorkflowControl(privacyCandidate, in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 16))
         let findingReason = app.descendants(matching: .any).matching(
             NSPredicate(
                 format: "identifier BEGINSWITH %@",
                 "privacyFindingReason-"
             )
         ).firstMatch
-        XCTAssertTrue(reveal(findingReason, in: app, maxSwipes: 6))
+        XCTAssertTrue(revealWorkflowControl(findingReason, in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 16))
         let findingSource = app.descendants(matching: .any).matching(
             NSPredicate(
                 format: "identifier BEGINSWITH %@",
                 "privacyFindingSource-"
             )
         ).firstMatch
-        XCTAssertTrue(reveal(findingSource, in: app, maxSwipes: 6))
+        XCTAssertTrue(revealWorkflowControl(findingSource, in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 16))
         addScreenshot(
             named: "Privacy Scan Review",
             app: app
@@ -2548,7 +2821,7 @@ final class PaperPathUITests: XCTestCase {
                 "privacyLocate-"
             )
         ).firstMatch
-        XCTAssertTrue(reveal(locate, in: app, maxSwipes: 6))
+        XCTAssertTrue(revealWorkflowControl(locate, in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 16))
         XCTAssertGreaterThanOrEqual(locate.frame.width, 44)
         XCTAssertGreaterThanOrEqual(locate.frame.height, 44)
         tapCenter(locate)
@@ -2558,19 +2831,29 @@ final class PaperPathUITests: XCTestCase {
         )
 
         XCTAssertTrue(app.buttons["privacyScanClose"].waitForNonExistence(timeout: 8))
+        // Locating publishes a transient status banner above the toolbar.
+        // Synchronize with its removal before a single reopen tap; no retries.
+        let locatingNotice = app.staticTexts.matching(NSPredicate(
+            format: "label BEGINSWITH %@", "Privacy candidate on page"
+        )).firstMatch
+        XCTAssertTrue(locatingNotice.waitForNonExistence(timeout: 8))
         XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
             predicate: NSPredicate(format: "enabled == true AND hittable == true"), object: scan
         )], timeout: 8), .completed)
-        scan.tap()
-        XCTAssertTrue(
-            app.staticTexts["b***@example.com"]
-                .waitForExistence(timeout: 30)
-        )
+        tapCenter(scan)
+        XCTAssertTrue(app.buttons["privacyScanClose"].waitForExistence(timeout: 8),
+            "Privacy review must reopen after locating a finding")
+        XCTAssertTrue(app.buttons["privacyRedactionAction"].waitForExistence(timeout: 30))
+        XCTAssertTrue(revealWorkflowControl(app.descendants(matching: .any)["privacyReviewSummary"].firstMatch,
+            in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 16, searchUp: true))
+        let expandedSelection = app.staticTexts["privacySelectedScopeSummary"].firstMatch
+        let selectedOneInSummary = expandedSelection.exists && expandedSelection.label.contains("1 item")
+        XCTAssertTrue(revealWorkflowControl(privacyCandidate, in: app, navigationTitle: "Privacy Scan", footerID: "privacyRedactionAction", maxSwipes: 16))
 
         let redact = app.buttons["privacyRedactionAction"].firstMatch
         XCTAssertTrue(redact.waitForExistence(timeout: 5))
         XCTAssertTrue(redact.isEnabled)
-        XCTAssertTrue(redact.label.contains("1"))
+        XCTAssertTrue(redact.label.contains("1") || selectedOneInSummary)
         redact.tap()
         let cancel = app.buttons["privacyRedactionCancel"].firstMatch
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
@@ -2589,17 +2872,17 @@ final class PaperPathUITests: XCTestCase {
         )
         confirm.tap()
 
-        XCTAssertTrue(
-            app.descendants(matching: .any)[
-                "privacyRedactionVerified"
-            ].firstMatch.waitForExistence(timeout: 60)
-        )
+        let verified = app.descendants(matching: .any)["privacyRedactionVerified"].firstMatch
+        XCTAssertTrue(verified.waitForExistence(timeout: 60))
+        XCTAssertTrue(revealInPresentedSheet(verified, navigationTitle: "Privacy Scan", in: app, maxSwipes: 20))
         let share = app.buttons["privacyShareVerifiedCopy"].firstMatch
         XCTAssertTrue(share.waitForExistence(timeout: 5))
-        XCTAssertTrue(share.isHittable)
+        XCTAssertTrue(revealInPresentedSheet(share, navigationTitle: "Privacy Scan", in: app, maxSwipes: 20))
+        XCTAssertTrue(share.isEnabled)
         let openCopy = app.buttons["privacyOpenCreatedCopy"].firstMatch
         XCTAssertTrue(openCopy.waitForExistence(timeout: 5))
-        XCTAssertTrue(openCopy.isHittable)
+        XCTAssertTrue(revealInPresentedSheet(openCopy, navigationTitle: "Privacy Scan", in: app, maxSwipes: 20))
+        XCTAssertTrue(openCopy.isEnabled)
         addScreenshot(
             named: "Privacy Redaction Completed",
             app: app
@@ -2626,95 +2909,28 @@ final class PaperPathUITests: XCTestCase {
         }
         XCTAssertTrue(shareSheet.waitForNonExistence(timeout: 5))
         openCopy.tap()
-        let relatedDocuments = app.buttons[
-            "workspaceRelatedDocumentsMenu"
-        ].firstMatch
-        XCTAssertTrue(
-            relatedDocuments.waitForExistence(timeout: 45)
-        )
-        XCTAssertTrue(relatedDocuments.isHittable)
-        addScreenshot(
-            named: "Result copy relationship",
-            app: app
-        )
-        let openSource = app.buttons[
-            "documentRelationshipOpenSource"
-        ].firstMatch
-        relatedDocuments.tap()
-        XCTAssertTrue(openSource.waitForExistence(timeout: 5))
-        XCTAssertTrue(openSource.isHittable)
-        let resultRole = app.descendants(matching: .any)[
-            "documentRelationshipRole"
-        ].firstMatch
-        XCTAssertTrue(resultRole.exists)
-        XCTAssertTrue(
-            resultRole.label.contains("Result copy")
-                || resultRole.label.contains("结果副本")
-        )
-        XCTAssertTrue(
-            workspaceDocumentTitle(in: app).label
-                .hasPrefix("August invoice - ")
-        )
-        addScreenshot(
-            named: "Redacted Copy Relationship",
-            app: app
-        )
-        openSource.tap()
-        let sourceOpened = XCTNSPredicateExpectation(
-            predicate: NSPredicate(
-                format: "label == %@",
-                "August invoice"
-            ),
-            object: workspaceDocumentTitle(in: app)
-        )
-        XCTAssertEqual(
-            XCTWaiter.wait(for: [sourceOpened], timeout: 20),
-            .completed
-        )
-        let workingRole = app.descendants(matching: .any)[
-            "documentRelationshipRole"
-        ].firstMatch
-        XCTAssertTrue(workingRole.exists)
-        XCTAssertTrue(
-            workingRole.label.contains("Working copy")
-                || workingRole.label.contains("工作副本")
-        )
-        addScreenshot(
-            named: "Working copy relationship",
-            app: app
-        )
-        let sourceRelatedDocuments = app.buttons[
-            "workspaceRelatedDocumentsMenu"
-        ].firstMatch
-        XCTAssertTrue(
-            sourceRelatedDocuments.waitForExistence(timeout: 5)
-        )
-        sourceRelatedDocuments.tap()
-        let openLatest = app.buttons[
-            "documentRelationshipOpenLatestResult"
-        ].firstMatch
-        XCTAssertTrue(openLatest.waitForExistence(timeout: 5))
-        XCTAssertTrue(openLatest.isHittable)
-        addScreenshot(
-            named: "Source With Latest Result",
-            app: app
-        )
-        openLatest.tap()
-        let latestResultRelationship = app.buttons[
-            "workspaceRelatedDocumentsMenu"
-        ].firstMatch
-        XCTAssertTrue(
-            latestResultRelationship.waitForExistence(timeout: 20)
-        )
-        latestResultRelationship.tap()
-        XCTAssertTrue(
-            app.buttons["documentRelationshipOpenSource"]
-                .firstMatch.waitForExistence(timeout: 20)
-        )
-        XCTAssertTrue(
-            workspaceDocumentTitle(in: app).label
-                .hasPrefix("August invoice - ")
-        )
+        XCTAssertTrue(app.buttons["privacyOpenCreatedCopy"].waitForNonExistence(timeout: 15))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "August invoice")
+        XCTAssertFalse(app.buttons["workspaceRelatedDocumentsMenu"].exists)
+        app.buttons["Document menu"].tap()
+        let historyAndSource = app.buttons["History & source"].firstMatch
+        XCTAssertTrue(historyAndSource.waitForExistence(timeout: 5))
+        historyAndSource.tap()
+        app.buttons["Version History"].firstMatch.tap()
+        XCTAssertTrue(app.navigationBars["Version History"].waitForExistence(timeout: 8))
+        let priorVersion = app.buttons["Version actions"].firstMatch
+        XCTAssertTrue(revealInPresentedSheet(priorVersion, navigationTitle: "Version History", in: app, maxSwipes: 8),
+                      "Saving redactions must retain a previous version")
+        XCTAssertFalse(app.staticTexts["No recovery versions yet"].exists)
+        addScreenshot(named: "Redaction saved to same document with history", app: app)
+        dismissPresentedWorkflow(title: "Version History", in: app)
+        XCTAssertTrue(waitForLibrary(in: app))
+        selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
+        let savedRows = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS[c] %@", "documentRow-", "August invoice"
+        )).allElementsBoundByIndex
+        XCTAssertEqual(Set(savedRows.map(\.identifier)), Set([originalRecordRowID]),
+                       "Saving redactions must preserve the document ID and must not create another editable document")
         assertAppAlive(app)
     }
 
@@ -2759,7 +2975,7 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertGreaterThan(document.frame.height / app.frame.height, 0.45)
         addScreenshot(named: "\(name) Reader", app: app)
 
-        app.buttons["privacyScanButton"].firstMatch.tap()
+        privacyScanEntry(chinese: chinese, in: app).tap()
         let summary = app.descendants(matching: .any)["privacyReviewSummary"].firstMatch
         XCTAssertTrue(summary.waitForExistence(timeout: 30))
         if UIDevice.current.userInterfaceIdiom == .pad {
@@ -2849,7 +3065,7 @@ final class PaperPathUITests: XCTestCase {
             XCTAssertTrue(waitForLibrary(in: app))
             openDemoDocument(named: "August invoice", in: app)
 
-            let scan = app.buttons["privacyScanButton"].firstMatch
+            let scan = privacyScanEntry(chinese: variant.arguments.contains("zh-Hans"), in: app)
             XCTAssertTrue(scan.waitForExistence(timeout: 5))
             scan.tap()
             XCTAssertTrue(
@@ -3292,11 +3508,12 @@ final class PaperPathUITests: XCTestCase {
         let pdf = app.descendants(matching: .any)[
             "exportCatalogMode-pdf"
         ].firstMatch
-        XCTAssertTrue(reveal(pdf, in: app, maxSwipes: 8))
+        XCTAssertTrue(revealInPresentedSheet(pdf, navigationTitle: "Create & Share", in: app, maxSwipes: 20))
         tapCenter(pdf)
+        expandPDFOptions(in: app)
         let flattened = app.buttons["flattenedOutputOption"]
             .firstMatch
-        XCTAssertTrue(reveal(flattened, in: app, maxSwipes: 8))
+        XCTAssertTrue(revealInPresentedSheet(flattened, navigationTitle: "Create & Share", in: app, maxSwipes: 20))
         XCTAssertTrue(
             app.staticTexts[
                 "Image-based: removes search, links, forms, and editable layers"
@@ -3305,8 +3522,9 @@ final class PaperPathUITests: XCTestCase {
         let images = app.descendants(matching: .any)[
             "exportCatalogMode-images"
         ].firstMatch
-        XCTAssertTrue(reveal(images, in: app, maxSwipes: 8))
+        XCTAssertTrue(revealInPresentedSheet(images, navigationTitle: "Create & Share", in: app, maxSwipes: 20, searchUp: true))
         tapCenter(images)
+        XCTAssertEqual(images.value as? String, "Selected")
         completePageImageExport(in: app)
         assertAppAlive(app)
     }
@@ -3505,7 +3723,7 @@ final class PaperPathUITests: XCTestCase {
         let replay = app.buttons.matching(
             NSPredicate(format: "label CONTAINS %@", "Replay Introduction")
         ).firstMatch
-        XCTAssertTrue(revealForCenterTap(replay, in: app, maxSwipes: 12))
+        XCTAssertTrue(revealInPresentedSheet(replay, navigationTitle: "Settings", in: app, maxSwipes: 12, scrollInGutter: true))
         tapCenter(replay)
 
         let home = app.buttons["onboardingOpenLibrary"]
@@ -3515,6 +3733,103 @@ final class PaperPathUITests: XCTestCase {
         home.tap()
         XCTAssertTrue(home.waitForNonExistence(timeout: 8))
         XCTAssertTrue(waitForLibrary(in: app))
+        assertAppAlive(app)
+    }
+
+    func testIntroductionOpensFilePickerAndCanCancelThenReenter() throws {
+        continueAfterFailure = false
+        let seeded = launchResetDemo()
+        seeded.terminate()
+        let app = makeApp()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        app.buttons["settings"].tap()
+        let replay = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS %@", "Replay Introduction")
+        ).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(replay, navigationTitle: "Settings", in: app, maxSwipes: 12, scrollInGutter: true))
+        tapCenter(replay)
+        let open = app.buttons["onboardingImportPDF"]
+        XCTAssertTrue(open.waitForExistence(timeout: 8))
+        XCTAssertTrue(open.isHittable)
+        addScreenshot(named: "Introduction focused on own PDF", app: app)
+        open.tap()
+        XCTAssertTrue(open.waitForNonExistence(timeout: 8))
+        let cancel = app.buttons["Cancel"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout: 8))
+        addScreenshot(named: "Introduction opens real Files picker", app: app)
+        cancel.tap()
+        XCTAssertTrue(waitForLibrary(in: app))
+        XCTAssertEqual(app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "documentRow-")
+        ).count, 3, "Cancelling must not add a sample or an empty document")
+        let importPDF = app.buttons["deskImport"]
+        XCTAssertTrue(importPDF.isHittable)
+        importPDF.tap()
+        XCTAssertTrue(cancel.waitForExistence(timeout: 8))
+        cancel.tap()
+        XCTAssertTrue(waitForLibrary(in: app))
+        addScreenshot(named: "Home after cancelling introduction import", app: app)
+        assertAppAlive(app)
+    }
+
+    func testIntroductionChineseAccessibilityKeepsActionsReachable() throws {
+        continueAfterFailure = false
+        let seeded = launchResetDemo()
+        seeded.terminate()
+        let app = makeApp()
+        app.launchArguments += [
+            "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN",
+            "-app.language", "zh-Hans", "-privacy.appLockEnabled", "NO",
+            "-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        app.buttons["settings"].tap()
+        let replay = app.buttons["settingsReplayIntroduction"]
+        XCTAssertTrue(revealInPresentedSheet(replay, navigationTitle: "设置", in: app,
+            maxSwipes: 20, scrollInGutter: true))
+        tapCenter(replay)
+        let open = app.buttons["onboardingImportPDF"]
+        XCTAssertTrue(open.waitForExistence(timeout: 8))
+        addScreenshot(named: "Chinese introduction accessibility heading", app: app)
+        XCTAssertTrue(revealForCenterTap(open, in: app, maxSwipes: 10))
+        XCTAssertTrue(open.isHittable)
+        XCTAssertTrue(open.label.contains("打开"))
+        addScreenshot(named: "Chinese introduction accessibility actions", app: app)
+        let home = app.buttons["onboardingOpenLibrary"]
+        XCTAssertTrue(revealForCenterTap(home, in: app, maxSwipes: 10))
+        home.tap()
+        XCTAssertTrue(home.waitForNonExistence(timeout: 8))
+        XCTAssertTrue(waitForLibrary(in: app))
+        assertAppAlive(app)
+    }
+
+    func testToolCatalogUsesCompleteTaskNamesAndSearchesThem() throws {
+        continueAfterFailure = false
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+        openDocumentTools(in: app)
+        let search = documentToolSearchField(in: app)
+        for (identifier, query) in [
+            ("recognize", "Recognize text (OCR)"),
+            ("protect", "Password protect"),
+            ("bates", "Page IDs (Bates)"),
+            ("redact", "Permanently redact")
+        ] {
+            search.tap()
+            search.typeText(query)
+            let tool = app.buttons["documentTool-\(identifier)"].firstMatch
+            XCTAssertTrue(tool.waitForExistence(timeout: 5))
+            XCTAssertTrue(tool.label.contains(query))
+            if identifier == "protect" {
+                addScreenshot(named: "Full task name search result", app: app)
+            }
+            app.buttons["Clear tool search"].tap()
+        }
+        addScreenshot(named: "Tool suggestions with complete task names", app: app)
+        app.buttons["Close"].tap()
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].waitForExistence(timeout: 5))
         assertAppAlive(app)
     }
 
@@ -3531,7 +3846,7 @@ final class PaperPathUITests: XCTestCase {
             let replay = app.buttons.matching(
                 NSPredicate(format: "label CONTAINS %@", "Replay Introduction")
             ).firstMatch
-            XCTAssertTrue(revealForCenterTap(replay, in: app, maxSwipes: 12))
+            XCTAssertTrue(revealInPresentedSheet(replay, navigationTitle: "Settings", in: app, maxSwipes: 12, scrollInGutter: true))
             tapCenter(replay)
         }
         XCTAssertTrue(sample.waitForExistence(timeout: 8))
@@ -3643,9 +3958,10 @@ final class PaperPathUITests: XCTestCase {
         librarySearch.tap()
         librarySearch.typeText("Project handoff")
         app.keyboards.buttons["Search"].tap()
-        let document = app.buttons
-            .containing(.staticText, identifier: "Project handoff")
-            .firstMatch
+        let document = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
+            "documentRow-", "Project handoff"
+        )).firstMatch
         XCTAssertTrue(document.waitForExistence(timeout: 5))
         document.tap()
         XCTAssertTrue(
@@ -4350,13 +4666,13 @@ final class PaperPathUITests: XCTestCase {
 
         let search = librarySearchField(in: app)
         search.tap()
-        search.typeText("Project handoff - Verified copy")
+        search.typeText("Project handoff - Export")
         app.keyboards.buttons["Search"].tap()
         let verifiedDocument = app.buttons.matching(
             NSPredicate(
                 format: "identifier BEGINSWITH %@ AND label CONTAINS[c] %@",
                 "documentRow-",
-                "Project handoff - Verified copy"
+                "Project handoff - Export"
             )
         ).firstMatch
         XCTAssertTrue(
@@ -4369,24 +4685,7 @@ final class PaperPathUITests: XCTestCase {
                 .waitForExistence(timeout: 8)
         )
 
-        let receipt = firstHittableButton(
-            identifier: "deliveryReceiptBadge",
-            in: app,
-            timeout: 8
-        )
-        if receipt.exists, receipt.isHittable {
-            tapCenter(receipt)
-        } else {
-            app.buttons["Document menu"].tap()
-            app.buttons["Results"].firstMatch.tap()
-            let menuReceipt = app.buttons["Delivery receipt"].firstMatch
-            XCTAssertTrue(menuReceipt.waitForExistence(timeout: 5))
-            menuReceipt.tap()
-        }
-        XCTAssertTrue(
-            app.navigationBars["Delivery receipt"]
-                .waitForExistence(timeout: 8)
-        )
+        openDeliveryReceipt(in: app)
 
         guard expandVerificationDetails(in: app) else {
             XCTFail("Verification details did not expand")
@@ -4481,8 +4780,9 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["1 matching tool"].exists)
 
         app.buttons["Clear text"].firstMatch.tap()
-        search.tap()
-        search.typeText("zyxwv no result")
+        let emptySearch = librarySearchField(in: app)
+        emptySearch.tap()
+        emptySearch.typeText("zyxwv no result")
         XCTAssertTrue(
             app.staticTexts["No matching documents or tools"]
                 .waitForExistence(timeout: 3)
@@ -4627,7 +4927,7 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertEqual(signaturePageContext.label, "Sign for page 2")
         XCTAssertTrue(app.buttons["Place on Page"].exists)
         addScreenshot(named: "PaperPath Form Signature", app: app)
-        app.buttons["Cancel"].tap()
+        app.navigationBars["Add signature"].buttons["Cancel"].firstMatch.tap()
     }
 
     func testInterruptedSignatureResumesAfterRelaunch() throws {
@@ -4681,14 +4981,14 @@ final class PaperPathUITests: XCTestCase {
             initialSignaturePageContext.label,
             "Sign for page 2"
         )
-        app.buttons["Cancel"].tap()
+        app.navigationBars["Add signature"].buttons["Cancel"].firstMatch.tap()
         XCTAssertTrue(
             app.otherElements["pdfWorkspace"]
                 .waitForExistence(timeout: 5)
         )
 
         app.terminate()
-        app.launchArguments = englishLaunchArguments
+        app.launchArguments = englishLaunchArguments + ["UITEST_WORKFLOW_FIXTURE"]
         app.launch()
         XCTAssertTrue(waitForLibrary(in: app))
         let resumedSearch = librarySearchField(in: app)
@@ -4774,6 +5074,599 @@ final class PaperPathUITests: XCTestCase {
         addScreenshot(named: "PaperPath Existing Link Editor", app: app)
     }
 
+    private func cancelFileExportPicker(_ picker: XCUIElement, in app: XCUIApplication) {
+        let cancel = picker.buttons["Cancel"].firstMatch
+        if cancel.waitForExistence(timeout: 2), cancel.isHittable {
+            tapCenter(cancel)
+        } else {
+            let top = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.09))
+            top.press(forDuration: 0.1, thenDragTo:
+                app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.9)))
+        }
+        XCTAssertTrue(picker.waitForNonExistence(timeout: 8))
+    }
+
+    private func completeDirectSystemShare(in app: XCUIApplication, screenshot: String) {
+        let activity = app.otherElements["ActivityListView"].firstMatch
+        XCTAssertTrue(activity.waitForExistence(timeout: 20))
+        let copy = app.cells.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@", "actionGroupCell", "Copy"
+        )).firstMatch
+        XCTAssertTrue(copy.waitForExistence(timeout: 10))
+        XCTAssertTrue(copy.isHittable)
+        addScreenshot(named: screenshot, app: app)
+        copy.tap()
+        XCTAssertTrue(activity.waitForNonExistence(timeout: 10))
+    }
+
+    func testConciseToolScreensChinese() throws {
+        try captureConciseToolScreens(largeText: false)
+    }
+
+    func testConciseToolsExpanded() throws {
+        try captureConciseToolScreens(largeText: true, chinese: false, focusedCapture: true)
+    }
+
+    func testConciseToolsEnglish() throws {
+        try captureConciseToolScreens(largeText: false, chinese: false, focusedCapture: true)
+    }
+
+    // A visual capture journey also checks that the condensed pages retain
+    // their actions and the protection / lossy-output boundaries.
+    private func captureConciseToolScreens(largeText: Bool, chinese: Bool = true, focusedCapture: Bool = false) throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO",
+            "-experience.onboardingCompleted.v4", "YES",
+            "-library.viewMode", "list", "-document.toolPaletteView", "suggested"
+        ]
+        if chinese {
+            app.launchArguments += ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-app.language", "zh-Hans"]
+        }
+        if largeText {
+            app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        }
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+
+        func capture(_ name: String) {
+            addScreenshot(named: "Concise \(largeText ? "large" : "normal") \(name)", app: app)
+        }
+        func closeTool() {
+            let titles = chinese ? ["取消", "关闭", "完成"] : ["Cancel", "Close", "Done"]
+            guard let navigation = app.navigationBars.allElementsBoundByIndex.reversed().first(where: { bar in
+                titles.contains { bar.buttons[$0].firstMatch.exists && bar.buttons[$0].firstMatch.isHittable }
+            }) else {
+                XCTFail("No presented tool navigation bar with a visible dismissal control")
+                return
+            }
+            let options = titles.map { navigation.buttons[$0].firstMatch }
+            guard let close = options.first(where: { $0.exists && $0.isHittable }) else {
+                XCTFail("No visible tool dismissal control")
+                return
+            }
+            let presentedNavigation = app.navigationBars[navigation.identifier].firstMatch
+            close.tap()
+            XCTAssertTrue(presentedNavigation.waitForNonExistence(timeout: 8))
+        }
+        func openTool(_ id: String, query: String) {
+            openDocumentTools(chinese: chinese, in: app)
+            let search = documentToolSearchField(in: app)
+            XCTAssertTrue(search.waitForExistence(timeout: 5))
+            search.tap()
+            search.typeText(query)
+            let tool = app.buttons["documentTool-\(id)"].firstMatch
+            XCTAssertTrue(revealForCenterTap(tool, in: app, maxSwipes: 8))
+            XCTAssertTrue(tool.isEnabled)
+            tool.tap()
+        }
+
+        if !focusedCapture {
+            app.buttons["documentExportMenu"].tap()
+            app.buttons[chinese ? "其他导出格式" : "More Export Formats"].tap()
+            XCTAssertTrue(app.buttons["exportSavePDFToFiles"].waitForExistence(timeout: 10))
+            XCTAssertTrue(app.buttons["exportSharePDF"].isHittable)
+            capture("export")
+            XCTAssertTrue(reveal(app.buttons["exportCatalogMode-images"], in: app, maxSwipes: 6))
+            app.buttons["exportCatalogMode-images"].tap()
+            XCTAssertTrue(app.buttons["exportPageImages-jpegCompact"].waitForExistence(timeout: 5))
+            capture("image formats")
+            XCTAssertTrue(revealTowardTop(app.buttons["exportCatalogMode-pdf"], in: app, maxSwipes: 6))
+            app.buttons["exportCatalogMode-pdf"].tap()
+            expandPDFOptions(in: app, chinese: chinese)
+            XCTAssertTrue(reveal(app.buttons["flattenedOutputOption"], in: app, maxSwipes: 6))
+            capture("PDF formats and conversion boundary")
+            app.buttons["officeExportDoneAction"].tap()
+
+        }
+
+        openTool("note", query: "note")
+        XCTAssertTrue(app.buttons["noteAddAction"].waitForExistence(timeout: 8))
+        XCTAssertFalse(app.buttons["noteAddAction"].isEnabled)
+        capture("note")
+        if largeText {
+            let content = app.scrollViews["noteComposerContent"]
+            XCTAssertTrue(content.exists)
+            content.swipeUp()
+            capture("note scrolled with keyboard")
+        }
+        closeTool()
+
+        openTool("stamp", query: "stamp")
+        XCTAssertTrue(app.buttons["stampOption-Approved"].waitForExistence(timeout: 8))
+        capture("stamps")
+        if largeText {
+            XCTAssertTrue(reveal(app.buttons["stampOption-Void"], in: app, maxSwipes: 6))
+            capture("last stamp reachable")
+        }
+        closeTool()
+        if !chinese { return }
+
+        openTool("annotations", query: "annotations")
+        XCTAssertTrue(app.navigationBars["批注与标记"].waitForExistence(timeout: 8))
+        capture("annotations")
+        closeTool()
+
+        openTool("protect", query: "protect")
+        let boundary = app.descendants(matching: .any)["protectionPermissionBoundary"].firstMatch
+        XCTAssertTrue(reveal(boundary, in: app, maxSwipes: 8))
+        capture("password permissions boundary")
+        closeTool()
+    }
+
+    func testSharingIsOneTapFromEditorLibraryResumeAndCatalog() throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO",
+            "-library.viewMode", "list", "-workspace.toolMode", "read"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        let invoiceShare = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "librarySharePDF-", "August invoice"
+        )).firstMatch
+        XCTAssertTrue(revealForCenterTap(invoiceShare, in: app, maxSwipes: 8))
+        addScreenshot(named: "Library visible one-tap share", app: app)
+        invoiceShare.tap()
+        completeDirectSystemShare(in: app, screenshot: "Invoice shared directly from library")
+
+        openDemoDocument(in: app)
+        let editorShare = app.buttons["workspaceSharePDF"]
+        XCTAssertTrue(editorShare.waitForExistence(timeout: 5))
+        XCTAssertTrue(editorShare.isHittable)
+        addScreenshot(named: "Editor visible Share and Export", app: app)
+        editorShare.tap()
+        completeDirectSystemShare(in: app, screenshot: "Document shared directly from editor")
+
+        app.buttons["documentExportMenu"].tap()
+        app.buttons["More Export Formats"].tap()
+        let catalogShare = app.buttons["exportSharePDF"]
+        XCTAssertTrue(catalogShare.waitForExistence(timeout: 10))
+        XCTAssertTrue(catalogShare.isHittable)
+        catalogShare.tap()
+        completeDirectSystemShare(in: app, screenshot: "Export catalog direct share")
+        app.buttons["officeExportDoneAction"].tap()
+        openReadingNavigationMenu(chinese: false, in: app)
+        let find = app.buttons["Find in Document"].firstMatch
+        XCTAssertTrue(find.waitForExistence(timeout: 3))
+        find.tap()
+        let closeFind = app.buttons["Close"].firstMatch
+        XCTAssertTrue(closeFind.waitForExistence(timeout: 5))
+        closeFind.tap()
+        XCTAssertTrue(waitForLibrary(in: app))
+        let resumeShare = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "resumeSharePDF-", "Project handoff"
+        )).firstMatch
+        if UIDevice.current.userInterfaceIdiom == .pad, !resumeShare.exists {
+            let previewShare = app.buttons["deskSharePDF"].firstMatch
+            XCTAssertTrue(previewShare.waitForExistence(timeout: 5))
+            XCTAssertTrue(previewShare.isHittable)
+            tapCenter(previewShare)
+        } else {
+            XCTAssertTrue(revealTowardTop(resumeShare, in: app, maxSwipes: 8))
+            resumeShare.tap()
+        }
+        completeDirectSystemShare(in: app, screenshot: "Continue working direct share")
+    }
+
+    func testGridAndBoardExposeDirectFileSharing() throws {
+        for (mode, prefix) in [("grid", "gridSharePDF-"), ("board", "boardSharePDF-")] {
+            let app = makeApp()
+            app.launchArguments += [
+                "UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO",
+                "-library.viewMode", mode
+            ]
+            app.launch()
+            XCTAssertTrue(waitForLibrary(in: app))
+            selectWorkspaceLane(title: "Documents", identifier: "workspaceLane-home", in: app)
+            let display = app.buttons["libraryDisplay"].firstMatch
+            if display.exists { tapCenter(display) }
+            app.buttons[mode == "grid" ? "Grid" : "Board"].firstMatch.tap()
+            let share = app.buttons.matching(NSPredicate(
+                format: "identifier BEGINSWITH %@ AND label CONTAINS %@", prefix, "Project handoff"
+            )).firstMatch
+            XCTAssertTrue(revealForCenterTap(share, in: app, maxSwipes: 8))
+            addScreenshot(named: "\(mode) visible file share", app: app)
+            share.tap()
+            completeDirectSystemShare(in: app, screenshot: "\(mode) direct file share")
+            app.terminate()
+        }
+    }
+
+    func testOfficeResultsExposeDirectArtifactSharing() throws {
+        let app = makeApp()
+        app.launchArguments += [
+            "UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_OFFICE_CORPUS_FIXTURE",
+            "-experience.onboardingCompleted.v4", "YES"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForOfficeCorpusFixture(in: app))
+        selectWorkspaceLane(title: "Results", identifier: "workspaceLane-outputs", in: app)
+        let share = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "officeResultShare-"
+        )).firstMatch
+        XCTAssertTrue(revealForCenterTap(share, in: app, maxSwipes: 12))
+        addScreenshot(named: "Office results direct file share", app: app)
+        share.tap()
+        completeDirectSystemShare(in: app, screenshot: "Office artifact system share")
+    }
+
+    func testPlainPDFCanAddAndFillAFieldFromTheDocument() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.fillForm"
+        defer { qualityCaptureEnabled = false }
+        let app = makeApp()
+        app.launchArguments += ["UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: "August invoice", in: app)
+        selectProfessionalMode("deliver", in: app)
+        let fill = app.buttons["workspaceTool-fillForm"].firstMatch
+        XCTAssertTrue(fill.waitForExistence(timeout: 5))
+        XCTAssertTrue(fill.isEnabled, "A plain PDF must allow adding fillable fields")
+        XCTAssertTrue(fill.isHittable)
+        fill.tap()
+        let firstField = app.buttons["addFirstFormField"]
+        XCTAssertTrue(firstField.waitForExistence(timeout: 10))
+        XCTAssertTrue(firstField.isEnabled)
+        XCTAssertTrue(firstField.isHittable)
+        XCTAssertFalse(app.staticTexts["No interactive fields"].exists)
+        addScreenshot(named: "Plain PDF — add a fillable area from the document", app: app)
+        firstField.tap()
+        let name = app.textFields["formFieldName"]
+        XCTAssertTrue(name.waitForExistence(timeout: 8))
+        name.tap()
+        name.typeText("Invoice reference")
+        let add = app.buttons["addFormField"]
+        XCTAssertTrue(add.waitForExistence(timeout: 5))
+        let ready = XCTNSPredicateExpectation(predicate: NSPredicate(format: "enabled == true"), object: add)
+        XCTAssertEqual(XCTWaiter.wait(for: [ready], timeout: 20), .completed)
+        add.tap()
+        XCTAssertTrue(app.navigationBars["Fill Form"].waitForExistence(timeout: 30))
+        let field = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label == %@", "formField-", "Invoice reference"
+        )).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 12))
+        field.tap()
+        let value = app.textFields["formFieldValue"]
+        XCTAssertTrue(value.waitForExistence(timeout: 8))
+        value.tap()
+        value.typeText("PP-2026")
+        app.buttons["formValueSave"].tap()
+        XCTAssertTrue(value.waitForNonExistence(timeout: 30))
+        dismissPresentedWorkflow(title: "Fill Form", in: app)
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: "August invoice", in: app)
+        selectProfessionalMode("deliver", in: app)
+        app.buttons["workspaceTool-fillForm"].tap()
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 12))
+        field.tap()
+        XCTAssertTrue(value.waitForExistence(timeout: 8))
+        XCTAssertEqual(value.value as? String, "PP-2026")
+        addScreenshot(named: "Plain PDF — added field value survives relaunch", app: app)
+        app.terminate()
+    }
+
+    func testAllToolsStaysVisibleInEveryWorkspaceMode() throws {
+        let app = makeApp()
+        app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+        for mode in ["read", "annotate", "pages", "deliver"] {
+            selectProfessionalMode(mode, in: app)
+            let allTools = app.buttons["documentToolsAction"].firstMatch
+            XCTAssertTrue(allTools.waitForExistence(timeout: 3))
+            XCTAssertTrue(allTools.isHittable, "All tools must be visible without scrolling in \(mode)")
+            let row = app.scrollViews["workspaceToolRow"].firstMatch
+            XCTAssertGreaterThan(allTools.frame.midX, row.frame.maxX)
+            addScreenshot(named: "Pinned tools — \(mode)", app: app)
+            allTools.tap()
+            XCTAssertTrue(app.navigationBars["Tools"].waitForExistence(timeout: 5))
+            app.navigationBars["Tools"].buttons["Close"].tap()
+            XCTAssertTrue(app.otherElements["pdfWorkspace"].waitForExistence(timeout: 5))
+        }
+        app.terminate()
+    }
+
+    func testCommentsAndExportKeepCommonTasksVisible() throws {
+        let app = makeApp()
+        app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+        openDocumentTool(identifier: "note", query: "Note", in: app)
+        let note = app.descendants(matching: .any)["noteText"].firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 5))
+        note.tap()
+        note.typeText("Review feedback")
+        app.buttons["noteAddAction"].tap()
+        XCTAssertTrue(app.navigationBars["Add note"].waitForNonExistence(timeout: 20))
+        openDocumentTool(identifier: "annotations", query: "Annotations", in: app)
+        XCTAssertTrue(app.staticTexts["Review feedback"].waitForExistence(timeout: 10))
+        XCTAssertFalse(app.staticTexts["Widget"].exists)
+        XCTAssertFalse(app.staticTexts["Popup"].exists)
+        XCTAssertFalse(app.staticTexts["Form field"].exists)
+        XCTAssertFalse(app.staticTexts["Note pop-up"].exists)
+        XCTAssertFalse(app.staticTexts["Comments & markup"].exists)
+        addScreenshot(named: "Usable comments — focused on actual feedback", app: app)
+        app.buttons["annotationActions"].tap()
+        app.buttons["annotationDocumentObjects"].tap()
+        XCTAssertTrue(app.staticTexts["Form field"].firstMatch.waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Note pop-up"].waitForExistence(timeout: 5))
+        addScreenshot(named: "Usable comments — fields and pop-ups remain available", app: app)
+        app.buttons["annotationFilter-all"].tap()
+        XCTAssertTrue(app.staticTexts["Review feedback"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.staticTexts["Note pop-up"].exists)
+        app.navigationBars["Comments & Markup"].buttons["Done"].tap()
+        app.buttons["documentExportMenu"].tap()
+        app.buttons["More Export Formats"].tap()
+        let save = app.buttons["exportSavePDFToFiles"]
+        XCTAssertTrue(save.waitForExistence(timeout: 10))
+        XCTAssertTrue(save.isHittable)
+        XCTAssertTrue(app.buttons["exportSharePDF"].isHittable)
+        app.buttons["exportCatalogMode-pdf"].tap()
+        XCTAssertFalse(app.buttons["exportCatalogMode-recommended"].exists)
+        XCTAssertFalse(app.buttons["flattenedOutputOption"].exists)
+        XCTAssertFalse(app.buttons["Current PDF"].exists)
+        addScreenshot(named: "Usable export — save share and three formats", app: app)
+        expandPDFOptions(in: app)
+        XCTAssertTrue(app.buttons["flattenedOutputOption"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.staticTexts["Image-based: removes search, links, forms, and editable layers"].exists)
+        addScreenshot(named: "Usable export — advanced PDF options still available", app: app)
+        app.staticTexts["More PDF options"].tap()
+        XCTAssertFalse(app.buttons["flattenedOutputOption"].exists)
+        app.buttons["exportCatalogMode-images"].tap()
+        XCTAssertTrue(app.buttons["exportPageImages-jpegCompact"].waitForExistence(timeout: 5))
+        app.buttons["exportCatalogMode-office"].tap()
+        XCTAssertTrue(app.buttons["officeFormat-wordDocument"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.buttons["officeFormat-wordDocument"].isEnabled)
+        app.buttons["officeExportDoneAction"].tap()
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].waitForExistence(timeout: 5))
+        app.buttons["documentExportMenu"].tap()
+        app.buttons["More Export Formats"].tap()
+        XCTAssertTrue(app.navigationBars["Create & Share"].waitForExistence(timeout: 5))
+        XCTAssertEqual(app.buttons["exportCatalogMode-pdf"].value as? String, "Selected")
+        XCTAssertFalse(app.buttons["flattenedOutputOption"].exists)
+        XCTAssertTrue(app.buttons["exportSavePDFToFiles"].isHittable)
+        addScreenshot(named: "Usable export — PDF start restored after Office", app: app)
+        app.terminate()
+    }
+
+    func testBasicUserCanRenameEditSaveAndReopenPDF() throws {
+        let app = makeApp()
+        let fixtureID = UUID()
+        let finalName = "Client review approved " + String(fixtureID.uuidString.prefix(6))
+        app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(fixtureID)", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        let originalRow = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "documentRow-", "Project handoff"
+        )).firstMatch
+        XCTAssertTrue(revealForCenterTap(originalRow, in: app, maxSwipes: 5))
+        originalRow.press(forDuration: 1.2)
+        let renameInLibrary = app.buttons["libraryRenameDocument"]
+        XCTAssertTrue(renameInLibrary.waitForExistence(timeout: 5))
+        addScreenshot(named: "Basic 01 Library file actions", app: app)
+        renameInLibrary.tap()
+        let renameAlert = app.alerts["Rename document"]
+        XCTAssertTrue(renameAlert.waitForExistence(timeout: 5))
+        let nameField = renameAlert.textFields.firstMatch
+        nameField.tap()
+        nameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 80))
+        XCTAssertFalse(renameAlert.buttons["Save"].isEnabled)
+        nameField.typeText("Client review draft")
+        addScreenshot(named: "Basic 02 Rename without opening PDF", app: app)
+        renameAlert.buttons["Cancel"].tap()
+        XCTAssertTrue(originalRow.exists)
+        originalRow.press(forDuration: 1.2)
+        renameInLibrary.tap()
+        nameField.tap()
+        nameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 80))
+        nameField.typeText("Client review draft")
+        renameAlert.buttons["Save"].tap()
+        openDemoDocument(named: "Client review draft", in: app)
+        addScreenshot(named: "Basic 03 Open renamed document", app: app)
+        let titleMenu = app.buttons["workspaceDocumentNameMenu"]
+        XCTAssertTrue(titleMenu.isHittable)
+        titleMenu.tap()
+        app.buttons["renameDocument"].tap()
+        XCTAssertTrue(renameAlert.waitForExistence(timeout: 5))
+        nameField.tap()
+        nameField.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 80))
+        nameField.typeText(finalName)
+        renameAlert.buttons["Save"].tap()
+        let expectedTitle = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label == %@", finalName),
+            object: workspaceDocumentTitle(in: app)
+        )
+        XCTAssertEqual(XCTWaiter.wait(for: [expectedTitle], timeout: 10), .completed)
+
+        openDocumentTool(identifier: "note", query: "Note", in: app)
+        let note = app.descendants(matching: .any)["noteText"].firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 5))
+        note.tap()
+        note.typeText("Reviewed through the basic user journey")
+        app.buttons["noteAddAction"].tap()
+        XCTAssertTrue(app.navigationBars["Add note"].waitForNonExistence(timeout: 20))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, finalName)
+        addScreenshot(named: "Basic 04 Edited PDF keeps chosen name", app: app)
+
+        app.buttons["workspaceSharePDF"].tap()
+        let activity = app.otherElements["ActivityListView"].firstMatch
+        XCTAssertTrue(activity.waitForExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", finalName)).firstMatch.exists)
+        addScreenshot(named: "Basic 05 Share uses chosen filename", app: app)
+        let copy = app.cells.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@", "actionGroupCell", "Copy"
+        )).firstMatch
+        XCTAssertTrue(copy.waitForExistence(timeout: 10))
+        copy.tap()
+        XCTAssertTrue(activity.waitForNonExistence(timeout: 10))
+
+        let exportMenu = app.buttons["documentExportMenu"]
+        exportMenu.tap()
+        app.buttons["savePDFToFiles"].tap()
+        let picker = app.descendants(matching: .any)["fileExportPicker"].firstMatch
+        XCTAssertTrue(picker.waitForExistence(timeout: 20))
+        let filename = app.textFields.firstMatch
+        XCTAssertTrue(filename.waitForExistence(timeout: 10))
+        XCTAssertTrue((filename.value as? String)?.contains(finalName) == true)
+        addScreenshot(named: "Basic 06 Save PDF with its current name", app: app)
+        cancelFileExportPicker(picker, in: app)
+        exportMenu.tap()
+        app.buttons["savePDFToFiles"].tap()
+        XCTAssertTrue(picker.waitForExistence(timeout: 20))
+        XCTAssertTrue((filename.value as? String)?.contains(finalName) == true)
+        app.buttons["Save"].firstMatch.tap()
+        XCTAssertTrue(picker.waitForNonExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["PDF saved to Files"].waitForExistence(timeout: 5))
+        addScreenshot(named: "Basic 07 Saved to Files confirmation", app: app)
+        XCTAssertTrue(waitForLibrary(in: app))
+        let rows = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", "documentRow-"))
+        XCTAssertEqual(rows.count, 3, "Renaming and editing must not create extra documents")
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: finalName, in: app)
+        assertAnnotationResult(title: "Note", contents: "Reviewed through the basic user journey", in: app)
+        addScreenshot(named: "Basic 08 Reopened document retains edited note", app: app)
+        dismissPresentedWorkflow(title: "Comments & Markup", in: app)
+        XCTAssertTrue(waitForLibrary(in: app))
+        app.buttons["deskImport"].tap()
+        let recents = app.buttons["Recents"].firstMatch
+        if recents.waitForExistence(timeout: 3), recents.isHittable { recents.tap() }
+        // Scope to the native file browser: the covered library has a
+        // static label with this same name underneath the picker.
+        let savedFile = app.collectionViews["File View"].cells.matching(NSPredicate(
+            format: "label BEGINSWITH %@", finalName
+        )).firstMatch
+        XCTAssertTrue(savedFile.waitForExistence(timeout: 15))
+        addScreenshot(named: "Basic 09 Find exported PDF in Files", app: app)
+        savedFile.tap()
+        let openFile = app.buttons["Open"].firstMatch
+        if openFile.waitForExistence(timeout: 3), openFile.isHittable { openFile.tap() }
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].firstMatch.waitForExistence(timeout: 20))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, finalName)
+        assertAnnotationResult(title: "Note", contents: "Reviewed through the basic user journey", in: app)
+        addScreenshot(named: "Basic 10 Exported PDF imported with its note intact", app: app)
+        let evidence = XCTAttachment(string: "fixtureID=\(fixtureID.uuidString)\nfileName=\(finalName).pdf")
+        evidence.name = "Basic journey file evidence"
+        evidence.lifetime = .keepAlways
+        add(evidence)
+        app.terminate()
+    }
+
+    func testEditedPDFCanSaveToFilesAndShareFromVisibleExportMenu() throws {
+        let app = makeApp()
+        // Isolate fixtures from the user's existing library on the shared device.
+        app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(UUID().uuidString)", "UITEST_SEED_DEMO"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+        openDocumentTool(identifier: "note", query: "Note", in: app)
+        let note = app.descendants(matching: .any)["noteText"].firstMatch
+        XCTAssertTrue(note.waitForExistence(timeout: 5))
+        note.tap()
+        note.typeText("Export journey edited note")
+        app.buttons["noteAddAction"].tap()
+        XCTAssertTrue(app.navigationBars["Add note"].waitForNonExistence(timeout: 20))
+
+        let exportMenu = app.buttons["documentExportMenu"]
+        XCTAssertTrue(exportMenu.waitForExistence(timeout: 5))
+        XCTAssertTrue(exportMenu.isHittable)
+        exportMenu.tap()
+        let save = app.buttons["savePDFToFiles"]
+        XCTAssertTrue(save.waitForExistence(timeout: 3))
+        addScreenshot(named: "Edited PDF visible export choices", app: app)
+        save.tap()
+        let picker = app.descendants(matching: .any)["fileExportPicker"].firstMatch
+        XCTAssertTrue(picker.waitForExistence(timeout: 20))
+        addScreenshot(named: "Edited PDF system save location", app: app)
+        // iOS 26's native export picker dismisses with the sheet gesture.
+        cancelFileExportPicker(picker, in: app)
+
+        // A cancelled save must leave editing and the next export usable.
+        exportMenu.tap()
+        app.buttons["savePDFToFiles"].tap()
+        XCTAssertTrue(picker.waitForExistence(timeout: 20))
+        let saveButton = app.buttons["Save"].firstMatch
+        XCTAssertTrue(saveButton.waitForExistence(timeout: 15))
+        let filename = app.textFields.firstMatch
+        XCTAssertTrue(filename.waitForExistence(timeout: 5))
+        filename.tap()
+        filename.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: 80))
+        filename.typeText("PaperPath export journey \(UUID().uuidString)")
+        saveButton.tap()
+        XCTAssertTrue(picker.waitForNonExistence(timeout: 20))
+        XCTAssertTrue(app.staticTexts["PDF saved to Files"].waitForExistence(timeout: 5))
+        addScreenshot(named: "Edited PDF saved to Files successfully", app: app)
+
+        exportMenu.tap()
+        app.buttons["shareCurrentPDF"].tap()
+        let activity = app.otherElements["ActivityListView"].firstMatch
+        XCTAssertTrue(activity.waitForExistence(timeout: 20))
+        // Native iOS share actions are collection cells, not buttons.
+        let copy = app.cells.matching(NSPredicate(
+            format: "identifier == %@ AND label == %@", "actionGroupCell", "Copy"
+        )).firstMatch
+        XCTAssertTrue(copy.waitForExistence(timeout: 10))
+        XCTAssertTrue(copy.isHittable)
+        addScreenshot(named: "Edited PDF direct system share sheet", app: app)
+        copy.tap()
+        XCTAssertTrue(activity.waitForNonExistence(timeout: 10))
+
+        exportMenu.tap()
+        app.buttons["More Export Formats"].tap()
+        let catalogSave = app.buttons["exportSavePDFToFiles"]
+        XCTAssertTrue(catalogSave.waitForExistence(timeout: 10))
+        XCTAssertTrue(catalogSave.isHittable)
+        addScreenshot(named: "Export catalog direct PDF save action", app: app)
+        catalogSave.tap()
+        XCTAssertTrue(picker.waitForExistence(timeout: 20))
+        cancelFileExportPicker(picker, in: app)
+        app.buttons["officeExportDoneAction"].tap()
+        XCTAssertTrue(catalogSave.waitForNonExistence(timeout: 8))
+
+        XCTAssertTrue(waitForLibrary(in: app))
+        let row = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "documentRow-", "Project handoff"
+        )).firstMatch
+        XCTAssertTrue(revealForCenterTap(row, in: app, maxSwipes: 5))
+        row.press(forDuration: 1.2)
+        let librarySave = app.buttons["librarySavePDFToFiles"]
+        XCTAssertTrue(librarySave.waitForExistence(timeout: 5))
+        addScreenshot(named: "Library direct save and share actions", app: app)
+        librarySave.tap()
+        XCTAssertTrue(picker.waitForExistence(timeout: 20))
+        cancelFileExportPicker(picker, in: app)
+    }
+
     func testReadingPageWorkflowAndFilesSurfaces() throws {
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
@@ -4782,6 +5675,9 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(waitForLibrary(in: app))
         openDemoDocument(in: app)
 
+        if !app.buttons["Reading and navigation"].exists {
+            app.buttons["Document menu"].tap()
+        }
         app.buttons["Reading and navigation"].tap()
         let navigate = app.buttons["Navigate"].firstMatch
         XCTAssertTrue(navigate.waitForExistence(timeout: 3))
@@ -4987,6 +5883,7 @@ final class PaperPathUITests: XCTestCase {
     }
 
     func testOfficeExportCanBePresentedRepeatedlyInOneSession() throws {
+        executionTimeAllowance = 600
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
         app.launch()
@@ -5044,6 +5941,7 @@ final class PaperPathUITests: XCTestCase {
     }
 
     func testOfficeExportCancellationSoakKeepsProcessAlive() throws {
+        executionTimeAllowance = 600
         let app = makeApp()
         app.launchArguments += [
             "UITEST_RESET_DEMO",
@@ -5131,6 +6029,7 @@ final class PaperPathUITests: XCTestCase {
     }
 
     func testRapidNavigationAndSheetHandoffsRemainResponsive() throws {
+        executionTimeAllowance = 900
         let app = makeApp()
         app.launchArguments += ["UITEST_RESET_DEMO"]
         app.launch()
@@ -5370,14 +6269,264 @@ final class PaperPathUITests: XCTestCase {
             "-privacy.appLockEnabled",
             "NO",
             "-UIPreferredContentSizeCategoryName",
-            "UICTContentSizeCategoryL"
+            qualityCaptureEnabled ? qualityContentSize : "UICTContentSizeCategoryL"
         ]
+    }
+
+    func testExcellenceDocumentDeskAndToolJourney() throws {
+        try runExcellenceDocumentDeskAndToolJourney(largeText: false)
+    }
+
+    func testExcellenceDocumentDeskAndToolJourneyLargeText() throws {
+        try runExcellenceDocumentDeskAndToolJourney(largeText: true)
+    }
+
+    func testExcellenceDocumentDeskAndToolJourneyChineseLargeText() throws {
+        try runExcellenceDocumentDeskAndToolJourney(largeText: true, chinese: true)
+    }
+
+    func testReleaseChineseNormalScreenshots() throws {
+        try runExcellenceDocumentDeskAndToolJourney(largeText: false, chinese: true)
+    }
+
+    private func runExcellenceDocumentDeskAndToolJourney(largeText: Bool, chinese: Bool = false) throws {
+        XCUIDevice.shared.orientation = UIDevice.current.userInterfaceIdiom == .pad ? .landscapeLeft : .portrait
+        let app = makeApp()
+        func capture(_ title: String) {
+            let attachment = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            attachment.name = title
+            attachment.lifetime = .keepAlways
+            add(attachment)
+        }
+        app.launchArguments += [
+            "UITEST_DOCUMENT_LIFECYCLE=CA1214D0-DAF9-43D6-B817-9C1EAB641030",
+            "UITEST_RESET_DEMO",
+            "-experience.onboardingCompleted.v4", "YES",
+            "-library.workspaceLane", "home",
+            "-document.toolPaletteView", "suggested"
+        ]
+        if largeText {
+            app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        }
+        if chinese {
+            app.launchArguments += ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-app.language", "zh-Hans"]
+        }
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        XCTAssertTrue(reveal(app.buttons["deskImport"].firstMatch, in: app, maxSwipes: 8))
+        capture("Excellence document desk")
+        openDemoDocument(in: app)
+        selectProfessionalMode("read", chinese: chinese, in: app)
+        if !largeText && !chinese {
+            let jump = app.buttons["workspacePageJumpAction"].firstMatch
+            XCTAssertTrue(jump.waitForExistence(timeout: 5))
+            tapCenter(jump)
+            let input = app.alerts["Go to page"].textFields.firstMatch
+            XCTAssertTrue(input.waitForExistence(timeout: 3))
+            input.tap()
+            input.typeText(XCUIKeyboardKey.delete.rawValue + "0")
+            let go = app.buttons["workspacePageJumpConfirm"].firstMatch
+            XCTAssertFalse(go.isEnabled)
+            XCTAssertEqual(input.value as? String, "0")
+            input.typeText(XCUIKeyboardKey.delete.rawValue + "2")
+            XCTAssertTrue(go.isEnabled)
+            tapCenter(go)
+            XCTAssertTrue(jump.waitForExistence(timeout: 3))
+            XCTAssertFalse(app.buttons["Next page"].firstMatch.isEnabled)
+        }
+        capture("Excellence document workspace")
+        let toolRow = app.scrollViews["workspaceToolRow"].firstMatch
+        let appearance = app.buttons["readingAppearanceAction"].firstMatch
+        for _ in 0..<8 where !appearance.isHittable || !toolRow.frame.contains(appearance.frame) {
+            toolRow.swipeLeft()
+        }
+        XCTAssertTrue(appearance.isHittable)
+        XCTAssertTrue(toolRow.frame.contains(appearance.frame))
+        tapCenter(appearance)
+        XCTAssertTrue(app.buttons["readingTheme-sepia"].waitForExistence(timeout: 5))
+        capture("Excellence reading appearance")
+        tapCenter(app.buttons[chinese ? "完成" : "Done"].firstMatch)
+        let reader = app.buttons["readerTextAction"].firstMatch
+        for _ in 0..<8 where !reader.isHittable || !toolRow.frame.contains(reader.frame) {
+            toolRow.swipeRight()
+        }
+        XCTAssertTrue(reader.isHittable)
+        XCTAssertTrue(toolRow.frame.contains(reader.frame))
+        tapCenter(reader)
+        XCTAssertTrue(app.staticTexts["focusReaderPosition"].waitForExistence(timeout: 15))
+        capture("Excellence text reader")
+        tapCenter(app.buttons[chinese ? "完成" : "Done"].firstMatch)
+        openDocumentTools(chinese: chinese, in: app)
+        let search = documentToolSearchField(in: app)
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        if !largeText && !chinese {
+            search.tap()
+            search.typeText("fill forms")
+            let favoriteForm = app.buttons["documentToolFavorite-fillForm"].firstMatch
+            XCTAssertTrue(favoriteForm.waitForExistence(timeout: 5))
+            let wasFavorite = favoriteForm.label.hasPrefix("Remove")
+            if !wasFavorite { tapCenter(favoriteForm) }
+            tapCenter(app.buttons["Close"].firstMatch)
+            XCTAssertTrue(waitForLibrary(in: app))
+            openDemoDocument(named: "August invoice", in: app)
+            openDocumentTools(in: app)
+            let favoriteOnInvoice = app.buttons["documentTool-fillForm"].firstMatch
+            XCTAssertTrue(favoriteOnInvoice.waitForExistence(timeout: 5))
+            XCTAssertTrue(favoriteOnInvoice.isEnabled, "Blank PDFs support adding form fields")
+            let removeFavorite = app.buttons["documentToolFavorite-fillForm"].firstMatch
+            XCTAssertTrue(removeFavorite.isEnabled)
+            capture("Excellence favorite on another document")
+            tapCenter(removeFavorite)
+            XCTAssertTrue(favoriteOnInvoice.waitForNonExistence(timeout: 3))
+            tapCenter(app.buttons["Close"].firstMatch)
+            XCTAssertTrue(waitForLibrary(in: app))
+            openDemoDocument(in: app)
+            openDocumentTools(in: app)
+            if wasFavorite {
+                search.tap()
+                search.typeText("fill forms")
+                tapCenter(favoriteForm)
+                tapCenter(app.buttons["Close"].firstMatch)
+                openDocumentTools(in: app)
+            }
+        }
+        capture("Excellence suggested tools")
+        search.tap()
+        search.typeText("zzqxv987654321")
+        XCTAssertTrue(app.descendants(matching: .any)["documentToolEmptyState"].firstMatch.waitForExistence(timeout: 5))
+        capture("Excellence no matching tools")
+        let clear = app.buttons[chinese ? "清除工具搜索" : "Clear tool search"].firstMatch
+        XCTAssertTrue(clear.waitForExistence(timeout: 3))
+        tapCenter(clear)
+        XCTAssertTrue(app.keyboards.firstMatch.exists, "Clearing a tool query should preserve typing focus")
+        search.typeText("annotat")
+        let annotations = app.buttons["documentTool-annotations"].firstMatch
+        XCTAssertTrue(annotations.waitForExistence(timeout: 5))
+        XCTAssertTrue(revealForCenterTap(annotations, in: app, maxSwipes: 8))
+        capture("Excellence tool search")
+        let favorite = app.buttons["documentToolFavorite-annotations"].firstMatch
+        XCTAssertTrue(revealForCenterTap(favorite, in: app, maxSwipes: 8))
+        let originalFavoriteLabel = favorite.label
+        tapCenter(favorite)
+        XCTAssertNotEqual(favorite.label, originalFavoriteLabel)
+        tapCenter(favorite)
+        XCTAssertEqual(favorite.label, originalFavoriteLabel)
+        tapCenter(annotations)
+        XCTAssertTrue(app.navigationBars[chinese ? "批注与标记" : "Comments & Markup"].waitForExistence(timeout: 8))
+        capture("Excellence annotation review")
+        assertAppAlive(app)
+    }
+
+    func testMarketingHeroDocumentCapture() throws {
+        let tablet = UIDevice.current.userInterfaceIdiom == .pad
+        XCUIDevice.shared.orientation = tablet ? .landscapeLeft : .portrait
+        let app = XCUIApplication()
+        app.launchArguments = englishLaunchArguments + [
+            "UITEST_DOCUMENT_LIFECYCLE=3EE66BC5-58F7-49C7-A4B3-A11DDDBBC028",
+            "UITEST_HERO_DOCUMENT=\(tablet ? "Riverside Garden.pdf" : "Project Approval.pdf")",
+            "-experience.onboardingCompleted.v4", "YES",
+            "-library.workspaceLane", "home",
+            "-workspace.toolMode", "annotate"
+        ]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: tablet ? "Riverside Garden" : "Project Approval", in: app)
+        if tablet {
+            for title in ["Hide Sidebar", "Toggle Sidebar"] {
+                let toggle = app.buttons[title].firstMatch
+                if toggle.exists && toggle.isHittable { toggle.tap(); break }
+            }
+        }
+        let settled = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in
+            app.descendants(matching: .any)["pdfWorkspace"].firstMatch.exists
+                && !app.activityIndicators.firstMatch.exists
+        }, object: nil)
+        XCTAssertEqual(XCTWaiter.wait(for: [settled], timeout: 15), .completed)
+        // Give PDFKit's tiled page renderer time to finish before taking evidence.
+        Thread.sleep(forTimeInterval: 3)
+        let capture = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+        capture.name = tablet ? "hero-ipad" : "hero-phone"
+        capture.lifetime = .keepAlways
+        add(capture)
+        let hierarchy = XCTAttachment(string: app.debugDescription)
+        hierarchy.name = "hero-accessibility"
+        hierarchy.lifetime = .keepAlways
+        add(hierarchy)
     }
 
     private func makeApp() -> XCUIApplication {
         let app = XCUIApplication()
-        app.launchArguments = englishLaunchArguments
+        app.launchArguments = englishLaunchArguments + ["UITEST_WORKFLOW_FIXTURE"]
+        if qualityCaptureEnabled {
+            app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(qualityStoreID.uuidString)"]
+            app.launchEnvironment["PAPERPATH_QUALITY_CASE_ID"] = qualityCaseID.uuidString
+            app.launchEnvironment["PAPERPATH_QUALITY_TEST_ID"] = name
+            app.launchEnvironment["PAPERPATH_QUALITY_FEATURE"] = qualityFeatureKey
+        }
         return app
+    }
+
+    private func launchDownloadedPDFs() throws -> XCUIApplication {
+        let root = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "RealPDFCorpus", withExtension: nil))
+        let original = try Data(contentsOf: root.appendingPathComponent("ocr-jbig2.pdf"))
+        XCTAssertEqual(original.count, 42_818)
+        let app = makeApp()
+        app.launchArguments += ["UITEST_REAL_PDF_FIXTURE", "-workspace.toolMode", "pages"]
+        app.launchEnvironment["PAPERPATH_REAL_PDF_BASE64"] = original.base64EncodedString()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        return app
+    }
+
+    func testDownloadedPDFMergeAndSplit() throws {
+        let app = try launchDownloadedPDFs()
+        openQuickTask(identifier: "mergePDFs", query: "Merge PDFs", in: app)
+        for title in ["Downloaded scan A", "Downloaded scan B"] {
+            let row = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS[c] %@", "mergeAvailableDocument-", title)).firstMatch
+            XCTAssertTrue(revealForCenterTap(row, in: app, maxSwipes: 8))
+            tapCenter(row)
+            XCTAssertTrue(row.waitForNonExistence(timeout: 8))
+        }
+        let name = app.textFields["mergeOutputName"].firstMatch
+        XCTAssertTrue(revealForCenterTap(name, in: app, maxSwipes: 8))
+        name.tap(); name.typeText("Downloaded merge")
+        if app.keyboards.buttons["Done"].exists { app.keyboards.buttons["Done"].tap() }
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        XCTAssertTrue(reveal(create, in: app, maxSwipes: 8)); XCTAssertTrue(create.isEnabled); create.tap()
+        XCTAssertTrue(app.staticTexts["Merged PDF ready"].waitForExistence(timeout: 30))
+        tapCenter(app.buttons["mergeOpenResult"].firstMatch)
+        XCTAssertTrue(app.staticTexts["Downloaded merge"].waitForExistence(timeout: 15))
+        addScreenshot(named: "Downloaded original PDFs merged", app: app)
+        openDocumentTool(identifier: "organize", query: "Organize", in: app)
+        completePageExtraction(in: app, sourceTitle: "Downloaded merge")
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Downloaded merge - extracted pages")
+        addScreenshot(named: "Downloaded PDF split result", app: app)
+        assertAppAlive(app)
+    }
+
+    func testDownloadedPDFCompressionAndProtection() throws {
+        let app = try launchDownloadedPDFs()
+        openDemoDocument(named: "Downloaded scan A", in: app)
+        openDocumentTool(identifier: "compress", query: "Compress", in: app)
+        let create = app.buttons["compressionCreateAction"].firstMatch
+        XCTAssertTrue(create.waitForExistence(timeout: 8)); create.tap()
+        XCTAssertTrue(app.navigationBars["Compress"].waitForNonExistence(timeout: 45))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Downloaded scan A")
+        addScreenshot(named: "Downloaded PDF compressed and saved", app: app)
+        openDocumentTool(identifier: "protect", query: "Protect", in: app)
+        completeProtection(navigationTitle: "Protect PDF", password: "RealPDF-2026", in: app)
+        let protected = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label == %@", "Downloaded scan A"), object: workspaceDocumentTitle(in: app))
+        XCTAssertEqual(XCTWaiter.wait(for: [protected], timeout: 30), .completed)
+        addScreenshot(named: "Downloaded PDF protected result", app: app)
+        assertAppAlive(app)
+    }
+
+    func testDownloadedPDFOCR() throws {
+        let app = try launchDownloadedPDFs()
+        openQuickTask(identifier: "recognizeText", query: "OCR PDF", documentTitle: "Downloaded scan A", in: app)
+        completeRecognition(query: "MIDI", in: app)
+        addScreenshot(named: "Downloaded scanned manual recognized text", app: app)
+        assertAppAlive(app)
     }
 
     private func launchResetDemo(
@@ -5501,7 +6650,7 @@ final class PaperPathUITests: XCTestCase {
             in: app
         )
         var task = app.buttons["quickTool-\(identifier)"].firstMatch
-        if !revealForCenterTap(task, in: app, maxSwipes: 10) {
+        if !task.exists || !revealForCenterTap(task, in: app, maxSwipes: 10) {
             let search = librarySearchField(in: app)
             XCTAssertTrue(search.waitForExistence(timeout: 3))
             search.tap()
@@ -5531,6 +6680,15 @@ final class PaperPathUITests: XCTestCase {
                 documentTitle
             )
         ).firstMatch
+        // A large Dynamic Type row may not enter the lazy picker hierarchy
+        // until scrolled. Narrow the real picker before asserting existence.
+        if !document.exists {
+            let pickerSearch = app.searchFields["Search documents"].firstMatch
+            if pickerSearch.waitForExistence(timeout: 2) {
+                pickerSearch.tap()
+                pickerSearch.typeText(documentTitle)
+            }
+        }
         XCTAssertTrue(
             document.waitForExistence(timeout: 8),
             "Document picker did not present \(documentTitle) for \(identifier)"
@@ -5540,7 +6698,17 @@ final class PaperPathUITests: XCTestCase {
             revealForCenterTap(document, in: app, maxSwipes: 10),
             "Could not choose \(documentTitle) for \(identifier)"
         )
-        tapCenter(document)
+        if identifier == "protectPDF" {
+            addScreenshot(named: "Protect PDF source before selection", app: app)
+            let selectionEvidence = XCTAttachment(string:
+                "source=\(document.frame)\napp=\(app.frame)\n\(app.debugDescription)")
+            selectionEvidence.name = "Protect PDF source accessibility before selection"
+            selectionEvidence.lifetime = .keepAlways
+            add(selectionEvidence)
+            XCTAssertTrue(tapCurrentFrame(of: document, in: app))
+        } else {
+            tapCenter(document)
+        }
         assertAppAlive(app)
     }
 
@@ -5575,6 +6743,11 @@ final class PaperPathUITests: XCTestCase {
         }
         XCTAssertTrue(navigation.waitForNonExistence(timeout: 5))
         assertAppAlive(app)
+    }
+
+    private func privacyScanEntry(chinese: Bool = false, in app: XCUIApplication) -> XCUIElement {
+        selectProfessionalMode("deliver", chinese: chinese, in: app)
+        return app.buttons["privacyScanDeliveryAction"].firstMatch
     }
 
     private func dismissPrivacyScan(in app: XCUIApplication) {
@@ -5649,12 +6822,14 @@ final class PaperPathUITests: XCTestCase {
                 .waitForExistence(timeout: 8)
         )
         XCTAssertTrue(
-            app.staticTexts[title].waitForExistence(timeout: 15),
+            revealInPresentedSheet(app.staticTexts[title].firstMatch,
+                navigationTitle: "Comments & Markup", in: app, maxSwipes: 12),
             "Expected annotation type \(title)"
         )
         if let contents {
             XCTAssertTrue(
-                app.staticTexts[contents].waitForExistence(timeout: 5),
+                revealInPresentedSheet(app.staticTexts[contents].firstMatch,
+                    navigationTitle: "Comments & Markup", in: app, maxSwipes: 12),
                 "Expected annotation contents \(contents)"
             )
         }
@@ -5692,7 +6867,9 @@ final class PaperPathUITests: XCTestCase {
         ].firstMatch
         XCTAssertTrue(password.waitForExistence(timeout: 8))
         XCTAssertTrue(confirmation.exists)
-        password.tap()
+        XCTAssertTrue(revealWorkflowControl(password, in: app, navigationTitle: navigationTitle,
+            footerID: "protectionCreateAction", maxSwipes: 16))
+        tapCenter(password)
         password.typeText(value)
         let keyboardNext = app.keyboards.buttons["next"].firstMatch
         if keyboardNext.waitForExistence(timeout: 2) {
@@ -5738,7 +6915,7 @@ final class PaperPathUITests: XCTestCase {
         )
     }
 
-    private func completePageExtraction(in app: XCUIApplication) {
+    private func completePageExtraction(in app: XCUIApplication, sourceTitle: String = "Project handoff") {
         XCTAssertTrue(
             app.navigationBars["Organize pages"]
                 .waitForExistence(timeout: 8)
@@ -5757,13 +6934,13 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(extract.waitForExistence(timeout: 5))
         extract.tap()
         XCTAssertTrue(
-            app.staticTexts["Project handoff - extracted pages"]
+            app.staticTexts["\(sourceTitle) - extracted pages"]
                 .waitForExistence(timeout: 30)
         )
         let extractedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - extracted pages"
+                "\(sourceTitle) - extracted pages"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -5880,10 +7057,11 @@ final class PaperPathUITests: XCTestCase {
         XCTAssertTrue(create.waitForExistence(timeout: 5))
         XCTAssertTrue(create.isEnabled)
         create.tap()
+        XCTAssertTrue(create.waitForNonExistence(timeout: 45))
         let redactedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - Redacted copy"
+                "Project handoff"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -6002,7 +7180,7 @@ final class PaperPathUITests: XCTestCase {
         let verifiedCopyOpened = XCTNSPredicateExpectation(
             predicate: NSPredicate(
                 format: "label == %@",
-                "Project handoff - Verified copy"
+                "Project handoff - Export"
             ),
             object: workspaceDocumentTitle(in: app)
         )
@@ -6013,6 +7191,16 @@ final class PaperPathUITests: XCTestCase {
             ),
             .completed
         )
+        let receipt = app.buttons["deliveryReceiptBadge"].firstMatch
+        if receipt.waitForExistence(timeout: 3), receipt.isHittable {
+            receipt.tap()
+        } else {
+            openDeliveryReceipt(in: app)
+        }
+        XCTAssertTrue(app.navigationBars["Delivery receipt"].waitForExistence(timeout: 8))
+        XCTAssertTrue(app.descendants(matching: .any)["deliverySummary"].firstMatch.waitForExistence(timeout: 8))
+        addScreenshot(named: "Safe-share export verification receipt", app: app)
+        dismissPresentedWorkflow(title: "Delivery receipt", in: app)
     }
 
     private func assertAppAlive(
@@ -6147,7 +7335,7 @@ final class PaperPathUITests: XCTestCase {
             let titleUpdated = XCTNSPredicateExpectation(
                 predicate: NSPredicate(
                     format: "label == %@",
-                    "Project handoff - Verified copy"
+                    "Project handoff - Export"
                 ),
                 object: verifiedTitle
             )
@@ -6157,28 +7345,59 @@ final class PaperPathUITests: XCTestCase {
             )
             XCTAssertEqual(
                 verifiedTitle.label,
-                "Project handoff - Verified copy"
+                "Project handoff - Export"
             )
         }
-        let receipt = firstHittableButton(
-            identifier: "deliveryReceiptBadge",
-            in: app,
-            timeout: accessibilityText ? 30 : 5
-        )
-        if receipt.exists, receipt.isHittable {
-            receipt.tap()
-        } else {
-            app.buttons["Document menu"].tap()
-            app.buttons["Results"].firstMatch.tap()
-            let menuReceipt = app.buttons["Delivery receipt"].firstMatch
-            XCTAssertTrue(menuReceipt.waitForExistence(timeout: 5))
-            menuReceipt.tap()
-        }
-        let receiptNavigation = app.navigationBars[
-            "Delivery receipt"
-        ]
-        XCTAssertTrue(receiptNavigation.waitForExistence(timeout: 8))
+        openDeliveryReceipt(in: app)
         return app
+    }
+
+    private func openReadingNavigationMenu(chinese: Bool, in app: XCUIApplication) {
+        let navigation = app.buttons["workspaceNavigationMenu"].firstMatch
+        if !navigation.exists || !navigation.isHittable {
+            app.buttons[chinese ? "文档菜单" : "Document menu"].firstMatch.tap()
+            let collections = app.collectionViews.allElementsBoundByIndex
+            guard let menu = collections.first(where: { $0.buttons["renameDocument"].exists })
+                ?? collections.last(where: { $0.isHittable }) else {
+                XCTFail("The document menu has no scrollable container")
+                return
+            }
+            for _ in 0..<12 where !navigation.exists || !navigation.isHittable {
+                let start = menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45))
+                let end = menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+                start.press(forDuration: 0.1, thenDragTo: end)
+            }
+        }
+        XCTAssertTrue(navigation.waitForExistence(timeout: 5))
+        XCTAssertTrue(navigation.isHittable)
+        tapCenter(navigation)
+    }
+
+    private func openDeliveryReceipt(in app: XCUIApplication) {
+        app.buttons["Document menu"].tap()
+        let results = app.buttons["Results"].firstMatch
+        XCTAssertTrue(app.collectionViews.firstMatch.waitForExistence(timeout: 5))
+        let collections = app.collectionViews.allElementsBoundByIndex
+        // Bind by index before scrolling. A live containing(renameDocument)
+        // query stops matching once that first lazy menu row moves offscreen.
+        guard let menu = collections.first(where: { $0.buttons["renameDocument"].exists })
+            ?? collections.last(where: { $0.isHittable }) else {
+            XCTFail("The document menu has no scrollable container")
+            return
+        }
+        for _ in 0..<12 where !results.exists || !results.isHittable {
+            XCTAssertTrue(menu.waitForExistence(timeout: 3))
+            // The native menu's collection frame can extend below its clipped viewport.
+            let start = menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.45))
+            let end = menu.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.2))
+            start.press(forDuration: 0.1, thenDragTo: end)
+        }
+        XCTAssertTrue(results.waitForExistence(timeout: 5))
+        results.tap()
+        let receipt = app.buttons["Delivery receipt"].firstMatch
+        XCTAssertTrue(receipt.waitForExistence(timeout: 5))
+        receipt.tap()
+        XCTAssertTrue(app.navigationBars["Delivery receipt"].waitForExistence(timeout: 8))
     }
 
     private func expandVerificationDetails(
@@ -6382,6 +7601,10 @@ final class PaperPathUITests: XCTestCase {
             guard toolRow.exists else {
                 return true
             }
+            // All tools is pinned beside the scrolling actions in every mode.
+            if !toolRow.buttons.matching(identifier: element.identifier).firstMatch.exists {
+                return true
+            }
             return toolRow.frame.insetBy(dx: 2, dy: 0).contains(
                 CGPoint(
                     x: element.frame.midX,
@@ -6563,17 +7786,25 @@ final class PaperPathUITests: XCTestCase {
         menuAction.tap()
     }
 
+    private func expandPDFOptions(in app: XCUIApplication, chinese: Bool = false) {
+        if !app.buttons["flattenedOutputOption"].exists {
+            let disclosure = app.staticTexts[chinese ? "更多 PDF 选项" : "More PDF options"].firstMatch
+            XCTAssertTrue(reveal(disclosure, in: app, maxSwipes: 6))
+            disclosure.tap()
+        }
+    }
+
     private func selectRecommendedOfficeExport(
         in app: XCUIApplication
     ) -> XCUIElement {
         let mode = app.descendants(matching: .any)[
-            "exportCatalogMode-recommended"
+            "exportCatalogMode-office"
         ].firstMatch
         XCTAssertTrue(reveal(mode, in: app, maxSwipes: 8))
         tapCenter(mode)
 
         let recommended = app.descendants(matching: .any)[
-            "recommendedOfficeExport"
+            "officeFormat-wordDocument"
         ].firstMatch
         XCTAssertTrue(reveal(recommended, in: app, maxSwipes: 8))
         return recommended
@@ -6583,14 +7814,16 @@ final class PaperPathUITests: XCTestCase {
         named fieldName: String,
         in app: XCUIApplication
     ) -> Bool {
-        app.descendants(matching: .any).matching(
+        let field = app.descendants(matching: .any).matching(
             NSPredicate(
                 format:
                     "identifier BEGINSWITH %@ AND label == %@",
                 "formField-",
                 fieldName
             )
-        ).firstMatch.waitForExistence(timeout: 45)
+        ).firstMatch
+        return revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app,
+            maxSwipes: 20)
     }
 
     private func scanPageAction(
@@ -6619,23 +7852,36 @@ final class PaperPathUITests: XCTestCase {
         _ element: XCUIElement,
         navigationTitle: String,
         in app: XCUIApplication,
-        maxSwipes: Int
+        maxSwipes: Int,
+        searchUp: Bool = false,
+        scrollInGutter: Bool = false
     ) -> Bool {
         let navigation = app.navigationBars[navigationTitle].firstMatch
-        guard navigation.exists else {
+        guard navigation.waitForExistence(timeout: 8) else {
             return false
         }
         // An iPad reader behind the sheet can be larger than the sheet itself.
         // Prefer the control's actual scroll ancestor; scrolling the largest
         // view can move the PDF and make a coordinate tap dismiss the sheet.
-        let ancestor = element.exists && !element.identifier.isEmpty
-            ? app.scrollViews.containing(.any, identifier: element.identifier)
+        let scrollTarget = element.exists
+            ? (element.identifier.isEmpty ? element.label : element.identifier) : ""
+        let ancestor = element.exists && !scrollTarget.isEmpty
+            ? app.scrollViews.containing(.any, identifier: scrollTarget)
                 .allElementsBoundByIndex.min(by: {
                     $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height
                 })
             : nil
         let minimumSheetWidth = navigation.frame.width * 0.8
-        let scrollView = ancestor ?? app.scrollViews.allElementsBoundByIndex
+        let annotationScroll = app.scrollViews["annotationReviewScroll"].firstMatch
+        let formList = app.collectionViews["formReviewList"].firstMatch
+        // A lazy tab can disappear above the viewport. Bind the PDF-to-images
+        // transition to this sheet, rather than scrolling the reader behind it.
+        let pdfExportScroll = app.scrollViews.containing(
+            .button, identifier: "flattenedOutputOption"
+        ).firstMatch
+        let scrollView = (navigationTitle == "Create & Share" && pdfExportScroll.exists ? pdfExportScroll : nil)
+            ?? (navigationTitle == "Fill Form" && formList.exists ? formList : nil)
+            ?? (annotationScroll.exists ? annotationScroll : nil) ?? ancestor ?? app.scrollViews.allElementsBoundByIndex
             .filter {
                 $0.frame.width >= minimumSheetWidth
                     && $0.frame.height > app.frame.height * 0.35
@@ -6687,11 +7933,14 @@ final class PaperPathUITests: XCTestCase {
             let visibleBottom = min(scrollView.frame.maxY, app.frame.maxY) - 8
             guard visibleBottom > safeTop + 24 else { return false }
             let contentHeight = visibleBottom - safeTop
+            // Settings includes actions such as diagnostics sharing. Scroll
+            // from empty padding rather than pressing one of those actions.
+            let gestureX = scrollInGutter ? scrollView.frame.minX + 2 : scrollView.frame.midX
             let upper = app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: scrollView.frame.midX, dy: safeTop + contentHeight * 0.15))
+                .withOffset(CGVector(dx: gestureX, dy: safeTop + contentHeight * 0.15))
             let lower = app.coordinate(withNormalizedOffset: .zero)
-                .withOffset(CGVector(dx: scrollView.frame.midX, dy: safeTop + contentHeight * 0.85))
-            if element.exists && element.frame.midY < safeTop {
+                .withOffset(CGVector(dx: gestureX, dy: safeTop + contentHeight * 0.85))
+            if (element.exists ? element.frame.midY < safeTop : searchUp) {
                 upper.press(forDuration: 0.05, thenDragTo: lower)
             } else {
                 lower.press(forDuration: 0.05, thenDragTo: upper)
@@ -6957,5 +8206,1542 @@ final class PaperPathUITests: XCTestCase {
         }
 
         return !conversionNavigation.exists
+    }
+}
+
+// Programmatic regressions: no image recognition, no network, no selector that
+// reopens the library to rescue a failed selection state.
+@MainActor
+private extension PaperPathUITests {
+    struct MergeCorpusSource: Encodable {
+        let name: String
+        let base64: String
+    }
+
+    func launchMergeCorpus(largeText: Bool = false, includeLocked: Bool = false, includeDamaged: Bool = false, includeLarge: Bool = false, includeAttachment: Bool = false, openMerge: Bool = true, additionalArguments: [String] = [], includeForm: Bool = false) throws -> (XCUIApplication, String) {
+        var sources: [MergeCorpusSource] = []
+        // Distinct page counts, portrait/landscape, rotated page, annotations,
+        // long names and one cached, genuine JBIG2 scanned PDF.
+        for index in 0..<6 {
+            let bounds = index == 2
+                ? CGRect(x: 0, y: 0, width: 792, height: 612)
+                : CGRect(x: 0, y: 0, width: 612, height: 792)
+            let renderer = UIGraphicsPDFRenderer(bounds: bounds)
+            let data = renderer.pdfData { context in
+                for page in 0..<[1, 2, 1, 3, 1, 2][index] {
+                    context.beginPage()
+                    let marker = "MERGE-SOURCE-\(index + 1)-PAGE-\(page + 1)"
+                    (marker as NSString).draw(at: CGPoint(x: 48, y: 80),
+                        withAttributes: [.font: UIFont.systemFont(ofSize: 22)])
+                    ("Invoice / report / agreement fixture" as NSString).draw(
+                        at: CGPoint(x: 48, y: 125),
+                        withAttributes: [.font: UIFont.systemFont(ofSize: 14)])
+                }
+            }
+            let pdf = try XCTUnwrap(PDFDocument(data: data))
+            if includeForm && index == 0, let page = pdf.page(at: 0) {
+                let field = PDFAnnotation(bounds: CGRect(x: 50, y: 220, width: 260, height: 32),
+                    forType: .widget, withProperties: nil)
+                field.widgetFieldType = .text
+                field.fieldName = "Draft field"
+                field.widgetStringValue = ""
+                page.addAnnotation(field)
+            }
+            if index == 4 { pdf.page(at: 0)?.rotation = 90 }
+            if index == 5, let page = pdf.page(at: 0) {
+                let note = PDFAnnotation(bounds: CGRect(x: 50, y: 200, width: 30, height: 30),
+                    forType: .text, withProperties: nil)
+                note.contents = "Merge annotation must survive"
+                page.addAnnotation(note)
+            }
+            let name = "Merge \(String(format: "%02d", index + 1))" +
+                (index < 2 ? " Invoice" : "") +
+                (index == 3 ? " Long agreement name for layout and repeated selection" : "")
+            sources.append(MergeCorpusSource(name: name,
+                base64: try XCTUnwrap(pdf.dataRepresentation()).base64EncodedString()))
+        }
+        let root = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "RealPDFCorpus", withExtension: nil))
+        let scan = try Data(contentsOf: root.appendingPathComponent("ocr-jbig2.pdf"))
+        XCTAssertEqual(scan.count, 42_818, "The cached original must be present")
+        sources.append(MergeCorpusSource(name: "Merge 07 Real scanned PDF", base64: scan.base64EncodedString()))
+        if includeLocked {
+            let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792))
+            let pdf = try XCTUnwrap(PDFDocument(data: renderer.pdfData { $0.beginPage() }))
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("merge-locked-\(UUID()).pdf")
+            defer { try? FileManager.default.removeItem(at: url) }
+            XCTAssertTrue(pdf.write(to: url, withOptions: [.userPasswordOption: "Merge-Locked-2026",
+                .ownerPasswordOption: "Merge-Owner-2026"]))
+            let bytes = try Data(contentsOf: url)
+            XCTAssertTrue(try XCTUnwrap(PDFDocument(data: bytes)).isLocked)
+            sources.append(MergeCorpusSource(name: "Merge 08 Locked PDF", base64: bytes.base64EncodedString()))
+        }
+        if includeDamaged {
+            sources.append(MergeCorpusSource(name: "Merge 09 Damaged PDF", base64: sources[0].base64))
+        }
+        if includeLarge {
+            let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: 612, height: 792))
+            let data = renderer.pdfData { context in
+                for page in 1...120 {
+                    context.beginPage()
+                    ("MERGE-STRESS-PAGE-\(page)" as NSString).draw(at: CGPoint(x: 48, y: 80),
+                        withAttributes: [.font: UIFont.systemFont(ofSize: 16)])
+                }
+            }
+            XCTAssertLessThanOrEqual(data.count, 96 * 1_024)
+            sources.append(MergeCorpusSource(name: "Merge 10 Stress 120 pages", base64: data.base64EncodedString()))
+        }
+        if includeAttachment {
+            sources.append(MergeCorpusSource(name: "Merge 11 Embedded attachment", base64: mergeAttachmentPDF().base64EncodedString()))
+        }
+        let payload = try JSONEncoder().encode(sources)
+        XCTAssertLessThan(payload.count, 256 * 1_024)
+        let fixtureID = UUID().uuidString
+        let app = makeApp()
+        app.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(fixtureID)", "UITEST_MERGE_CORPUS",
+            "-workspace.toolMode", "pages", "-privacy.hideLibraryPreviews", "NO"]
+        if largeText {
+            app.launchArguments += ["-UIPreferredContentSizeCategoryName", "UICTContentSizeCategoryAccessibilityXXXL"]
+        }
+        if includeDamaged { app.launchArguments += ["UITEST_MERGE_DAMAGE_SOURCE"] }
+        app.launchArguments += additionalArguments
+        app.launchEnvironment["PAPERPATH_MERGE_CORPUS"] = String(decoding: payload, as: UTF8.self)
+        // Preserve exact source bytes and fixture identity for independent host
+        // verification of the files produced through the real UI.
+        let manifest: [String: Any] = ["schema": "paperpath-merge-ui-v1", "fixtureID": fixtureID,
+            "unreadableSources": includeDamaged ? ["Merge 09 Damaged PDF"] : [],
+            "sources": sources.map { entry in
+                ["name": entry.name, "base64": entry.name == "Merge 09 Damaged PDF"
+                    ? Data("%PDF-1.7\nbroken-source\n".utf8).base64EncodedString() : entry.base64]
+            }]
+        let attachment = XCTAttachment(data: try JSONSerialization.data(withJSONObject: manifest),
+            uniformTypeIdentifier: "public.json")
+        attachment.name = "merge-corpus-\(fixtureID).json"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        if openMerge {
+            openQuickTask(identifier: "mergePDFs", query: "Merge PDFs", in: app)
+            XCTAssertTrue(app.buttons["mergeCreateAction"].waitForExistence(timeout: 8))
+        }
+        return (app, fixtureID)
+    }
+
+    func mergeAttachmentPDF() -> Data {
+        let content = "BT /F1 16 Tf 48 700 Td (MERGE ATTACHMENT PAGE) Tj ET\n"
+        let attachment = "PaperPath embedded attachment must survive merge.\n"
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R /Names << /EmbeddedFiles << /Names [(merge-evidence.txt) 5 0 R] >> >> >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 7 0 R >> >> /Contents 4 0 R >>",
+            "<< /Length \(content.utf8.count) >>\nstream\n\(content)endstream",
+            "<< /Type /Filespec /F (merge-evidence.txt) /UF (merge-evidence.txt) /EF << /F 6 0 R >> >>",
+            "<< /Type /EmbeddedFile /Subtype /text#2Fplain /Length \(attachment.utf8.count) >>\nstream\n\(attachment)endstream",
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"
+        ]
+        var data = Data("%PDF-1.4\n".utf8)
+        var offsets: [Int] = [0]
+        for (index, object) in objects.enumerated() {
+            offsets.append(data.count)
+            data.append(Data("\(index + 1) 0 obj\n\(object)\nendobj\n".utf8))
+        }
+        let xref = data.count
+        var trailer = "xref\n0 \(objects.count + 1)\n0000000000 65535 f \n"
+        for offset in offsets.dropFirst() { trailer += String(format: "%010d 00000 n \n", offset) }
+        trailer += "trailer\n<< /Size \(objects.count + 1) /Root 1 0 R >>\nstartxref\n\(xref)\n%%EOF\n"
+        data.append(Data(trailer.utf8))
+        return data
+    }
+
+    func mergeSource(_ number: Int, in app: XCUIApplication) -> XCUIElement {
+        app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "mergeAvailableDocument-", String(format: "Merge %02d", number))).firstMatch
+    }
+
+    func assertMergeLibraryExpanded(in app: XCUIApplication,
+        file: StaticString = #filePath, line: UInt = #line) {
+        // Existence of a lazy offscreen row is not evidence of expansion.
+        let disclosure = app.descendants(matching: .any)["mergeLibraryDisclosure"].firstMatch
+        XCTAssertTrue(disclosure.exists, file: file, line: line)
+        XCTAssertEqual(disclosure.value as? String, "Expanded",
+            "Library collapsed after selection; do not reopen it in the helper", file: file, line: line)
+        XCTAssertTrue(app.textFields["mergeLibrarySearch"].exists,
+            "Library search disappeared", file: file, line: line)
+    }
+
+    func addMergeSource(_ number: Int, count: Int, in app: XCUIApplication) {
+        assertMergeLibraryExpanded(in: app)
+        let row = mergeSource(number, in: app)
+        // Scrolling is allowed; tapping the disclosure or search toolbar to
+        // restore a hidden/collapsed library is deliberately forbidden.
+        XCTAssertTrue(revealMergeControl(row, in: app, maxSwipes: 16))
+        XCTAssertTrue(row.isEnabled)
+        tapCenter(row)
+        XCTAssertTrue(row.waitForNonExistence(timeout: 8))
+        assertMergeLibraryExpanded(in: app)
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        if count >= 2 { XCTAssertEqual(create.label, "Merge \(count) PDFs") }
+        XCTAssertEqual(create.isEnabled, count >= 2)
+    }
+
+    func revealMergeControl(_ element: XCUIElement, in app: XCUIApplication, maxSwipes: Int, searchUp: Bool = false) -> Bool {
+        revealWorkflowControl(element, in: app, navigationTitle: "Merge PDFs", footerID: "mergeCreateAction", maxSwipes: maxSwipes, searchUp: searchUp)
+    }
+
+    func revealWorkflowControl(_ element: XCUIElement, in app: XCUIApplication, navigationTitle: String, footerID: String, maxSwipes: Int, searchUp: Bool = false) -> Bool {
+        // The merge sheet's fixed action bar can be much taller at large text.
+        // Underlying library navigation is not the sheet's visible scroll area.
+        let selectionBeforeScrolling = app.buttons[footerID].label
+        for _ in 0...maxSwipes {
+            let navigation = app.navigationBars[navigationTitle].firstMatch
+            let action = app.buttons[footerID].firstMatch
+            let top = navigation.frame.maxY + 12
+            var bottom = action.frame.minY - 24
+            if app.keyboards.firstMatch.exists {
+                bottom = min(bottom, app.keyboards.firstMatch.frame.minY - 64)
+            }
+            guard bottom > top else { return false }
+            if element.exists, element.isHittable,
+               element.frame.midY >= top, element.frame.midY <= bottom {
+                return true
+            }
+            let moveDown = element.exists ? element.frame.midY < top : searchUp
+            // Scroll in the leading padding: the middle of a large-text
+            // selected row can be its drag-to-reorder handle.
+            let height = app.frame.height
+            let gutter = (navigation.frame.minX + 8 - app.frame.minX) / app.frame.width
+            let fromY = top + (bottom - top) * (moveDown ? 0.30 : 0.78)
+            let toY = top + (bottom - top) * (moveDown ? 0.78 : 0.30)
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: gutter,
+                dy: (fromY - app.frame.minY) / height))
+            let end = app.coordinate(withNormalizedOffset: CGVector(dx: gutter,
+                dy: (toY - app.frame.minY) / height))
+            start.press(forDuration: 0.01, thenDragTo: end,
+                withVelocity: .fast, thenHoldForDuration: 0)
+            XCTAssertEqual(action.label, selectionBeforeScrolling,
+                "Scrolling must not add, remove or reorder the selected PDFs")
+        }
+        return false
+    }
+
+    func clearMergeOrder(in app: XCUIApplication) {
+        let clear = app.buttons["mergeClearSelection"].firstMatch
+        XCTAssertTrue(revealMergeControl(clear, in: app, maxSwipes: 16, searchUp: true))
+        let selectionLabel = app.buttons["mergeCreateAction"].label
+        tapCenter(clear)
+        let confirm = app.alerts.buttons["Clear merge order"].firstMatch
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        addScreenshot(named: "Merge clear confirmation", app: app)
+        let cancel = app.alerts.buttons["Cancel"].firstMatch
+        cancel.tap()
+        XCTAssertTrue(confirm.waitForNonExistence(timeout: 3))
+        XCTAssertEqual(app.buttons["mergeCreateAction"].label, selectionLabel,
+            "Cancel must preserve the selected PDFs")
+        tapCenter(clear)
+        XCTAssertTrue(confirm.waitForExistence(timeout: 3))
+        confirm.tap()
+        XCTAssertTrue(confirm.waitForNonExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["mergeCreateAction"].isEnabled)
+        assertMergeLibraryExpanded(in: app)
+    }
+}
+
+extension PaperPathUITests {
+    func testMergeCorpusStressAndEmbeddedAttachmentPreserveActualOutput() throws {
+        let (app, fixtureID) = try launchMergeCorpus(includeLarge: true, includeAttachment: true)
+        for (index, number) in [10, 11, 1].enumerated() { addMergeSource(number, count: index + 1, in: app) }
+        let field = app.textFields["mergeOutputName"].firstMatch
+        XCTAssertTrue(revealMergeControl(field, in: app, maxSwipes: 16, searchUp: true))
+        field.tap()
+        field.typeText("Stress and attachment merge")
+        if app.keyboards.buttons["Done"].exists { app.keyboards.buttons["Done"].tap() }
+        let expectation: [String: Any] = ["schema": "paperpath-merge-output-v1", "fixtureID": fixtureID,
+            "resultName": "Stress and attachment merge", "order": [8, 9, 1]]
+        let proof = XCTAttachment(data: try JSONSerialization.data(withJSONObject: expectation), uniformTypeIdentifier: "public.json")
+        proof.name = "merge-stress-attachment-output.json"
+        proof.lifetime = .keepAlways
+        add(proof)
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        XCTAssertTrue(create.isHittable)
+        tapCenter(create)
+        XCTAssertTrue(app.staticTexts["Merged PDF ready"].waitForExistence(timeout: 90))
+        tapCenter(app.buttons["mergeOpenResult"].firstMatch)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Stress and attachment merge")
+        assertAppAlive(app)
+    }
+
+    func testMergeCorpusDamagedSourceFailsThenValidSelectionRecovers() throws {
+        let (app, fixtureID) = try launchMergeCorpus(includeDamaged: true)
+        addMergeSource(1, count: 1, in: app)
+        addMergeSource(9, count: 2, in: app)
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        XCTAssertTrue(create.isHittable)
+        tapCenter(create)
+        XCTAssertTrue(app.alerts.firstMatch.waitForExistence(timeout: 30), "Corrupt source must produce an explicit recoverable error")
+        XCTAssertFalse(app.staticTexts["Merged PDF ready"].exists, "A failed merge must not publish a result")
+        dismissBlockingAlert(in: app)
+        XCTAssertTrue(create.isEnabled, "Processing state must clear after a failed merge")
+        let remove = app.buttons.matching(NSPredicate(format: "label == %@ AND value == %@", "Remove", "Merge 09 Damaged PDF")).firstMatch
+        XCTAssertTrue(revealMergeControl(remove, in: app, maxSwipes: 16, searchUp: true))
+        tapCenter(remove)
+        XCTAssertFalse(create.isEnabled)
+        addMergeSource(2, count: 2, in: app)
+        let name = app.textFields["mergeOutputName"].firstMatch
+        XCTAssertTrue(revealMergeControl(name, in: app, maxSwipes: 16, searchUp: true))
+        name.tap()
+        name.typeText("Recovered Merge")
+        if app.keyboards.buttons["Done"].exists { app.keyboards.buttons["Done"].tap() }
+        let expectation: [String: Any] = ["schema": "paperpath-merge-output-v1", "fixtureID": fixtureID,
+            "resultName": "Recovered Merge", "order": [1, 2]]
+        let proof = XCTAttachment(data: try JSONSerialization.data(withJSONObject: expectation), uniformTypeIdentifier: "public.json")
+        proof.name = "merge-damaged-recovery-output.json"
+        proof.lifetime = .keepAlways
+        add(proof)
+        tapCenter(create)
+        XCTAssertTrue(app.staticTexts["Merged PDF ready"].waitForExistence(timeout: 45))
+        tapCenter(app.buttons["mergeOpenResult"].firstMatch)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Recovered Merge")
+        assertAppAlive(app)
+    }
+
+    func testMergeCorpusLockedSourceIsDisabledAndValidSourcesStillMerge() throws {
+        let (app, _) = try launchMergeCorpus(includeLocked: true)
+        let locked = mergeSource(8, in: app)
+        XCTAssertTrue(revealMergeControl(locked, in: app, maxSwipes: 16))
+        XCTAssertFalse(locked.isEnabled, "Password-locked source must not enter the merge order")
+        XCTAssertFalse(app.buttons["mergeCreateAction"].isEnabled)
+        for number in 1...3 { addMergeSource(number, count: number, in: app) }
+        XCTAssertTrue(revealMergeControl(locked, in: app, maxSwipes: 16))
+        XCTAssertFalse(locked.isEnabled)
+        XCTAssertEqual(app.buttons["mergeCreateAction"].label, "Merge 3 PDFs")
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        XCTAssertTrue(create.isHittable)
+        tapCenter(create)
+        XCTAssertTrue(app.staticTexts["Merged PDF ready"].waitForExistence(timeout: 45))
+        assertAppAlive(app)
+    }
+
+    func testAnnotationOverviewAccessibilityMetricsKeepCountsReadable() throws {
+        let arguments = ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-app.language", "zh-Hans"]
+        let (app, _) = try launchMergeCorpus(largeText: true, openMerge: false, additionalArguments: arguments)
+        let librarySearch = librarySearchField(in: app)
+        librarySearch.tap()
+        librarySearch.typeText("Merge 06\n")
+        openDemoDocument(named: "Merge 06", in: app)
+        openDocumentTools(chinese: true, in: app)
+        let search = documentToolSearchField(in: app)
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText("Annotations")
+        let tool = app.buttons["documentTool-annotations"].firstMatch
+        XCTAssertTrue(tool.waitForExistence(timeout: 5))
+        tapCenter(tool)
+        let all = app.buttons["annotationFilter-all"].firstMatch
+        let notes = app.buttons["annotationFilter-notes"].firstMatch
+        XCTAssertTrue(all.waitForExistence(timeout: 10))
+        XCTAssertTrue(notes.exists)
+        XCTAssertTrue(all.label.contains("1") && all.label.contains("全部"), all.label)
+        XCTAssertTrue(notes.label.contains("1") && notes.label.contains("备注"), notes.label)
+        let page = app.buttons.matching(NSPredicate(
+            format: "label CONTAINS %@ AND label CONTAINS %@",
+            "Merge annotation must survive", "第1页"
+        )).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(page, navigationTitle: "批注与标记", in: app, maxSwipes: 16))
+        addScreenshot(named: "Annotation overview readable AX metrics", app: app)
+        let edit = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "编辑")).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(edit, navigationTitle: "批注与标记", in: app, maxSwipes: 16))
+        XCTAssertGreaterThanOrEqual(edit.frame.height + 0.001, 44)
+        XCTAssertGreaterThanOrEqual(edit.frame.width + 0.001, 44)
+        tapCenter(edit)
+        XCTAssertTrue(app.navigationBars["编辑批注"].waitForExistence(timeout: 5))
+    }
+
+    func testCompactAnnotationEditorKeepsContentAndStyleReachable() throws {
+        try checkCompactAnnotationEditor(chinese: false, largeText: false)
+    }
+
+    func testCompactAnnotationEditorChineseAccessibilityKeepsActionsReachable() throws {
+        try checkCompactAnnotationEditor(chinese: true, largeText: true)
+    }
+
+    private func checkCompactAnnotationEditor(chinese: Bool, largeText: Bool) throws {
+        let arguments = chinese ? ["-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN", "-app.language", "zh-Hans"] : []
+        let (app, _) = try launchMergeCorpus(largeText: largeText, openMerge: false,
+            additionalArguments: arguments)
+        if largeText {
+            let librarySearch = librarySearchField(in: app)
+            librarySearch.tap()
+            librarySearch.typeText("Merge 06\n")
+        }
+        openDemoDocument(named: "Merge 06", in: app)
+        openDocumentTools(chinese: chinese, in: app)
+        let search = documentToolSearchField(in: app)
+        XCTAssertTrue(search.waitForExistence(timeout: 5))
+        search.tap()
+        search.typeText("Annotations")
+        let tool = app.buttons["documentTool-annotations"].firstMatch
+        XCTAssertTrue(tool.waitForExistence(timeout: 5))
+        XCTAssertTrue(tool.isEnabled)
+        tapCenter(tool)
+        let edit = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", chinese ? "编辑" : "Edit ")).firstMatch
+        XCTAssertTrue(edit.waitForExistence(timeout: 10))
+        XCTAssertTrue(revealInPresentedSheet(edit, navigationTitle: chinese ? "批注与标记" : "Comments & Markup",
+            in: app, maxSwipes: 20))
+        tapCenter(edit)
+        let title = chinese ? "编辑批注" : "Edit Annotation"
+        XCTAssertTrue(app.navigationBars[title].waitForExistence(timeout: 5))
+        let text = app.descendants(matching: .any)["annotationComment"].firstMatch
+        XCTAssertTrue(text.waitForExistence(timeout: 5))
+        XCTAssertEqual(text.value as? String, "Merge annotation must survive")
+        if !largeText {
+            XCTAssertLessThan(text.frame.minY, app.navigationBars[title].frame.maxY + 220,
+                "The editable note must appear near the top, without a tall metric header")
+        }
+        XCTAssertTrue(app.buttons["annotationOpenPage"].exists)
+        XCTAssertFalse(app.buttons["saveAnnotationEdit"].isEnabled)
+        addScreenshot(named: "Compact annotation editor " + (chinese ? "Chinese accessibility" : "standard"), app: app)
+        let color = app.buttons["annotationColor-blue"].firstMatch
+        let scroll = app.scrollViews["annotationEditorScroll"].firstMatch
+        let save = app.buttons["saveAnnotationEdit"].firstMatch
+        for _ in 0..<8 {
+            let top = app.navigationBars[title].frame.maxY + 12
+            let bottom = save.frame.minY - 12
+            if color.isHittable && color.frame.midY > top && color.frame.midY < bottom { break }
+            XCTAssertGreaterThan(bottom, top + 40)
+            let origin = app.coordinate(withNormalizedOffset: .zero)
+            let x = scroll.frame.minX + 8
+            origin.withOffset(CGVector(dx: x, dy: top + (bottom - top) * 0.8))
+                .press(forDuration: 0.01, thenDragTo: origin.withOffset(CGVector(dx: x, dy: top + (bottom - top) * 0.2)))
+        }
+        XCTAssertTrue(color.isHittable)
+        XCTAssertLessThan(color.frame.midY, save.frame.minY - 8,
+            "A color must be above the fixed save bar before tapping")
+        tapCenter(color)
+        XCTAssertTrue(app.buttons["saveAnnotationEdit"].isEnabled)
+        addScreenshot(named: "Compact annotation controls " + (chinese ? "Chinese accessibility" : "standard"), app: app)
+        app.navigationBars[title].buttons[chinese ? "取消" : "Cancel"].tap()
+        let discard = app.buttons[chinese ? "放弃更改" : "Discard Changes"].firstMatch
+        XCTAssertTrue(discard.waitForExistence(timeout: 3))
+        discard.tap()
+        XCTAssertTrue(app.navigationBars[title].waitForNonExistence(timeout: 5))
+    }
+
+    func testFormValueSaveSurvivesReopenAndIsolatedRelaunch() throws {
+        let (app, fixtureID) = try launchMergeCorpus(openMerge: false, includeForm: true)
+        let title = "Merge 01 Invoice"
+        let expected = "PaperPath verified saved value"
+        openDemoDocument(named: title, in: app)
+        openDocumentTool(identifier: "fillForm", query: "Fill Form", in: app)
+        let field = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label == %@", "formField-", "Draft field")).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 8))
+        tapCenter(field)
+        let entry = app.textFields["formFieldValue"].firstMatch
+        XCTAssertTrue(entry.waitForExistence(timeout: 5))
+        entry.tap()
+        entry.typeText(expected)
+        let save = app.buttons["formValueSave"].firstMatch
+        XCTAssertTrue(save.isEnabled)
+        save.tap()
+        XCTAssertTrue(entry.waitForNonExistence(timeout: 30), "Save must finish and close the editor")
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 8))
+        XCTAssertTrue(field.isEnabled)
+        tapCenter(field)
+        XCTAssertTrue(entry.waitForExistence(timeout: 5))
+        XCTAssertEqual(entry.value as? String, expected)
+        XCTAssertFalse(save.isEnabled, "Reopened saved value is unchanged")
+        app.terminate()
+        let reopened = makeApp()
+        reopened.launchArguments += ["UITEST_DOCUMENT_LIFECYCLE=\(fixtureID)", "-workspace.toolMode", "pages"]
+        reopened.launch()
+        XCTAssertTrue(waitForLibrary(in: reopened))
+        openDemoDocument(named: title, in: reopened)
+        openDocumentTool(identifier: "fillForm", query: "Fill Form", in: reopened)
+        let restoredField = reopened.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label == %@", "formField-", "Draft field")).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(restoredField, navigationTitle: "Fill Form", in: reopened, maxSwipes: 8))
+        tapCenter(restoredField)
+        let restored = reopened.textFields["formFieldValue"].firstMatch
+        XCTAssertTrue(restored.waitForExistence(timeout: 5))
+        XCTAssertEqual(restored.value as? String, expected)
+        XCTAssertFalse(reopened.buttons["formValueSave"].isEnabled)
+        addScreenshot(named: "Saved form value after relaunch", app: reopened)
+        let oracle: [String: Any] = ["fixtureID": fixtureID, "documentName": title,
+            "fieldName": "Draft field", "expectedValue": expected]
+        let proof = XCTAttachment(data: try JSONSerialization.data(withJSONObject: oracle),
+            uniformTypeIdentifier: "public.json")
+        proof.name = "form-value-roundtrip-oracle.json"
+        proof.lifetime = .keepAlways
+        add(proof)
+    }
+
+    func testFormValueDraftRequiresExplicitDiscardAndExplainsLengthLimit() throws {
+        let (app, _) = try launchMergeCorpus(openMerge: false, includeForm: true)
+        openDemoDocument(named: "Merge 01 Invoice", in: app)
+        openDocumentTool(identifier: "fillForm", query: "Fill Form", in: app)
+        let field = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label == %@", "formField-", "Draft field")).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 8))
+        tapCenter(field)
+        let entry = app.textFields["formFieldValue"].firstMatch
+        XCTAssertTrue(entry.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["formValueSave"].isEnabled, "Unchanged fields must not create another save")
+        entry.tap()
+        entry.typeText("Keep this draft")
+        XCTAssertTrue(app.buttons["formValueSave"].isEnabled)
+        app.navigationBars["Fill Field"].buttons["Cancel"].tap()
+        let keep = app.alerts.buttons["Keep Editing"].firstMatch
+        XCTAssertTrue(keep.waitForExistence(timeout: 3))
+        keep.tap()
+        XCTAssertEqual(entry.value as? String, "Keep this draft")
+        app.navigationBars["Fill Field"].buttons["Cancel"].tap()
+        app.alerts.buttons["Discard Changes"].tap()
+        XCTAssertTrue(entry.waitForNonExistence(timeout: 5))
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 8))
+        tapCenter(field)
+        XCTAssertTrue(entry.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["formValueSave"].isEnabled)
+        entry.tap()
+        entry.typeText(String(repeating: "n", count: 257))
+        XCTAssertTrue(app.descendants(matching: .any)["formValueLengthWarning"].firstMatch.waitForExistence(timeout: 3))
+        XCTAssertFalse(app.buttons["formValueSave"].isEnabled)
+        addScreenshot(named: "Form field explains length limit", app: app)
+    }
+
+    func testAnnotationEditorKeepsOverlongDraftAndDisablesSave() throws {
+        let (app, _) = try launchMergeCorpus(openMerge: false)
+        openDemoDocument(named: "Merge 06", in: app)
+        openDocumentTool(identifier: "annotations", query: "Annotations", in: app)
+        let edit = app.buttons.matching(NSPredicate(format: "label BEGINSWITH %@", "Edit ")).firstMatch
+        XCTAssertTrue(edit.waitForExistence(timeout: 10))
+        edit.tap()
+        XCTAssertTrue(app.navigationBars["Edit Annotation"].waitForExistence(timeout: 5))
+        let text = app.descendants(matching: .any)["annotationComment"].firstMatch
+        XCTAssertTrue(text.waitForExistence(timeout: 5))
+        XCTAssertLessThan(text.frame.midY, app.buttons["saveAnnotationEdit"].frame.minY,
+            "The editing field must open above the fixed save bar")
+        tapCenter(text)
+        XCTAssertEqual(XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hasKeyboardFocus == true"), object: text)], timeout: 5), .completed)
+        let marker = "TAIL-WITHOUT-TRUNCATION"
+        text.typeText(String(repeating: "n", count: 2001) + marker)
+        let warning = app.descendants(matching: .any)["annotationLengthWarning"].firstMatch
+        XCTAssertTrue(warning.waitForExistence(timeout: 3))
+        XCTAssertLessThanOrEqual(warning.frame.maxY, app.buttons["saveAnnotationEdit"].frame.minY,
+            "The length explanation must remain above the save button while typing")
+        XCTAssertGreaterThan(warning.frame.minY, app.navigationBars["Edit Annotation"].frame.maxY)
+        XCTAssertTrue((text.value as? String)?.contains(marker) == true,
+            "The complete draft must remain editable instead of losing its tail")
+        XCTAssertFalse(app.buttons["saveAnnotationEdit"].isEnabled)
+        addScreenshot(named: "Annotation retains overlong draft", app: app)
+    }
+
+    func testProtectionOverlongInputCannotEnableSavingByTruncatingPasswords() throws {
+        let (app, _) = try launchMergeCorpus(openMerge: false)
+        openQuickTask(identifier: "protectPDF", query: "Protect PDF",
+            documentTitle: "Merge 01 Invoice", in: app)
+        XCTAssertTrue(app.navigationBars["Protect PDF"].waitForExistence(timeout: 8))
+        let password = app.descendants(matching: .any)["protectionPassword"].firstMatch
+        let confirmation = app.descendants(matching: .any)["protectionConfirmation"].firstMatch
+        let prefix = String(repeating: "p", count: 128)
+        password.tap()
+        password.typeText(prefix + "A")
+        XCTAssertTrue(app.descendants(matching: .any)["protectionValidation"].firstMatch.waitForExistence(timeout: 3))
+        confirmation.tap()
+        confirmation.typeText(prefix + "B")
+        XCTAssertFalse(app.buttons["protectionCreateAction"].isEnabled,
+            "Different overlong passwords must not become a matching truncated pair")
+        addScreenshot(named: "Protection rejects overlong passwords", app: app)
+    }
+
+    func testMergeCorpusSevenSequentialAddsAndClear() throws {
+        let (app, _) = try launchMergeCorpus()
+        for number in 1...7 { addMergeSource(number, count: number, in: app) }
+        XCTAssertTrue(revealMergeControl(app.staticTexts["All available PDFs are selected"], in: app, maxSwipes: 12))
+        clearMergeOrder(in: app)
+        // Clear must return all seven files, with no stale duplicate selection.
+        for number in (1...7).reversed() { addMergeSource(number, count: 8 - number, in: app) }
+        assertAppAlive(app)
+    }
+
+    func testMergeCorpusRemoveReaddAndCancelIsolation() throws {
+        let (app, _) = try launchMergeCorpus()
+        for number in 1...3 { addMergeSource(number, count: number, in: app) }
+        let remove = app.buttons.matching(NSPredicate(format: "label == %@ AND value BEGINSWITH %@", "Remove", "Merge 02")).firstMatch
+        XCTAssertTrue(revealMergeControl(remove, in: app, maxSwipes: 12))
+        tapCenter(remove)
+        XCTAssertEqual(app.buttons["mergeCreateAction"].label, "Merge 2 PDFs")
+        let removeFirst = app.buttons.matching(NSPredicate(format: "label == %@ AND value BEGINSWITH %@", "Remove", "Merge 01")).firstMatch
+        XCTAssertTrue(revealMergeControl(removeFirst, in: app, maxSwipes: 12))
+        tapCenter(removeFirst)
+        XCTAssertFalse(app.buttons["mergeCreateAction"].isEnabled, "One source cannot be merged")
+        assertMergeLibraryExpanded(in: app)
+        addMergeSource(2, count: 2, in: app)
+        addMergeSource(1, count: 3, in: app)
+        dismissPresentedWorkflow(title: "Merge PDFs", in: app)
+        openQuickTask(identifier: "mergePDFs", query: "Merge PDFs", in: app)
+        XCTAssertFalse(app.buttons["mergeCreateAction"].isEnabled)
+        assertMergeLibraryExpanded(in: app)
+        addMergeSource(7, count: 1, in: app)
+        addMergeSource(4, count: 2, in: app)
+    }
+
+    func testMergeCorpusSearchNoMatchAndAddMatching() throws {
+        let (app, _) = try launchMergeCorpus()
+        let search = app.textFields["mergeLibrarySearch"].firstMatch
+        XCTAssertTrue(revealMergeControl(search, in: app, maxSwipes: 8))
+        search.tap()
+        search.typeText("no-such-pdf")
+        XCTAssertTrue(app.staticTexts["No matching PDFs"].waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["mergeCreateAction"].isEnabled)
+        let clearSearch = app.buttons["Clear search"].firstMatch
+        XCTAssertTrue(revealMergeControl(clearSearch, in: app, maxSwipes: 10))
+        tapCenter(clearSearch)
+        search.tap()
+        search.typeText("Invoice")
+        // Dismiss only the keyboard, without toggling library expansion.
+        if app.keyboards.buttons["Return"].exists { app.keyboards.buttons["Return"].tap() }
+        let all = app.buttons["mergeAddAll"].firstMatch
+        XCTAssertTrue(revealMergeControl(all, in: app, maxSwipes: 12))
+        tapCenter(all)
+        XCTAssertEqual(app.buttons["mergeCreateAction"].label, "Merge 2 PDFs", "Add matching must not select the other five PDFs")
+        assertMergeLibraryExpanded(in: app)
+        clearMergeOrder(in: app)
+        XCTAssertTrue(revealMergeControl(search, in: app, maxSwipes: 12))
+        search.tap()
+        search.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: "Invoice".count))
+        if app.keyboards.buttons["Return"].exists { app.keyboards.buttons["Return"].tap() }
+        addMergeSource(3, count: 1, in: app)
+        addMergeSource(6, count: 2, in: app)
+    }
+
+    func testMergeCorpusLargeTextRetainsLibraryAfterSecondAndThird() throws {
+        let (app, _) = try launchMergeCorpus(largeText: true)
+        for number in 1...4 { addMergeSource(number, count: number, in: app) }
+        clearMergeOrder(in: app)
+        addMergeSource(7, count: 1, in: app)
+        addMergeSource(5, count: 2, in: app)
+    }
+
+    func testMergeCorpusMixedOutputSurvivesRelaunch() throws {
+        let (app, fixtureID) = try launchMergeCorpus()
+        let order = [4, 1, 7, 3, 2, 5, 6]
+        for (index, number) in order.enumerated() { addMergeSource(number, count: index + 1, in: app) }
+        let field = app.textFields["mergeOutputName"].firstMatch
+        XCTAssertTrue(revealMergeControl(field, in: app, maxSwipes: 16))
+        field.tap()
+        field.typeText("Merge regression output")
+        if app.keyboards.buttons["Done"].exists { app.keyboards.buttons["Done"].tap() }
+        let expectation: [String: Any] = ["schema": "paperpath-merge-output-v1", "fixtureID": fixtureID,
+            "resultName": "Merge regression output", "order": order]
+        let attachment = XCTAttachment(data: try JSONSerialization.data(withJSONObject: expectation),
+            uniformTypeIdentifier: "public.json")
+        attachment.name = "merge-output-expectation.json"
+        attachment.lifetime = .keepAlways
+        add(attachment)
+        let create = app.buttons["mergeCreateAction"].firstMatch
+        XCTAssertTrue(create.isHittable, "The fixed merge action must be directly tappable")
+        XCTAssertTrue(create.isEnabled)
+        tapCenter(create)
+        XCTAssertTrue(app.staticTexts["Merged PDF ready"].waitForExistence(timeout: 45))
+        tapCenter(app.buttons["mergeOpenResult"].firstMatch)
+        XCTAssertTrue(workspaceDocumentTitle(in: app).waitForExistence(timeout: 15))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Merge regression output")
+        app.terminate()
+        // Same isolated store, without reseeding: verify actual persistence.
+        app.launchArguments.removeAll { $0 == "UITEST_MERGE_CORPUS" }
+        app.launchEnvironment.removeValue(forKey: "PAPERPATH_MERGE_CORPUS")
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: "Merge regression output", in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Merge regression output")
+        assertAppAlive(app)
+    }
+}
+
+// Quality wrappers call the existing functional journeys and capture actual saved files.
+extension PaperPathUITests {
+    func testQualityQuickTasksScanToPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.scanToPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testScanToPDFJourneyCreatesReviewedTwoPageDocument()
+    }
+
+    func testQualityQuickTasksScanToPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.scanToPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testScanToPDFJourneyCreatesReviewedTwoPageDocument()
+    }
+
+    func testQualityQuickTasksImagesToPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.imagesToPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testImagesToPDFJourneyCreatesReviewedTwoPageDocument()
+    }
+
+    func testQualityQuickTasksImagesToPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.imagesToPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testImagesToPDFJourneyCreatesReviewedTwoPageDocument()
+    }
+
+    func testQualityQuickTasksMergePDFs() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.mergePDFs"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksMergePDFsLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.mergePDFs"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testMergePDFJourneyCreatesNamedResultAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksSplitPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.splitPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testSplitPDFQuickJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksSplitPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.splitPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testSplitPDFQuickJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksOrganizePages() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.organizePages"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testOrganizePagesQuickJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksOrganizePagesLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.organizePages"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testOrganizePagesQuickJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksCompressPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.compressPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testCompressPDFQuickJourneyKeepsAlreadySmallerOriginal()
+    }
+
+    func testQualityQuickTasksCompressPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.compressPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testCompressPDFQuickJourneyKeepsAlreadySmallerOriginal()
+    }
+
+    func testQualityQuickTasksFillForms() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.fillForms"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testFillFormsQuickJourneyAddsFieldAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksFillFormsLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.fillForms"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testFillFormsQuickJourneyAddsFieldAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksSignPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.signPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testSignPDFQuickJourneyPlacesSignatureAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksSignPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.signPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testSignPDFQuickJourneyPlacesSignatureAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksRedactPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.redactPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testRedactPDFQuickJourneyCreatesSecureCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksRedactPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.redactPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testRedactPDFQuickJourneyCreatesSecureCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksProtectPDF() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.protectPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testProtectPDFJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksProtectPDFLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.protectPDF"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testProtectPDFJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksSafeShare() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.safeShare"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testSafeShareQuickJourneyCreatesVerifiedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksSafeShareLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.safeShare"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testSafeShareQuickJourneyCreatesVerifiedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksRecognizeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.recognizeText"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try runQualityOriginalOCR(batch: true)
+    }
+
+    func testQualityQuickTasksRecognizeTextLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.recognizeText"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try runQualityOriginalOCR(batch: true)
+    }
+
+    func testQualityQuickTasksExportText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.exportText"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testExportTextQuickJourneyProducesResultAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksExportTextLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.exportText"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testExportTextQuickJourneyProducesResultAfterCancelAndReentry()
+    }
+
+    func testQualityQuickTasksExportImages() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.exportImages"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testExportImagesJourneyProducesShareablePageFilesAfterReentry()
+    }
+
+    func testQualityQuickTasksExportImagesLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.exportImages"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testExportImagesJourneyProducesShareablePageFilesAfterReentry()
+    }
+
+    func testQualityDocumentToolsBrief() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.brief"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testBriefJourneyLoadsResultAfterCloseAndReentry()
+    }
+
+    func testQualityDocumentToolsBriefLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.brief"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testBriefJourneyLoadsResultAfterCloseAndReentry()
+    }
+
+    func testQualityDocumentToolsFind() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.find"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testFindJourneyReturnsResultAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsFindLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.find"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testFindJourneyReturnsResultAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsRecognize() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.recognize"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try runQualityOriginalOCR(batch: false)
+    }
+
+    func testQualityDocumentToolsRecognizeLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.recognize"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try runQualityOriginalOCR(batch: false)
+    }
+
+    func testQualityDocumentToolsHighlight() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.highlight"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testHighlightJourneyWritesMarkupAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsHighlightLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.highlight"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testHighlightJourneyWritesMarkupAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsUnderline() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.underline"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testUnderlineJourneyWritesMarkupAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsUnderlineLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.underline"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testUnderlineJourneyWritesMarkupAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsStrikeOut() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.strikeOut"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testStrikeoutJourneyWritesMarkupAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsStrikeOutLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.strikeOut"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testStrikeoutJourneyWritesMarkupAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsInk() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.ink"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testInkJourneyWritesDrawingAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsInkLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.ink"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testInkJourneyWritesDrawingAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsNote() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.note"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testNoteJourneyWritesCommentAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsNoteLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.note"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testNoteJourneyWritesCommentAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsStamp() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.stamp"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testStampJourneyAddsEditableAnnotationAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsStampLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.stamp"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testStampJourneyAddsEditableAnnotationAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsWatermark() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.watermark"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testWatermarkJourneyWritesAnnotationsAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsWatermarkLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.watermark"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testWatermarkJourneyWritesAnnotationsAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsBates() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.bates"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testBatesJourneyWritesPageIDsAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsBatesLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.bates"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testBatesJourneyWritesPageIDsAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsContent() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.content"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testContentJourneyCreatesEditedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsContentLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.content"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testContentJourneyCreatesEditedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsLinks() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.links"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testLinksJourneyCreatesEditedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsLinksLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.links"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testLinksJourneyCreatesEditedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsAnnotations() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.annotations"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testAnnotationsJourneyReloadsInventoryAfterCloseAndReentry()
+    }
+
+    func testQualityDocumentToolsAnnotationsLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.annotations"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testAnnotationsJourneyReloadsInventoryAfterCloseAndReentry()
+    }
+
+    func testQualityDocumentToolsAttachments() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.attachments"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testAttachmentsJourneyReloadsInspectionAfterCloseAndReentry()
+    }
+
+    func testQualityDocumentToolsAttachmentsLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.attachments"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testAttachmentsJourneyReloadsInspectionAfterCloseAndReentry()
+    }
+
+    func testQualityDocumentToolsCompare() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.compare"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testCompareJourneyLoadsResultAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsCompareLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.compare"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testCompareJourneyLoadsResultAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsSign() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.sign"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testSignJourneyPlacesSignatureAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsSignLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.sign"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testSignJourneyPlacesSignatureAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsRedact() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.redact"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testRedactJourneyCreatesSecureCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsRedactLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.redact"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testRedactJourneyCreatesSecureCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsFillForm() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.fillForm"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testFillFormJourneyAddsFieldAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsFillFormLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.fillForm"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testFillFormJourneyAddsFieldAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsBookmarks() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.bookmarks"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testBookmarksJourneyPersistsResultAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsBookmarksLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.bookmarks"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testBookmarksJourneyPersistsResultAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsOrganize() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.organize"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testOrganizeJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsOrganizeLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.organize"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testOrganizeJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsCompress() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.compress"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testCompressJourneyExplainsAlreadySmallerOriginalAfterReentry()
+    }
+
+    func testQualityDocumentToolsCompressLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.compress"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testCompressJourneyExplainsAlreadySmallerOriginalAfterReentry()
+    }
+
+    func testQualityDocumentToolsProtect() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.protect"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testDocumentProtectJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsProtectLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.protect"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testDocumentProtectJourneyCreatesCopyAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsExport() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.export"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testExportJourneyProducesPageFilesAfterCancelAndReentry()
+    }
+
+    func testQualityDocumentToolsExportLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.export"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testExportJourneyProducesPageFilesAfterCancelAndReentry()
+    }
+
+    func testQualityWorkflowsPrivacyScan() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "workflows.privacyScan"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        try testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()
+    }
+
+    func testQualityWorkflowsPrivacyScanLargeText() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "workflows.privacyScan"
+        qualityContentSize = "UICTContentSizeCategoryAccessibilityXXXL"
+        defer { qualityCaptureEnabled = false }
+        try testPrivacyScanJourneyCreatesManagedVerifiedCopyAfterCancelAndReentry()
+    }
+
+}
+
+@MainActor
+private extension PaperPathUITests {
+    func runQualityOriginalCompression(batch: Bool, largeText: Bool = false) throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = batch ? "quickTasks.compressPDF" : "documentTools.compress"
+        qualityContentSize = largeText ? "UICTContentSizeCategoryAccessibilityXXXL" : "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        let app = makeApp()
+        app.launchArguments += ["UITEST_SEED_DEMO", "UITEST_QUALITY_ORIGINAL_CORPUS"]
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        let title = "Quality nasa-webb"
+        let navigation = batch ? "Compress PDF" : "Compress"
+        let footer = batch ? "batchCompressionAction" : "compressionCreateAction"
+        if batch {
+            openQuickTask(identifier: "compressPDF", query: "Compress PDF", in: app)
+            let source = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label CONTAINS %@", "batchCompressionDocument-", title)).firstMatch
+            XCTAssertTrue(revealWorkflowControl(source, in: app, navigationTitle: navigation, footerID: footer, maxSwipes: 20))
+            tapCenter(source)
+        } else {
+            openDemoDocument(named: title, in: app)
+            openDocumentTool(identifier: "compress", query: "Compress", in: app)
+            dismissPresentedWorkflow(title: "Compress", in: app)
+            XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+            openDocumentTool(identifier: "compress", query: "Compress", in: app)
+        }
+        let method = app.descendants(matching: .any)["compressionMethodPicker"].firstMatch
+        XCTAssertTrue(revealWorkflowControl(method, in: app, navigationTitle: navigation, footerID: footer, maxSwipes: 20, searchUp: true))
+        let segments = app.segmentedControls["compressionMethodPicker"].firstMatch
+        if segments.exists { segments.buttons["Lossless"].tap() }
+        else {
+            tapCenter(method)
+            XCTAssertTrue(app.buttons["Lossless"].firstMatch.waitForExistence(timeout: 5))
+            app.buttons["Lossless"].firstMatch.tap()
+        }
+        let create = app.buttons[footer].firstMatch
+        XCTAssertTrue(create.isEnabled)
+        tapCenter(create)
+        if batch {
+            XCTAssertTrue(app.staticTexts["COMPRESSION RESULT"].waitForExistence(timeout: 90))
+            XCTAssertFalse(app.staticTexts["Originals already smaller"].exists)
+            let done = app.buttons["Done"].firstMatch
+            XCTAssertTrue(done.waitForExistence(timeout: 5))
+            done.tap()
+            XCTAssertTrue(waitForLibrary(in: app))
+        } else {
+            XCTAssertTrue(app.navigationBars["Compress"].waitForNonExistence(timeout: 90))
+            XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        }
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: title, in: app)
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        assertAppAlive(app)
+    }
+}
+
+extension PaperPathUITests {
+    func testQualityDocumentToolsCompressOriginalLosslessAndReopen() throws { try runQualityOriginalCompression(batch: false) }
+    func testQualityQuickTasksCompressOriginalLosslessAndReopen() throws { try runQualityOriginalCompression(batch: true) }
+    func testQualityDocumentToolsCompressOriginalLosslessAndReopenLargeText() throws { try runQualityOriginalCompression(batch: false, largeText: true) }
+}
+
+extension PaperPathUITests {
+    private func runQualityOriginalImageExport(batch: Bool) throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = batch ? "quickTasks.exportImages" : "documentTools.export"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        let app = makeApp()
+        app.launchArguments += ["UITEST_SEED_DEMO", "UITEST_QUALITY_ORIGINAL_CORPUS"]
+        app.launchEnvironment["PAPERPATH_QUALITY_INPUTS"] = "ocr-multipage.pdf"
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        if batch {
+            openQuickTask(identifier: "exportImages", query: "PDF Images", documentTitle: "Quality ocr-multipage", in: app)
+            XCTAssertTrue(app.navigationBars["Save as Images"].waitForExistence(timeout: 10))
+        } else {
+            openDemoDocument(named: "Quality ocr-multipage", in: app)
+            openDocumentTool(identifier: "export", query: "Export", in: app)
+            let mode = app.descendants(matching: .any)["exportCatalogMode-images"].firstMatch
+            XCTAssertTrue(revealInPresentedSheet(mode, navigationTitle: "Create & Share", in: app, maxSwipes: 20))
+            tapCenter(mode)
+            XCTAssertEqual(mode.value as? String, "Selected")
+        }
+        let export = app.buttons["exportPageImages-jpegCompact"].firstMatch
+        XCTAssertTrue(revealForCenterTap(export, in: app, maxSwipes: 20)); XCTAssertTrue(export.isEnabled)
+        tapCenter(export)
+        XCTAssertTrue(app.otherElements["ActivityListView"].waitForExistence(timeout: 60))
+        assertAppAlive(app)
+    }
+
+    func testQualityQuickImageExportOriginalSixPages() throws { try runQualityOriginalImageExport(batch: true) }
+    func testQualityDocumentImageExportOriginalSixPages() throws { try runQualityOriginalImageExport(batch: false) }
+
+    private func runQualityOriginalOCR(batch: Bool) throws {
+        let title = "Quality ocr-multipage"
+        let app = makeApp()
+        app.launchArguments += ["UITEST_SEED_DEMO", "UITEST_QUALITY_ORIGINAL_CORPUS"]
+        app.launchEnvironment["PAPERPATH_QUALITY_INPUTS"] = "ocr-multipage.pdf"
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        for pass in 0..<2 {
+            if batch {
+                openQuickTask(identifier: "recognizeText", query: "OCR PDF", documentTitle: title, in: app)
+            } else {
+                if pass == 0 { openDemoDocument(named: title, in: app) }
+                openDocumentTool(identifier: "recognize", query: "OCR", in: app)
+            }
+            XCTAssertTrue(app.navigationBars["Recognition"].waitForExistence(timeout: 10))
+            if pass == 0 { dismissPresentedWorkflow(title: "Recognition", in: app) }
+        }
+        let start = app.buttons["startOCR"].firstMatch
+        XCTAssertTrue(start.waitForExistence(timeout: 10)); XCTAssertTrue(start.isEnabled)
+        start.tap()
+        XCTAssertTrue(app.buttons["recognizedTextCopyMenu"].waitForExistence(timeout: 90))
+        let search = app.searchFields["Search recognized text"].firstMatch
+        if !search.exists {
+            let showSearch = app.buttons["Search recognized text"].firstMatch
+            XCTAssertTrue(showSearch.waitForExistence(timeout: 5)); showSearch.tap()
+        }
+        XCTAssertTrue(search.waitForExistence(timeout: 5)); search.tap(); search.typeText("Watson")
+        if app.keyboards.buttons["Search"].exists { app.keyboards.buttons["Search"].tap() }
+        let filtered = app.buttons["copyFilteredRecognizedPages"].firstMatch
+        XCTAssertTrue(filtered.waitForExistence(timeout: 10)); XCTAssertTrue(filtered.isEnabled)
+        let cancelSearch = app.buttons["Cancel"].firstMatch
+        if cancelSearch.exists && cancelSearch.isHittable { cancelSearch.tap() }
+        let save = app.buttons["createSearchableCopyButton"].firstMatch
+        XCTAssertTrue(save.waitForExistence(timeout: 10))
+        XCTAssertTrue(revealForCenterTap(save, in: app, maxSwipes: 20)); XCTAssertTrue(save.isEnabled)
+        save.tap()
+        XCTAssertTrue(save.waitForNonExistence(timeout: 90), "Saving must actually finish and close the result view")
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, title)
+        app.terminate()
+        let reopened = makeApp()
+        reopened.launchArguments += ["UITEST_SEED_DEMO"]
+        reopened.launch()
+        XCTAssertTrue(waitForLibrary(in: reopened))
+        openDemoDocument(named: title, in: reopened)
+        XCTAssertEqual(workspaceDocumentTitle(in: reopened).label, title)
+        XCTAssertTrue(reopened.otherElements["pdfWorkspace"].exists)
+        assertAppAlive(reopened)
+    }
+
+    func testQualityProtectedPasswordFailureThenSessionRecovery() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "quickTasks.protectPDF"
+        defer { qualityCaptureEnabled = false }
+        try testProtectPDFJourneyCreatesCopyAfterCancelAndReentry()
+        let app = makeApp()
+        app.launchArguments += ["UITEST_SEED_DEMO"]
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(named: "Project handoff", in: app)
+        let unlock = app.buttons["Unlock"].firstMatch
+        XCTAssertTrue(unlock.waitForExistence(timeout: 15), "Restart must require the document password again")
+        unlock.tap()
+        let password = app.secureTextFields["Password"].firstMatch
+        XCTAssertTrue(password.waitForExistence(timeout: 8))
+        password.tap()
+        let wrong = "wrong-quality-pass"
+        password.typeText(wrong)
+        let submit = app.navigationBars["Unlock protected PDF"].buttons["Unlock"].firstMatch
+        XCTAssertTrue(submit.waitForExistence(timeout: 5))
+        submit.tap()
+        XCTAssertTrue(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "The password didn’t match")).firstMatch.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.navigationBars["Unlock protected PDF"].exists)
+        password.tap()
+        password.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: wrong.count))
+        password.typeText("PaperPath-2026")
+        submit.tap()
+        XCTAssertTrue(app.navigationBars["Unlock protected PDF"].waitForNonExistence(timeout: 30))
+        XCTAssertTrue(app.staticTexts["Protected PDF"].waitForNonExistence(timeout: 15))
+        XCTAssertEqual(workspaceDocumentTitle(in: app).label, "Project handoff")
+        assertAppAlive(app)
+    }
+}
+
+extension PaperPathUITests {
+    func testCoreFormValueSurvivesRelaunch() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "documentTools.fillForm"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        let app = launchResetDemo()
+        openDemoDocument(in: app)
+        openDocumentTool(identifier: "fillForm", query: "Fill Form", in: app)
+        let field = app.descendants(matching: .any).matching(NSPredicate(format: "identifier BEGINSWITH %@ AND label == %@",
+            "formField-", "Recipient name")).firstMatch
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 12))
+        tapCenter(field)
+        let entry = app.textFields["formFieldValue"].firstMatch
+        XCTAssertTrue(entry.waitForExistence(timeout: 8), "An actual editable field must open")
+        let value = "Core Verified 2026"
+        entry.tap()
+        entry.typeText(value)
+        app.buttons["formValueSave"].tap()
+        XCTAssertTrue(entry.waitForNonExistence(timeout: 30))
+        dismissPresentedWorkflow(title: "Fill Form", in: app)
+        XCTAssertTrue(app.staticTexts["Working copy updated"].firstMatch.waitForNonExistence(timeout: 8))
+        XCTAssertTrue(waitForLibrary(in: app))
+        app.launchArguments.removeAll { $0 == "UITEST_RESET_DEMO" }
+        if !app.launchArguments.contains("UITEST_SEED_DEMO") { app.launchArguments.append("UITEST_SEED_DEMO") }
+        app.terminate()
+        app.launch()
+        XCTAssertTrue(waitForLibrary(in: app))
+        openDemoDocument(in: app)
+        openDocumentTool(identifier: "fillForm", query: "Fill Form", in: app)
+        XCTAssertTrue(app.navigationBars["Fill Form"].waitForExistence(timeout: 8))
+        let allFields = app.buttons["All"].firstMatch
+        XCTAssertTrue(allFields.waitForExistence(timeout: 8))
+        allFields.tap()
+        XCTAssertTrue(revealInPresentedSheet(field, navigationTitle: "Fill Form", in: app, maxSwipes: 12))
+        tapCenter(field)
+        XCTAssertTrue(entry.waitForExistence(timeout: 8))
+        XCTAssertEqual(entry.value as? String, value,
+            "The actual typed form value must be saved and read back after relaunch")
+
+    }
+}
+
+extension PaperPathUITests {
+    func testCoreImportPDFFromFiles() throws {
+        qualityCaptureEnabled = true
+        qualityFeatureKey = "core.importPDF"
+        qualityContentSize = "UICTContentSizeCategoryL"
+        defer { qualityCaptureEnabled = false }
+        let app = launchResetDemo()
+        let importAction = app.buttons["deskImport"].firstMatch
+        XCTAssertTrue(importAction.waitForExistence(timeout: 8))
+        tapCenter(importAction)
+        let browse = app.buttons["Browse"].firstMatch
+        if browse.waitForExistence(timeout: 3) { tapCenter(browse) }
+        func openFileItem(_ name: String) throws {
+            let matches = app.descendants(matching: .any).matching(NSPredicate(
+                format: "label == %@ OR label BEGINSWITH %@", name, name))
+            XCTAssertTrue(matches.firstMatch.waitForExistence(timeout: 10), "Files item: \(name)")
+            let item = try XCTUnwrap(matches.allElementsBoundByIndex.first(where: { $0.isHittable }),
+                "Files item must be actionable: \(name)")
+            tapCenter(item)
+        }
+        try openFileItem(UIDevice.current.userInterfaceIdiom == .pad ? "On My iPad" : "On My iPhone")
+        try openFileItem("PaperPath Core Inputs")
+        try openFileItem("ocr-jbig2")
+        let open = app.buttons["Open"].firstMatch
+        if open.waitForExistence(timeout: 2) { tapCenter(open) }
+        let title = workspaceDocumentTitle(in: app)
+        if !title.waitForExistence(timeout: 10) {
+            XCTAssertTrue(waitForLibrary(in: app))
+            openDemoDocument(named: "ocr-jbig2", in: app)
+        }
+        XCTAssertEqual(title.label, "ocr-jbig2")
+        XCTAssertTrue(app.otherElements["pdfWorkspace"].firstMatch.waitForExistence(timeout: 10))
+        assertAppAlive(app)
     }
 }

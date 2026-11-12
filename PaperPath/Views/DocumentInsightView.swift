@@ -55,7 +55,7 @@ struct DocumentInsightView: View {
                 ),
                 WorkflowMetric(
                     value: record.profile.formattedSize,
-                    label: "Private copy",
+                    label: "Current document",
                     symbol: "internaldrive",
                     tint: PPColor.cyan
                 ),
@@ -1481,6 +1481,13 @@ struct PDFVersionHistoryView: View {
                                     )
                                 )
                             }
+                            if versions.contains(where: { $0.compactHistoryEnabled == true })
+                                || PDFHistoryStoragePolicy.usesCompactHistory(byteCount: record.profile.byteCount) {
+                                Text("Large PDF: the starting version and latest saved result are kept. Automatic step history is off; explicit pinned milestones may also remain.")
+                                    .font(.footnote)
+                                    .foregroundStyle(PPColor.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                             history(record)
                         }
                         .frame(maxWidth: 880)
@@ -1703,7 +1710,7 @@ struct PDFVersionHistoryView: View {
                 }
             } message: {
                 Text(
-                    "Saves the current copy first. The Files original stays unchanged."
+                    "Saves the current version in History first. The original file in Files stays unchanged."
                 )
             }
             .interactiveDismissDisabled(
@@ -1893,7 +1900,6 @@ struct PDFVersionHistoryView: View {
         WorkflowCommandHeader(
             eyebrow: "LOCAL RECOVERY",
             title: record.displayName,
-            detail: "Protected versions are saved before the working copy changes.",
             symbol: "clock.arrow.circlepath",
             tint: PPColor.mint,
             metrics: [
@@ -1986,7 +1992,7 @@ struct PDFVersionHistoryView: View {
             SectionEyebrow(text: "CURRENT VERSION")
             layout {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Working copy".localizedUI)
+                    Text("Document".localizedUI)
                         .font(.headline)
                         .foregroundStyle(PPColor.textPrimary)
                     Text(
@@ -2162,7 +2168,7 @@ struct PDFVersionHistoryView: View {
                     revisionArrow
                     revisionPreview(
                         label: "CURRENT",
-                        title: "Working copy",
+                        title: "Document",
                         url: model.url(for: recordID),
                         pageCount: current.profile.pageCount,
                         size: current.profile.formattedSize,
@@ -2186,7 +2192,7 @@ struct PDFVersionHistoryView: View {
                     )
                     revisionPreview(
                         label: "CURRENT",
-                        title: "Working copy",
+                        title: "Document",
                         url: model.url(for: recordID),
                         pageCount: current.profile.pageCount,
                         size: current.profile.formattedSize,
@@ -2408,7 +2414,7 @@ struct PDFVersionHistoryView: View {
         )
         .accessibilityHint(
             versionActionHint(
-                "Saves the current copy first, then restores this version."
+                "Saves the current version in History first, then restores this version."
             )
         )
     }
@@ -2543,7 +2549,7 @@ struct PDFVersionHistoryView: View {
                     "No recovery versions yet",
                     systemImage: "clock.arrow.circlepath",
                     description: Text(
-                        "A protected version appears here before the working copy changes."
+                        "Earlier versions appear here when you save changes to this document."
                     )
                 )
                 .frame(maxWidth: .infinity)
@@ -2736,7 +2742,7 @@ struct PDFVersionHistoryView: View {
                     inspect(version)
                 } label: {
                     Label(
-                        "Compare with working copy".localizedUI,
+                        "Compare with current document".localizedUI,
                         systemImage: "doc.text.magnifyingglass"
                     )
                 }
@@ -2804,7 +2810,7 @@ struct PDFVersionHistoryView: View {
             .foregroundStyle(PPColor.cyan)
             .disabled(hasBlockingVersionTask)
             .accessibilityLabel(
-                "Compare this version with the working copy"
+                "Compare this version with the current document"
                     .localizedUI
             )
             .accessibilityHint(
@@ -2832,7 +2838,7 @@ struct PDFVersionHistoryView: View {
             .help("Restore this version")
             .accessibilityHint(
                 versionActionHint(
-                    "Saves the current copy first, then restores this version."
+                    "Saves the current version in History first, then restores this version."
                 )
             )
         }

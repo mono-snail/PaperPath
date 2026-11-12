@@ -60,6 +60,8 @@ struct DocumentToolPalette: View {
                             if !hasSearchQuery {
                                 paletteHero
                                 paletteViewPicker
+                            } else if !filteredTools.isEmpty {
+                                toolSearchSummary
                             }
 
                             switch effectivePaletteView {
@@ -67,6 +69,7 @@ struct DocumentToolPalette: View {
                                 if !favoriteTools.isEmpty {
                                     favoriteToolSection
                                 }
+
                                 if !recommendedMoves.isEmpty {
                                     recommendedMoveSection
                                 }
@@ -113,9 +116,6 @@ struct DocumentToolPalette: View {
                                 emptyToolsState
                             }
 
-                            if hasSearchQuery {
-                                toolSearchSummary
-                            }
                         }
                         .frame(
                             maxWidth: horizontalSizeClass == .regular
@@ -195,12 +195,12 @@ struct DocumentToolPalette: View {
         .padding(.trailing, PPSpacing.xSmall)
         .frame(minHeight: 50)
         .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(PPColor.surface)
+            RoundedRectangle(cornerRadius: PPRadius.control, style: .continuous)
+                .fill(PPColor.surfaceMuted)
         )
         .overlay {
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(PPColor.border.opacity(0.72), lineWidth: 1)
+            RoundedRectangle(cornerRadius: PPRadius.control, style: .continuous)
+                .stroke(isToolSearchFocused ? PPColor.accent : PPColor.border.opacity(0.45), lineWidth: 1)
         }
     }
 
@@ -282,12 +282,15 @@ struct DocumentToolPalette: View {
     private var recommendedMoveSection: some View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             SectionEyebrow(text: "SUGGESTED ACTIONS")
+            if let primary = recommendedMoves.first {
+                recommendedMoveRow(primary, isPrimary: true)
+            }
             LazyVGrid(
                 columns: toolColumns,
                 alignment: .leading,
                 spacing: 0
             ) {
-                ForEach(recommendedMoves) { tool in
+                ForEach(Array(recommendedMoves.dropFirst())) { tool in
                     recommendedMoveRow(tool)
                 }
             }
@@ -302,30 +305,23 @@ struct DocumentToolPalette: View {
     }
 
     private func recommendedMoveRow(
-        _ tool: DocumentTool
+        _ tool: DocumentTool,
+        isPrimary: Bool = false
     ) -> some View {
         Button {
             choose(tool)
         } label: {
             HStack(spacing: PPSpacing.small) {
-                ToolSymbolPlate(
-                    symbol: tool.symbol,
-                    tint: tint(for: tool),
-                    size: 36
-                )
+                paletteSymbol(tool.symbol, tint: isPrimary ? PPColor.accent : tint(for: tool))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(tool.title.localizedUI)
+                    Text(tool.catalogTitle.localizedUI)
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                         .lineLimit(
-                            dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                            dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2
                         )
-                    Text(recommendedMoveDetail(tool).localizedUI)
-                        .font(.caption2)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(
-                            dynamicTypeSize.ppPrefersExpandedLayout ? 3 : 1
-                        )
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "arrow.right")
@@ -336,13 +332,16 @@ struct DocumentToolPalette: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .frame(
                 minHeight:
-                    dynamicTypeSize.ppPrefersExpandedLayout ? 68 : 48
+                    dynamicTypeSize.ppPrefersExpandedLayout ? 68 : (isPrimary ? 56 : 48)
             )
+            .padding(.vertical, dynamicTypeSize.ppPrefersExpandedLayout ? PPSpacing.small : 0)
+            .background(isPrimary ? PPColor.accent.opacity(0.08) : .clear, in: RoundedRectangle(cornerRadius: PPRadius.control))
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PPPressButtonStyle())
         .disabled(isCommittingSelection)
-        .accessibilityHint(tool.detail.localizedUI)
+        .hoverEffect(.highlight)
+        .accessibilityHint(recommendedMoveDetail(tool).localizedUI)
         .accessibilityIdentifier("documentTool-\(tool.rawValue)")
         .contextMenu {
             Button {
@@ -355,38 +354,19 @@ struct DocumentToolPalette: View {
 
     private var paletteHero: some View {
         HStack(alignment: .center, spacing: PPSpacing.small) {
-            ToolSymbolPlate(
-                symbol: searchText.isEmpty
-                    ? "doc.text"
-                    : "magnifyingglass",
-                tint: searchText.isEmpty
-                    ? PPColor.cyan
-                    : PPColor.rose,
-                size: 36
-            )
+            paletteSymbol("doc.text", tint: PPColor.textSecondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(recordTitle)
-                    .font(.subheadline.weight(.semibold))
+                    .font(PPType.display)
                     .foregroundStyle(PPColor.textPrimary)
                     .lineLimit(
-                        dynamicTypeSize.ppPrefersExpandedLayout ? 2 : 1
+                        dynamicTypeSize.ppPrefersExpandedLayout ? nil : 2
                     )
-                Text(
-                    searchText.isEmpty
-                        ? suggestedSummary
-                        : AppLocalization.format(
-                            "%lld matching tool%@",
-                            filteredTools.count,
-                            filteredTools.count == 1 ? "" : "s"
-                        )
-                )
-                .font(.caption)
-                .foregroundStyle(PPColor.textSecondary)
-                .lineLimit(1)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
         }
-        .padding(.vertical, PPSpacing.xSmall)
+        .padding(.vertical, PPSpacing.small)
         .overlay(alignment: .bottom) {
             Rectangle()
                 .fill(PPColor.border.opacity(0.62))
@@ -399,22 +379,10 @@ struct DocumentToolPalette: View {
             SectionEyebrow(
                 text: "RECENT TOOLS"
             )
-            if dynamicTypeSize.ppPrefersExpandedLayout {
-                VStack(spacing: 0) {
-                    ForEach(quickTools) { tool in
-                        toolRow(tool)
-                    }
+            LazyVGrid(columns: toolColumns, alignment: .leading, spacing: 0) {
+                ForEach(quickTools) { tool in
+                    toolRow(tool)
                 }
-            } else {
-                ScrollView(.horizontal) {
-                    HStack(spacing: PPSpacing.large) {
-                        ForEach(quickTools) { tool in
-                            quickMoveButton(tool)
-                        }
-                    }
-                    .padding(.horizontal, 2)
-                }
-                .scrollIndicators(.hidden)
             }
         }
         .overlay(alignment: .bottom) {
@@ -435,6 +403,7 @@ struct DocumentToolPalette: View {
                 .frame(height: 0.6)
         }
         .accessibilityElement(children: .combine)
+        .accessibilityHint(toolSearchSummaryDetail)
         .accessibilityIdentifier("documentToolSearchSummary")
     }
 
@@ -444,10 +413,6 @@ struct DocumentToolPalette: View {
                 Text(toolSearchSummaryTitle)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(PPColor.textPrimary)
-                Text(toolSearchSummaryDetail)
-                    .font(.caption2)
-                    .foregroundStyle(PPColor.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
             }
         } icon: {
             Image(
@@ -466,7 +431,7 @@ struct DocumentToolPalette: View {
     private func clearToolSearch() {
         searchText = ""
         showsUnavailableTools = false
-        isToolSearchFocused = false
+        isToolSearchFocused = true
     }
 
     private var favoriteToolSection: some View {
@@ -496,70 +461,6 @@ struct DocumentToolPalette: View {
                 .frame(height: 0.6)
         }
         .accessibilityIdentifier("favoriteDocumentTools")
-    }
-
-    private func quickMoveButton(
-        _ tool: DocumentTool
-    ) -> some View {
-        ZStack(alignment: .topTrailing) {
-            Button {
-                choose(tool)
-            } label: {
-                VStack(spacing: 7) {
-                    ToolSymbolPlate(
-                        symbol: tool.symbol,
-                        tint: tint(for: tool),
-                        size: 46
-                    )
-                    Text(tool.compactTitle.localizedUI)
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(PPColor.textPrimary)
-                        .lineLimit(1)
-                }
-                .frame(width: 76)
-                .frame(minHeight: 76)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(isCommittingSelection)
-            .accessibilityHint(tool.detail.localizedUI)
-            .accessibilityIdentifier("documentTool-\(tool.rawValue)")
-
-            Button {
-                toggleFavorite(tool)
-            } label: {
-                Image(
-                    systemName: favoriteTools.contains(tool)
-                        ? "star.fill"
-                        : "star"
-                )
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(
-                    favoriteTools.contains(tool)
-                        ? PPColor.amber
-                        : PPColor.textSecondary
-                )
-                .frame(width: 30, height: 30)
-                .background(.thinMaterial, in: Circle())
-                .frame(width: 44, height: 44)
-                .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .disabled(isCommittingSelection)
-            .offset(x: 9, y: -8)
-            .accessibilityLabel(
-                favoriteTools.contains(tool)
-                    ? AppLocalization.format(
-                        "Remove %@ from favorites",
-                        tool.title.localizedUI
-                    )
-                    : AppLocalization.format(
-                        "Add %@ to favorites",
-                        tool.title.localizedUI
-                    )
-            )
-        }
-        .frame(width: 82, height: 82)
     }
 
     private func toolGroupCard(
@@ -610,8 +511,10 @@ struct DocumentToolPalette: View {
             } label: {
                 Label {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(tool.title.localizedUI)
+                        Text(tool.catalogTitle.localizedUI)
                             .font(PPType.document)
+                            .multilineTextAlignment(.leading)
+                            .fixedSize(horizontal: false, vertical: true)
                             .foregroundStyle(
                                 isAvailable
                                     ? PPColor.textPrimary
@@ -624,28 +527,21 @@ struct DocumentToolPalette: View {
                             )
                             .font(.caption)
                             .foregroundStyle(PPColor.amber)
-                        } else {
-                            Text(tool.detail.localizedUI)
-                                .font(.caption)
-                                .foregroundStyle(PPColor.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
                         }
                     }
                 } icon: {
-                    ToolSymbolPlate(
-                        symbol: tool.symbol,
-                        tint: isAvailable
-                            ? tint(for: tool)
-                            : PPColor.textSecondary,
-                        size: 38
-                    )
+                    paletteSymbol(tool.symbol, tint: isAvailable ? tint(for: tool) : PPColor.textSecondary)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.leading, PPSpacing.small)
                 .padding(.vertical, 5)
+                .frame(minHeight: PPDeskLayout.touchTarget)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(PPPressButtonStyle())
             .disabled(!isAvailable || isCommittingSelection)
+            .hoverEffect(.highlight)
             .accessibilityHint(
                 unavailableReason?.localizedUI
                     ?? AppLocalization.format(
@@ -668,12 +564,14 @@ struct DocumentToolPalette: View {
                         ? PPColor.amber
                         : PPColor.textSecondary
                 )
+                .font(.subheadline.weight(.medium))
                 .frame(width: 48, height: 48)
                 .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .disabled(!isAvailable || isCommittingSelection)
-            .opacity(isAvailable ? 1 : 0.35)
+            .buttonStyle(PPPressButtonStyle())
+            .disabled(isCommittingSelection || (!isAvailable && !favoriteTools.contains(tool)))
+            .hoverEffect(.highlight)
+            .opacity(isAvailable || favoriteTools.contains(tool) ? 1 : 0.35)
             .accessibilityLabel(
                 favoriteTools.contains(tool)
                     ? AppLocalization.format(
@@ -685,6 +583,7 @@ struct DocumentToolPalette: View {
                         tool.title.localizedUI
                     )
             )
+            .accessibilityIdentifier("documentToolFavorite-\(tool.rawValue)")
         }
         .overlay(alignment: .bottom) {
             Rectangle()
@@ -694,34 +593,34 @@ struct DocumentToolPalette: View {
         }
     }
 
+    private func paletteSymbol(_ symbol: String, tint: Color) -> some View {
+        Image(systemName: symbol)
+            .font(.system(size: 20, weight: .regular))
+            .symbolRenderingMode(.hierarchical)
+            .foregroundStyle(tint)
+            .frame(width: 36, height: 36)
+            .accessibilityHidden(true)
+    }
+
     private var emptyToolsState: some View {
         HStack(spacing: PPSpacing.medium) {
-            PPIllustration(kind: .search, width: 92)
-                .frame(width: 88, height: 72)
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                PPIllustration(kind: .search, width: 92)
+                    .frame(width: 88, height: 72)
+                    .accessibilityHidden(true)
+            }
             VStack(alignment: .leading, spacing: 3) {
                 Text("No matching tools")
                     .font(.headline)
                     .foregroundStyle(PPColor.textPrimary)
-                Text("Try sign, redact, compress, or pages.")
-                    .font(.caption)
-                    .foregroundStyle(PPColor.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 0)
-            if hasSearchQuery {
-                Button {
-                    searchText = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .frame(width: 44, height: 44)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(PPColor.textSecondary)
-                .accessibilityLabel("Clear tool search")
-                .help("Clear tool search")
-            }
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, PPSpacing.small)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("documentToolEmptyState")
     }
 
     private var emptyFavoritesState: some View {
@@ -766,12 +665,6 @@ struct DocumentToolPalette: View {
                     .font(.headline)
                     .fontDesign(.serif)
                     .foregroundStyle(PPColor.textPrimary)
-                Text(
-                    "Browse every action available for this PDF."
-                        .localizedUI
-                )
-                .font(.caption)
-                .foregroundStyle(PPColor.textSecondary)
             }
             Spacer(minLength: 0)
             Button {
@@ -861,27 +754,6 @@ struct DocumentToolPalette: View {
         return Array(result.prefix(6))
     }
 
-    private var suggestedSummary: String {
-        let suggestedCount = recommendedMoves.count
-        let shortcutCount = quickTools.count
-        if suggestedCount == 0 {
-            return "Browse available actions".localizedUI
-        }
-        if shortcutCount == 0 {
-            return AppLocalization.format(
-                "%lld next move%@",
-                suggestedCount,
-                suggestedCount == 1 ? "" : "s"
-            )
-        }
-        return AppLocalization.format(
-            "%lld suggested · %lld shortcut%@",
-            suggestedCount,
-            shortcutCount,
-            shortcutCount == 1 ? "" : "s"
-        )
-    }
-
     private var favoriteTools: [DocumentTool] {
         var result: [DocumentTool] = []
         for value in savedFavoriteTools.split(separator: ",") {
@@ -962,37 +834,21 @@ struct DocumentToolPalette: View {
 
     private var unavailableToolSection: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button {
-                guard !hasSearchQuery else { return }
-                withAnimation(
-                    reduceMotion ? nil : .snappy(duration: 0.2)
-                ) {
-                    showsUnavailableTools.toggle()
+            if hasSearchQuery {
+                unavailableSectionHeading
+            } else {
+                Button {
+                    withAnimation(
+                        reduceMotion ? nil : .snappy(duration: 0.2)
+                    ) {
+                        showsUnavailableTools.toggle()
+                    }
+                } label: {
+                    unavailableSectionHeading
                 }
-            } label: {
-                HStack {
-                    Label(
-                        "Unavailable for this PDF",
-                        systemImage: "circle.slash"
-                    )
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(PPColor.textSecondary)
-                    Spacer()
-                    Text("\(unavailableTools.count)")
-                        .monospacedDigit()
-                    Image(
-                        systemName:
-                            showsUnavailableTools || hasSearchQuery
-                            ? "chevron.up"
-                            : "chevron.down"
-                    )
-                }
-                .font(.caption)
-                .foregroundStyle(PPColor.textSecondary)
-                .frame(minHeight: 44)
-                .contentShape(Rectangle())
+                .buttonStyle(PPPressButtonStyle())
+                .accessibilityValue((showsUnavailableTools ? "Expanded" : "Collapsed").localizedUI)
             }
-            .buttonStyle(.plain)
 
             if showsUnavailableTools || hasSearchQuery {
                 LazyVGrid(
@@ -1011,6 +867,24 @@ struct DocumentToolPalette: View {
                 .fill(PPColor.border.opacity(0.62))
                 .frame(height: 0.6)
         }
+    }
+
+    private var unavailableSectionHeading: some View {
+        HStack {
+            Label("Unavailable for this PDF".localizedUI, systemImage: "circle.slash")
+                .font(.caption.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: PPSpacing.small)
+            Text("\(unavailableTools.count)").monospacedDigit()
+            if !hasSearchQuery {
+                Image(systemName: showsUnavailableTools ? "chevron.up" : "chevron.down")
+                    .accessibilityHidden(true)
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(PPColor.textSecondary)
+        .frame(minHeight: PPDeskLayout.touchTarget)
+        .contentShape(Rectangle())
     }
 
     private func choose(_ tool: DocumentTool) {

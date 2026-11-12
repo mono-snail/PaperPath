@@ -267,8 +267,9 @@ struct PageOrganizerView: View {
             ))
         }
         .onChange(of: pageJumpText) { _, value in
-            let digits = value.filter(\.isNumber)
-            let bounded = String(digits.prefix(6))
+            // Keep invalid pasted text visible so it cannot silently become
+            // a different page number. The shared parser validates the input.
+            let bounded = String(value.prefix(64))
             if bounded != value {
                 pageJumpText = bounded
             }
@@ -672,10 +673,10 @@ struct PageOrganizerView: View {
     }
 
     private var validJumpPage: Int? {
-        guard let page = Int(pageJumpText.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let count = model.record(id: recordID)?.profile.pageCount,
-              page > 0, page <= count else { return nil }
-        return page - 1
+        PDFPageNumberInput.pageIndex(
+            pageJumpText,
+            pageCount: model.record(id: recordID)?.profile.pageCount ?? 0
+        )
     }
 
     private func revealInitialSelection(
@@ -1980,7 +1981,7 @@ struct PageOrganizerView: View {
                 model[noticeFor: paperPathSceneID] = (
                     created == nil
                         ? "Page extraction stopped"
-                        : "Copy finished before stopping · copy kept in Library"
+                        : "Document saved before stopping"
                 ).localizedUI
                 return
             }
@@ -2758,7 +2759,6 @@ private struct PageReplacementSheet: View {
             VStack(alignment: .leading, spacing: PPSpacing.small) {
                 StudioSectionRule(
                     title: "REPLACEMENT PREVIEW",
-                    detail: "Current page → selected source",
                     symbol: "rectangle.split.2x1",
                     tint: PPColor.rose
                 )
@@ -2899,7 +2899,6 @@ private struct PageReplacementSheet: View {
             VStack(alignment: .leading, spacing: PPSpacing.small) {
                 StudioSectionRule(
                     title: "SOURCE PAGE",
-                    detail: "Preview before replacing",
                     symbol: "rectangle.stack",
                     count: effectivePageCount,
                     tint: PPColor.mint
@@ -3965,9 +3964,7 @@ private struct PageRuleWorkbench: View {
 
     private var ruleHeader: some View {
         WorkflowCommandHeader(
-            eyebrow: "DETERMINISTIC RULES",
             title: "Select and arrange pages",
-            detail: "Review every match before selection. Reordering keeps all pages.",
             symbol: "line.3.horizontal.decrease",
             tint: PPColor.mint,
             metrics: [
@@ -4184,7 +4181,6 @@ private struct PageRuleWorkbench: View {
         VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "ARRANGE",
-                detail: "Whole-document recoverable operations",
                 symbol: "arrow.up.arrow.down",
                 tint: PPColor.amber
             )
@@ -4676,10 +4672,7 @@ private struct PagePreparationView: View {
 
     private var preparationHeader: some View {
         WorkflowCommandHeader(
-            eyebrow: "PAGE PREPARATION",
             title: "Review detected margins",
-            detail:
-                "Local page evidence stays visible before one recoverable batch update.",
             symbol: "rectangle.inset.filled",
             tint: PPColor.cyan,
             metrics: [
@@ -5372,7 +5365,7 @@ private struct PageCropEditorView: View {
                 guard let url = model.url(for: recordID) else {
                     isLoadingPreview = false
                     previewErrorMessage =
-                        "The working copy is unavailable.".localizedUI
+                        "The document is unavailable.".localizedUI
                     return
                 }
                 let revision = model.refreshToken(for: recordID)
@@ -5428,12 +5421,10 @@ private struct PageCropEditorView: View {
 
     private var cropContextHeader: some View {
         WorkflowCommandHeader(
-            eyebrow: "PAGE GEOMETRY",
             title: AppLocalization.format(
                 "Crop page %lld",
                 pageIndex + 1
             ),
-            detail: "Adjust the visible crop box in this private working copy.",
             symbol: "crop",
             tint: PPColor.cyan,
             metrics: [

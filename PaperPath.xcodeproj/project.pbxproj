@@ -7,6 +7,22 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AADD11070000000000000002 /* ShareCheckStartView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11070000000000000001 /* ShareCheckStartView.swift */; };
+		AADD11060000000000000402 /* PDFAssistantView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11060000000000000401 /* PDFAssistantView.swift */; };
+		AADD11060000000000000302 /* PDFAssistantExecutor.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11060000000000000301 /* PDFAssistantExecutor.swift */; };
+		AADD11060000000000000202 /* PDFAssistantService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11060000000000000201 /* PDFAssistantService.swift */; };
+		AADD11060000000000000102 /* PDFAssistantModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11060000000000000101 /* PDFAssistantModels.swift */; };
+		AADD11050000000000000004 /* HandoffKeyDetailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11050000000000000003 /* HandoffKeyDetailsView.swift */; };
+		AADD11050000000000000002 /* HandoffKeyDetailService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11050000000000000001 /* HandoffKeyDetailService.swift */; };
+		AADD1104000000000000000A /* HandoffWorkflowUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11040000000000000009 /* HandoffWorkflowUITests.swift */; };
+		AADD11040000000000000008 /* HandoffWorkflowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11040000000000000007 /* HandoffWorkflowTests.swift */; };
+		AADD11040000000000000006 /* HandoffWorkspaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11040000000000000005 /* HandoffWorkspaceView.swift */; };
+		AADD11040000000000000004 /* HandoffArchiveService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11040000000000000003 /* HandoffArchiveService.swift */; };
+		AADD11040000000000000002 /* HandoffModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = AADD11040000000000000001 /* HandoffModels.swift */; };
+		F02610280000000000000003 /* RealPDFCorpus in Resources */ = {isa = PBXBuildFile; fileRef = F02610280000000000000002 /* RealPDFCorpus */; };
+		F02610280000000000000001 /* RealPDFCorpus in Resources */ = {isa = PBXBuildFile; fileRef = F02610280000000000000002 /* RealPDFCorpus */; };
+		AAAC00000000000000000002 /* SupportView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAC00000000000000000001 /* SupportView.swift */; };
+		AAAB00000000000000000002 /* SupportService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAAB00000000000000000001 /* SupportService.swift */; };
 		00C7507E75BF3ED2F1120FCC /* Localizable.strings in Resources */ = {isa = PBXBuildFile; fileRef = 5E0C53571186F83297FA896B /* Localizable.strings */; };
 		0146D9A135060A234A4248EF /* PDFFormInspectionService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6061F3EA8A1F1E60865AAAC7 /* PDFFormInspectionService.swift */; };
 		08E1123B5FE6F42AE597A6AE /* DemoPDFBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76046A9D59A11DFA597D93C8 /* DemoPDFBuilder.swift */; };
@@ -66,7 +82,6 @@
 		C93177A87B56BEE4CB66BF36 /* BatchBatesNumberingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D2F4829B9A70AB9A1B45F841 /* BatchBatesNumberingView.swift */; };
 		CC171F08B98FAD5A35F2728C /* PageOrganizerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4B3465201F2B01CD71FA7A8F /* PageOrganizerView.swift */; };
 		D0168F446CDED9AE0E875397 /* DocumentScannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0D223FBDA7680C9428ADFF2 /* DocumentScannerView.swift */; };
-		D0B70132230E12E828756F14 /* PaperPath.storekit in Resources */ = {isa = PBXBuildFile; fileRef = 872A63DBE557DBDC52AD3F8F /* PaperPath.storekit */; };
 		D330EA9C6814365F1167807E /* AppExperience.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01777B35F33E73E58C2236FA /* AppExperience.swift */; };
 		D860BB8CDE9231BCB751908D /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7BC29C82D1B4B35609270677 /* LibraryView.swift */; };
 		D904AD87F2708C8EEE950E5D /* DocumentBriefView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D438B849901F625919485649 /* DocumentBriefView.swift */; };
@@ -120,6 +135,21 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AADD11070000000000000001 /* ShareCheckStartView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShareCheckStartView.swift; sourceTree = "<group>"; };
+		AADD11060000000000000401 /* PDFAssistantView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFAssistantView.swift; sourceTree = "<group>"; };
+		AADD11060000000000000301 /* PDFAssistantExecutor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFAssistantExecutor.swift; sourceTree = "<group>"; };
+		AADD11060000000000000201 /* PDFAssistantService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFAssistantService.swift; sourceTree = "<group>"; };
+		AADD11060000000000000101 /* PDFAssistantModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFAssistantModels.swift; sourceTree = "<group>"; };
+		AADD11050000000000000003 /* HandoffKeyDetailsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffKeyDetailsView.swift; sourceTree = "<group>"; };
+		AADD11050000000000000001 /* HandoffKeyDetailService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffKeyDetailService.swift; sourceTree = "<group>"; };
+		AADD11040000000000000009 /* HandoffWorkflowUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffWorkflowUITests.swift; sourceTree = "<group>"; };
+		AADD11040000000000000007 /* HandoffWorkflowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffWorkflowTests.swift; sourceTree = "<group>"; };
+		AADD11040000000000000005 /* HandoffWorkspaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffWorkspaceView.swift; sourceTree = "<group>"; };
+		AADD11040000000000000003 /* HandoffArchiveService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffArchiveService.swift; sourceTree = "<group>"; };
+		AADD11040000000000000001 /* HandoffModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HandoffModels.swift; sourceTree = "<group>"; };
+		F02610280000000000000002 /* RealPDFCorpus */ = {isa = PBXFileReference; lastKnownFileType = folder; name = RealPDFCorpus; path = PaperPathTests/Fixtures/RealPDFCorpus; sourceTree = SOURCE_ROOT; };
+		AAAC00000000000000000001 /* SupportView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupportView.swift; sourceTree = "<group>"; };
+		AAAB00000000000000000001 /* SupportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupportService.swift; sourceTree = "<group>"; };
 		00AB1021B7B6226F4B2EA9F7 /* OfficeInteropCorpus */ = {isa = PBXFileReference; lastKnownFileType = folder; name = OfficeInteropCorpus; path = PaperPathTests/Fixtures/OfficeInteropCorpus; sourceTree = SOURCE_ROOT; };
 		00FD0EE35D7BB58DB7F3D8B9 /* PDFMetadataSyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFMetadataSyncService.swift; sourceTree = "<group>"; };
 		01777B35F33E73E58C2236FA /* AppExperience.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppExperience.swift; sourceTree = "<group>"; };
@@ -166,7 +196,6 @@
 		7EE61F757BFE837787D85DD9 /* AnnotationReviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnnotationReviewView.swift; sourceTree = "<group>"; };
 		7EFC61BDC7D6B1368F8FB636 /* DocumentToolPalette.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentToolPalette.swift; sourceTree = "<group>"; };
 		8072B630F3AF499E052CA7F1 /* PDFOutputService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PDFOutputService.swift; sourceTree = "<group>"; };
-		872A63DBE557DBDC52AD3F8F /* PaperPath.storekit */ = {isa = PBXFileReference; path = PaperPath.storekit; sourceTree = "<group>"; };
 		88699ABC5818D5CC59EB9B61 /* SignatureStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignatureStore.swift; sourceTree = "<group>"; };
 		89B72B03E0B458A466F6C542 /* DocumentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentModels.swift; sourceTree = "<group>"; };
 		909403FBB196D7C0BC62870F /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
@@ -197,6 +226,10 @@
 		0E594B3166C63283E8C1796F /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				AADD11060000000000000401 /* PDFAssistantView.swift */,
+				AADD11050000000000000003 /* HandoffKeyDetailsView.swift */,
+				AADD11070000000000000001 /* ShareCheckStartView.swift */,
+				AADD11040000000000000005 /* HandoffWorkspaceView.swift */,
 				7EE61F757BFE837787D85DD9 /* AnnotationReviewView.swift */,
 				D2F4829B9A70AB9A1B45F841 /* BatchBatesNumberingView.swift */,
 				156427EB69BDE7C613766A56 /* CombineDocumentsView.swift */,
@@ -223,6 +256,7 @@
 				909403FBB196D7C0BC62870F /* RootView.swift */,
 				36422736B810FC3ACAF3B89E /* ScanReviewView.swift */,
 				6391C198FAB80F2C2FB4481D /* StampPickerView.swift */,
+				AAAC00000000000000000001 /* SupportView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -250,6 +284,7 @@
 				B10DE60D1F8C363B02667BA2 /* PaperPathUITests */,
 				47C2AC3FBE0054244FC5AAFA /* zh-Hans.lproj */,
 				00AB1021B7B6226F4B2EA9F7 /* OfficeInteropCorpus */,
+				F02610280000000000000002 /* RealPDFCorpus */,
 				61E45A0C90ECC97B41EFCB50 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -285,6 +320,10 @@
 		6D27CE32A1B9086599509B32 /* Services */ = {
 			isa = PBXGroup;
 			children = (
+				AADD11060000000000000201 /* PDFAssistantService.swift */,
+				AADD11060000000000000301 /* PDFAssistantExecutor.swift */,
+				AADD11050000000000000001 /* HandoffKeyDetailService.swift */,
+				AADD11040000000000000003 /* HandoffArchiveService.swift */,
 				76046A9D59A11DFA597D93C8 /* DemoPDFBuilder.swift */,
 				5E6525861E09ADE60143BA4C /* DocumentStore.swift */,
 				337B50815C8196041060E1E3 /* DocumentUnderstandingService.swift */,
@@ -305,6 +344,7 @@
 				554933F371CF8D45658C6DF0 /* SecurePasteboard.swift */,
 				88699ABC5818D5CC59EB9B61 /* SignatureStore.swift */,
 				3688D3DA468152557A1330EF /* VisionOCRService.swift */,
+				AAAB00000000000000000001 /* SupportService.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -314,7 +354,6 @@
 			children = (
 				F4CC5CC5A8468C88F2899289 /* Assets.xcassets */,
 				F214C94589BC4881E738D8EB /* InfoPlist.strings */,
-				872A63DBE557DBDC52AD3F8F /* PaperPath.storekit */,
 				6BD58F0FF5D9477F16CA58E1 /* PrivacyInfo.xcprivacy */,
 			);
 			path = Resources;
@@ -323,6 +362,7 @@
 		9B14D36AD1E623F9CE9AAD52 /* PaperPathTests */ = {
 			isa = PBXGroup;
 			children = (
+				AADD11040000000000000007 /* HandoffWorkflowTests.swift */,
 				68282E311E6DB5FB6E471250 /* PaperPathTests.swift */,
 				1F7576120333A3681BCEB0ED /* PDFCoreServiceRegressionTests.swift */,
 				DC19C4E29E9EA37A7DF951A8 /* PDFTestFixtureFactory.swift */,
@@ -343,6 +383,7 @@
 		B10DE60D1F8C363B02667BA2 /* PaperPathUITests */ = {
 			isa = PBXGroup;
 			children = (
+				AADD11040000000000000009 /* HandoffWorkflowUITests.swift */,
 				BDB2DB0116E6577F34E9DD46 /* PaperPathUITests.swift */,
 				60B2A1992539FD926A3B10BF /* ReleaseReadinessUITests.swift */,
 			);
@@ -362,6 +403,8 @@
 		CA4FDED7EB0E1935DD754E0B /* Models */ = {
 			isa = PBXGroup;
 			children = (
+				AADD11060000000000000101 /* PDFAssistantModels.swift */,
+				AADD11040000000000000001 /* HandoffModels.swift */,
 				89B72B03E0B458A466F6C542 /* DocumentModels.swift */,
 			);
 			path = Models;
@@ -530,6 +573,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				755BB323A4E9DF7CD425CD26 /* OfficeInteropCorpus in Resources */,
+				F02610280000000000000001 /* RealPDFCorpus in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -537,7 +581,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D0B70132230E12E828756F14 /* PaperPath.storekit in Resources */,
+				F02610280000000000000003 /* RealPDFCorpus in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -558,6 +602,16 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AADD11060000000000000102 /* PDFAssistantModels.swift in Sources */,
+				AADD11060000000000000202 /* PDFAssistantService.swift in Sources */,
+				AADD11060000000000000302 /* PDFAssistantExecutor.swift in Sources */,
+				AADD11060000000000000402 /* PDFAssistantView.swift in Sources */,
+				AADD11050000000000000004 /* HandoffKeyDetailsView.swift in Sources */,
+				AADD11050000000000000002 /* HandoffKeyDetailService.swift in Sources */,
+				AADD11070000000000000002 /* ShareCheckStartView.swift in Sources */,
+				AADD11040000000000000006 /* HandoffWorkspaceView.swift in Sources */,
+				AADD11040000000000000004 /* HandoffArchiveService.swift in Sources */,
+				AADD11040000000000000002 /* HandoffModels.swift in Sources */,
 				7B570990F939C1D049E4367C /* AnnotationReviewView.swift in Sources */,
 				D330EA9C6814365F1167807E /* AppExperience.swift in Sources */,
 				C93177A87B56BEE4CB66BF36 /* BatchBatesNumberingView.swift in Sources */,
@@ -604,6 +658,8 @@
 				28B8CA1CE9C89A4FC7D7C74D /* ReadingAndBookmarksView.swift in Sources */,
 				DBE9264C9B41D9F2C086A752 /* RecognizedTextView.swift in Sources */,
 				18F640BAAD48116B6264565F /* ReleaseExperienceViews.swift in Sources */,
+				AAAC00000000000000000002 /* SupportView.swift in Sources */,
+				AAAB00000000000000000002 /* SupportService.swift in Sources */,
 				832033BA97103B51EFE3BC35 /* RootView.swift in Sources */,
 				F369072757B8E5F584042081 /* ScanPDFRenderer.swift in Sources */,
 				50B56F2E0F053720A6AB1F95 /* ScanReviewView.swift in Sources */,
@@ -618,6 +674,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AADD1104000000000000000A /* HandoffWorkflowUITests.swift in Sources */,
 				1CA6D6E521ECF68D3C1EAB14 /* PaperPathUITests.swift in Sources */,
 				AF825656F221D6121B5A1C2A /* ReleaseReadinessUITests.swift in Sources */,
 			);
@@ -636,6 +693,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AADD11040000000000000008 /* HandoffWorkflowTests.swift in Sources */,
 				27369D25201E3E6B75F6DE7E /* PDFCoreServiceRegressionTests.swift in Sources */,
 				71CB29AC936C26DB0F990E97 /* PDFTestFixtureFactory.swift in Sources */,
 				7B397E9118CA6EF983183979 /* PaperPathTests.swift in Sources */,
@@ -797,7 +855,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 23;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
@@ -881,7 +939,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 23;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_NS_ASSERTIONS = NO;

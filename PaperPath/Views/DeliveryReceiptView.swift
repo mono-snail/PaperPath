@@ -1012,7 +1012,6 @@ struct DeliveryReceiptView: View {
     }
 
     @EnvironmentObject private var model: PaperPathModel
-    @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.dismiss) private var dismiss
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -1057,7 +1056,6 @@ struct DeliveryReceiptView: View {
     @State private var recheckGeneration = UUID()
     @State private var milestoneProtectionGeneration = UUID()
     @State private var sharePreparationGeneration = UUID()
-    @State private var isPresentingVerifiedOutputUnlock = false
     @State private var showsVerificationDetails = false
     @State private var hasReviewedWarnings = false
     @State private var verificationScrollRequest = 0
@@ -1070,9 +1068,6 @@ struct DeliveryReceiptView: View {
     @State private var milestoneNavigationGeneration = UUID()
     @State private var milestoneNavigationFeedback = 0
     @State private var showsAllLinkedMilestones = false
-    @State private var resumesRecheckAfterUnlock = false
-    @State private var unlockContinuationTask:
-        Task<Void, Never>?
 
     init(
         recordID: UUID,
@@ -1221,12 +1216,6 @@ struct DeliveryReceiptView: View {
                     selectedMilestone = nil
                 }
             )
-        }
-        .sheet(
-            isPresented: $isPresentingVerifiedOutputUnlock,
-            onDismiss: completeVerifiedOutputUnlock
-        ) {
-            FullUnlockView(context: .singleVerifiedOutput)
         }
         .task(id: milestoneEvidenceTaskID) {
             let receiptID = displayedReceipt?.id
@@ -1495,7 +1484,6 @@ struct DeliveryReceiptView: View {
         ) {
             StudioSectionRule(
                 title: "DELIVERY SUMMARY",
-                detail: "Source, output, issues, and send status",
                 symbol: "list.clipboard",
                 tint: receiptIsCurrent
                     ? (
@@ -2383,14 +2371,6 @@ struct DeliveryReceiptView: View {
 
     private func recheck(_ record: DocumentRecord) {
         guard !hasActiveTask else { return }
-        guard purchase.isUnlocked
-                || model.verifiedOutputSuccessCount == 0
-        else {
-            resumesRecheckAfterUnlock = true
-            isPresentingVerifiedOutputUnlock = true
-            return
-        }
-        resumesRecheckAfterUnlock = false
         let generation = UUID()
         recheckGeneration = generation
         recheckStopRequested = false
@@ -3461,7 +3441,6 @@ struct DeliveryReceiptView: View {
             || milestoneProtectionTask != nil
             || sharePreparationTask != nil
             || milestoneNavigationTask != nil
-            || unlockContinuationTask != nil
             || pendingMilestonePageOpen != nil
     }
 
@@ -3505,10 +3484,6 @@ struct DeliveryReceiptView: View {
         } else if milestoneNavigationTask != nil
                     || pendingMilestonePageOpen != nil {
             stopMilestoneNavigation()
-        } else if unlockContinuationTask != nil {
-            unlockContinuationTask?.cancel()
-            unlockContinuationTask = nil
-            resumesRecheckAfterUnlock = false
         } else if recheckTask != nil {
             guard !recheckStopRequested else { return }
             recheckStopRequested = true
@@ -3532,9 +3507,6 @@ struct DeliveryReceiptView: View {
         milestoneEvidence = nil
         milestoneEvidenceErrorMessage = nil
         stopMilestoneNavigation()
-        unlockContinuationTask?.cancel()
-        unlockContinuationTask = nil
-        resumesRecheckAfterUnlock = false
         fingerprintCopy.reset()
         invalidatePersistentReceiptTasks()
         stopSharePreparation()
@@ -3542,25 +3514,6 @@ struct DeliveryReceiptView: View {
         cleanupPreparedShare()
     }
 
-    private func completeVerifiedOutputUnlock() {
-        guard resumesRecheckAfterUnlock else { return }
-        resumesRecheckAfterUnlock = false
-        guard purchase.isUnlocked else { return }
-        unlockContinuationTask?.cancel()
-        unlockContinuationTask = Task { @MainActor in
-            await Task.yield()
-            guard !Task.isCancelled,
-                  scenePhase == .active,
-                  UIApplication.shared.isProtectedDataAvailable,
-                  let record = model.record(id: recordID)
-            else {
-                unlockContinuationTask = nil
-                return
-            }
-            unlockContinuationTask = nil
-            recheck(record)
-        }
-    }
 
     private func stopMilestoneNavigation() {
         milestoneNavigationGeneration = UUID()
@@ -4245,7 +4198,6 @@ struct CompareVersionsView: View {
         WorkflowCommandHeader(
             eyebrow: "LOCAL CHANGE REVIEW",
             title: "Compare versions",
-            detail: "Compare visible pixels, text, page count, and geometry on this device.",
             symbol: "doc.on.doc",
             tint: PPColor.cyan,
             metrics: [
@@ -4821,7 +4773,6 @@ struct LinkedChangeReportSection: View {
                 VStack(alignment: .leading, spacing: 0) {
                     StudioSectionRule(
                         title: "RELATED SIGNED REPORT",
-                        detail: "Stored locally · reverified on open",
                         symbol: "lock.doc",
                         count: reports.count,
                         tint: PPColor.cyan

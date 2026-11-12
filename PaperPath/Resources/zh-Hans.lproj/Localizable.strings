@@ -1394,7 +1394,6 @@
 "Settings" = "设置";
 "OWNERSHIP" = "所有权";
 "Unlock Verified Output" = "解锁可信输出";
-"Verified Output Lifetime" = "可信输出终身版";
 "%@ once · no subscription" = "一次性 %@ · 无订阅";
 "LANGUAGE" = "语言";
 "LOCAL-FIRST" = "本地优先";
@@ -1443,8 +1442,6 @@
 "Thank you for supporting private, on-device PDF work." = "感谢你支持私密的设备端 PDF 工作方式。";
 "Return to your document to continue." = "返回文档即可继续。";
 "Your first real Verified Output is free. Unlock unlimited use when PaperPath has proved useful." = "首次真实可信输出免费。确认 PaperPath 有用后，再解锁无限使用。";
-"Your free Verified Output has been used. One purchase unlocks unlimited verified copies." = "免费可信输出已使用。一次购买即可无限创建可信副本。";
-"Batch Verified Output is included with lifetime access. Reading and editing remain available." = "批量可信输出包含在终身版中，阅读和编辑功能仍可继续使用。";
 "Single verified" = "单份可信输出";
 "Used" = "已使用";
 "Included" = "已包含";
@@ -1452,37 +1449,14 @@
 "Free once" = "首次免费";
 "Free tier" = "免费版";
 "Unlocked" = "已解锁";
-"Lifetime access" = "终身版";
 "Active" = "已生效";
 "Optional" = "可选";
-"Lifetime access is active on this device" = "此设备上的终身使用权已生效";
-"One purchase · Family Sharing" = "一次购买 · 支持家人共享";
-"One purchase · no recurring charge" = "一次购买 · 无周期扣费";
-"Lifetime Access Active" = "终身使用权已生效";
 "Check App Store" = "检查 App Store";
 "Unlock with App Store" = "通过 App Store 解锁";
-"Check Purchase Status" = "检查购买状态";
-"Purchase Pending" = "购买待批准";
-"Unlock Batch Verified Output" = "解锁批量可信输出";
-"FIRST FREE" = "首次免费";
-"UNLOCK" = "解锁";
-"Creates your free separate PDF and verifies the result" = "创建一份免费的独立 PDF 并验证结果";
-"Opens lifetime access before creating another verified PDF" = "创建下一份可信 PDF 前打开终身版解锁页面";
 "Unlock for %@" = "以 %@ 解锁";
-"Restore Purchase" = "恢复购买";
-"One-time purchase · no subscription" = "一次性购买 · 无订阅";
 "Checking App Store" = "正在检查 App Store";
-"Confirming purchase" = "正在确认购买";
-"Checking previous purchases" = "正在检查历史购买";
-"Purchase approval is pending" = "购买正在等待批准";
-"No approved purchase was found yet." = "尚未找到已批准的购买。";
-"Lifetime Verified Output is active" = "可信输出终身版已生效";
-"Purchase cancelled" = "购买已取消";
 "App Store product is unavailable" = "App Store 商品暂不可用";
-"The purchase could not be verified." = "无法验证此次购买。";
-"The purchase is no longer active." = "此次购买已不再有效。";
 "The App Store returned an unknown result." = "App Store 返回了未知结果。";
-"No lifetime purchase was found." = "未找到可信输出终身版购买记录。";
 "PAPERPATH V4" = "PAPERPATH V4";
 "A calmer path to trusted output" = "更克制的可信输出路径";
 "The home screen now prioritizes the next document task." = "首页现在优先呈现下一项文档任务。";
@@ -1491,7 +1465,6 @@
 "Private support bundle" = "隐私支持包";
 "Share diagnostics without PDF names, bytes, or extracted text." = "分享不含 PDF 名称、字节或提取文字的诊断信息。";
 "One-time ownership" = "一次性拥有";
-"Unlimited Verified Output uses one purchase, not a recurring subscription." = "无限次可信输出采用一次性购买，不使用周期订阅。";
 "START" = "开始";
 "PRIMARY PATH" = "主要路径";
 "Create a private working copy" = "创建私密工作副本";
@@ -1505,7 +1478,6 @@
 "iCloud metadata sync turned off" = "iCloud 元数据同步已关闭";
 "Synced metadata deleted" = "已同步元数据已删除";
 "All local PaperPath data deleted" = "PaperPath 本地数据已全部删除";
-"Lifetime access is required for batch Verified Output." = "批量可信输出需要终身使用权。";
 "iCloud metadata is off" = "iCloud 元数据已关闭";
 "Sync is off" = "同步已关闭";
 "Private workbench" = "私密工作台";
@@ -2489,7 +2461,6 @@
 "Group even and odd pages" = "按偶奇页分组";
 "Interleave page halves" = "交错排列页面半区";
 "PROCESSING LEDGER" = "处理账本";
-"Data object · location · lifetime · boundary" = "数据对象 · 位置 · 生命周期 · 边界";
 "OBJECT" = "对象";
 "LOCATION" = "位置";
 "LIFETIME" = "生命周期";
@@ -2522,7 +2493,6 @@
 "Chosen target" = "所选目标";
 "Explicit handoff" = "明确交付";
 "Share or Files" = "共享或“文件”";
-"Lifetime" = "生命周期";
 "CAPACITY LEDGER" = "容量账本";
 "Category · size · share · retention" = "类别 · 大小 · 占比 · 保留策略";
 "CATEGORY" = "类别";
@@ -2541,7 +2511,6 @@
 "Receipt policy" = "凭证策略";
 "Temporary" = "临时保留";
 "Share packages" = "共享包";
-"Library lifetime" = "资料库生命周期";
 "Records and receipts" = "记录与凭证";
 "RETENTION LEDGER" = "保留账本";
 "Original Files documents remain unchanged" = "“文件”中的原始文档保持不变";
@@ -4715,7 +4684,6 @@
 "Review the basic workflow" = "重新了解基本流程";
 "STORAGE & DATA" = "存储与数据";
 "PAPERPATH" = "PAPERPATH";
-"One-time access, no account" = "一次购买，无需账户";
 "SPLIT PDF" = "拆分 PDF";
 "QUICK ACTIONS" = "快捷操作";
 "Select a page below for more actions" = "选择下方页面以查看更多操作";
@@ -6083,11 +6051,8 @@
 "Replacement Scan" = "替换扫描";
 "Retry App Store" = "重试连接 App Store";
 "Privacy & Data" = "隐私与数据";
-"Read how your files and purchases are handled" = "了解文件处理与购买规则";
 "Terms of Use" = "使用条款";
-"Approval may take time. You can close this screen and keep using PaperPath; access updates when the App Store approves the purchase." = "购买批准可能需要一些时间。你可以关闭此页继续使用 PaperPath，App Store 批准后会更新使用权限。";
 "Connect to the App Store to load the price. Your PDFs, reading, and editing remain available." = "连接 App Store 后可查看价格。你仍可阅读和编辑已有 PDF。";
-"A one-time purchase is charged to your Apple Account after confirmation. Restore it with the same Apple Account on another device. There is no recurring charge." = "确认后将通过 Apple 账户收取一次性费用。可在其他设备使用同一 Apple 账户恢复购买，无需续费。";
 "Ready for your next PDF" = "准备处理下一份 PDF";
 "Finish your PDF with fewer steps" = "更顺手地完成 PDF";
 "Pick up where you left off" = "接着上次继续";
@@ -6108,8 +6073,6 @@
 "Files leave PaperPath when you choose to share or export them. The destination app or service then handles that copy. Private diagnostics include app, device, and library counts, but exclude PDF contents, file names, extracted text, passwords, and signatures." = "你主动分享或导出后，副本由目标应用或服务处理。私密诊断包含应用、设备和文档库统计，不包含 PDF 内容、文件名、提取文字、密码或签名。";
 "Permissions you control" = "系统权限";
 "Camera access is used for document and identity-code scanning. Face ID is used for App Lock. Notifications are optional due-date reminders. You can change system permissions in Settings." = "相机用于扫描文档和身份二维码，面容 ID 用于应用锁；通知仅用于你选择启用的到期提醒。系统权限可在系统设置中修改。";
-"Purchases and tracking" = "购买与追踪";
-"Apple handles payments and purchase restoration. PaperPath uses the verified purchase status to unlock Verified Output. PaperPath includes no advertising or third-party analytics SDK." = "付款与恢复购买由 Apple 处理。PaperPath 根据已验证的购买状态解锁可信输出，不包含广告或第三方分析 SDK。";
 "Delete and protect your data" = "删除与保护数据";
 "Manage working copies and Trash in PaperPath. Delete All Local Data in Settings removes local documents and related data, while your imported originals stay untouched. Synced metadata has a separate Delete Synced Metadata action. Copies already shared or exported are managed separately." = "可在 PaperPath 管理工作副本与废纸篓。设置中的“删除全部本地数据”会移除本地文档及关联数据，导入前的原件不受影响。iCloud 元数据需单独使用“删除已同步元数据”。已分享或导出的副本需另行管理。";
 "Keep a copy outside PaperPath" = "在 PaperPath 之外保留副本";
@@ -6247,7 +6210,6 @@
 "Turns off sync and deletes iCloud metadata. Local files stay unchanged." = "关闭同步并删除 iCloud 元数据；本地文件不变。";
 "Waiting for App Store approval. You can close this screen." = "正在等待 App Store 批准，可关闭此页面。";
 "Connect to the App Store to load the price." = "连接 App Store 以加载价格。";
-"One-time purchase. Restore with the same Apple Account." = "一次性购买，可使用同一 Apple 账户恢复。";
 "Your next document and import actions stay close." = "待处理文档与导入操作触手可及。";
 "Keep the page visible and review uncertain words first." = "保持页面可见，优先检查不确定文字。";
 "Check candidates, then create a separate redacted copy." = "检查候选内容，再创建独立脱敏副本。";
@@ -6257,7 +6219,6 @@
 "Annotation verification failed. The PDF was not changed." = "批注验证失败，PDF 未更改。";
 "Switch to Processed to check the inserted page." = "切换到“处理后”以检查插入页面。";
 "First Verified Output is free. Unlock unlimited copies anytime." = "首次可信输出免费，之后可随时解锁无限使用。";
-"Lifetime access includes batch Verified Output. Reading and editing stay available." = "终身版包含批量可信输出；阅读与编辑始终可用。";
 "Bookmarks, tags, status, and receipts are synced. PDFs and text stay local." = "同步书签、标签、状态与凭证；PDF 和文字留在本机。";
 "Sign in to iCloud and enable PaperPath sync. PDFs and text stay local." = "登录 iCloud 并开启 PaperPath 同步；PDF 和文字留在本机。";
 "This PDF is busy. Wait for the current task to finish or stop it." = "此 PDF 正在处理；请等待完成或停止当前任务。";
@@ -6291,7 +6252,6 @@
 "Drag to reorder" = "拖动调整顺序";
 "Or use Move earlier and Move later." = "也可使用上移和下移按钮。";
 "Works offline" = "支持离线使用";
-"Merge, split, compress, and recognize text on this device. No document uploads or PaperPath processing server. Apple purchases and optional iCloud metadata sync use the internet. Sharing or exporting may send files to the destination you choose." = "合并、拆分、压缩和文字识别均在本机完成，无需上传文档或使用 PaperPath 处理服务器。Apple 购买和可选的 iCloud 元数据同步需要联网。分享或导出可能将文件发送至你选择的目标。";
 "Local OCR" = "本地 OCR";
 
 "On device · No uploads" = "本机处理 · 不上传文档";
@@ -6313,3 +6273,754 @@
 "Split" = "拆分";
 
 "Recent" = "最近";
+
+/* Support conversations */
+"Contact Support" = "联系支持";
+"Send feedback and read replies" = "发送反馈并查看回复";
+"New feedback" = "新建反馈";
+"Send a problem or suggestion and read replies here. Requires an internet connection." = "提交问题或建议，并在这里查看回复。需要连接互联网。";
+"Your conversations" = "你的会话";
+"No conversations on this device." = "此设备上暂无会话。";
+"Email support" = "通过邮件联系";
+"Support website" = "支持网站";
+"Conversations are saved securely on this device. They do not sync through iCloud. Do not include private documents, passwords, or signatures." = "会话安全保存在此设备上，不通过 iCloud 同步。请勿填写机密文档、密码或签名。";
+"Feedback type" = "反馈类型";
+"Problem" = "问题";
+"Feature request" = "功能建议";
+"Improvement" = "改进建议";
+"Title (3–160 characters)" = "标题（3–160 个字符）";
+"What happened? (10–5,000 characters)" = "请描述问题（10–5,000 个字符）";
+"Include app and OS version" = "附带应用与系统版本";
+"Your email and feedback are sent to Monoware Support. No PDF, document name, extracted text, or signature is attached automatically." = "邮箱和反馈将发送给 Monoware 支持团队。不会自动附带 PDF、文档名称、提取文字或签名。";
+"Save conversation again" = "重新保存会话";
+"Send again…" = "再次发送…";
+"Send feedback" = "发送反馈";
+"Send again?" = "再次发送？";
+"Allow another attempt" = "允许再次尝试";
+"The first request may already have arrived. Another attempt can create a duplicate conversation." = "第一次请求可能已送达。再次尝试可能创建重复会话。";
+"Discard feedback?" = "放弃反馈？";
+"Keep editing" = "继续编辑";
+"Conversation" = "会话";
+"Messages" = "消息";
+"You" = "你";
+"Support" = "支持团队";
+"Reply" = "回复";
+"Write a reply" = "填写回复";
+"Send reply" = "发送回复";
+"Refresh" = "刷新";
+"Review and allow another attempt…" = "核对后允许再次尝试…";
+"Refresh and check the latest messages first. Sending again may create a duplicate reply." = "请先刷新并核对最新消息。再次发送可能产生重复回复。";
+"Received" = "已收到";
+"Under review" = "处理中";
+"Planned" = "已计划";
+"Resolved" = "已解决";
+"Closed" = "已关闭";
+"Check your email, title (3–160 characters), and description (10–5,000 characters)." = "请检查邮箱、标题（3–160 个字符）和描述（10–5,000 个字符）。";
+"Support is unavailable. Your text is still here; try again later or email hello@monoware.app." = "支持服务暂不可用。输入内容已保留，请稍后再试或发邮件至 hello@monoware.app。";
+"This conversation cannot be opened with the saved credentials. Contact hello@monoware.app." = "无法使用已保存的凭据打开此会话。请联系 hello@monoware.app。";
+"Support has reached its message or storage limit. Email hello@monoware.app." = "支持服务已达到消息或存储上限。请发邮件至 hello@monoware.app。";
+"Support could not accept this request. Check the text or email hello@monoware.app." = "支持服务无法接受此请求。请检查内容或发邮件至 hello@monoware.app。";
+"Delivery could not be confirmed. Check the conversation before sending again to avoid duplicates." = "无法确认是否送达。再次发送前请核对会话，避免重复。";
+"The conversation could not be saved securely. Keep this screen open and try saving again." = "无法安全保存会话。请保持此页面打开并重新保存。";
+"Support returned an unexpected response. Delivery may have completed; contact hello@monoware.app before resubmitting." = "支持服务返回了意外响应。请求可能已送达，重新提交前请联系 hello@monoware.app。";
+"Support conversations" = "支持会话";
+"When you send feedback, your email and message go to Monoware Support. App and OS versions are optional. Conversation credentials stay in this device’s Keychain and do not sync through iCloud." = "发送反馈时，邮箱和消息将发送给 Monoware 支持团队，可选择附带应用与系统版本。会话凭据保存在此设备的钥匙串中，不通过 iCloud 同步。";
+"Discard" = "放弃";
+
+"Your PDF. Ready to work." = "打开 PDF，即刻开始。";
+
+"Fill, sign, and share a private working copy." = "在本机副本上填表、签名，复核后分享。";
+
+"Fill & sign" = "填表与签名";
+
+"Check & share" = "复核与分享";
+
+"Your original stays unchanged." = "原文件保持不变。";
+
+"Go to documents" = "进入文档库";
+
+"Document summary" = "文档摘要";
+
+"Recognize text (OCR)" = "识别文字（OCR）";
+
+"Add a note" = "添加批注";
+
+"Page IDs (Bates)" = "连续页编号（贝茨）";
+
+"Add text, images & links" = "添加文字、图片与链接";
+
+"Review annotations" = "查看批注";
+
+"Embedded attachments" = "内嵌附件";
+
+"Permanently redact" = "永久脱敏";
+
+"Password protect" = "设置打开密码";
+
+"Export & share" = "导出与分享";
+
+"Continue with existing PDF" = "继续处理已有 PDF";
+"Extract text" = "识别文字";
+
+"Keep text & links" = "保留文字与链接";
+
+"Image copy" = "图片副本";
+
+"Compression method" = "压缩方式";
+
+"Optimizes embedded images and streams. Text, links, forms, and notes stay editable." = "优化内嵌图片和数据流，文字、链接、表单和批注保持可用。";
+
+"Rebuilds pages as images. Removes search, links, forms, and editable notes." = "将页面重建为图片，移除搜索、链接、表单和可编辑批注。";
+
+"Measured after compression" = "压缩后实测";
+
+"Large PDFs may take a few minutes. Keep PaperPath open. Stop keeps your original." = "大文件可能需要几分钟，请保持 PaperPath 在前台。停止操作会保留原件。";
+
+"Sample suggests little saving. You can still try; only a smaller verified copy is saved." = "抽样显示可能节省不多，仍可尝试；只有验证通过且更小的副本才会保存。";
+
+"Compressing PDF" = "正在压缩 PDF";
+
+"Verifying compressed PDF" = "正在验证压缩结果";
+
+"Saving compressed copy" = "正在保存压缩副本";
+
+"This PDF structure cannot yet be optimized while keeping its content. Choose Image copy only if you can remove search, links, forms, and notes. The original is unchanged." = "暂不支持保留此 PDF 的结构进行优化。如允许移除搜索、链接、表单和批注，可选择“图片副本”。原件未更改。";
+
+"This PDF contains a digital signature. Recompression would invalidate it, so compression was stopped. Use an unsigned version to compress this document." = "此 PDF 含有数字签名，重新压缩会使签名失效，因此已停止压缩。如需压缩，请使用未签名版本。";
+
+"Output size" = "输出大小";
+
+"Sample estimate: %@ versus %@ original. Actual size may differ." = "抽样估算约为 %@，原件为 %@，实际结果可能不同。";
+
+"The PDF could not be opened for local compression." = "无法打开 PDF 进行本地压缩。";
+
+"the source PDF changed or became unreadable during compression" = "压缩期间原 PDF 已更改或无法读取";
+
+"compression changed page geometry, searchable text, or annotations" = "压缩结果的页面边界、可搜索文字或批注发生变化";
+
+"the compressed PDF could not be reopened with every page" = "无法重新打开压缩结果的全部页面";
+
+"Lossless compression" = "无损压缩";
+
+"Image copy (lossy)" = "图片副本（有损）";
+
+"Keeps image pixels and resolution unchanged. Preserves text, links, forms, and notes. Savings depend on the file." = "不改变图片像素和分辨率，保留文字、链接、表单和批注。压缩效果取决于原文件。";
+
+"Lossy conversion: rebuilds pages as images. Removes search, links, forms, and editable notes." = "有损转换：将页面重建为图片，会移除搜索、链接、表单和可编辑批注。";
+
+"Lossless" = "无损";
+
+"High quality (lossy)" = "高质量（有损）";
+
+"Lossy image compression. Keeps text, links, forms, and notes. Fine image detail may change; your original is kept." = "有损压缩图片，保留文字、链接、表单和批注。图片细节可能改变，原件会保留。";
+
+"Try high-quality compression (lossy)" = "尝试高质量压缩（有损）";
+
+
+"7 days free · no automatic charge" = "免费试用 7 天 · 到期不自动扣费";
+
+
+
+
+
+"Try every tool for 7 days." = "免费体验全部工具 7 天";
+
+"Continue with PaperPath." = "继续使用 PaperPath";
+
+"Unlock all PDF tools." = "解锁全部 PDF 工具";
+
+
+
+
+
+"No subscription · no automatic charge" = "无订阅 · 不自动扣费";
+
+
+
+"Merge, split, compress and local OCR" = "合并、拆分、压缩与本机 OCR";
+
+"Fill, sign, redact and batch process" = "填表、签名、脱敏与批量处理";
+
+
+
+
+
+
+
+
+
+"Save as New Document" = "另存为新文档";
+
+"Updates this document. The previous version is available in History." = "更新当前文档，之前的版本可在历史记录中恢复。";
+
+"Updates each selected document. Previous versions are available in History." = "更新所选文档，之前的版本可在历史记录中恢复。";
+
+"Opens the updated document." = "打开更新后的文档。";
+
+"No change needed" = "无需更改";
+
+"Changes stopped" = "已停止修改";
+
+"Document saved before stopping" = "停止前已保存文档";
+
+"Compression failed. The document and quality setting are unchanged." = "压缩失败，文档和画质设置均未更改。";
+
+"Sample suggests little saving. You can still try; the document is updated only if smaller and verified." = "抽样显示压缩空间较小，仍可尝试；仅在文件更小且校验通过后更新文档。";
+
+"Protecting PDF" = "正在设置密码";
+
+"PaperPath does not store this password. Keep it safe to reopen this PDF. Earlier versions in History may be unencrypted." = "PaperPath 不保存密码，请妥善保管。历史记录中的早期版本可能尚未加密。";
+
+"Removes marked content from this document. Earlier versions in History still contain it." = "移除当前文档中标记的内容。历史记录中的早期版本仍保留这些内容。";
+
+"Redaction rebuilds pages as images" = "脱敏会将页面重建为图片";
+
+"Apply Redaction" = "应用脱敏";
+
+"Applying Redaction" = "正在应用脱敏";
+
+"Saving document" = "正在保存文档";
+
+"Saving document changes" = "正在保存修改";
+
+"Saves changes to this document. Previous versions are in History." = "保存到当前文档，之前的版本在历史记录中。";
+
+"Rename document" = "重命名文档";
+
+"Renaming document" = "正在重命名文档";
+
+"Print Document" = "打印文档";
+
+"Move this document to Trash?" = "将此文档移到废纸篓？";
+
+"The document can be recovered from Trash. The original file in Files stays untouched." = "可从废纸篓恢复此文档。“文件”中的原始文件不受影响。";
+
+"Removes the password from this document. The encrypted version is kept in History." = "移除当前文档的密码，加密版本保留在历史记录中。";
+
+"Password not removed" = "尚未移除密码";
+
+"Retry removing password" = "重试移除密码";
+
+"Remove password" = "移除密码";
+
+"Continue with this document without a password. The encrypted version stays in History." = "继续处理当前文档，无需密码。加密版本保留在历史记录中。";
+
+"Stopping password removal" = "正在停止移除密码";
+
+"Stop removing password" = "停止移除密码";
+
+"Exported PDF" = "已导出的 PDF";
+
+"Prepare Export" = "准备导出";
+
+"Share Export" = "分享导出文件";
+
+"Export Booklet" = "导出小册子";
+
+"Exporting Booklet" = "正在导出小册子";
+
+"Export for Printing" = "导出打印文件";
+
+"Preparing Print Export" = "正在准备打印导出";
+
+"Document saved · previous version in History" = "文档已保存，之前的版本在历史记录中";
+
+"Export saved · current document unchanged" = "导出文件已保存，当前文档未更改";
+
+"Export saved before stopping" = "停止前已保存导出文件";
+
+"Searchable text saved in document" = "可搜索文字已保存到当前文档";
+
+"Apply redaction" = "应用脱敏";
+
+"Flatten PDF" = "合并批注到页面";
+
+"Replace text" = "替换文字";
+
+"Save changes" = "保存修改";
+
+"Export for printing" = "导出打印文件";
+
+"Export booklet" = "导出小册子";
+
+"Prepare export" = "准备导出";
+
+"Export uses image-based pages" = "导出文件使用图片页面";
+
+"Prepares an image-based export and checks every page. The current document stays editable." = "生成图片页面导出文件，并逐页检查。当前文档仍可编辑。";
+
+"The password and permission changes have not been saved." = "密码和权限修改尚未保存。";
+
+"The PDF changed. Review these settings before saving." = "PDF 已更新，请检查设置后再保存。";
+
+"Choose what readers can do after opening this PDF." = "选择读者打开 PDF 后可进行的操作。";
+
+"Wait for password protection to finish." = "请等待密码设置完成。";
+
+"Reviews these settings without changing the PDF." = "检查设置，不更改 PDF。";
+
+"Protection failed. Password and permissions are unchanged." = "密码设置失败，密码和权限未更改。";
+
+"Redaction failed. The document and marked areas are unchanged." = "脱敏失败，文档和标记区域未更改。";
+
+"Wait for redaction to finish." = "请等待脱敏完成。";
+
+"Mark at least one area before applying redaction." = "请先标记至少一个区域再应用脱敏。";
+
+"These changes have not been saved to the document." = "这些修改尚未保存到文档。";
+
+"The selected photo has not been saved to the document." = "所选图片尚未保存到文档。";
+
+"Stops waiting; changes already saved remain in the document" = "停止等待，已保存的修改会保留在文档中";
+
+"Closes without saving changes" = "关闭且不保存修改";
+
+"The document is unavailable." = "文档不可用。";
+
+"The document could not be opened." = "无法打开文档。";
+
+"Remove the password from this document to use this tool." = "请先移除当前文档的密码，再使用此工具。";
+
+"Unlock this PDF and remove its password first." = "请先解锁 PDF 并移除密码。";
+
+"Stopping searchable text" = "正在停止保存可搜索文字";
+
+"Stop saving searchable text" = "停止保存可搜索文字";
+
+"Searchable text stopped" = "已停止保存可搜索文字";
+
+"Searchable text saved before stopping" = "停止前已保存可搜索文字";
+
+"Save PDF Outline" = "保存 PDF 目录";
+
+"Saving PDF outline" = "正在保存 PDF 目录";
+
+"Edit Page Labels" = "编辑页码标签";
+
+"Save Page Labels" = "保存页码标签";
+
+"Saving page labels" = "正在保存页码标签";
+
+"The PDF outline could not be saved. Try again." = "无法保存 PDF 目录，请重试。";
+
+"The page labels could not be saved. Try again." = "无法保存页码标签，请重试。";
+
+"Wait for page labels to finish saving." = "请等待页码标签保存完成。";
+
+"Review the page label rules before saving." = "请先检查页码标签规则再保存。";
+
+"Saves page labels in this document. Previous versions are in History." = "保存到当前文档，之前的版本在历史记录中。";
+
+"Save Searchable Text" = "保存可搜索文字";
+
+"Saving searchable text" = "正在保存可搜索文字";
+
+"Searchable text could not be saved. Try again." = "无法保存可搜索文字，请重试。";
+
+"The selected documents were updated. Previous versions are in History." = "所选文档已更新，之前的版本在历史记录中。";
+
+"Documents were left unchanged when compression did not reduce their size." = "未能减小体积的文档保持不变。";
+
+"Export Flattened PDF" = "导出合并批注的 PDF";
+
+"Changes already saved remain in this document." = "已保存的修改会保留在当前文档。";
+
+"Prepare an export to share; your document stays here" = "准备导出文件用于分享，文档仍保留在这里";
+
+"Reduce this document’s size" = "减小当前文档体积";
+
+"Save a searchable text layer in this document." = "将可搜索文字层保存到当前文档。";
+
+"Rotate, move, or remove pages in this document." = "旋转、移动或移除当前文档中的页面。";
+
+"Prepare an export and verify every page." = "准备导出文件并逐页检查。";
+
+"Recognized text is ready to save in this document." = "识别文字已就绪，可保存到当前文档。";
+
+"Compress this document; previous versions stay in History" = "压缩当前文档，之前的版本保留在历史记录中";
+
+"Set a password on this document" = "为当前文档设置密码";
+
+"Password removed" = "已移除密码";
+
+"Compression" = "压缩";
+
+"Redaction" = "脱敏";
+
+"Password protection" = "密码保护";
+
+"Password removal" = "移除密码";
+
+"Content edit" = "内容编辑";
+
+"Text replacement" = "文字替换";
+
+"Print export" = "打印导出";
+
+"Booklet export" = "小册子导出";
+
+"Compression would increase size (%@ → %@). The document was left unchanged." = "压缩将使体积增加（%@ → %@），文档保持不变。";
+"No size reduction with this method (%@ → %@). The document was left unchanged." = "此方式未能减小体积（%1$@ → %2$@），已保留原文件。";
+
+"This PDF is already efficiently compressed. The document was left unchanged." = "此 PDF 已较充分压缩，文档保持不变。";
+
+"Recognize the text before saving it in this document." = "请先识别文字，再保存到当前文档。";
+
+"These booklet export options have not been applied." = "小册子导出设置尚未应用。";
+
+"Wait for the booklet export to finish." = "请等待小册子导出完成。";
+
+"Retry the check before exporting the booklet." = "请重新检查后再导出小册子。";
+
+"The booklet export failed. Your document and options are unchanged." = "小册子导出失败，文档和设置未更改。";
+
+"These print export options have not been applied." = "打印导出设置尚未应用。";
+
+"Prepare a print export" = "准备打印导出";
+
+"Print export · annotations included · current document unchanged" = "打印导出 · 包含批注 · 当前文档不变";
+
+"Wait for the print export to finish." = "请等待打印导出完成。";
+
+"Retry the check before exporting for print." = "请重新检查后再导出打印文件。";
+
+"The print export failed. Your document and options are unchanged." = "打印导出失败，文档和设置未更改。";
+
+"Shares this checked export" = "分享此已检查的导出文件";
+
+"Opening export" = "正在打开导出文件";
+
+"Opening export %@" = "正在打开导出文件 %@";
+
+"Keeps the export in export history and stops automatic opening." = "保留在导出历史中，不自动打开。";
+
+"Export kept in export history" = "导出文件已保留在导出历史中";
+
+"Prepare a temporary file for sharing" = "准备临时文件用于分享";
+
+"Prepares this checked PDF for sharing" = "准备此已检查的 PDF 用于分享";
+
+"Prepares an export and records remaining warnings" = "准备导出文件并记录剩余提醒";
+
+"PDF documents" = "PDF 文档";
+
+"Flattened export" = "合并批注导出";
+
+"Open original document: %@" = "打开原文档：%@";
+
+"Image pages (lossy)" = "图片页面（有损）";
+
+"Image pages" = "图片页面";
+
+"Saves the current version in History first. The original file in Files stays unchanged." = "先将当前版本存入历史记录。“文件”中的原始文件不受影响。";
+
+"Saves the current version in History first, then restores this version." = "先将当前版本存入历史记录，再恢复所选版本。";
+
+"Earlier versions of this document are kept here." = "此文档的早期版本保留在这里。";
+
+"Earlier versions appear here when you save changes to this document." = "保存文档修改后，可在这里找到之前的版本。";
+
+"Compare with current document" = "与当前文档对比";
+
+"Compare this version with the current document" = "将此版本与当前文档对比";
+
+"Current document" = "当前文档";
+
+"Merge, split, compress, and recognize text on this device. No document uploads or PaperPath processing server. App Store downloads, optional iCloud metadata sync, and support conversations use the internet. Sharing or exporting may send files to the destination you choose." = "在本机合并、拆分、压缩 PDF 和识别文字，无需上传文档，也没有 PaperPath 文档处理服务器。App Store 下载、可选的 iCloud 元数据同步和支持沟通需要联网。分享或导出可能会将文件发送到你选择的位置。";
+"PaperPath is a one-time paid download from the App Store. All PDF tools are included, with no subscription or in-app purchases. Apple handles payment; PaperPath does not receive your payment card details. Core PDF processing works offline. PaperPath has no ads or third-party analytics." = "在 App Store 一次付费下载，即可使用全部 PDF 工具，无订阅、无应用内购买。付款由 Apple 处理，PaperPath 不会接收你的银行卡信息。核心 PDF 处理可离线使用，没有广告或第三方分析。";
+"Read how your files and App Store payment are handled" = "了解文件与 App Store 付款的处理方式";
+
+/* Verified current-document privacy redaction */
+"Saved redactions. The previous version is in History." = "脱敏已保存，修改前的版本保留在历史记录中。";
+"Open Redacted Document" = "打开脱敏后的文档";
+"Opens this document with the saved redactions." = "打开已保存脱敏修改的当前文档。";
+"Removes %@ on %@ from this document. The previous version remains in History and may contain the removed content." = "将从当前文档的%2$@中移除%1$@。修改前的版本仍保留在历史记录中，可能包含已移除的内容。";
+"Redaction was not completed. Review the notice and try again." = "脱敏未完成，请查看提示后重试。";
+"The redactions were saved, but the document file is unavailable." = "脱敏修改已保存，但文档文件目前不可用。";
+"Changes saved in the Library. Open the document there to share." = "修改已保存到资料库，请在那里打开文档以分享。";
+
+/* Bounded history for large PDFs */
+"Starting version" = "起始版本";
+"Large PDF storage" = "大 PDF 的存储保护";
+"Understood" = "知道了";
+"For PDFs of 100 MiB or more, PaperPath keeps the starting version and your latest saved result instead of every editing step. Existing pinned milestones stay until you clear them in Local Storage. For older documents, the starting version is the earliest history still available. Saving still needs temporary free space." = "对于达到 100 MiB 的 PDF，PaperPath 保留起始版本和最新保存的结果，不再逐步累积编辑历史。已有的固定里程碑会保留，直到你在「本地存储」中清理。旧文档的起始版本是目前最早可用的历史。保存时仍需额外的临时空间。";
+"Clear intermediate versions?" = "清理中间版本？";
+"Clear Intermediate Versions" = "清理中间版本";
+"Keeps each document’s starting version and current saved PDF. All other recovery versions, including pinned milestones and their receipt links, are deleted. For older documents, only the earliest available history can be kept. This cannot be undone. Small PDFs will continue saving editing history after cleanup." = "保留每份文档的起始版本和当前已保存的 PDF。其余恢复版本（包括固定里程碑及其校验记录关联）将被删除。旧文档只能保留目前最早可用的历史。此操作不可撤销。清理后，小 PDF 仍会继续保存后续编辑历史。";
+"Keep the starting version and latest saved PDF. PDFs of 100 MiB or more do not accumulate automatic editing history. Starting versions use additional space outside the 1 GiB intermediate-history budget." = "保留起始版本和最新保存的 PDF。达到 100 MiB 的 PDF 不再累积自动编辑历史。起始版本另占空间，不计入 1 GiB 的中间历史预算。";
+"Wait for document tasks to finish before clearing history." = "请等待文档任务完成后再清理历史。";
+"%lld intermediate versions cleared" = "已清理 %lld 个中间版本";
+
+"Changes saved · starting version retained" = "已保存修改 · 起始版本已保留";
+
+"Large PDF: the starting version and latest saved result are kept. Automatic step history is off; explicit pinned milestones may also remain." = "大 PDF 保留起始版本和最新保存的结果，不再逐步累积自动历史；手动固定的里程碑可能仍会保留。";
+"Available storage could not be measured. Try again before editing this large PDF." = "暂时无法确认可用空间，请稍后再编辑这份大 PDF。";
+
+"Fill Field" = "填写字段";
+
+"This field cannot accept that value." = "此字段无法接受该内容。";
+
+"The form field changed. Review it again." = "表单字段已更改，请重新检查。";
+
+"The form value could not be read back." = "无法读回保存的表单内容。";
+
+"The value could not be saved. Review the field and try again." = "未能保存内容，请检查字段后重试。";
+
+"Edits this field’s value" = "填写此字段的内容";
+
+"Clear merge order?" = "清空合并顺序？";
+"Your PDFs stay in the Library." = "PDF 仍会保留在文档库中。";
+
+"No compressed output" = "未生成压缩结果";
+"No PDFs were compressed. Review the results." = "没有 PDF 完成压缩，请查看处理结果。";
+
+"Use up to 2,000 characters. Your full text is kept here." = "最多可保存 2,000 个字符，完整草稿仍保留在此处。";
+
+"Use up to %lld characters for this field." = "此字段最多可填写 %lld 个字符。";
+
+"Use up to 500 characters. Your full text is kept here." = "最多可保存 500 个字符，完整草稿仍保留在此处。";
+
+"Feedback" = "反馈";
+
+/* Direct PDF export */
+"Save PDF to Files" = "存储 PDF 到文件";
+"Share PDF" = "分享 PDF";
+"More Export Formats" = "其他导出格式";
+"Choose iCloud Drive or On My iPhone in Files." = "在“文件”中选择 iCloud Drive 或本机存储位置。";
+"PDF saved to Files" = "PDF 已存储到文件";
+
+"Share %@" = "分享 %@";
+"Files saved in iCloud Drive sync automatically when iCloud Drive is enabled. Files saved on this device stay local." = "启用 iCloud Drive 后，存入其中的文件会自动同步；存到本机的文件仅保存在此设备。";
+
+"This name is also used when you share or save the PDF to Files. The original file is unchanged." = "分享或将 PDF 存储到‘文件’时也会使用此名称，原始文件不受影响。";
+
+"Form fields & pop-ups" = "表单字段与批注弹窗";
+
+"Form field" = "表单字段";
+
+"Note pop-up" = "批注弹窗";
+
+"No comments or markup" = "暂无批注";
+
+"More PDF options" = "更多 PDF 选项";
+
+"Export fields & pop-ups" = "导出字段与批注弹窗";
+
+"Add fields to fill this PDF" = "添加填写区域以填写此 PDF";
+
+"Close feedback?" = "关闭反馈？";
+
+"Your feedback was sent. Reopen Support to retry saving this conversation. If the app closes before it is saved, contact hello@monoware.app with the reference shown here." = "反馈已发送。重新打开支持页面可重试保存会话。如果尚未保存就退出 App，请凭页面显示的编号联系 hello@monoware.app。";
+
+"The conversation could not be saved securely. Try saving again, or close and reopen Support during this app session." = "会话暂时无法安全保存。请重试，或在本次 App 使用期间关闭并重新打开支持页面。";
+
+
+/* Document handoff rules and material packets — 2026-11-04 */
+"Handoff" = "交付";
+"Packets" = "材料包";
+"New delivery rule" = "新建交付规则";
+"New packet" = "新建材料包";
+"Prepare the whole handoff" = "把交付材料准备齐";
+"Choose a rule, list the materials you need, and confirm the exact PDFs you will send." = "选择交付规则，列出所需材料，再逐项确认要发送的 PDF。";
+"Create a rule" = "创建规则";
+"Create a packet" = "创建材料包";
+"Try a sample packet" = "体验示例材料包";
+"%lld of %lld materials confirmed" = "已确认 %lld / %lld 项材料";
+"Your checklist defines completeness. PaperPath does not certify an institution's requirements." = "完整性以你设定的清单为准，不代表已满足任何机构的材料要求。";
+"Save the checks and output requirements you use again." = "保存常用的检查项目和输出要求，下次继续使用。";
+"Changing a rule requires new file confirmations. Rules never delete sensitive content automatically." = "规则变更后需要重新确认文件。规则不会自动删除敏感内容。";
+"Sample handoff rule" = "示例交付规则";
+"Sample client handoff" = "示例客户材料包";
+"Main document" = "主要文件";
+"Supporting document" = "补充材料";
+"The sample could not be created. Try again." = "未能创建示例，请重试。";
+"The handoff workspace changed. Reopen it and review the latest version." = "交付工作区已变更。请重新打开并复核最新版本。";
+"Rule name" = "规则名称";
+"Filename prefix (optional)" = "文件名前缀（可选）";
+"PDF format" = "PDF 格式";
+"Keep PDF format" = "保留 PDF 格式";
+"Image-based copy" = "图像型副本";
+"Image-based copies remove searchable text, links and interactive fields. Review before sharing." = "图像型副本不保留可搜索文字、链接和交互字段，分享前请复核。";
+"Require privacy review" = "需要隐私复核";
+"Require output receipt" = "需要输出检查回执";
+"Limit file size" = "限制文件大小";
+"Maximum per PDF (MB)" = "每份 PDF 上限（MB）";
+"Delivery rule" = "交付规则";
+"Save rule" = "保存规则";
+"Packet name" = "材料包名称";
+"Required materials" = "所需材料";
+"Material name" = "材料名称";
+"Add material" = "添加材料";
+"Packet checklist" = "材料清单";
+"Choose a delivery rule" = "选择交付规则";
+"Confirmed" = "已确认";
+"Preparing packet" = "正在准备材料包";
+"Export packet + checklist" = "导出材料包与清单";
+"The ZIP includes the selected PDFs, available output receipts, and a checklist with file fingerprints. Sharing sends these files to the service you choose." = "ZIP 包含所选 PDF、可用的输出检查回执及文件指纹清单。分享会将这些文件交给你选择的服务。";
+"Packet unavailable" = "材料包不可用";
+"Open and review PDF" = "打开并复核 PDF";
+"I reviewed private details in this version" = "我已复核此版本中的隐私信息";
+"Open the PDF to review it and use Privacy Scan if needed. Automatic detection can miss information. Confirm only after reviewing the document yourself." = "请打开 PDF 复核，必要时使用隐私扫描。自动检测可能遗漏，请在人工复核后确认。";
+"Create checked image-based copy" = "创建已检查的图像型副本";
+"Creates a separate copy and removes searchable text, links, interactive fields and editable layers. Then review and confirm the new copy." = "创建独立副本，不保留可搜索文字、链接、交互字段或可编辑图层。随后请复核并确认新副本。";
+"File checks" = "文件检查";
+"View output receipt" = "查看输出检查回执";
+"Confirm for packet" = "确认用于此材料包";
+"Clear confirmation" = "清除确认";
+"Material" = "材料";
+"The output could not be created. The selected file has not changed." = "未能创建输出副本，当前所选文件未改变。";
+"No matching PDFs. Import a PDF from the document library first." = "没有匹配的 PDF。请先从文档库导入文件。";
+"Search PDFs" = "搜索 PDF";
+"Add the required PDF" = "添加所需 PDF";
+"This PDF is used more than once" = "同一份 PDF 被重复使用";
+"Unlock and review this PDF first" = "请先解锁并复核此 PDF";
+"Create an image-based copy" = "创建图像型副本";
+"A current output receipt is required" = "需要与当前版本匹配的输出回执";
+"Review the output receipt warnings" = "请复核输出回执中的警告";
+"This PDF exceeds the rule's size limit" = "此 PDF 超出规则设定的大小上限";
+"Confirm privacy review for this version" = "确认此版本已完成隐私复核";
+"Confirm this file for the packet" = "确认此文件用于材料包";
+"Complete the packet checks before exporting." = "请完成材料包检查后再导出。";
+"The handoff workspace is too large to read." = "交付工作区过大，无法读取。";
+"The handoff workspace could not be read. Existing data has been preserved." = "无法读取交付工作区，已有数据已保留。";
+"The handoff workspace changed in another window. Review it and try again." = "另一个窗口修改了交付工作区，请复核后重试。";
+"The handoff workspace contains invalid or too many items." = "交付工作区的项目无效或数量过多。";
+
+"Use this PDF" = "使用此 PDF";
+
+"Keep selected PDF" = "保留所选 PDF";
+
+/* Cross-material key-detail checks — 2026-11-05 */
+"Catch conflicting details before sharing" = "交出去之前，核对关键内容";
+"Check the details that must agree across your application, contract and attachments. Then confirm the files you will send." = "核对申请表、合同和附件中需要一致的信息，再确认要交出的文件。";
+"Check the packet's key details before exporting" = "导出前还需完成关键信息核对";
+"Matches expected text" = "与预期文字一致";
+"Does not match" = "内容不一致";
+"Needs manual review" = "需要人工复核";
+"Field not found in readable text" = "未在可读取文字中找到字段";
+"Material not assigned" = "尚未关联材料文件";
+"Readable PDF text is needed" = "需要带可读取文字的 PDF";
+"Could not check all text" = "未能完整核对文字";
+"Choose the project references, client names or other labelled text that must agree across your materials." = "指定这套材料里需要一致的项目编号、客户名称等字段。";
+"Add a key detail" = "添加核对项";
+"Check the selected PDFs again after changing a file or a check condition." = "文件或核对条件变更后，请重新核对。";
+"Add at least two materials to the packet first." = "请先在材料包里添加至少两项材料。";
+"Checks compare labelled readable text. Missing text, multiple possible values and incomplete reading need review. This does not verify business meaning or document accuracy." = "按字段名称核对可读取文字。缺少文字、存在多个可能值或读取不完整时，需要复核；结果不代表业务内容准确。";
+"Expected values and page excerpts stay on this device. The exported packet includes only a check summary." = "预期值和页面摘录留在本机，导出材料包仅附核对概况。";
+"For scans, first create a searchable PDF copy. Large PDFs may need splitting before checking." = "扫描件请先生成可搜索 PDF；较大的 PDF 可能需要先拆分再核对。";
+"Key details" = "关键信息核对";
+"Selected key details match" = "所选关键信息一致";
+"Some details need attention" = "有信息需要复核";
+"Key details need checking" = "关键信息待核对";
+"Expected: %@" = "预期：%@";
+"Removed material" = "已移除的材料";
+"Choose another PDF" = "换一份 PDF";
+"Remove check" = "移除核对项";
+"Options for %@" = "%@的操作";
+"No unambiguous value" = "没有明确的对应值";
+"Check name" = "核对项名称";
+"Label in PDF" = "PDF 中的字段名";
+"Expected text" = "预期文字";
+"Use the field label as it appears in the PDF, for example Project ID. Expected text is compared as written, without inferring amounts, dates or meaning." = "填写 PDF 中实际出现的字段名，例如“项目编号”。按预期文字核对，不自动推断金额、日期或业务含义。";
+"Materials to compare" = "需要核对的材料";
+"Select at least two materials." = "请选择至少两项材料。";
+"Select at least two current materials for this check." = "请为此核对项选择至少两项现有材料。";
+"The check condition changed in another window. Reopen it first." = "核对条件已在另一个窗口变更，请重新打开。";
+"The material changed in another window. Review it again." = "材料已在另一个窗口变更，请重新复核。";
+"Add a key detail to check across at least two materials." = "请添加需要在至少两项材料中核对的关键字段。";
+"Check key details" = "核对关键信息";
+"Choose details that must agree across these PDFs" = "指定这些 PDF 中需要一致的信息";
+"Project reference" = "项目编号";
+"Client name" = "客户名称";
+"Reviewed" = "已复核";
+"Not reviewed" = "未复核";
+"File version confirmed" = "此文件版本已确认";
+"Open PDF for review" = "打开 PDF 复核";
+
+"Check conditions and excerpts are not added to the exported checklist. Your selected PDFs are shared as chosen." = "导出清单不附带核对条件和摘录，所选 PDF 仍按你的选择交付。";
+
+"Sample application" = "示例申请材料";
+
+"Sample supporting invoice" = "示例附加发票";
+
+"Sample corrected invoice" = "示例更正发票";
+
+"Check PDFs" = "材料核对";
+
+"Check materials" = "材料核对";
+
+"Try a reference mismatch" = "体验编号不一致的示例";
+
+"Check references and names across your PDFs" = "先核对整套材料里的编号和名称";
+
+"Example: application A102 · attachment A120" = "示例：申请表 A102，附件 A120";
+
+"Use the same check conditions for your application, contract and attachments." = "按同一组要求核对申请表、合同和附件。";
+
+/* PDF Assistant demo */
+"PDF Assistant" = "PDF 助手";
+"On-device AI ready" = "本机 AI 已就绪";
+"Requests and PDF processing stay on this device." = "需求理解和 PDF 处理均在本机完成。";
+"On-device AI unavailable" = "本机 AI 暂不可用";
+"This device or region does not support the system model. Quick actions still work." = "此设备或地区无法使用系统模型，仍可使用快捷操作。";
+"Apple Intelligence is not enabled" = "尚未启用 Apple Intelligence";
+"You can use Quick actions. This app will not enable or download a model for you." = "仍可使用快捷操作。本应用不会替你启用或下载模型。";
+"The system model is not ready" = "系统模型尚未就绪";
+"You can use Quick actions. This app will not download a model for you." = "仍可使用快捷操作。本应用不会下载模型。";
+"The system model is unavailable. Quick actions still work." = "系统模型暂不可用，仍可使用快捷操作。";
+"Requires iOS 26 for AI chat" = "AI 对话需要 iOS 26 或更高版本";
+"Quick actions work on this system without a language model." = "当前系统可使用不依赖模型的快捷操作。";
+"The proposed steps need clarification. Please specify the file numbers and operation." = "暂时无法确定操作步骤，请说明文件编号和要做的操作。";
+"The page range is outside the selected PDF. Please specify a valid range." = "页码超出所选 PDF 的范围，请填写有效页码。";
+"A selected PDF changed. Please prepare the steps again." = "所选 PDF 已改变，请重新生成操作步骤。";
+"The on-device model is unavailable. You can still use Quick actions." = "本机模型暂不可用，你仍可使用快捷操作。";
+"The PDF operation did not finish. Completed copies remain in your library." = "PDF 操作未能完成，已生成的副本仍保留在文档库。";
+"Please specify the file numbers and operation." = "请说明文件编号和要做的操作。";
+"Assistant combined copy" = "助手合并副本";
+"Quick actions" = "快捷操作";
+"Refresh model status" = "刷新模型状态";
+"Choose from Library" = "从文档库选择";
+"Add PDFs" = "添加 PDF";
+"Tap a number to reference" = "点编号可引用";
+"Insert this file reference into your request" = "将此文件编号插入需求";
+"Reference in request" = "引用";
+"Remove from conversation" = "从本次对话移除";
+"What would you like to do with your PDFs?" = "想怎样处理这些 PDF？";
+"Choose PDFs, then mention them as #1 or #2. Generated PDFs get their own numbers, too." = "选择文件，用 #1、#2 指定要处理哪一份。生成的文件也能继续引用。";
+"Combine #1 and #2, then compress the result" = "合并 #1 和 #2，再压缩合并结果";
+"Extract pages 2–4 from #1" = "提取 #1 的第 2–4 页";
+"Demo: combine, extract pages and compress. Each task creates copies in Library." = "Demo 支持合并、提取页面和压缩，生成的副本会保存到文档库。";
+"Proposed steps" = "待执行步骤";
+"Quick action preview" = "快捷操作预览";
+"Creates new PDFs; keeps the originals. Compression uses balanced settings and cannot guarantee a file size." = "生成新 PDF，保留原文件。压缩采用均衡设置，不保证指定体积。";
+"Generate PDFs" = "生成 PDF";
+"Dismiss steps" = "取消这组步骤";
+"Previous step result" = "上一步结果";
+"Describe your task, or type # to reference a PDF" = "描述需求，输入 # 可引用文件";
+"Prepare PDF steps" = "生成操作步骤";
+"PDF Assistant · Demo" = "PDF 助手 · Demo";
+"Choose available, unlocked PDFs before preparing steps." = "请先选择可用且已解锁的 PDF。";
+"Preparing steps on this device" = "正在用本机模型理解需求";
+"Stopped. Completed copies remain in Library." = "已停止。已生成的副本保留在文档库。";
+"Completed step %lld · #%lld saved in Library" = "步骤 %lld 已完成，#%lld 已存入文档库";
+"Add up to 12 PDFs, leaving room for generated results." = "最多添加 12 份 PDF，为后续生成结果留出位置。";
+"Some PDFs could not be imported. Please check Library." = "部分 PDF 未能导入，请到文档库检查。";
+"Preparing PDF for sharing" = "正在准备分享 PDF";
+"Could not prepare this PDF for sharing." = "未能准备此 PDF 的分享副本。";
+"Combines files in the displayed order." = "按显示顺序合并文件。";
+"Quick actions do not use a language model. You review the steps before generating copies." = "快捷操作不使用 AI 模型，预览步骤后即可生成副本。";
+"Review steps" = "预览步骤";
+"PDF request" = "PDF 处理需求";
+"Compress a copy" = "压缩副本";
+"Extract pages" = "提取页面";
+
+"Review private details, then check the copy you share." = "先复核敏感信息，再检查要分享的文件。";
+"Try a fictional sample" = "用虚构样例体验";
+"Or choose from Library" = "或从文档库选择";
+"Import a PDF above, or try the fictional sample." = "可导入 PDF，也可以用虚构样例体验。";
+"Could not import this PDF. Please try another file." = "未能导入这份 PDF，请尝试其他文件。";
+"Unlock the PDF before checking private details." = "请先解锁 PDF，再检查隐私信息。";
+"Fictional sharing sample" = "虚构分享样例";
+"Review privacy and check your output" = "复核隐私，再检查要发送的文件";
+
+"Automatic detection can miss information. Review before sharing." = "自动检测可能遗漏信息，分享前请人工复核。";

@@ -8,6 +8,52 @@ private struct PDFInkRenderStyle: Hashable {
     let halfPointWidth: Int
 }
 
+// PDFKit records this drawing in /AP when saving. A FreeText /Rotate value
+// alone does not reliably render arbitrary angles or fallback CJK fonts.
+private final class PDFWatermarkAnnotation: PDFAnnotation {
+    override func draw(with box: PDFDisplayBox, in context: CGContext) {
+        guard let text = contents, !text.isEmpty, let font else { return }
+        let opacity = (value(
+            forAnnotationKey: PDFAnnotationKey(rawValue: "PaperPathOpacity")
+        ) as? NSNumber)?.doubleValue ?? 1
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: (fontColor ?? UIColor.black)
+                .withAlphaComponent(opacity)
+        ]
+        let string = text as NSString
+        let size = string.size(withAttributes: attributes)
+        guard size.width > 0, size.height > 0 else { return }
+        let rotation = (value(
+            forAnnotationKey: PDFAnnotationKey(rawValue: "Rotate")
+        ) as? NSNumber)?.intValue ?? 0
+        // PDF page space points upward; the preview's -45° is +45° here.
+        let angle: CGFloat = rotation == 315 ? .pi / 4 : 0
+        let projectedWidth = size.width * abs(cos(angle))
+            + size.height * abs(sin(angle))
+        let projectedHeight = size.width * abs(sin(angle))
+            + size.height * abs(cos(angle))
+        let scale = min(
+            1,
+            min(max(1, bounds.width - 8) / projectedWidth,
+                max(1, bounds.height - 8) / projectedHeight)
+        )
+        context.saveGState()
+        defer { context.restoreGState() }
+        // Own the text alpha; PDFKit may already have applied fontColor's alpha.
+        context.setAlpha(1)
+        context.translateBy(x: bounds.midX, y: bounds.midY)
+        context.rotate(by: angle)
+        context.scaleBy(x: scale, y: -scale)
+        UIGraphicsPushContext(context)
+        defer { UIGraphicsPopContext() }
+        string.draw(
+            at: CGPoint(x: -size.width / 2, y: -size.height / 2),
+            withAttributes: attributes
+        )
+    }
+}
+
 struct PDFMutationService: Sendable {
     private static let maximumPageCount = 100_000
     private static let maximumAnnotationsPerPage = 4_096
@@ -1292,7 +1338,7 @@ struct PDFMutationService: Sendable {
                 else {
                     throw PaperPathError.invalidPage
                 }
-                let annotation = PDFAnnotation(
+                let annotation = PDFWatermarkAnnotation(
                     bounds: watermarkBounds(
                         layout: payload.layout,
                         intensity: payload.intensity,
@@ -1315,7 +1361,7 @@ struct PDFMutationService: Sendable {
                 )
                 annotation.fontColor = watermarkColor(
                     payload.tone,
-                    opacity: payload.intensity.opacity
+                    opacity: 1
                 )
                 annotation.color = .clear
                 annotation.backgroundColor = .clear
@@ -2199,6 +2245,28 @@ struct PDFMutationService: Sendable {
                 PDFGeneratedAnnotationKind.resolve(
                     author: annotation.userName
                 )?.author ?? "PaperPath"
+            if isGeneratedWatermark(annotation),
+               visibleTextChanged || colorChanged {
+                // Reopened annotations are PDFKit base objects. Restore our
+                // renderer before regenerating their appearance after an edit.
+                let replacement = PDFWatermarkAnnotation(
+                    bounds: annotation.bounds,
+                    forType: .freeText,
+                    withProperties: annotation.annotationKeyValues
+                )
+                replacement.contents = annotation.contents
+                replacement.font = annotation.font
+                replacement.fontColor = annotation.fontColor
+                replacement.color = annotation.color
+                replacement.backgroundColor = annotation.backgroundColor
+                replacement.alignment = annotation.alignment
+                replacement.removeValue(forAnnotationKey: .appearanceDictionary)
+                let following = Array(page.annotations.dropFirst(payload.annotationIndex + 1))
+                page.removeAnnotation(annotation)
+                following.forEach { page.removeAnnotation($0) }
+                page.addAnnotation(replacement)
+                following.forEach { page.addAnnotation($0) }
+            }
         }
     }
 
@@ -2456,6 +2524,37 @@ struct PDFMutationService: Sendable {
             blue: 0,
             alpha: 1
         )
+    }
+
+    func setTextFormValue(_ value: String, field: PDFFormFieldSnapshot, in url: URL) throws {
+        guard field.kind == .text, !field.isReadOnly, field.issue == nil,
+              value.count <= min(field.maximumLength ?? 256, 256),
+              !value.unicodeScalars.contains(where: {
+                  CharacterSet.controlCharacters.contains($0)
+                      && !(field.isMultiline && ($0 == "\n" || $0 == "\t"))
+              }) else {
+            throw PaperPathError.insufficientSelection("This field cannot accept that value.")
+        }
+        try mutate(url: url, verification: { reopened, _ in
+            guard let page = reopened.page(at: field.pageIndex),
+                  page.annotations.indices.contains(field.annotationIndex),
+                  page.annotations[field.annotationIndex].fieldName == field.name,
+                  page.annotations[field.annotationIndex].widgetStringValue == value else {
+                throw PaperPathError.outputVerificationFailed("The form value could not be read back.")
+            }
+        }) { document in
+            guard let page = document.page(at: field.pageIndex),
+                  page.annotations.indices.contains(field.annotationIndex) else {
+                throw PaperPathError.invalidPage
+            }
+            let annotation = page.annotations[field.annotationIndex]
+            guard annotation.widgetFieldType == .text, annotation.fieldName == field.name,
+                  !annotation.isReadOnly,
+                  (annotation.maximumLength <= 0 || value.count <= annotation.maximumLength) else {
+                throw PaperPathError.insufficientSelection("The form field changed. Review it again.")
+            }
+            annotation.widgetStringValue = value
+        }
     }
 
     func refreshFormAutomation(in url: URL) throws {
@@ -2842,7 +2941,12 @@ struct PDFMutationService: Sendable {
         let height: CGFloat
         let y: CGFloat
         switch layout {
-        case .diagonal, .centered:
+        case .diagonal:
+            let side = min(availableWidth, pageBounds.height - margin * 2)
+            return CGRect(x: pageBounds.midX - side / 2,
+                          y: pageBounds.midY - side / 2,
+                          width: side, height: side)
+        case .centered:
             height = centeredHeight
             y = pageBounds.midY - height / 2
         case .header:
@@ -3144,11 +3248,7 @@ struct PDFMutationService: Sendable {
             )
         defer { try? FileManager.default.removeItem(at: temporaryURL) }
         do {
-            guard document.write(to: temporaryURL) else {
-                throw PaperPathError.storageFailure(
-                    "The changed PDF could not be encoded."
-                )
-            }
+            try PDFContentPreservingWriter.write(document, to: temporaryURL, sourceURLs: [url])
             try LocalFileSecurity.requireCompleteProtection(
                 to: temporaryURL
             )

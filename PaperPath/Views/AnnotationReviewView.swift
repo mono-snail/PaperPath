@@ -66,6 +66,7 @@ private enum AnnotationReviewFilter:
     case signatures
     case generated
     case other
+    case documentObjects
 
     var id: String { rawValue }
 
@@ -77,6 +78,7 @@ private enum AnnotationReviewFilter:
         case .drawings: return "Drawings"
         case .signatures: return "Signatures"
         case .generated: return "Generated"
+        case .documentObjects: return "Form fields & pop-ups"
         case .other: return "Other"
         }
     }
@@ -89,6 +91,7 @@ private enum AnnotationReviewFilter:
         case .drawings: return "pencil.tip"
         case .signatures: return "signature"
         case .generated: return "wand.and.stars"
+        case .documentObjects: return "list.bullet.rectangle"
         case .other: return "ellipsis.circle"
         }
     }
@@ -166,7 +169,9 @@ private enum AnnotationReviewProjector {
             && annotation.contents == "Signature"
         switch filter {
         case .all:
-            return true
+            return !["widget", "popup"].contains(type)
+        case .documentObjects:
+            return ["widget", "popup"].contains(type)
         case .markup:
             return [
                 "highlight",
@@ -185,7 +190,8 @@ private enum AnnotationReviewProjector {
         case .generated:
             return annotation.generatedKind != nil
         case .other:
-            return !matches(annotation, filter: .markup)
+            return !matches(annotation, filter: .documentObjects)
+                && !matches(annotation, filter: .markup)
                 && !matches(annotation, filter: .notes)
                 && !matches(annotation, filter: .drawings)
                 && !isSignature
@@ -227,6 +233,8 @@ private enum AnnotationReviewProjector {
         case "underline": return "Underline"
         case "strikeout": return "Strikethrough"
         case "ink": return "Drawing"
+        case "widget": return "Form field"
+        case "popup": return "Note pop-up"
         case "text": return "Note"
         case "freetext": return "Added Text"
         case "link": return "Web Link"
@@ -276,6 +284,7 @@ struct AnnotationReviewView: View {
     @State private var protectedDataAvailable =
         UIApplication.shared.isProtectedDataAvailable
     @State private var editingAnnotation: PDFAnnotationSnapshot?
+    @State private var annotationEditorDetent: PresentationDetent = .large
     @State private var editingContentRevisionID: UUID?
     @State private var pendingEditorAction: PendingEditorAction?
     @State private var filter = AnnotationReviewFilter.all
@@ -338,36 +347,39 @@ struct AnnotationReviewView: View {
                     )
                     .padding(PPSpacing.regular)
                 } else {
-                    VStack(spacing: 0) {
-                        annotationOverview
-                            .padding(.horizontal, PPSpacing.regular)
-                            .padding(.top, PPSpacing.small)
-                        if isTruncated {
-                            inventoryLimitNotice
-                                .padding(.horizontal, PPSpacing.regular)
-                        }
-                        annotationFilterRail
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            if isTruncated {
+                                inventoryLimitNotice
+                                    .padding(.horizontal, PPSpacing.regular)
+                            }
+                            annotationFilterRail
 
-                        if displayedAnnotations.isEmpty {
-                            ScrollView {
+                            if displayedAnnotations.isEmpty {
                                 VStack(spacing: PPSpacing.medium) {
                                     PPEmptyState(
                                         kind: .tools,
                                         title: searchText.isEmpty
-                                            ? AppLocalization.format(
-                                                "No %@",
-                                                filter.title.localizedUI
-                                            )
+                                            ? (filter == .all
+                                                ? "No comments or markup".localizedUI
+                                                : AppLocalization.format("No %@", filter.title.localizedUI))
                                             : "No matching annotations",
                                         message: searchText.isEmpty
                                             ? "Choose another annotation type."
                                             : "Try another word, type, or page number."
                                     )
                                     Button {
-                                        resetAnnotationScope()
+                                        if filter == .all && annotationCount(.documentObjects) > 0 {
+                                            filter = .documentObjects
+                                            scheduleProjection(debounced: false)
+                                        } else {
+                                            resetAnnotationScope()
+                                        }
                                     } label: {
                                         Label(
-                                            "Show All Annotations",
+                                            (filter == .all && annotationCount(.documentObjects) > 0
+                                                ? "Form fields & pop-ups"
+                                                : "Show All Annotations").localizedUI,
                                             systemImage:
                                                 "line.3.horizontal.decrease.circle"
                                         )
@@ -385,10 +397,7 @@ struct AnnotationReviewView: View {
                                 .frame(maxWidth: 520)
                                 .padding(PPSpacing.regular)
                                 .frame(maxWidth: .infinity)
-                            }
-                            .scrollBounceBehavior(.basedOnSize)
-                        } else {
-                            ScrollView {
+                            } else {
                                 LazyVStack(spacing: 0) {
                                     ForEach(displayedAnnotations) { annotation in
                                         annotationRow(annotation)
@@ -401,6 +410,7 @@ struct AnnotationReviewView: View {
                             }
                         }
                     }
+                    .accessibilityIdentifier("annotationReviewScroll")
                 }
             }
             .background(PPColor.canvas)
@@ -519,7 +529,7 @@ struct AnnotationReviewView: View {
                             editingAnnotation = nil
                         }
                     )
-                    .presentationDetents([.medium, .large])
+                    .presentationDetents([.medium, .large], selection: $annotationEditorDetent)
                     .presentationDragIndicator(.visible)
                 }
             }
@@ -726,32 +736,6 @@ struct AnnotationReviewView: View {
         }
     }
 
-    private var annotationOverview: some View {
-        WorkflowCommandHeader(
-            eyebrow: "DOCUMENT MARKUP",
-            title: "Comments & markup",
-            detail: "Review, edit, or remove marks in this PDF.",
-            symbol: "text.bubble",
-            tint: PPColor.amber,
-            metrics: [
-                WorkflowMetric(
-                    value: isTruncated
-                        ? "\(annotations.count)+"
-                        : "\(annotations.count)",
-                    label: "Marks",
-                    symbol: "text.bubble",
-                    tint: PPColor.amber
-                ),
-                WorkflowMetric(
-                    value: "\(annotationPageCount)",
-                    label: "Pages",
-                    symbol: "doc.on.doc",
-                    tint: PPColor.accent
-                )
-            ]
-        )
-    }
-
     private var inventoryLimitNotice: some View {
         Label(
             AppLocalization.format(
@@ -769,6 +753,20 @@ struct AnnotationReviewView: View {
 
     private var annotationActionsMenu: some View {
         Menu {
+            if annotationCount(.documentObjects) > 0 {
+                Button {
+                    filter = filter == .documentObjects ? .all : .documentObjects
+                    selectedAnnotationIDs.removeAll()
+                    scheduleProjection(debounced: false)
+                } label: {
+                    Label(
+                        (filter == .documentObjects ? "Comments & Markup" : "Form fields & pop-ups").localizedUI,
+                        systemImage: "list.bullet.rectangle"
+                    )
+                }
+                .accessibilityIdentifier("annotationDocumentObjects")
+                Divider()
+            }
             Button {
                 isSelecting = true
                 recoverableRemovalCount = nil
@@ -779,15 +777,24 @@ struct AnnotationReviewView: View {
                     systemImage: "checkmark.circle"
                 )
             }
-            .disabled(!annotations.contains(where: \.canRemove))
+            .disabled(displayedRemovableAnnotations.isEmpty)
             Button {
                 exportSummary(
-                    annotations,
-                    scope: "All annotations".localizedUI
+                    annotations.filter {
+                        AnnotationReviewProjector.matches(
+                            $0,
+                            filter: filter == .documentObjects ? .documentObjects : .all
+                        )
+                    },
+                    scope: (filter == .documentObjects
+                        ? "Form fields & pop-ups"
+                        : "All annotations").localizedUI
                 )
             } label: {
                 Label(
-                    "Export all annotations",
+                    (filter == .documentObjects
+                        ? "Export fields & pop-ups"
+                        : "Export all annotations").localizedUI,
                     systemImage: "square.and.arrow.up"
                 )
             }
@@ -1043,10 +1050,12 @@ struct AnnotationReviewView: View {
                 Button {
                     guard hasCurrentInventory else { return }
                     editingContentRevisionID = loadedContentRevisionID
+                    annotationEditorDetent = .large
                     editingAnnotation = annotation
                 } label: {
                     Image(systemName: "pencil")
                         .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(
@@ -1071,6 +1080,7 @@ struct AnnotationReviewView: View {
                 } label: {
                     Image(systemName: "trash")
                         .frame(width: 44, height: 44)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.red)
@@ -1147,6 +1157,7 @@ struct AnnotationReviewView: View {
                     .accessibilityValue(
                         isSelected ? "Selected" : ""
                     )
+                    .accessibilityIdentifier("annotationFilter-\(candidate.rawValue)")
                 }
             }
             .padding(.horizontal, PPSpacing.regular)
@@ -1164,7 +1175,9 @@ struct AnnotationReviewView: View {
 
     private var visibleFilters: [AnnotationReviewFilter] {
         AnnotationReviewFilter.allCases.filter {
-            $0 == .all || annotationCount($0) > 0
+            $0 == .all || ($0 == .documentObjects
+                ? filter == .documentObjects
+                : annotationCount($0) > 0)
         }
     }
 
@@ -1975,9 +1988,7 @@ struct PDFAttachmentsView: View {
 
     private var attachmentOverview: some View {
         WorkflowCommandHeader(
-            eyebrow: "ATTACHMENT WORKFLOW",
             title: "Embedded files",
-            detail: "Verify embedded bytes before creating temporary extraction copies.",
             symbol: "paperclip",
             tint: PPColor.cyan,
             metrics: [
@@ -2462,71 +2473,10 @@ private struct AnnotationEditorSheet: View {
                         alignment: .leading,
                         spacing: PPSpacing.large
                     ) {
-                        WorkflowCommandHeader(
-                            eyebrow: "ANNOTATION STYLE",
-                            title: annotation.type,
-                            detail: "Edit supported properties without flattening the annotation.",
-                            symbol: "pencil.tip",
-                            tint: Color(
-                                red: selectedColor.red,
-                                green: selectedColor.green,
-                                blue: selectedColor.blue
-                            ),
-                            metrics: [
-                                WorkflowMetric(
-                                    value:
-                                        "\(annotation.pageIndex + 1)",
-                                    label: "Page",
-                                    symbol: "doc.text",
-                                    tint: PPColor.accent
-                                ),
-                                WorkflowMetric(
-                                    value: annotation.canEditStyle
-                                        ? "Editable"
-                                        : "Read only",
-                                    label: "Style",
-                                    symbol: annotation.canEditStyle
-                                        ? "paintpalette"
-                                        : "lock",
-                                    tint: annotation.canEditStyle
-                                        ? PPColor.mint
-                                        : PPColor.amber
-                                ),
-                                WorkflowMetric(
-                                    value: supportsLineWidth
-                                        ? lineWidth.formatted(
-                                            .number.precision(
-                                                .fractionLength(0...1)
-                                            )
-                                        ) + " pt"
-                                        : "—",
-                                    label: "Line",
-                                    symbol: "scribble",
-                                    tint: PPColor.cyan
-                                )
-                            ]
-                        )
-
-                        Button {
-                            requestExit(.openPage)
-                        } label: {
-                            Label(
-                                "Open on Page",
-                                systemImage:
-                                    "doc.text.magnifyingglass"
-                            )
-                        }
-                        .disabled(isSaving || hasRevisionConflict)
+                        annotationContext
 
                         if annotation.canEditContents {
-                            WorkflowSectionHeader(
-                                eyebrow: "CONTENT",
-                                title: "Text or Note",
-                                count: contents.count,
-                                tint: contents.count > 2_000
-                                    ? .red
-                                    : PPColor.cyan
-                            )
+                            annotationTextHeading
                             HStack(alignment: .bottom) {
                                 TextField(
                                     "Optional annotation text",
@@ -2534,13 +2484,16 @@ private struct AnnotationEditorSheet: View {
                                     axis: .vertical
                                 )
                                 .lineLimit(2...6)
+                                .font(.body)
+                                .padding(PPSpacing.medium)
+                                .frame(minHeight: 88, alignment: .topLeading)
+                                .background(PPColor.surface, in: RoundedRectangle(cornerRadius: PPRadius.control))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: PPRadius.control)
+                                        .stroke(PPColor.border, lineWidth: 0.7)
+                                }
                                 .onChange(of: contents) {
-                                    _, value in
-                                    if value.count > 2_000 {
-                                        contents = String(
-                                            value.prefix(2_000)
-                                        )
-                                    }
+                                    _, _ in
                                     saveErrorMessage = nil
                                 }
                                 .accessibilityIdentifier(
@@ -2552,9 +2505,7 @@ private struct AnnotationEditorSheet: View {
                                 ) { values in
                                     guard let value = values.first
                                     else { return }
-                                    contents = String(
-                                        value.prefix(2_000)
-                                    )
+                                    contents = value
                                 }
                                 .labelStyle(.iconOnly)
                                 .frame(minWidth: 44, minHeight: 44)
@@ -2567,24 +2518,13 @@ private struct AnnotationEditorSheet: View {
                         }
 
                         if annotation.canEditStyle {
-                            WorkflowSectionHeader(
-                                eyebrow: "APPEARANCE",
-                                title: "Color and line"
-                            )
-                            if dynamicTypeSize
-                                .ppPrefersExpandedLayout {
-                                VStack(
-                                    alignment: .leading,
-                                    spacing: PPSpacing.small
-                                ) {
-                                    annotationColorPalette
-                                    annotationLineWidthControl
-                                }
-                            } else {
-                                HStack(spacing: PPSpacing.small) {
-                                    annotationColorPalette
-                                    annotationLineWidthControl
-                                }
+                            VStack(alignment: .leading, spacing: PPSpacing.small) {
+                                Text((supportsLineWidth ? "Color and line" : "Color").localizedUI)
+                                    .font(.headline)
+                                    .foregroundStyle(PPColor.textPrimary)
+                                    .accessibilityAddTraits(.isHeader)
+                                annotationColorPalette
+                                annotationLineWidthControl
                             }
                         }
 
@@ -2604,10 +2544,22 @@ private struct AnnotationEditorSheet: View {
                     .frame(maxWidth: .infinity)
                 }
                 .scrollDismissesKeyboard(.interactively)
+                .accessibilityIdentifier("annotationEditorScroll")
                 .disabled(isSaving)
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: PPSpacing.xSmall) {
+                    if contents.count > 2_000 {
+                        Label(
+                            "Use up to 2,000 characters. Your full text is kept here.".localizedUI,
+                            systemImage: "exclamationmark.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(PPColor.rose)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("annotationLengthWarning")
+                    }
                     if hasRevisionConflict && !isSaving {
                         Label(
                             "The PDF changed in another view. Your draft has not been applied.".localizedUI,
@@ -2739,6 +2691,76 @@ private struct AnnotationEditorSheet: View {
         }
     }
 
+    @ViewBuilder
+    private var annotationTextHeading: some View {
+        if dynamicTypeSize.ppPrefersExpandedLayout {
+            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                annotationTextTitle
+                annotationCharacterCount
+            }
+        } else {
+            HStack(alignment: .firstTextBaseline) {
+                annotationTextTitle
+                Spacer(minLength: PPSpacing.small)
+                annotationCharacterCount
+            }
+        }
+    }
+
+    private var annotationTextTitle: some View {
+        Text("Text or Note".localizedUI)
+            .font(.headline)
+            .foregroundStyle(PPColor.textPrimary)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private var annotationCharacterCount: some View {
+        Text("\(contents.count.formatted()) / \(2_000.formatted())")
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(contents.count > 2_000 ? PPColor.rose : PPColor.textSecondary)
+            .accessibilityLabel(AppLocalization.format("%lld characters", contents.count))
+    }
+
+    @ViewBuilder
+    private var annotationContext: some View {
+        VStack(alignment: .leading, spacing: PPSpacing.small) {
+            if dynamicTypeSize.ppPrefersExpandedLayout {
+                VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                    annotationContextLabel
+                    openAnnotationPageButton
+                }
+            } else {
+                HStack(spacing: PPSpacing.medium) {
+                    annotationContextLabel
+                    Spacer(minLength: PPSpacing.small)
+                    openAnnotationPageButton
+                }
+            }
+            Divider().overlay(PPColor.border)
+        }
+    }
+
+    private var annotationContextLabel: some View {
+        Text(AnnotationReviewProjector.title(for: annotation).localizedUI
+            + " · " + AppLocalization.format("Page %lld", annotation.pageIndex + 1))
+            .font(.subheadline.weight(.medium))
+            .foregroundStyle(PPColor.textSecondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .accessibilityIdentifier("annotationEditorContext")
+    }
+
+    private var openAnnotationPageButton: some View {
+        Button { requestExit(.openPage) } label: {
+            Label("Open on Page".localizedUI, systemImage: "doc.text.magnifyingglass")
+                .font(.subheadline)
+                .frame(minHeight: 44)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(PPColor.accent)
+        .disabled(isSaving || hasRevisionConflict)
+        .accessibilityIdentifier("annotationOpenPage")
+    }
+
     private var supportsLineWidth: Bool {
         switch annotation.type.lowercased() {
         case "ink", "square", "circle", "line":
@@ -2763,7 +2785,7 @@ private struct AnnotationEditorSheet: View {
                                 option.color
                             ) {
                                 Image(systemName: "checkmark")
-                                    .font(.caption.weight(.bold))
+                                    .font(.system(size: 12, weight: .bold))
                                     .foregroundStyle(
                                         option.id == "yellow"
                                             ? Color.black
@@ -2803,25 +2825,25 @@ private struct AnnotationEditorSheet: View {
     @ViewBuilder
     private var annotationLineWidthControl: some View {
         if supportsLineWidth {
-            Slider(
-                value: $lineWidth,
-                in: 0.5...12,
-                step: 0.5
-            ) {
-                Text("Line width")
-            } minimumValueLabel: {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 5))
-            } maximumValueLabel: {
-                Image(systemName: "circle.fill")
-                    .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: PPSpacing.xSmall) {
+                HStack {
+                    Text("Line width".localizedUI)
+                    Spacer()
+                    Text(lineWidth.formatted(.number.precision(.fractionLength(0...1))) + " pt")
+                        .monospacedDigit()
+                }
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
+                Slider(value: $lineWidth, in: 0.5...12, step: 0.5) {
+                    Text("Line width")
+                } minimumValueLabel: {
+                    Image(systemName: "circle.fill").font(.system(size: 5))
+                } maximumValueLabel: {
+                    Image(systemName: "circle.fill").font(.system(size: 13))
+                }
+                .accessibilityIdentifier("annotationLineWidth")
+                .accessibilityValue(lineWidth.formatted(.number.precision(.fractionLength(0...1))) + " pt")
             }
-            .frame(
-                maxWidth: dynamicTypeSize.ppPrefersExpandedLayout
-                    ? .infinity
-                    : nil
-            )
-            .accessibilityIdentifier("annotationLineWidth")
         }
     }
 
@@ -2841,6 +2863,9 @@ private struct AnnotationEditorSheet: View {
     }
 
     private var saveAccessibilityHint: String {
+        if contents.count > 2_000 {
+            return "Use up to 2,000 characters. Your full text is kept here.".localizedUI
+        }
         if hasRevisionConflict {
             return "The PDF changed in another view. Your draft has not been applied.".localizedUI
         }

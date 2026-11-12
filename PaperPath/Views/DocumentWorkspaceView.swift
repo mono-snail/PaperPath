@@ -9,7 +9,12 @@ private enum ProtectedPDFPasswordValidationResult: Sendable {
 }
 
 struct DocumentWorkspaceView: View {
-    @State private var isPrivacyScanPresented = false
+    private struct PrivacyScanPresentation: Identifiable {
+        let id = UUID()
+    }
+    @State private var privacyScanPresentation: PrivacyScanPresentation?
+    private var isPrivacyScanPresented: Bool { privacyScanPresentation != nil }
+    @State private var isPrivacyScanSessionActive = false
     @StateObject private var privacyScanReviewModel =
         PrivacyScanReviewModel()
 
@@ -148,7 +153,7 @@ struct DocumentWorkspaceView: View {
             case .pin:
                 return "Updating pin".localizedUI
             case .rename:
-                return "Renaming working copy".localizedUI
+                return "Renaming document".localizedUI
             case .bookmark:
                 return "Updating bookmark".localizedUI
             case .trash:
@@ -193,6 +198,8 @@ struct DocumentWorkspaceView: View {
     let recordID: UUID
     let initialPageIndex: Int?
     let initialQuickTask: PDFQuickTask?
+    let initialPrivacyScan: Bool
+    @State private var didHandleInitialPrivacyScan = false
     let initialContentRevisionID: UUID?
     let onReadingPositionChange: (Int, UUID) -> Void
     let onOpenDocument: (DocumentRoute) -> Void
@@ -242,6 +249,8 @@ struct DocumentWorkspaceView: View {
     @State private var currentPageIndex = 0
     @State private var pageStateContentRevisionID: UUID?
     @State private var pageScrubberValue = 0.0
+    @State private var showsLargePDFHistoryNotice = false
+    @State private var historyNoticeAcknowledgement = 0
     @State private var isScrubbingPage = false
     @State private var pageBackHistory: [Int] = []
     @State private var pageForwardHistory: [Int] = []
@@ -279,6 +288,7 @@ struct DocumentWorkspaceView: View {
     @State private var isRedactionMode = false
     @State private var pageNavigationFeedback = 0
     @State private var shareItems: [Any] = []
+    @State private var savesShareToFiles = false
     @State private var isPresentingPencil = false
     @State private var isPresentingSignature = false
     @State private var signaturePageIndex: Int?
@@ -302,6 +312,7 @@ struct DocumentWorkspaceView: View {
         initialPageIndex: Int? = nil,
         initialQuickTask: PDFQuickTask? = nil,
         initialContentRevisionID: UUID? = nil,
+        initialPrivacyScan: Bool = false,
         onReadingPositionChange: @escaping (Int, UUID) -> Void = {
             _,
             _ in
@@ -310,6 +321,7 @@ struct DocumentWorkspaceView: View {
     ) {
         self.recordID = recordID
         self.initialPageIndex = initialPageIndex
+        self.initialPrivacyScan = initialPrivacyScan
         self.initialQuickTask = initialQuickTask
         self.initialContentRevisionID = initialContentRevisionID
         self.onReadingPositionChange = onReadingPositionChange
@@ -331,7 +343,21 @@ struct DocumentWorkspaceView: View {
             }
         }
         .navigationBarTitleDisplayMode(.inline)
-        .task(id: recordID) {
+        .alert("Large PDF storage", isPresented: $showsLargePDFHistoryNotice) {
+            Button("Understood") {
+                UserDefaults.standard.set(true, forKey: "document.compactHistoryNotice.\(recordID.uuidString)")
+                historyNoticeAcknowledgement += 1
+            }
+        } message: {
+            Text("For PDFs of 100 MiB or more, PaperPath keeps the starting version and your latest saved result instead of every editing step. Existing pinned milestones stay until you clear them in Local Storage. For older documents, the starting version is the earliest history still available. Saving still needs temporary free space.")
+        }
+        .task(id: "\(recordID.uuidString)-\(historyNoticeAcknowledgement)") {
+            if let record = model.record(id: recordID),
+               PDFHistoryStoragePolicy.usesCompactHistory(byteCount: record.profile.byteCount),
+               !UserDefaults.standard.bool(forKey: "document.compactHistoryNotice.\(recordID.uuidString)") {
+                showsLargePDFHistoryNotice = true
+                return
+            }
             await model.ensureAnalysisLoaded(for: recordID)
             guard !Task.isCancelled else { return }
             await model.synchronizeCompletionState(recordID: recordID)
@@ -367,6 +393,15 @@ struct DocumentWorkspaceView: View {
                         recordsHistory: false
                     )
                 }
+                return
+            }
+            if initialPrivacyScan && !didHandleInitialPrivacyScan {
+                didHandleInitialPrivacyScan = true
+                guard !record.profile.isLocked else { return }
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                isPrivacyScanSessionActive = true
+                privacyScanPresentation = PrivacyScanPresentation()
                 return
             }
             if let initialPageIndex {
@@ -461,6 +496,12 @@ struct DocumentWorkspaceView: View {
                 )
             }
         }
+        .onChange(of: model.record(id: recordID)?.profile.byteCount) { _, bytes in
+            if let bytes, PDFHistoryStoragePolicy.usesCompactHistory(byteCount: bytes),
+               !UserDefaults.standard.bool(forKey: "document.compactHistoryNotice.\(recordID.uuidString)") {
+                showsLargePDFHistoryNotice = true
+            }
+        }
         .onChange(of: scenePhase) { _, phase in
             guard phase == .background else { return }
             interruptProtectedWorkspaceWork()
@@ -475,10 +516,6 @@ struct DocumentWorkspaceView: View {
     }
 
     private func workspace(record: DocumentRecord, url: URL) -> some View {
-        let recentDocuments = model.recentDocuments(
-            excluding: record.id,
-            limit: 5
-        )
         let activeSessionPassword = sessionPassword
         let activeSessionGeneration = sessionUnlockGeneration
         let workspaceChrome = AnyView(
@@ -671,55 +708,57 @@ struct DocumentWorkspaceView: View {
             .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
-                    isPrivacyScanPresented = true
+                    share(recordID: recordID)
                 } label: {
-                    Label(
-                        "Privacy Scan".localizedUI,
-                        systemImage: "checkmark.shield"
-                    )
+                    if horizontalSizeClass == .compact {
+                        Image(systemName: "square.and.arrow.up")
+                    } else {
+                        Text("Share".localizedUI)
+                    }
                 }
-                .help("Privacy Scan".localizedUI)
-                .accessibilityLabel("Privacy Scan".localizedUI)
-                .accessibilityHint(
-                    privacyScanAvailabilityHint(for: record)
-                )
-                .accessibilityIdentifier("privacyScanButton")
-                .sheet(
-                    isPresented: $isPrivacyScanPresented,
-                    onDismiss: handleWorkspacePresentationDismissal
-                ) {
-                    PrivacyScanWorkspaceSheet(
-                        reviewModel: privacyScanReviewModel,
-                        recordID: recordID,
-                        contentRevisionID: record.contentRevisionID,
-                        sourceURL: url,
-                        estimatedPageCount: record.profile.pageCount,
-                        documentName: record.displayName,
-                        textIndex: model.textIndices[recordID],
-                        onLocate: { finding in
-                            locatePrivacyFinding(
-                                finding,
-                                contentRevisionID:
-                                    record.contentRevisionID
-                            )
-                        },
-                        onOpenDocument: { route in
-                            queueWorkspaceHandoff(.openDocument(route))
-                            isPrivacyScanPresented = false
-                        }
-                    )
-                    .presentationDetents([.large])
-                    .presentationDragIndicator(.visible)
+                .accessibilityLabel("Share PDF".localizedUI)
+                .accessibilityIdentifier("workspaceSharePDF")
+                .disabled(hasBlockingWorkspaceControlTask || isApplyingSessionUnlock || isRedactionMode || !redactionMarks.isEmpty)
+            }
+            ToolbarItem(placement: .topBarTrailing) {
+                Menu {
+                    Button {
+                        share(recordID: recordID, toFiles: true)
+                    } label: {
+                        Label("Save PDF to Files".localizedUI, systemImage: "folder")
+                    }
+                    .accessibilityIdentifier("savePDFToFiles")
+                    Button {
+                        share(recordID: recordID)
+                    } label: {
+                        Label("Share PDF".localizedUI, systemImage: "square.and.arrow.up")
+                    }
+                    .accessibilityIdentifier("shareCurrentPDF")
+                    Button {
+                        presentedSheet = .export
+                    } label: {
+                        Label("More Export Formats".localizedUI, systemImage: "doc.badge.arrow.up")
+                    }
+                    Divider()
+                    Button {
+                        isPrivacyScanSessionActive = true
+                        privacyScanPresentation = PrivacyScanPresentation()
+                    } label: {
+                        Label("Privacy Scan".localizedUI, systemImage: "checkmark.shield")
+                    }
+                    .disabled(record.profile.isLocked || isPrivacyScanSessionActive)
+                    .accessibilityIdentifier("privacyScanButton")
+                } label: {
+                    Text("Export".localizedUI)
                 }
-                .disabled(
-                    record.profile.isLocked
-                        || model.isProcessing(recordID)
-                )
+                .accessibilityIdentifier("documentExportMenu")
+                .disabled(hasBlockingWorkspaceControlTask || isApplyingSessionUnlock || isRedactionMode || !redactionMarks.isEmpty)
             }
                 ToolbarItem(placement: .principal) {
                     if hasDocumentRelationship(record) {
                         Menu {
                             Section(record.displayName) {
+                                renameDocumentButton(record)
                                 documentRelationshipMenuCommands(record)
                                 Button {
                                     presentedSheet = .deliveryHistory
@@ -736,215 +775,30 @@ struct DocumentWorkspaceView: View {
                         .accessibilityIdentifier("workspaceRelatedDocumentsMenu")
                         .disabled(hasBlockingWorkspaceControlTask)
                     } else {
-                        workspaceTitle(record, showsRelationship: false)
-                    }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Menu {
-                        Button {
-                            presentedSheet = .find
-                        } label: {
-                            Label(
-                                "Find in Document",
-                                systemImage: "text.magnifyingglass"
-                            )
-                        }
-                        .keyboardShortcut("f", modifiers: .command)
-
-                        Button {
-                            presentedSheet = .tools
-                        } label: {
-                            Label("All tools", systemImage: "wrench.and.screwdriver")
-                        }
-                        .keyboardShortcut("t", modifiers: .command)
-
-                        Menu("Workspace tools".localizedUI) {
-                            ForEach(ToolMode.allCases) { mode in
-                                Button {
-                                    savedToolMode = mode.rawValue
-                                } label: {
-                                    Label(mode.title.localizedUI, systemImage: mode == toolMode ? "checkmark" : "circle")
-                                }
-                                .keyboardShortcut(mode.shortcut, modifiers: [.command, .control])
-                            }
-                        }
-                        .disabled(isRedactionMode)
-
                         Menu {
-                            Button {
-                                presentedSheet = .reading
-                            } label: {
-                                Label(
-                                    "Reading Settings",
-                                    systemImage: "textformat.size"
-                                )
-                            }
-                            Button {
-                                toggleImmersiveReading()
-                            } label: {
-                                Label(
-                                    isImmersiveReading
-                                        ? "Exit immersive reading"
-                                        : "Immersive Reading",
-                                    systemImage:
-                                        "arrow.up.left.and.arrow.down.right"
-                                )
-                            }
-                            .keyboardShortcut(
-                                "i",
-                                modifiers: [.command, .shift]
-                            )
-                            Menu {
-                                Button {
-                                    runViewportCommand(.zoomIn)
-                                } label: {
-                                    Label(
-                                        "Zoom In",
-                                        systemImage: "plus.magnifyingglass"
-                                    )
-                                }
-                                .keyboardShortcut(
-                                    "+",
-                                    modifiers: .command
-                                )
-
-                                Button {
-                                    runViewportCommand(.zoomOut)
-                                } label: {
-                                    Label(
-                                        "Zoom Out",
-                                        systemImage: "minus.magnifyingglass"
-                                    )
-                                }
-                                .keyboardShortcut(
-                                    "-",
-                                    modifiers: .command
-                                )
-
-                                Button {
-                                    runViewportCommand(.fitToWindow)
-                                } label: {
-                                    Label(
-                                        "Fit to Window",
-                                        systemImage: "viewfinder"
-                                    )
-                                }
-                                .keyboardShortcut(
-                                    "0",
-                                    modifiers: .command
-                                )
-                            } label: {
-                                Label(
-                                    "Zoom",
-                                    systemImage: "plus.magnifyingglass"
-                                )
-                            }
-                            Button {
-                                presentedSheet = .reader
-                            } label: {
-                                Label(
-                                    "Focus Reader",
-                                    systemImage: "text.alignleft"
-                                )
+                            Section(record.displayName) {
+                                renameDocumentButton(record)
                             }
                         } label: {
-                            Label("Reading", systemImage: "book")
+                            workspaceTitle(record, showsRelationship: false)
                         }
-                        Button {
-                            presentedSheet = .bookmarks
-                        } label: {
-                            Label(
-                                "Navigate",
-                                systemImage: "bookmark"
-                            )
-                            .accessibilityIdentifier(
-                                "workspaceNavigateAction"
-                            )
-                        }
-                        Button {
-                            presentedSheet = .privateNote
-                        } label: {
-                            Label(
-                                record.privateNote == nil
-                                    ? "Add Private Note"
-                                    : "Edit Private Note",
-                                systemImage: "note.text"
-                            )
-                        }
-                        if let previousDocument =
-                                recentDocuments.first {
-                            Divider()
-
-                            Button {
-                                openRecentDocument(previousDocument)
-                            } label: {
-                                Label(
-                                    "Previously Viewed Document",
-                                    systemImage: "arrow.left.arrow.right"
-                                )
-                            }
-                            .keyboardShortcut(
-                                .tab,
-                                modifiers: .control
-                            )
-                            .accessibilityHint(
-                                AppLocalization.format(
-                                    "Switches to %@",
-                                    previousDocument.displayName
-                                )
-                            )
-
-                            Menu("Recent Documents") {
-                                ForEach(recentDocuments) { recentRecord in
-                                    Button {
-                                        openRecentDocument(recentRecord)
-                                    } label: {
-                                        Label(
-                                            "\(recentRecord.displayName) · p\(recentRecord.lastPageIndex + 1)",
-                                            systemImage: recentRecord.profile
-                                                .kind.symbol
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        if UIDevice.current.userInterfaceIdiom == .pad {
-                            Divider()
-
-                            Button {
-                                openCurrentDocumentInNewWindow(
-                                    record.id
-                                )
-                            } label: {
-                                Label(
-                                    "Open in New Window",
-                                    systemImage: "macwindow.badge.plus"
-                                )
-                            }
-                            .accessibilityHint(
-                                "Opens this PDF in a separate iPad window."
-                                    .localizedUI
-                            )
-                            .keyboardShortcut(
-                                "n",
-                                modifiers: [.command, .shift]
-                            )
-                            .help("Open in New Window".localizedUI)
-                        }
-                    } label: {
-                        Image(systemName: "book.pages")
+                        .accessibilityIdentifier("workspaceDocumentNameMenu")
+                        .disabled(hasBlockingWorkspaceControlTask)
                     }
-                    .accessibilityLabel(
-                        "Reading and navigation".localizedUI
-                    )
-                    .accessibilityIdentifier(
-                        "workspaceNavigationMenu"
-                    )
-                    .disabled(hasBlockingWorkspaceControlTask)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    if horizontalSizeClass == .regular {
+                        workspaceNavigationMenu(record)
+                    }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        renameDocumentButton(record)
+                        Divider()
+                        if horizontalSizeClass == .compact {
+                            workspaceNavigationMenu(record, showsTitle: true)
+                            Divider()
+                        }
                         Menu {
                             Menu("Move to") {
                                 ForEach(DocumentWorkflowStatus.allCases) { status in
@@ -971,14 +825,6 @@ struct DocumentWorkspaceView: View {
                                         ? "pin.slash"
                                         : "pin"
                                 )
-                            }
-
-                            Button {
-                                originalName = record.displayName
-                                proposedName = record.displayName
-                                isRenaming = true
-                            } label: {
-                                Label("Rename", systemImage: "pencil")
                             }
                         } label: {
                             Label("Organize", systemImage: "folder")
@@ -1081,7 +927,7 @@ struct DocumentWorkspaceView: View {
                             printDocument(record: record, url: url)
                         } label: {
                             Label(
-                                "Print Working Copy",
+                                "Print Document",
                                 systemImage: "printer"
                             )
                         }
@@ -1166,8 +1012,17 @@ struct DocumentWorkspaceView: View {
                                     .presentationDetents([.large])
                                     .presentationDragIndicator(.visible)
                             case .share:
-                                ShareSheet(items: shareItems)
-                                    .presentationDetents([.medium, .large])
+                                if savesShareToFiles, let url = temporaryShareURL {
+                                    FileExportPicker(url: url, onCompletion: {
+                                        presentedSheet = nil
+                                    }, onExported: { _ in
+                                        model[noticeFor: paperPathSceneID] = "PDF saved to Files".localizedUI
+                                    })
+                                    .ignoresSafeArea()
+                                } else {
+                                    ShareSheet(items: shareItems)
+                                        .presentationDetents([.medium, .large])
+                                }
                             case .tools:
                                 DocumentToolPalette(
                                     recordTitle: record.displayName,
@@ -1487,6 +1342,42 @@ struct DocumentWorkspaceView: View {
                     )
                 }
                 .sheet(
+                    item: $privacyScanPresentation,
+                    onDismiss: {
+                        if privacyScanPresentation == nil {
+                            isPrivacyScanSessionActive = false
+                        }
+                        handleWorkspacePresentationDismissal()
+                    }
+                ) { presentation in
+                    PrivacyScanWorkspaceSheet(
+                        reviewModel: privacyScanReviewModel,
+                        recordID: recordID,
+                        contentRevisionID: record.contentRevisionID,
+                        sourceURL: url,
+                        estimatedPageCount: record.profile.pageCount,
+                        documentName: record.displayName,
+                        textIndex: model.textIndices[recordID],
+                        onLocate: { finding in
+                            locatePrivacyFinding(
+                                finding,
+                                contentRevisionID:
+                                    record.contentRevisionID
+                            )
+                            privacyScanPresentation = nil
+                        },
+                        onOpenDocument: { route in
+                            if route.recordID != recordID || route.quickTask != nil {
+                                queueWorkspaceHandoff(.openDocument(route))
+                            }
+                            privacyScanPresentation = nil
+                        }
+                    )
+                    .id(presentation.id)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+                }
+                .sheet(
                     isPresented: $isConfiguringRecognition,
                     onDismiss: completeRecognitionConfigurationDismissal
                 ) {
@@ -1577,7 +1468,7 @@ struct DocumentWorkspaceView: View {
 
         return AnyView(
             workspaceEditors
-                .alert("Rename working copy", isPresented: $isRenaming) {
+                .alert("Rename document", isPresented: $isRenaming) {
                     TextField("Document name", text: $proposedName)
                         .focused($renameFieldFocused)
                         .submitLabel(.done)
@@ -1597,11 +1488,12 @@ struct DocumentWorkspaceView: View {
                                 .isEmpty
                     )
                 } message: {
-                    Text("This changes only the name inside PaperPath.")
+                    Text("This name is also used when you share or save the PDF to Files. The original file is unchanged.".localizedUI)
                 }
                 .alert("Go to page", isPresented: $isJumpingToPage) {
                     TextField("Page number", text: $pageJumpInput)
                         .keyboardType(.numberPad)
+                        .accessibilityIdentifier("workspacePageJumpInput")
                         .focused($pageJumpFieldFocused)
                         .submitLabel(.go)
                         .onSubmit {
@@ -1614,6 +1506,7 @@ struct DocumentWorkspaceView: View {
                         jumpToEnteredPage()
                     }
                     .disabled(!pageJumpIsValid)
+                    .accessibilityIdentifier("workspacePageJumpConfirm")
                 } message: {
                     Text(
                         AppLocalization.format(
@@ -1623,7 +1516,7 @@ struct DocumentWorkspaceView: View {
                     )
                 }
                 .confirmationDialog(
-                    "Move this private copy to Trash?",
+                    "Move this document to Trash?",
                     isPresented: $isConfirmingDelete,
                     titleVisibility: .visible
                 ) {
@@ -1633,7 +1526,7 @@ struct DocumentWorkspaceView: View {
                     Button("Cancel", role: .cancel) {}
                 } message: {
                     Text(
-                        "The copy remains recoverable. The original imported file stays untouched."
+                        "The document can be recovered from Trash. The original file in Files stays untouched."
                     )
                 }
                 .sheet(
@@ -1693,7 +1586,7 @@ struct DocumentWorkspaceView: View {
                                     Text(
                                         (
                                             continuesVerifiedOutputAfterUnlock
-                                                ? "Unlocks into a separate copy. The encrypted original stays unchanged."
+                                                ? "Removes the password from this document. The encrypted version is kept in History."
                                                 : "The password is kept only while this PDF is open."
                                         ).localizedUI
                                     )
@@ -1793,18 +1686,7 @@ struct DocumentWorkspaceView: View {
                         pageJumpFieldFocused = true
                     }
                 }
-                .onChange(of: pageJumpInput) { _, value in
-                    let digits = value.filter(\.isNumber)
-                    if digits != value {
-                        pageJumpInput = String(digits.prefix(6))
-                    } else if value.count > 6 {
-                        pageJumpInput = String(value.prefix(6))
-                    }
-                }
-                .onChange(of: unlockInput) { _, value in
-                    if value.count > 128 {
-                        unlockInput = String(value.prefix(128))
-                    }
+                .onChange(of: unlockInput) { _, _ in
                     unlockErrorMessage = nil
                 }
                 .onChange(
@@ -1815,7 +1697,9 @@ struct DocumentWorkspaceView: View {
                 .onChange(of: record.contentRevisionID) {
                     oldRevisionID,
                     newRevisionID in
-                    privacyScanReviewModel.reset()
+                    if privacyScanReviewModel.phase != .redacting {
+                        privacyScanReviewModel.reset()
+                    }
                     rebuildPageStateForUpdatedPDF(
                         from: oldRevisionID,
                         to: newRevisionID
@@ -1982,7 +1866,7 @@ struct DocumentWorkspaceView: View {
                     .frame(width: 28, height: 28)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Editable copy not created")
+                    Text("Password not removed")
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(PPColor.textPrimary)
                     Text(issue.message.localizedUI)
@@ -2070,7 +1954,7 @@ struct DocumentWorkspaceView: View {
     private var unlockPasswordPasteButton: some View {
         PasteButton(payloadType: String.self) { values in
             guard let value = values.first else { return }
-            unlockInput = String(value.prefix(128))
+            unlockInput = value
         }
         .frame(minWidth: 44, minHeight: 44)
         .disabled(unlockValidationTask != nil)
@@ -2309,7 +2193,223 @@ struct DocumentWorkspaceView: View {
     private func documentRelationshipRoleTitle(
         _ record: DocumentRecord
     ) -> String {
-        record.isDeliveryArtifact ? "Result copy" : "Working copy"
+        record.isDeliveryArtifact ? "Exported PDF" : "Document"
+    }
+
+    private func workspaceNavigationMenu(
+        _ record: DocumentRecord,
+        showsTitle: Bool = false
+    ) -> some View {
+        let recentDocuments = model.recentDocuments(
+            excluding: record.id,
+            limit: 5
+        )
+        return Menu {
+            Button {
+                presentedSheet = .find
+            } label: {
+                Label(
+                    "Find in Document",
+                    systemImage: "text.magnifyingglass"
+                )
+            }
+            .keyboardShortcut("f", modifiers: .command)
+
+            Button {
+                presentedSheet = .tools
+            } label: {
+                Label("All tools", systemImage: "wrench.and.screwdriver")
+            }
+            .keyboardShortcut("t", modifiers: .command)
+
+            Menu("Workspace tools".localizedUI) {
+                ForEach(ToolMode.allCases) { mode in
+                    Button {
+                        savedToolMode = mode.rawValue
+                    } label: {
+                        Label(mode.title.localizedUI, systemImage: mode == toolMode ? "checkmark" : "circle")
+                    }
+                    .keyboardShortcut(mode.shortcut, modifiers: [.command, .control])
+                }
+            }
+            .disabled(isRedactionMode)
+
+            Menu {
+                Button {
+                    presentedSheet = .reading
+                } label: {
+                    Label(
+                        "Reading Settings",
+                        systemImage: "textformat.size"
+                    )
+                }
+                Button {
+                    toggleImmersiveReading()
+                } label: {
+                    Label(
+                        isImmersiveReading
+                            ? "Exit immersive reading"
+                            : "Immersive Reading",
+                        systemImage:
+                            "arrow.up.left.and.arrow.down.right"
+                    )
+                }
+                .keyboardShortcut(
+                    "i",
+                    modifiers: [.command, .shift]
+                )
+                Menu {
+                    Button {
+                        runViewportCommand(.zoomIn)
+                    } label: {
+                        Label(
+                            "Zoom In",
+                            systemImage: "plus.magnifyingglass"
+                        )
+                    }
+                    .keyboardShortcut(
+                        "+",
+                        modifiers: .command
+                    )
+
+                    Button {
+                        runViewportCommand(.zoomOut)
+                    } label: {
+                        Label(
+                            "Zoom Out",
+                            systemImage: "minus.magnifyingglass"
+                        )
+                    }
+                    .keyboardShortcut(
+                        "-",
+                        modifiers: .command
+                    )
+
+                    Button {
+                        runViewportCommand(.fitToWindow)
+                    } label: {
+                        Label(
+                            "Fit to Window",
+                            systemImage: "viewfinder"
+                        )
+                    }
+                    .keyboardShortcut(
+                        "0",
+                        modifiers: .command
+                    )
+                } label: {
+                    Label(
+                        "Zoom",
+                        systemImage: "plus.magnifyingglass"
+                    )
+                }
+                Button {
+                    presentedSheet = .reader
+                } label: {
+                    Label(
+                        "Focus Reader",
+                        systemImage: "text.alignleft"
+                    )
+                }
+            } label: {
+                Label("Reading", systemImage: "book")
+            }
+            Button {
+                presentedSheet = .bookmarks
+            } label: {
+                Label(
+                    "Navigate",
+                    systemImage: "bookmark"
+                )
+                .accessibilityIdentifier(
+                    "workspaceNavigateAction"
+                )
+            }
+            Button {
+                presentedSheet = .privateNote
+            } label: {
+                Label(
+                    record.privateNote == nil
+                        ? "Add Private Note"
+                        : "Edit Private Note",
+                    systemImage: "note.text"
+                )
+            }
+            if let previousDocument =
+                    recentDocuments.first {
+                Divider()
+
+                Button {
+                    openRecentDocument(previousDocument)
+                } label: {
+                    Label(
+                        "Previously Viewed Document",
+                        systemImage: "arrow.left.arrow.right"
+                    )
+                }
+                .keyboardShortcut(
+                    .tab,
+                    modifiers: .control
+                )
+                .accessibilityHint(
+                    AppLocalization.format(
+                        "Switches to %@",
+                        previousDocument.displayName
+                    )
+                )
+
+                Menu("Recent Documents") {
+                    ForEach(recentDocuments) { recentRecord in
+                        Button {
+                            openRecentDocument(recentRecord)
+                        } label: {
+                            Label(
+                                "\(recentRecord.displayName) · p\(recentRecord.lastPageIndex + 1)",
+                                systemImage: recentRecord.profile
+                                    .kind.symbol
+                            )
+                        }
+                    }
+                }
+            }
+
+            if UIDevice.current.userInterfaceIdiom == .pad {
+                Divider()
+
+                Button {
+                    openCurrentDocumentInNewWindow(
+                        record.id
+                    )
+                } label: {
+                    Label(
+                        "Open in New Window",
+                        systemImage: "macwindow.badge.plus"
+                    )
+                }
+                .accessibilityHint(
+                    "Opens this PDF in a separate iPad window."
+                        .localizedUI
+                )
+                .keyboardShortcut(
+                    "n",
+                    modifiers: [.command, .shift]
+                )
+                .help("Open in New Window".localizedUI)
+            }
+        } label: {
+            if showsTitle {
+                Label("Reading and navigation".localizedUI, systemImage: "book.pages")
+            } else {
+                Image(systemName: "book.pages")
+            }
+        }
+        .accessibilityLabel(
+            "Reading and navigation".localizedUI
+        )
+        .accessibilityIdentifier(
+            "workspaceNavigationMenu"
+        )
+        .disabled(hasBlockingWorkspaceControlTask)
     }
 
     private func workspaceTitle(
@@ -2317,11 +2417,19 @@ struct DocumentWorkspaceView: View {
         showsRelationship: Bool
     ) -> some View {
         VStack(spacing: 2) {
-            Text(record.displayName)
-                .font(PPType.document)
-                .foregroundStyle(PPColor.textPrimary)
-                .lineLimit(1)
-                .accessibilityIdentifier("workspaceDocumentTitle")
+            HStack(spacing: 4) {
+                Text(record.displayName)
+                    .font(PPType.document)
+                    .foregroundStyle(PPColor.textPrimary)
+                    .lineLimit(1)
+                    .accessibilityIdentifier("workspaceDocumentTitle")
+                if !showsRelationship {
+                    Image(systemName: "chevron.down")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(PPColor.textSecondary)
+                        .accessibilityHidden(true)
+                }
+            }
             if showsRelationship {
                 HStack(spacing: 4) {
                     Text(documentRelationshipRoleTitle(record).localizedUI)
@@ -2339,7 +2447,7 @@ struct DocumentWorkspaceView: View {
                     .lineLimit(1)
             }
         }
-        .frame(minHeight: PPDeskLayout.touchTarget)
+        .frame(maxWidth: horizontalSizeClass == .compact ? 120 : nil, minHeight: PPDeskLayout.touchTarget)
     }
 
     private func documentRelationshipTint(
@@ -2353,13 +2461,13 @@ struct DocumentWorkspaceView: View {
         _ record: DocumentRecord
     ) -> some View {
         if record.isDeliveryArtifact {
-            if let source = model.sourceRecord(for: record) {
+            if let source = model.originalDocument(for: record) {
                 Button {
                     openRecentDocument(source)
                 } label: {
                     Label(
                         AppLocalization.format(
-                            "Open source: %@",
+                            "Open original document: %@",
                             source.displayName
                         ),
                         systemImage: "arrow.left"
@@ -2465,8 +2573,8 @@ struct DocumentWorkspaceView: View {
             isDeliveryAction
                 ? (
                     model.verifiedShareTarget(for: recordID) == nil
-                        ? "Create verified sharing copy"
-                        : "Share verified copy"
+                        ? "Prepare Export"
+                        : "Share Export"
                 ).localizedUI
                 : AppLocalization.format(
                     "Next: %@",
@@ -2475,7 +2583,7 @@ struct DocumentWorkspaceView: View {
         )
         .accessibilityHint(
             isDeliveryAction
-                ? "PaperPath shares a checked output instead of the working copy"
+                ? "Prepare an export to share; your document stays here"
                     .localizedUI
                 : (
                 statusActionReason(
@@ -2549,10 +2657,10 @@ struct DocumentWorkspaceView: View {
             }
             if isSessionUnlocked,
                unlockCopyIssue?.isRetryable == true {
-                return "Retry editable copy"
+                return "Retry removing password"
             }
             return isSessionUnlocked
-                ? "Create editable copy"
+                ? "Remove password"
                 : "Unlock to continue"
         }
         return record.taskCheckpoint?.stage.title
@@ -2572,7 +2680,7 @@ struct DocumentWorkspaceView: View {
                 return unlockCopyIssue.recovery
             }
             return isSessionUnlocked
-                ? "Make a separate password-free private copy; the original stays encrypted."
+                ? "Continue with this document without a password. The encrypted version stays in History."
                 : "Enter the PDF password for this session only."
         }
         return record.taskCheckpoint?.resumeReason
@@ -2720,7 +2828,7 @@ struct DocumentWorkspaceView: View {
         unlockCopyStopRequested = true
         unlockCopyTask?.cancel()
         model[noticeFor: paperPathSceneID] =
-            "Stopping editable copy creation".localizedUI
+            "Stopping password removal".localizedUI
     }
 
     private func dismissUnlockCopyIssue() {
@@ -3140,6 +3248,12 @@ struct DocumentWorkspaceView: View {
                 }
                 workspaceToolRow(record)
                     .layoutPriority(1)
+                if !isRedactionMode {
+                    recentToolButton(record: record)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .environment(\.deskToolNamesVisible, showToolNames && verticalSizeClass != .compact)
+                        .environment(\.deskToolLabelWidth, horizontalSizeClass == .compact ? 64 : 88)
+                }
             }
             .padding(.horizontal, PPSpacing.regular)
             .padding(.vertical, PPSpacing.small)
@@ -3316,7 +3430,7 @@ struct DocumentWorkspaceView: View {
             return "The encrypted original stays unchanged."
                 .localizedUI
         case .openDocument:
-            return "The created copy stays in Library if you stop here."
+            return "Changes already saved remain in this document."
                 .localizedUI
         case .navigate:
             return "The evidence page opens before the next panel."
@@ -3463,17 +3577,20 @@ struct DocumentWorkspaceView: View {
         workspaceToolButton(.find, record: record)
             .accessibilityIdentifier("workspaceFindAction")
         workspaceToolButton(.bookmarks, record: record)
-        DeskIconButton(title: "Reader", symbol: "book", tint: toolMode.tint) {
+        DeskIconButton(title: "Text", symbol: "text.alignleft", tint: toolMode.tint) {
             presentedSheet = .reader
         }
-        DeskIconButton(title: "Reading", symbol: "textformat.size", tint: toolMode.tint) {
+        .accessibilityLabel("Focus Reader".localizedUI)
+        .accessibilityIdentifier("readerTextAction")
+        DeskIconButton(title: "Style", symbol: "textformat.size", tint: toolMode.tint) {
             presentedSheet = .reading
         }
+        .accessibilityLabel("Reading Settings".localizedUI)
+        .accessibilityIdentifier("readingAppearanceAction")
         DeskIconButton(title: "Focus reading", symbol: "arrow.up.left.and.arrow.down.right", tint: toolMode.tint) {
             toggleImmersiveReading()
         }
         .accessibilityIdentifier("enterFocusReading")
-        recentToolButton(record: record)
     }
 
     @ViewBuilder
@@ -3501,7 +3618,6 @@ struct DocumentWorkspaceView: View {
         DeskIconButton(title: "Version History", symbol: "clock.arrow.circlepath", tint: toolMode.tint) {
             presentedSheet = .versionHistory
         }
-        recentToolButton(record: record)
     }
 
     @ViewBuilder
@@ -3525,11 +3641,13 @@ struct DocumentWorkspaceView: View {
             symbol: "checkmark.shield",
             tint: PPColor.mint
         ) {
-            isPrivacyScanPresented = true
+            isPrivacyScanSessionActive = true
+            privacyScanPresentation = PrivacyScanPresentation()
         }
         .disabled(
             record.profile.isLocked
                 || model.isProcessing(recordID)
+                || isPrivacyScanSessionActive
         )
         .accessibilityHint(
             privacyScanAvailabilityHint(for: record)
@@ -3936,6 +4054,7 @@ struct DocumentWorkspaceView: View {
                     }
                     .buttonStyle(.plain)
                     .keyboardShortcut("j", modifiers: .command)
+                    .accessibilityIdentifier("workspacePageJumpAction")
                     .accessibilityLabel(
                         AppLocalization.format(
                             "Page %lld of %lld. Go to page",
@@ -4337,21 +4456,22 @@ struct DocumentWorkspaceView: View {
     }
 
     private var pageJumpIsValid: Bool {
-        guard let page = Int(pageJumpInput),
-              let pageCount = model.record(id: recordID)?.profile.pageCount,
-              pageCount > 0
-        else { return false }
-        return (1...pageCount).contains(page)
+        pageJumpTarget != nil
+    }
+
+    private var pageJumpTarget: Int? {
+        guard let pageCount = model.record(id: recordID)?.profile.pageCount else {
+            return nil
+        }
+        return PDFPageNumberInput.pageIndex(pageJumpInput, pageCount: pageCount)
     }
 
     private func jumpToEnteredPage() {
-        guard pageJumpIsValid,
-              let page = Int(pageJumpInput)
-        else { return }
+        guard let page = pageJumpTarget else { return }
         isJumpingToPage = false
         pageJumpInput = ""
         showPage(
-            page - 1,
+            page,
             message: "Jumped",
             showsNotice: false
         )
@@ -4366,9 +4486,6 @@ struct DocumentWorkspaceView: View {
         }
         if record.profile.kind != .scan && record.profile.kind != .mixed {
             tools.remove(.recognize)
-        }
-        if record.profile.kind != .form {
-            tools.remove(.fillForm)
         }
         if model.documents.filter({ !$0.profile.isLocked }).count < 2 {
             tools.remove(.compare)
@@ -4389,7 +4506,7 @@ struct DocumentWorkspaceView: View {
                     .map {
                         (
                             $0,
-                            "Create an unlocked private copy to use this tool."
+                            "Remove the password from this document to use this tool."
                         )
                     },
                 uniquingKeysWith: { current, _ in current }
@@ -4405,10 +4522,6 @@ struct DocumentWorkspaceView: View {
             && record.profile.kind != .mixed {
             reasons[.recognize] =
                 "This PDF already contains native searchable text."
-        }
-        if record.profile.kind != .form {
-            reasons[.fillForm] =
-                "No interactive form fields were detected."
         }
         if model.documents.filter({ !$0.profile.isLocked }).count < 2 {
             reasons[.compare] =
@@ -4627,7 +4740,10 @@ struct DocumentWorkspaceView: View {
     }
 
     private func openCreatedDocument(_ route: DocumentRoute) {
-        queueWorkspaceHandoff(.openDocument(route))
+        // Saving a version stays in the same workspace and navigation position.
+        if route.recordID != recordID || route.quickTask != nil {
+            queueWorkspaceHandoff(.openDocument(route))
+        }
         presentedSheet = nil
         isPresentingContentEditor = false
         isPresentingLinkEditor = false
@@ -4895,6 +5011,19 @@ struct DocumentWorkspaceView: View {
         }
     }
 
+    private func renameDocumentButton(
+        _ record: DocumentRecord
+    ) -> some View {
+        Button {
+            originalName = record.displayName
+            proposedName = record.displayName
+            isRenaming = true
+        } label: {
+            Label("Rename".localizedUI, systemImage: "pencil")
+        }
+        .accessibilityIdentifier("renameDocument")
+    }
+
     private func renameWorkingCopy() {
         guard workspaceMetadataTask == nil,
               !model.isProcessing(recordID),
@@ -5028,7 +5157,7 @@ struct DocumentWorkspaceView: View {
                 Text(
                     (
                         searchableCopyStopRequested
-                            ? "Stopping searchable copy"
+                            ? "Stopping searchable text"
                             : "Stopping text recognition"
                     ).localizedUI
                 )
@@ -5118,16 +5247,16 @@ struct DocumentWorkspaceView: View {
                         : unlockCopyTask != nil
                             ? (
                                 unlockCopyStopRequested
-                                    ? "Stopping editable copy"
-                                    : "Stop creating editable copy"
+                                    ? "Stopping password removal"
+                                    : "Stop removing password"
                             )
                         : isComparing
                             ? "Stop comparison"
                             : searchableCopyTask != nil
                                 ? (
                                     searchableCopyStopRequested
-                                        ? "Stopping searchable copy"
-                                        : "Stop creating searchable copy"
+                                        ? "Stopping searchable text"
+                                        : "Stop saving searchable text"
                                 )
                                 : recognitionStopRequested
                                     ? "Stopping text recognition"
@@ -5356,8 +5485,8 @@ struct DocumentWorkspaceView: View {
             searchableCopyStopRequested = false
             guard !wasStopped else {
                 model[noticeFor: paperPathSceneID] = created == nil
-                    ? "Searchable copy stopped".localizedUI
-                    : "Searchable copy finished before stopping · copy kept in Library"
+                    ? "Searchable text stopped".localizedUI
+                    : "Searchable text saved before stopping"
                         .localizedUI
                 return
             }
@@ -5385,7 +5514,7 @@ struct DocumentWorkspaceView: View {
         }
         if showsNotice {
             model[noticeFor: paperPathSceneID] =
-                "Stopping searchable copy".localizedUI
+                "Stopping searchable text".localizedUI
         }
     }
 
@@ -5610,13 +5739,14 @@ struct DocumentWorkspaceView: View {
         }
     }
 
-    private func share(recordID targetID: UUID) {
+    private func share(recordID targetID: UUID, toFiles: Bool = false) {
         guard shareTask == nil else { return }
         guard model.url(for: targetID) != nil else {
             model[noticeFor: paperPathSceneID] = "The PDF could not be found"
             return
         }
         cleanupShareCopy()
+        savesShareToFiles = toFiles
         let generation = UUID()
         shareGeneration = generation
         shareRateWindow.reset()

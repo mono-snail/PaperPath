@@ -1,0 +1,39 @@
+PaperPath 1.1.0 (23) - validation summary
+Recorded 2026-11-12. This is not an App Store approval.
+
+Shipping source was fingerprinted against the archive uploaded as build 23.
+No app, extension or build-setting differences were found during publication preparation.
+
+Latest results across the complete declared inventory and subsequent repair/retest runs:
+- iPhone UI: 224 expected, 224 passed.
+- iPad UI: 225 expected, 225 passed.
+- Unit tests on each device: 435 expected, 434 passed, 1 physical-device-only skip.
+- The permitted skip is testStoreAppliesCompleteFileProtection, requiring a real device.
+- Independent audits of actual saved merge PDFs passed on both devices: page order,
+  text, geometry, rendered pixels, annotations, attachments and source hashes.
+- Signed archive checks passed for versions, code signatures, privacy manifests
+  and exclusion of test corpus resources.
+
+The method was full-inventory execution followed by repairs and affected-workflow
+retests, not a claim that every initial full run was green. Original failures,
+result bundles and output evidence are retained locally outside the public tree.
+
+Build-23 repairs:
+- Full 44-point hit areas for receipt and annotation edit/removal controls.
+- Stable merge selection layout at accessibility text sizes.
+
+Compared with rejected build 17, later candidates expose the existing privacy
+workflow through a direct home entry, Files/Library selection and a fictional
+sample. Core privacy detection, output checking and receipts already existed
+in build 17 and are not represented as newly added capabilities.
+
+Boundaries:
+- Local iOS 26 simulator CJK glyph rendering was unavailable. Chinese semantic
+  interactions passed, but Chinese visual rendering is not certified by these runs.
+- Physical camera, biometrics, real iCloud and file protection require device checks.
+- Automatic detection can miss information. User review remains required.
+- File checks do not certify accuracy, signer identity or legal compliance.
+- The guide's receipt image is from a separate fictional Project handoff fixture,
+  not the receipt for the sharing sample shown beside it.
+
+App Review determines policy compliance, including Guideline 4.3(a) similarities.

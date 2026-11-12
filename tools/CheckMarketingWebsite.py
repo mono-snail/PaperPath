@@ -43,7 +43,7 @@ for path,page in pages.items():
     if '/privacy/' not in '/'+label:
         if 'locale-router.js' in source:errors.append(label+': automatic language redirect')
     if label.count('/')<=1 and not label.startswith(('privacy/','support/')):
-        if 'US$9.99' not in source:errors.append(label+': missing approved price')
+        if 'US$6.99' not in source:errors.append(label+': missing approved price')
         if any(s in source for s in ['Download free','免费下载','免费下载','"price": "0"']):errors.append(label+': stale free pricing')
         if len(page.schema)!=2:errors.append(label+': missing app/FAQ schema')
         if any('aggregateRating' in json.dumps(s) for s in page.schema):errors.append(label+': unverified ratings')

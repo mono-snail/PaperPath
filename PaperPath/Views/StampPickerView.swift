@@ -11,33 +11,9 @@ struct StampPickerView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: PPSpacing.large) {
-                    WorkflowCommandHeader(
-                        eyebrow: "STAMP WORKFLOW",
-                        title: "Stamp page \(pageIndex + 1)",
-                        detail: "Standard PDF stamps stay editable and appear in annotation review.",
-                        symbol: "seal",
-                        tint: PPColor.amber,
-                        metrics: [
-                            WorkflowMetric(
-                                value: "\(PDFStampKind.allCases.count)",
-                                label: "Marks",
-                                symbol: "seal",
-                                tint: PPColor.amber
-                            ),
-                            WorkflowMetric(
-                                value: "\(pageIndex + 1)",
-                                label: "Page",
-                                symbol: "doc.text",
-                                tint: PPColor.accent
-                            ),
-                            WorkflowMetric(
-                                value: "Editable",
-                                label: "Result",
-                                symbol: "pencil",
-                                tint: PPColor.mint
-                            )
-                        ]
-                    )
+                    Text(AppLocalization.format("Page %lld", pageIndex + 1))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(PPColor.textSecondary)
 
                     LazyVGrid(
                         columns: stampColumns,
@@ -268,7 +244,6 @@ struct PageNumberingSheet: View {
                     WorkflowCommandHeader(
                         eyebrow: "PAGE NUMBERING",
                         title: "Number pages",
-                        detail: "Editable PDF text · removable before delivery",
                         symbol: "number.square",
                         tint: PPColor.accent,
                         metrics: [
@@ -819,8 +794,6 @@ struct BatesNumberingSheet: View {
                     WorkflowCommandHeader(
                         eyebrow: "BATES NUMBERING",
                         title: "Assign page IDs",
-                        detail:
-                            "Fixed-width sequence · checked after writing",
                         symbol: "number.square.fill",
                         tint: PPColor.amber,
                         metrics: [
@@ -1526,8 +1499,6 @@ struct WatermarkSheet: View {
                     WorkflowCommandHeader(
                         eyebrow: "WATERMARK WORKFLOW",
                         title: "Mark document pages",
-                        detail:
-                            "Editable PDF text · checked after writing",
                         symbol: "textformat.alt",
                         tint: watermarkTint,
                         metrics: [
@@ -2211,36 +2182,17 @@ struct NoteComposerSheet: View {
 
     var body: some View {
         NavigationStack {
+            ScrollView {
             VStack(alignment: .leading, spacing: PPSpacing.large) {
-                WorkflowCommandHeader(
-                    eyebrow: "NOTE WORKFLOW",
-                    title: "Add note",
-                    detail: "The note stays editable and appears in annotation review.",
-                    symbol: "note.text.badge.plus",
-                    tint: PPColor.amber,
-                    metrics: [
-                        WorkflowMetric(
-                            value: "\(pageIndex + 1)",
-                            label: "Page",
-                            symbol: "doc.text",
-                            tint: PPColor.accent
-                        ),
-                        WorkflowMetric(
-                            value: "\(note.count)/1000",
-                            label: "Characters",
-                            symbol: "textformat",
-                            tint: note.count > 900
-                                ? PPColor.amber
-                                : PPColor.cyan
-                        ),
-                        WorkflowMetric(
-                            value: "Center",
-                            label: "Placement",
-                            symbol: "scope",
-                            tint: PPColor.mint
-                        )
-                    ]
-                )
+                HStack {
+                    Text(AppLocalization.format("Page %lld", pageIndex + 1))
+                    Spacer()
+                    Text("\(note.count)/1000")
+                        .monospacedDigit()
+                        .foregroundStyle(note.count > 900 ? PPColor.amber : PPColor.textSecondary)
+                }
+                .font(.caption)
+                .foregroundStyle(PPColor.textSecondary)
 
                 VStack(alignment: .trailing, spacing: PPSpacing.small) {
                     TextField(
@@ -2269,10 +2221,15 @@ struct NoteComposerSheet: View {
                     .accessibilityHint(
                         "Pastes text into the note"
                     )
+                    .accessibilityIdentifier("notePasteAction")
                 }
-                Spacer(minLength: 0)
             }
             .padding(PPSpacing.regular)
+            .frame(maxWidth: 760)
+            .frame(maxWidth: .infinity)
+            }
+            .scrollDismissesKeyboard(.interactively)
+            .accessibilityIdentifier("noteComposerContent")
             .background(PPCanvas())
             .navigationTitle("Add note")
             .navigationBarTitleDisplayMode(.inline)

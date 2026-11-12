@@ -311,7 +311,7 @@ struct PDFContentEditorView: View {
                 } else {
                     PPEmptyState(
                         kind: .workspace,
-                        title: "Working copy unavailable",
+                        title: "Document unavailable",
                         message: "Close this editor and reopen the document from the library."
                     )
                     .frame(
@@ -350,7 +350,7 @@ struct PDFContentEditorView: View {
                     .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create Copy") {
+                    Button("Save Changes") {
                         createCopy()
                     }
                     .disabled(!canCreate || isSaving)
@@ -371,7 +371,7 @@ struct PDFContentEditorView: View {
                 else {
                     isLoadingPagePreview = false
                     previewErrorMessage =
-                        "The private working copy could not be opened."
+                        "The document could not be opened."
                     return
                 }
                 if sourceContentRevisionID == nil {
@@ -412,7 +412,8 @@ struct PDFContentEditorView: View {
                 of: model.record(id: recordID)?
                     .contentRevisionID
             ) { _, revisionID in
-                guard let sourceContentRevisionID,
+                guard !isSaving,
+                      let sourceContentRevisionID,
                       revisionID != sourceContentRevisionID
                 else { return }
                 model[noticeFor: paperPathSceneID] =
@@ -456,7 +457,7 @@ struct PDFContentEditorView: View {
                 Button("Keep Editing".localizedUI, role: .cancel) {}
             } message: {
                 Text(
-                    "The text, link, or selected photo has not been added to a PDF copy."
+                    "These changes have not been saved to the document."
                         .localizedUI
                 )
             }
@@ -739,7 +740,7 @@ struct PDFContentEditorView: View {
                 (
                     isStopping
                         ? "Finishing current file commit"
-                        : "Creating private copy"
+                        : "Saving document"
                 ).localizedUI
             )
             .font(.caption.weight(.semibold))
@@ -1009,13 +1010,14 @@ struct PDFContentEditorView: View {
             guard operationGeneration == generation else { return }
             let wasStopped =
                 operationStopRequested || Task.isCancelled
+            if let created { self.sourceContentRevisionID = created.contentRevisionID }
             isSaving = false
             operationTask = nil
             operationStopRequested = false
             guard !wasStopped else {
                 model[noticeFor: paperPathSceneID] = created == nil
-                    ? "Copy creation stopped".localizedUI
-                    : "Copy finished before stopping · copy kept in Library"
+                    ? "Changes stopped".localizedUI
+                    : "Document saved before stopping"
                         .localizedUI
                 return
             }
@@ -1374,7 +1376,7 @@ struct PDFLinkEditorView: View {
                     .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create Copy") {
+                    Button("Save Changes") {
                         createUpdatedCopy()
                     }
                     .disabled(!canCreate || isSaving)
@@ -1389,7 +1391,8 @@ struct PDFLinkEditorView: View {
                 of: model.record(id: recordID)?
                     .contentRevisionID
             ) { _, revisionID in
-                guard let sourceContentRevisionID,
+                guard !isSaving,
+                      let sourceContentRevisionID,
                       revisionID != sourceContentRevisionID
                 else { return }
                 model[noticeFor: paperPathSceneID] =
@@ -1431,7 +1434,7 @@ struct PDFLinkEditorView: View {
                 isPresented: $isConfirmingRemoval,
                 titleVisibility: .visible
             ) {
-                Button("Remove from New Copy", role: .destructive) {
+                Button("Remove Link", role: .destructive) {
                     createRemovedCopy()
                 }
                 Button("Cancel", role: .cancel) {}
@@ -1738,7 +1741,7 @@ struct PDFLinkEditorView: View {
                 (
                     operationStopRequested
                         ? "Finishing current file commit"
-                        : "Creating private copy"
+                        : "Saving document"
                 ).localizedUI
             )
             .font(.caption.weight(.semibold))
@@ -2056,7 +2059,7 @@ struct PDFLinkEditorView: View {
             model.record(id: recordID)?.contentRevisionID
         else {
             isLoading = false
-            loadMessage = "The working copy is unavailable."
+            loadMessage = "The document is unavailable."
             return
         }
         if sourceContentRevisionID == nil {
@@ -2072,7 +2075,7 @@ struct PDFLinkEditorView: View {
         loadMessage = nil
         guard let url = model.url(for: recordID) else {
             isLoading = false
-            loadMessage = "The working copy is unavailable."
+            loadMessage = "The document is unavailable."
             return
         }
         do {
@@ -2154,7 +2157,7 @@ struct PDFLinkEditorView: View {
         guard let url = model.url(for: recordID) else {
             pagePreview = nil
             isLoading = false
-            loadMessage = "The working copy is unavailable.".localizedUI
+            loadMessage = "The document is unavailable.".localizedUI
             return
         }
         activePageIndex = requestedPageIndex
@@ -2192,7 +2195,7 @@ struct PDFLinkEditorView: View {
         }
         guard let url = model.url(for: recordID) else {
             isLoading = false
-            loadMessage = "The working copy is unavailable.".localizedUI
+            loadMessage = "The document is unavailable.".localizedUI
             return
         }
         loadGeneration += 1
@@ -2396,13 +2399,14 @@ struct PDFLinkEditorView: View {
             guard operationGeneration == generation else { return }
             let wasStopped =
                 operationStopRequested || Task.isCancelled
+            if let created { self.sourceContentRevisionID = created.contentRevisionID }
             isSaving = false
             operationTask = nil
             operationStopRequested = false
             guard !wasStopped else {
                 model[noticeFor: paperPathSceneID] = created == nil
-                    ? "Copy creation stopped".localizedUI
-                    : "Copy finished before stopping · copy kept in Library"
+                    ? "Changes stopped".localizedUI
+                    : "Document saved before stopping"
                         .localizedUI
                 return
             }
@@ -2572,7 +2576,7 @@ struct PDFImageReplacementView: View {
                     .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create Copy") {
+                    Button("Save Changes") {
                         if selectedObject?.replacesMultipleUses == true {
                             isConfirmingSharedReplacement = true
                         } else {
@@ -2594,7 +2598,8 @@ struct PDFImageReplacementView: View {
                 of: model.record(id: recordID)?
                     .contentRevisionID
             ) { _, revisionID in
-                guard let sourceContentRevisionID,
+                guard !isSaving,
+                      let sourceContentRevisionID,
                       revisionID != sourceContentRevisionID
                 else { return }
                 model[noticeFor: paperPathSceneID] =
@@ -2667,7 +2672,7 @@ struct PDFImageReplacementView: View {
                 Button("Keep Editing".localizedUI, role: .cancel) {}
             } message: {
                 Text(
-                    "The selected photo has not been applied to a PDF copy."
+                    "The selected photo has not been saved to the document."
                         .localizedUI
                 )
             }
@@ -2993,7 +2998,7 @@ struct PDFImageReplacementView: View {
                 (
                     operationStopRequested
                         ? "Finishing current file commit"
-                        : "Creating private copy"
+                        : "Saving document"
                 ).localizedUI
             )
             .font(.caption.weight(.semibold))
@@ -3080,7 +3085,7 @@ struct PDFImageReplacementView: View {
             model.record(id: recordID)?.contentRevisionID
         else {
             isInspecting = false
-            inspectionMessage = "The working copy is unavailable."
+            inspectionMessage = "The document is unavailable."
             inspectionFailed = true
             return
         }
@@ -3098,7 +3103,7 @@ struct PDFImageReplacementView: View {
         inspectionFailed = false
         guard let url = model.url(for: recordID) else {
             isInspecting = false
-            inspectionMessage = "The working copy is unavailable."
+            inspectionMessage = "The document is unavailable."
             inspectionFailed = true
             return
         }
@@ -3157,7 +3162,7 @@ struct PDFImageReplacementView: View {
         isInspecting = true
         inspectionFailed = false
         guard let url = model.url(for: recordID) else {
-            inspectionMessage = "The working copy is unavailable."
+            inspectionMessage = "The document is unavailable."
             inspectionFailed = true
             isInspecting = false
             return
@@ -3261,13 +3266,14 @@ struct PDFImageReplacementView: View {
             guard operationGeneration == generation else { return }
             let wasStopped =
                 operationStopRequested || Task.isCancelled
+            if let created { self.sourceContentRevisionID = created.contentRevisionID }
             isSaving = false
             operationTask = nil
             operationStopRequested = false
             guard !wasStopped else {
                 model[noticeFor: paperPathSceneID] = created == nil
-                    ? "Copy creation stopped".localizedUI
-                    : "Copy finished before stopping · copy kept in Library"
+                    ? "Changes stopped".localizedUI
+                    : "Document saved before stopping"
                         .localizedUI
                 return
             }

@@ -20,10 +20,45 @@ final class PrivacyRedactionShareTests: XCTestCase {
             }
         }
         for scenario in [
-            "read-only-output", "delete-after-preparation", "cleanup",
+            "edit-after-preparation", "delete-after-preparation", "cleanup",
             "stale-output", "deleted-output", "unverified-output", "cancelled"
         ] {
             try await exerciseShare(scenario: scenario)
+        }
+    }
+
+    @MainActor
+    func testSharingSampleNeverReusesOrChangesAnExistingDocument() async throws {
+        let syncKey = AppPreferences.metadataSyncEnabledKey
+        let oldSync = UserDefaults.standard.object(forKey: syncKey)
+        UserDefaults.standard.set(false, forKey: syncKey)
+        defer {
+            if let oldSync { UserDefaults.standard.set(oldSync, forKey: syncKey) }
+            else { UserDefaults.standard.removeObject(forKey: syncKey) }
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("ShareCheckSample-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let input = root.appendingPathComponent("real-source.pdf")
+        try PDFTestFixtureFactory.makeTextPDF(at: input, pageCount: 1)
+        let store = DocumentStore(rootURL: root.appendingPathComponent("Store"))
+        let source = try await store.importPDF(from: input, preserveSourceLocation: false)
+        let model = PaperPathModel(store: store, signatureStore: SignatureStore(rootURL: root.appendingPathComponent("Signatures")))
+        await model.bootstrap()
+        let sourceURL = try XCTUnwrap(model.url(for: source.id))
+        let bytes = try Data(contentsOf: sourceURL)
+        let first = try await model.createShareCheckSample()
+        let second = try await model.createShareCheckSample()
+        XCTAssertNotEqual(first.id, source.id)
+        XCTAssertNotEqual(first.id, second.id)
+        XCTAssertEqual(try Data(contentsOf: sourceURL), bytes)
+        XCTAssertEqual(model.record(id: source.id)?.contentRevisionID, source.contentRevisionID)
+        for sample in [first, second] {
+            let url = try XCTUnwrap(model.url(for: sample.id))
+            let pdf = try XCTUnwrap(PDFDocument(url: url))
+            XCTAssertEqual(pdf.pageCount, 1)
+            XCTAssertTrue(pdf.string?.contains("billing@example.com") == true)
+            XCTAssertTrue(pdf.string?.contains("fictional sample data") == true)
         }
     }
 
@@ -116,11 +151,11 @@ final class PrivacyRedactionShareTests: XCTestCase {
             )[.protectionKey] as? FileProtectionType
             XCTAssertEqual(protection, .complete, scenario)
 #endif
-            if scenario == "read-only-output" {
+            if scenario == "edit-after-preparation" {
                 let changed = await model.rotatePages(recordID: created.id, indices: [0])
-                XCTAssertFalse(changed, scenario)
-                XCTAssertEqual(try Data(contentsOf: managedURL), verifiedBytes, scenario)
-                XCTAssertTrue(model.record(id: created.id)?.hasCurrentDeliveryReceipt ?? false)
+                XCTAssertTrue(changed, scenario)
+                XCTAssertNotEqual(try Data(contentsOf: managedURL), verifiedBytes, scenario)
+                XCTAssertFalse(model.record(id: created.id)?.hasCurrentDeliveryReceipt ?? true)
             } else if scenario == "delete-after-preparation" {
                 let deleted = await model.delete(recordID: created.id)
                 XCTAssertTrue(deleted, scenario)
@@ -131,7 +166,7 @@ final class PrivacyRedactionShareTests: XCTestCase {
             outcome = nil
             XCTAssertFalse(FileManager.default.fileExists(atPath: outputURL.path), scenario)
         }
-        XCTAssertEqual(try Data(contentsOf: sourceURL), sourceBytes, scenario)
+        XCTAssertEqual(try Data(contentsOf: input), sourceBytes, scenario)
         XCTAssertFalse(model.hasActiveLocalDataOperations, scenario)
     }
 }

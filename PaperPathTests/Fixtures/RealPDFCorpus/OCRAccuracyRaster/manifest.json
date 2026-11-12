@@ -1,0 +1,88 @@
+{
+  "generator": "tools/GenerateOCRAccuracyFixtures.mjs",
+  "reason": "Avoid simulator font fallback turning Chinese test inputs into empty square glyphs. Raster-only fixtures contain no text layer.",
+  "fontSource": "/System/Library/AssetsV2/com_apple_MobileAsset_Font8/86ba2c91f017a3749571a82f2c6d890ac7ffb2fb.asset/AssetData/PingFang.ttc",
+  "fontSha256": "9ff3ce9439fe285cdabb46f9ceb46b1ac58f1ca07e6f4a764e8286db621a0af9",
+  "images": [
+    {
+      "file": "chinese-11pt.png",
+      "fontPoints": 11,
+      "width": 2479,
+      "height": 3508,
+      "dpi": 300,
+      "text": [
+        "文档内容识别与隐私保护",
+        "合同编号: PP-2026-1002",
+        "甲方: 星河科技有限公司",
+        "联系电话: 13800138000",
+        "项目金额: 1280.50 元",
+        "付款日期: 2026-10-02",
+        "请在发送前检查所有文字和数字。",
+        "保存后可继续编辑当前文档。"
+      ],
+      "sha256": "8d0ecd905227032939df64f8b29e424fcceb2608e279278a080f6df2f6bb27b5"
+    },
+    {
+      "file": "chinese-8pt.png",
+      "fontPoints": 8,
+      "width": 2479,
+      "height": 3508,
+      "dpi": 300,
+      "text": [
+        "文档内容识别与隐私保护",
+        "合同编号: PP-2026-1002",
+        "甲方: 星河科技有限公司",
+        "联系电话: 13800138000",
+        "项目金额: 1280.50 元",
+        "付款日期: 2026-10-02",
+        "请在发送前检查所有文字和数字。",
+        "保存后可继续编辑当前文档。"
+      ],
+      "sha256": "4724341f2ddf69edc830851bf84d4455ae73f823315a92fca09f21179c54bf4c"
+    },
+    {
+      "file": "english-8pt.png",
+      "fontPoints": 8,
+      "width": 2479,
+      "height": 3508,
+      "dpi": 300,
+      "text": [
+        "Document recognition and privacy protection",
+        "Contract reference: PP-2026-1002",
+        "Company: Northstar Technology Limited",
+        "Telephone: 13800138000",
+        "Invoice total: 1280.50",
+        "Payment date: 2026-10-02",
+        "Please check all text and numbers before sending.",
+        "Continue editing the same document after saving."
+      ],
+      "sha256": "7e5a58d1823169f240a1ad852e2b67b84811921be4db9a95bc8743d18cfa3c78"
+    },
+    {
+      "file": "bilingual-10pt.png",
+      "fontPoints": 10,
+      "width": 2479,
+      "height": 3508,
+      "dpi": 300,
+      "text": [
+        "文档内容识别与隐私保护",
+        "Document recognition and privacy protection",
+        "合同编号: PP-2026-1002",
+        "Contract reference: PP-2026-1002",
+        "甲方: 星河科技有限公司",
+        "Company: Northstar Technology Limited",
+        "联系电话: 13800138000",
+        "Telephone: 13800138000",
+        "项目金额: 1280.50 元",
+        "Invoice total: 1280.50",
+        "付款日期: 2026-10-02",
+        "Payment date: 2026-10-02",
+        "请在发送前检查所有文字和数字。",
+        "Please check all text and numbers before sending.",
+        "保存后可继续编辑当前文档。",
+        "Continue editing the same document after saving."
+      ],
+      "sha256": "bbae697dec90dceea1ca58dad32130ada208d7d5120aaf013fc8b77800b40799"
+    }
+  ]
+}

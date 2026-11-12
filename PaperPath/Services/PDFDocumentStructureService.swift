@@ -684,6 +684,7 @@ struct PDFDocumentStructureService: Sendable {
 
         var results: [PDFEmbeddedAttachmentPayload] = []
         var decodedByteCount = 0
+        let encodedAttachments = stableSourceData.map(boundedEncodedAttachments) ?? [:]
 
         func append(
             fileSpec: CGPDFDictionaryRef,
@@ -702,7 +703,8 @@ struct PDFDocumentStructureService: Sendable {
                       origin: origin,
                       decodedByteCount: decodedByteCount,
                       maximumDecodedBytes: maximumDecodedBytes,
-                      sourceByteCount: sourceByteCount
+                      sourceByteCount: sourceByteCount,
+                      encodedAttachments: encodedAttachments
                   )
             else { return }
             let duplicate = results.contains {
@@ -1041,7 +1043,8 @@ struct PDFDocumentStructureService: Sendable {
         origin: PDFEmbeddedAttachmentOrigin,
         decodedByteCount: Int,
         maximumDecodedBytes: Int,
-        sourceByteCount: Int
+        sourceByteCount: Int,
+        encodedAttachments: [String: Data]
     ) -> PDFEmbeddedAttachmentPayload? {
         guard let embeddedFiles = pdfDictionary(
             in: fileSpec,
@@ -1090,7 +1093,15 @@ struct PDFDocumentStructureService: Sendable {
             pdfName(in: $0, key: "Subtype")
         }.map(decodePDFName)
 
-        if hasFilter {
+        let boundedDecoded: Data?
+        if hasFilter, let declaredSize, declaredSize > 0,
+           declaredSize <= Self.maximumAttachmentBytes,
+           declaredSize <= maximumDecodedBytes - decodedByteCount,
+           let encodedSize, let encoded = encodedAttachments["\(encodedSize):\(declaredSize)"],
+           let decoded = pdfInflateZlib(encoded, maximumOutputByteCount: declaredSize), decoded.count == declaredSize {
+            boundedDecoded = decoded
+        } else { boundedDecoded = nil }
+        if hasFilter && boundedDecoded == nil {
             let limitation = declaredSize == nil
                 ? "Compressed attachment is missing a trusted decoded size"
                 : "Compressed attachments cannot be decoded within the local safety limit"
@@ -1206,11 +1217,13 @@ struct PDFDocumentStructureService: Sendable {
             )
         }
 
-        var format = CGPDFDataFormat.raw
-        guard let copied = CGPDFStreamCopyData(stream, &format) else {
-            return nil
+        let data: Data
+        if let boundedDecoded { data = boundedDecoded }
+        else {
+            var format = CGPDFDataFormat.raw
+            guard let copied = CGPDFStreamCopyData(stream, &format) else { return nil }
+            data = copied as Data
         }
-        let data = copied as Data
         guard data.count == trustedDecodedSize else {
             let snapshot = attachmentSnapshot(
                 fileName: fileName,
@@ -1520,4 +1533,37 @@ func decodePDFName(_ value: String) -> String {
         index = value.index(after: index)
     }
     return result
+}
+
+private extension PDFDocumentStructureService {
+    /// Extract encoded bytes directly, then use the bounded zlib decoder.
+    /// A claimed /Size never authorizes unbounded CGPDFStreamCopyData inflation.
+    func boundedEncodedAttachments(_ data: Data) -> [String: Data] {
+        guard data.count <= 64 * 1_024 * 1_024,
+              let structure = try? PDFImageObjectDocument(data: data, allowZeroOffsetPlaceholders: true) else { return [:] }
+        var candidates: [String: [Data]] = [:]
+        let references = structure.allObjects()
+        for (index, reference) in references.enumerated() {
+            if Task.isCancelled { return [:] }
+            let end = index + 1 < references.count ? references[index + 1].offset : data.count
+            guard reference.offset < end, end - reference.offset <= 32 * 1_024 * 1_024 else { continue }
+            let prefix = Data(data[reference.offset..<min(end, reference.offset + 64 * 1_024)])
+            guard let range = pdfFirstDictionaryRange(in: prefix),
+                  let values = pdfCompressionValues(Data(prefix[range])),
+                  ["/FlateDecode", "[/FlateDecode]"].contains(values["Filter"]?.filter { !$0.isWhitespace } ?? ""),
+                  values["DecodeParms"] == nil,
+                  let length = Int(values["Length"] ?? ""), length > 0,
+                  let params = values["Params"].flatMap({ pdfCompressionValues(Data($0.utf8)) }),
+                  let size = Int(params["Size"] ?? ""), size > 0, size <= Self.maximumAttachmentBytes,
+                  let marker = prefix.range(of: Data("stream".utf8), in: range.upperBound..<prefix.count) else { continue }
+            var start = marker.upperBound
+            if start < prefix.count, prefix[start] == 13 { start += 1 }
+            if start < prefix.count, prefix[start] == 10 { start += 1 }
+            start += reference.offset
+            guard length <= end - start else { continue }
+            let encoded = Data(data[start..<(start + length)])
+            candidates["\(length):\(size)", default: []].append(encoded)
+        }
+        return candidates.compactMapValues { $0.count == 1 ? $0[0] : nil }
+    }
 }

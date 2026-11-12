@@ -39,6 +39,12 @@ struct FormReviewView: View {
         let fields: [PDFFormFieldSnapshot]
     }
 
+    private struct FieldValueContext: Identifiable {
+        let id = UUID()
+        let field: PDFFormFieldSnapshot
+        let revisionID: UUID
+    }
+
     @EnvironmentObject private var model: PaperPathModel
     @Environment(\.dismiss) private var dismiss
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
@@ -57,6 +63,7 @@ struct FormReviewView: View {
     @State private var isLoading = true
     @State private var reportErrorMessage: String?
     @State private var fieldCreationContext: FieldCreationContext?
+    @State private var fieldValueContext: FieldValueContext?
     @State private var reloadAfterAddingField = false
     @State private var isSharingForCompatibility = false
     @State private var compatibilityShareURL: URL?
@@ -277,6 +284,10 @@ struct FormReviewView: View {
                     fieldCreationContext = nil
                 }
             }
+            .sheet(item: $fieldValueContext, onDismiss: { reloadReport() }) { context in
+                FormTextValueEditor(recordID: recordID, field: context.field,
+                    revisionID: context.revisionID)
+            }
             .sheet(
                 isPresented: $isSharingForCompatibility,
                 onDismiss: cleanupCompatibilityShare
@@ -417,16 +428,11 @@ struct FormReviewView: View {
             }
 
             if fields.isEmpty {
-                Section {
-                    ContentUnavailableView(
-                        "No interactive fields",
-                        systemImage: "list.bullet.clipboard",
-                        description: Text(
-                            report.hasXFA
-                                ? "XFA content is preserved for another compatible reader."
-                                : "Add text, choice, checkbox, or signature fields."
-                        )
-                    )
+                if report.hasXFA {
+                    Section {
+                        Text("XFA content is preserved for another compatible reader.".localizedUI)
+                            .foregroundStyle(PPColor.textSecondary)
+                    }
                 }
             } else {
                 Section {
@@ -563,6 +569,7 @@ struct FormReviewView: View {
             }
         }
         .listStyle(.insetGrouped)
+        .accessibilityIdentifier("formReviewList")
         .frame(
             maxWidth: horizontalSizeClass == .regular
                 ? 880
@@ -751,8 +758,13 @@ struct FormReviewView: View {
     private func fieldRow(
         _ field: PDFFormFieldSnapshot
     ) -> some View {
-        Button {
-            open(field)
+        let editsValue = field.kind == .text && !field.isReadOnly && field.issue == nil && !report.hasXFA
+        return Button {
+            if editsValue, let revisionID = reportContentRevisionID {
+                fieldValueContext = FieldValueContext(field: field, revisionID: revisionID)
+            } else {
+                open(field)
+            }
         } label: {
             HStack(alignment: .top, spacing: PPSpacing.medium) {
                 Image(systemName: field.kind.symbol)
@@ -781,7 +793,7 @@ struct FormReviewView: View {
                 } else {
                     Image(
                         systemName:
-                            "arrow.up.left.and.arrow.down.right"
+                            editsValue ? "square.and.pencil" : "arrow.up.left.and.arrow.down.right"
                     )
                     .font(.caption)
                     .foregroundStyle(PPColor.textSecondary)
@@ -792,7 +804,12 @@ struct FormReviewView: View {
             isFormActionUnavailable || isFilteringFields
                 || displayedFieldRequest != fieldProjectionRequest
         )
-        .help("Open on Page".localizedUI)
+        .help((editsValue ? "Fill Field" : "Open on Page").localizedUI)
+        .contextMenu {
+            if editsValue {
+                Button("Open on Page".localizedUI) { open(field) }
+            }
+        }
         .hoverEffect(.highlight)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(field.name)
@@ -872,6 +889,9 @@ struct FormReviewView: View {
         }
         if openingFieldID != nil {
             return "Wait for the selected field to open.".localizedUI
+        }
+        if field.kind == .text, !field.isReadOnly, field.issue == nil, !report.hasXFA {
+            return "Edits this field’s value".localizedUI
         }
         return isActionableSignature(field)
             ? AppLocalization.format(
@@ -1294,6 +1314,10 @@ struct FormReviewView: View {
             await model.withFeedbackTarget(paperPathSceneID) {
                 await loadReport()
             }
+            guard reportReloadGeneration == generation, !Task.isCancelled else { return }
+            // A full-screen field editor can suspend the view's projection task.
+            // Complete the reload with a projection of the newly inspected fields.
+            await projectFields()
         }
     }
 
@@ -2639,7 +2663,7 @@ private struct PDFFormFieldEditorView: View {
             guard generation == previewGeneration else { return }
             isLoadingPagePreview = false
             previewErrorMessage =
-                "The working copy is unavailable."
+                "The document is unavailable."
             return
         }
         let preview = await PDFEditorPreviewLoader.shared.preview(
@@ -2751,5 +2775,92 @@ private struct PDFFormFieldEditorView: View {
             width: width,
             height: height
         )
+    }
+}
+
+private struct FormTextValueEditor: View {
+    @EnvironmentObject private var model: PaperPathModel
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.paperPathSceneID) private var sceneID
+    let recordID: UUID
+    let field: PDFFormFieldSnapshot
+    let revisionID: UUID
+    @State private var value: String
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+    @State private var confirmsDiscard = false
+
+    private var hasChanges: Bool { value != (field.value ?? "") }
+    private var maximumValueLength: Int { min(field.maximumLength ?? 256, 256) }
+
+    private func requestDismissal() {
+        if hasChanges { confirmsDiscard = true }
+        else { dismiss() }
+    }
+
+    init(recordID: UUID, field: PDFFormFieldSnapshot, revisionID: UUID) {
+        self.recordID = recordID
+        self.field = field
+        self.revisionID = revisionID
+        _value = State(initialValue: field.value ?? "")
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section(field.name) {
+                    TextField("Value".localizedUI, text: $value, axis: field.isMultiline ? .vertical : .horizontal)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("formFieldValue")
+                        .disabled(isSaving)
+                    if value.count > maximumValueLength {
+                        Text(AppLocalization.format(
+                            "Use up to %lld characters for this field.", max(0, maximumValueLength)
+                        ))
+                        .font(.caption)
+                        .foregroundStyle(PPColor.rose)
+                        .accessibilityIdentifier("formValueLengthWarning")
+                    }
+                }
+                if let errorMessage {
+                    Text(errorMessage).foregroundStyle(.red)
+                        .accessibilityIdentifier("formValueError")
+                }
+            }
+            .navigationTitle("Fill Field".localizedUI)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel".localizedUI) { requestDismissal() }
+                        .disabled(isSaving)
+                        .keyboardShortcut(.cancelAction)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save".localizedUI) {
+                        guard !isSaving, hasChanges, value.count <= maximumValueLength else { return }
+                        isSaving = true
+                        errorMessage = nil
+                        Task { @MainActor in
+                            let saved = await model.withFeedbackTarget(sceneID) {
+                                await model.setTextFormValue(recordID: recordID, field: field,
+                                    value: value, expectedContentRevisionID: revisionID)
+                            }
+                            isSaving = false
+                            if saved { dismiss() }
+                            else { errorMessage = "The value could not be saved. Review the field and try again.".localizedUI }
+                        }
+                    }
+                    .disabled(isSaving || !hasChanges || value.count > maximumValueLength)
+                    .accessibilityIdentifier("formValueSave")
+                }
+            }
+            .interactiveDismissDisabled(isSaving || hasChanges)
+            .onChange(of: value) { _, _ in errorMessage = nil }
+            .alert("Discard changes?".localizedUI, isPresented: $confirmsDiscard) {
+                Button("Keep Editing".localizedUI, role: .cancel) { }
+                Button("Discard Changes".localizedUI, role: .destructive) { dismiss() }
+            }
+        }
     }
 }

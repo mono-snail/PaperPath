@@ -1,9 +1,5 @@
 import XCTest
 
-#if targetEnvironment(simulator)
-import StoreKitTest
-#endif
-
 @MainActor
 final class ReleaseReadinessUITests: XCTestCase {
     func testLockedWorkspaceHidesDocumentControlsFromAccessibility() throws {
@@ -52,119 +48,23 @@ final class ReleaseReadinessUITests: XCTestCase {
         app.terminate()
     }
 
-#if targetEnvironment(simulator)
-    private func commerceSession() throws -> SKTestSession {
-        try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["PAPERPATH_LOCAL_STOREKIT"] == "1",
-            "Run the PaperPathCommerce scheme to activate the local StoreKit catalog."
-        )
-        let session = try SKTestSession(configurationFileNamed: "PaperPath")
-        session.resetToDefaultState()
-        session.clearTransactions()
-        session.disableDialogs = true
-        return session
-    }
-
-    private func openPurchase(_ app: XCUIApplication) {
+    func testPaidDownloadHasNoTrialOrPurchaseFlow() throws {
+        let app = launch()
+        XCTAssertFalse(app.buttons["trialStatusBanner"].exists)
         app.buttons["settings"].tap()
-        XCTAssertTrue(app.buttons["settingsPurchase"].waitForExistence(timeout: 8))
-        app.buttons["settingsPurchase"].tap()
-    }
-
-    func testRestoreWithoutPurchaseShowsRecoverableFailure() throws {
-        let session = try commerceSession()
-        defer { session.clearTransactions(); session.resetToDefaultState() }
-        let app = launch()
-        openPurchase(app)
-        let restore = app.buttons["purchaseRestore"]
-        XCTAssertTrue(waitForEnabled(restore))
-        restore.tap()
-        XCTAssertTrue(app.staticTexts["No lifetime purchase was found."].waitForExistence(timeout: 15))
-        XCTAssertTrue(waitForEnabled(app.buttons["purchasePrimaryAction"]))
-        XCTAssertFalse(app.staticTexts["Lifetime Access Active"].exists)
-        screenshot("No purchase restore can be retried", app)
-    }
-
-    func testPurchasePersistsAcrossProcessRelaunchAndRefundRevokesAccess() async throws {
-        let session = try commerceSession()
-        defer { session.clearTransactions(); session.resetToDefaultState() }
-        let app = launch()
-        openPurchase(app)
-        let purchase = app.buttons["purchasePrimaryAction"]
-        XCTAssertTrue(waitForEnabled(purchase))
-        XCTAssertTrue(purchase.label.contains("Unlock for"))
-        purchase.tap()
-        XCTAssertTrue(app.staticTexts["Lifetime Access Active"].waitForExistence(timeout: 15))
-        let transaction = try XCTUnwrap(session.allTransactions().first)
-        app.terminate()
-        app.launchArguments.removeAll { $0 == "UITEST_RESET_DEMO" }
-        app.launch()
-        XCTAssertTrue(app.buttons["settings"].waitForExistence(timeout: 15))
-        openPurchase(app)
-        XCTAssertTrue(app.staticTexts["Lifetime Access Active"].waitForExistence(timeout: 15))
-        try session.refundTransaction(identifier: transaction.identifier)
-        XCTAssertTrue(purchase.waitForExistence(timeout: 15))
-        XCTAssertTrue(waitForEnabled(purchase))
-        XCTAssertFalse(app.staticTexts["Lifetime Access Active"].exists)
-        screenshot("Refund removes lifetime access", app)
-        app.terminate()
-        app.launch()
-        XCTAssertTrue(app.buttons["settings"].waitForExistence(timeout: 15))
-        openPurchase(app)
-        XCTAssertTrue(waitForEnabled(app.buttons["purchasePrimaryAction"]))
-        XCTAssertFalse(app.staticTexts["Lifetime Access Active"].exists)
-    }
-
-    func testPendingPurchaseSurvivesRecheckAndReopenThenApproves() throws {
-        try XCTSkipUnless(
-            ProcessInfo.processInfo.environment["PAPERPATH_LOCAL_STOREKIT"] == "1",
-            "Run the PaperPathCommerce scheme to activate the local StoreKit catalog."
-        )
-        let session = try SKTestSession(configurationFileNamed: "PaperPath")
-        session.resetToDefaultState()
-        session.clearTransactions()
-        session.disableDialogs = true
-        session.askToBuyEnabled = true
-        defer {
-            session.clearTransactions()
-            session.resetToDefaultState()
-        }
-
-        let app = launch()
-        app.buttons["settings"].tap()
-        let account = app.buttons["settingsPurchase"]
-        XCTAssertTrue(account.waitForExistence(timeout: 8))
-        account.tap()
-        let purchase = app.buttons["purchasePrimaryAction"]
-        XCTAssertTrue(purchase.waitForExistence(timeout: 10))
-        XCTAssertTrue(waitForEnabled(purchase))
-        XCTAssertTrue(purchase.label.contains("Unlock for"))
-        screenshot("Purchase with StoreKit price", app)
-        purchase.tap()
-
-        let pending = app.buttons["purchaseCheckStatus"]
-        XCTAssertTrue(pending.waitForExistence(timeout: 10))
-        XCTAssertTrue(waitForEnabled(pending))
-        pending.tap()
-        XCTAssertTrue(waitForEnabled(pending))
+        XCTAssertTrue(app.navigationBars["Settings"].waitForExistence(timeout: 8))
+        XCTAssertFalse(app.buttons["settingsPurchase"].exists)
+        XCTAssertFalse(app.buttons["trialStartAction"].exists)
         XCTAssertFalse(app.buttons["purchasePrimaryAction"].exists)
-        screenshot("Purchase still awaiting approval after recheck", app)
-
-        app.navigationBars["Verified Output Lifetime"].buttons["Done"].tap()
-        XCTAssertTrue(account.waitForExistence(timeout: 5))
-        account.tap()
-        XCTAssertTrue(pending.waitForExistence(timeout: 10))
-        XCTAssertTrue(waitForEnabled(pending))
-        XCTAssertFalse(app.buttons["purchasePrimaryAction"].exists)
-
-        let transaction = try XCTUnwrap(session.allTransactions().first)
-        try session.approveAskToBuyTransaction(identifier: transaction.identifier)
-        XCTAssertTrue(
-            app.staticTexts["Lifetime Access Active"].waitForExistence(timeout: 15)
-        )
-        screenshot("Approved purchase unlocks without another payment", app)
+        XCTAssertTrue(reveal(app.buttons["settingsPrivacyInformation"], app))
+        app.buttons["settingsPrivacyInformation"].tap()
+        let paidDownload = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "one-time paid download")
+        ).firstMatch
+        XCTAssertTrue(reveal(paidDownload, app))
+        screenshot("Paid download includes all tools", app)
     }
-#endif
+
 
     func testSettingsPrivacyInformationAndActualVersion() throws {
         let app = launch()
@@ -181,7 +81,7 @@ final class ReleaseReadinessUITests: XCTestCase {
         app.navigationBars["Privacy & Data"].buttons["Done"].tap()
         let version = app.staticTexts["settingsAppVersion"]
         XCTAssertTrue(reveal(version, app))
-        XCTAssertEqual(version.label, "PaperPath PDF · 1.1.0 (5)")
+        XCTAssertTrue(version.label.hasPrefix("PaperPath PDF · 1.1.0 ("))
     }
 
     func testChinesePrivacyInformationAtStandardSize() throws {
@@ -192,7 +92,7 @@ final class ReleaseReadinessUITests: XCTestCase {
         XCTAssertTrue(reveal(privacy, app))
         privacy.tap()
         XCTAssertTrue(app.navigationBars["隐私与数据"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["文件与数据，由你掌控"].exists)
+        XCTAssertTrue(app.staticTexts["支持离线使用"].exists)
         let backupDisclosure = app.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "PDF 不会备份")
         ).firstMatch
@@ -210,17 +110,100 @@ final class ReleaseReadinessUITests: XCTestCase {
         XCTAssertTrue(reveal(privacy, app))
         privacy.tap()
         XCTAssertTrue(app.navigationBars["隐私与数据"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["文件与数据，由你掌控"].exists)
+        XCTAssertTrue(app.staticTexts["支持离线使用"].exists)
         screenshot("Chinese privacy accessibility", app)
         XCTAssertTrue(reveal(app.staticTexts["分享文档之前"], app))
         screenshot("Chinese privacy last section accessibility", app)
     }
 
-    private func launch(chinese: Bool = false, largeText: Bool = false) -> XCUIApplication {
+    func testSupportStorageFailureCanCloseAndReopenWithoutResending() throws {
+        let app = launch(extraArguments: ["UITEST_SUPPORT_SAVE_FAILURE"])
+        app.buttons["settings"].tap()
+        app.buttons["settingsFeedback"].tap()
+        let retry = app.buttons["supportSaveConversationAgain"]
+        XCTAssertTrue(reveal(retry, app))
+        let submit = app.buttons["supportSubmit"]
+        XCTAssertTrue(reveal(submit, app))
+        XCTAssertFalse(submit.isEnabled)
+        XCTAssertTrue(reveal(retry, app))
+        retry.tap()
+        XCTAssertTrue(app.staticTexts["supportError"].exists)
+        let reference = "8C94C77A-37D1-4670-987D-C15D0E676A15"
+        XCTAssertTrue(app.staticTexts[reference].exists)
+        let close = app.buttons["supportCancel"]
+        XCTAssertTrue(close.isEnabled)
+        close.tap()
+        let alert = app.alerts["Close feedback?"]
+        XCTAssertTrue(alert.waitForExistence(timeout: 5))
+        alert.buttons["Keep Open"].tap()
+        XCTAssertTrue(retry.exists)
+        close.tap()
+        app.alerts.buttons.matching(identifier: "supportClosePending").firstMatch.tap()
+        XCTAssertTrue(app.buttons["settingsFeedback"].waitForExistence(timeout: 5))
+        app.buttons["settingsFeedback"].tap()
+        XCTAssertTrue(reveal(app.staticTexts[reference], app))
+        XCTAssertTrue(reveal(submit, app))
+        XCTAssertFalse(submit.isEnabled)
+        XCTAssertTrue(reveal(retry, app))
+        XCTAssertTrue(retry.isEnabled)
+        screenshot("Support pending conversation retained after closing", app)
+        app.buttons["supportCancel"].tap()
+        app.alerts.buttons.matching(identifier: "supportClosePending").firstMatch.tap()
+        XCTAssertTrue(app.buttons["settingsFeedback"].waitForExistence(timeout: 5))
+    }
+
+    func testSupportFormValidationAndDiscard() throws {
+        try checkSupportForm(chinese: false, largeText: false, dark: false)
+    }
+
+    func testChineseSupportAtAccessibilitySize() throws {
+        try checkSupportForm(chinese: true, largeText: true, dark: false)
+    }
+
+    func testSupportInDarkMode() throws {
+        try checkSupportForm(chinese: false, largeText: false, dark: true)
+    }
+
+    private func checkSupportForm(chinese: Bool, largeText: Bool, dark: Bool) throws {
+        let app = launch(chinese: chinese, largeText: largeText)
+        // Set simulator appearance with `simctl ui <device> appearance dark`
+        // before the dark-mode run; launch defaults do not change UIKit appearance.
+        app.buttons["settings"].tap()
+        // Feedback is immediately available in Settings and opens the native form directly.
+        XCTAssertTrue(app.buttons["settingsFeedback"].waitForExistence(timeout: 5))
+        app.buttons["settingsFeedback"].tap()
+        let submit = app.buttons["supportSubmit"]
+        screenshot("Support composer \(chinese) \(largeText) \(dark)", app)
+        let email = app.textFields["supportEmail"]
+        XCTAssertTrue(email.waitForExistence(timeout: 5))
+        email.tap()
+        email.typeText("person@example.com")
+        app.buttons["supportDismissKeyboard"].tap()
+        let title = app.descendants(matching: .any).matching(identifier: "supportTitle").firstMatch
+        XCTAssertTrue(reveal(title, app))
+        title.tap()
+        title.typeText("Export issue")
+        app.buttons["supportDismissKeyboard"].tap()
+        let description = app.descendants(matching: .any).matching(identifier: "supportDescription").firstMatch
+        XCTAssertTrue(reveal(description, app))
+        description.tap()
+        description.typeText("The export stops after selecting a destination.")
+        app.buttons["supportDismissKeyboard"].tap()
+        XCTAssertTrue(reveal(submit, app))
+        XCTAssertTrue(submit.isEnabled)
+        screenshot("Support ready to send \(chinese) \(largeText) \(dark)", app)
+        // Do not create a real support ticket during UI testing.
+        app.navigationBars.buttons[chinese ? "取消" : "Cancel"].tap()
+        XCTAssertTrue(app.alerts[chinese ? "放弃反馈？" : "Discard feedback?"].waitForExistence(timeout: 5))
+        app.alerts.buttons[chinese ? "放弃" : "Discard"].tap()
+        XCTAssertTrue(app.buttons["settingsFeedback"].waitForExistence(timeout: 5))
+    }
+
+    private func launch(chinese: Bool = false, largeText: Bool = false, extraArguments: [String] = []) -> XCUIApplication {
         continueAfterFailure = false
         let app = XCUIApplication()
         app.launchArguments = [
-            "UITEST_RESET_DEMO",
+            "UITEST_RESET_DEMO", "UITEST_WORKFLOW_FIXTURE",
             "-AppleLanguages", chinese ? "(zh-Hans)" : "(en)",
             "-AppleLocale", chinese ? "zh_CN" : "en_US",
             "-app.language", chinese ? "zh-Hans" : "en",
@@ -228,6 +211,7 @@ final class ReleaseReadinessUITests: XCTestCase {
             "-UIPreferredContentSizeCategoryName",
             largeText ? "UICTContentSizeCategoryAccessibilityXXXL" : "UICTContentSizeCategoryL"
         ]
+        app.launchArguments += extraArguments
         app.launch()
         XCTAssertTrue(app.buttons["settings"].waitForExistence(timeout: 15))
         return app

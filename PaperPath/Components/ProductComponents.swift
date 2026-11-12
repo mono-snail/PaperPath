@@ -854,7 +854,7 @@ struct TaskPackageButton: View {
             Group {
                 if isGridTile
                     && !dynamicTypeSize.isAccessibilitySize {
-                    HStack(alignment: .top, spacing: PPSpacing.small) {
+                    HStack(alignment: .center, spacing: PPSpacing.small) {
                         TaskPathArtwork(
                             package: package,
                             tint: tint,
@@ -881,22 +881,13 @@ struct TaskPackageButton: View {
                                     horizontal: false,
                                     vertical: true
                                 )
-
-                            Text(package.detail.localizedUI)
-                                .font(.caption2)
-                                .foregroundStyle(PPColor.textSecondary)
-                                .lineLimit(2)
-                                .fixedSize(
-                                    horizontal: false,
-                                    vertical: true
-                                )
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(
                         maxWidth: .infinity,
-                        minHeight: 76,
-                        alignment: .topLeading
+                        minHeight: 56,
+                        alignment: .leading
                     )
                     .padding(.horizontal, PPSpacing.small)
                     .padding(.vertical, 6)
@@ -937,9 +928,6 @@ struct TaskPackageButton: View {
                                 .font(.headline)
                                 .fontDesign(.serif)
                                 .foregroundStyle(PPColor.textPrimary)
-                            Text(package.detail.localizedUI)
-                                .font(.caption)
-                                .foregroundStyle(PPColor.textSecondary)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -989,10 +977,6 @@ struct TaskPackageButton: View {
                                 .font(.subheadline.weight(.semibold))
                                 .fontDesign(.serif)
                                 .foregroundStyle(PPColor.textPrimary)
-                            Text(package.detail.localizedUI)
-                                .font(.caption)
-                                .foregroundStyle(PPColor.textSecondary)
-                                .lineLimit(2)
                         }
                         Spacer(minLength: PPSpacing.small)
                         Image(systemName: "chevron.right")
@@ -2354,9 +2338,9 @@ struct WorkflowCommandHeader: View {
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
-    let eyebrow: String
+    var eyebrow: String? = nil
     let title: String
-    let detail: String
+    var detail: String? = nil
     let symbol: String
     let tint: Color
     let metrics: [WorkflowMetric]
@@ -2373,15 +2357,17 @@ struct WorkflowCommandHeader: View {
 
                 VStack(alignment: .leading, spacing: 2) {
                     if usesCompactHeader {
+                        if eyebrow != nil || (showsOnDevice && !dynamicTypeSize.ppPrefersExpandedLayout) {
                         HStack(spacing: PPSpacing.small) {
-                            SectionEyebrow(text: eyebrow)
+                            if let eyebrow { SectionEyebrow(text: eyebrow) }
                             Spacer(minLength: PPSpacing.xSmall)
                             if showsOnDevice,
                                !dynamicTypeSize.ppPrefersExpandedLayout {
                                 OnDeviceBadge(compact: true)
                             }
                         }
-                    } else {
+                        }
+                    } else if let eyebrow {
                         SectionEyebrow(text: eyebrow)
                     }
                     Text(title.localizedUI)
@@ -2394,15 +2380,12 @@ struct WorkflowCommandHeader: View {
                                 : usesCompactHeader ? 2 : 1
                         )
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(detail.localizedUI)
-                        .font(.caption)
-                        .foregroundStyle(PPColor.textSecondary)
-                        .lineLimit(
-                            dynamicTypeSize.ppPrefersExpandedLayout
-                                ? nil
-                                : usesCompactHeader ? 3 : 1
-                        )
-                        .fixedSize(horizontal: false, vertical: true)
+                    if let detail {
+                        Text(detail.localizedUI)
+                            .font(.caption)
+                            .foregroundStyle(PPColor.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -2513,11 +2496,14 @@ struct StudioMetricCell: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: PPSpacing.small) {
-            Image(systemName: symbol)
-                .font(.caption.weight(.semibold))
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(tint)
-                .frame(width: 18)
+            if !dynamicTypeSize.ppPrefersExpandedLayout {
+                Image(systemName: symbol)
+                    .font(.caption.weight(.semibold))
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(tint)
+                    .frame(width: 18)
+                    .accessibilityHidden(true)
+            }
 
             VStack(alignment: .leading, spacing: 1) {
                 Text(value.localizedUI)
@@ -2561,6 +2547,7 @@ struct StudioMetricCell: View {
                 .frame(width: 2)
         }
         .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("studioMetric-\(label)")
     }
 }
 

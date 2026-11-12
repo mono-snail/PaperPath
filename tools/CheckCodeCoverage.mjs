@@ -58,7 +58,13 @@ const domainFiles = app.files.filter((file) =>
 );
 const adapterExclusions = new Set([
   "DemoPDFBuilder.swift",
-  "SecurePasteboard.swift"
+  "SecurePasteboard.swift",
+  // Material-packet review has no entry point in the submitted release.
+  // Its lines remain included in the aggregate domain/service measurements.
+  "HandoffKeyDetailService.swift",
+  // These services are compiled only for the development assistant demo.
+  "PDFAssistantService.swift",
+  "PDFAssistantExecutor.swift"
 ]);
 const releaseCriticalServices = serviceFiles.filter(
   (file) => !adapterExclusions.has(path.basename(file.path))

@@ -1,6 +1,9 @@
 import Foundation
 import PDFKit
 import UIKit
+#if DEBUG
+import CryptoKit
+#endif
 
 struct ExternalDocumentHandoff: Equatable, Sendable {
     let recordID: UUID
@@ -487,6 +490,7 @@ final class PaperPathModel: ObservableObject {
         }
     }
     @Published private(set) var deletedDocuments: [DocumentRecord] = []
+    @Published private(set) var handoffWorkspace = HandoffWorkspace()
     @Published private(set) var documentURLs: [UUID: URL] = [:]
     @Published private(set) var refreshTokens: [UUID: Int] = [:]
     @Published private(set) var ocrResults: [UUID: OCRResult] = [:]
@@ -595,16 +599,12 @@ final class PaperPathModel: ObservableObject {
     var pendingExternalDocumentID: UUID? {
         externalDocumentHandoffs.entries.first?.recordID
     }
-    @Published private var fullUnlockContextsBySceneID:
-        [UUID: FullUnlockContext] = [:]
-    @Published private var unscopedFullUnlockContext:
-        FullUnlockContext?
     @Published private var settingsPresentationSceneIDs =
         Set<UUID>()
     @Published private var hasUnscopedSettingsPresentationRequest =
         false
     @Published private(set) var verifiedOutputSuccessCount =
-        AppEntitlement.verifiedOutputCount
+        AppUsageHistory.verifiedOutputCount
 
     private let store: DocumentStore
     private let mutationService: PDFMutationService
@@ -905,18 +905,67 @@ final class PaperPathModel: ObservableObject {
             await applyTrashRetention(showNotice: false)
 #if DEBUG
             let arguments = ProcessInfo.processInfo.arguments
-            if arguments.contains(
+            if arguments.contains("UITEST_MERGE_CORPUS"),
+               arguments.contains("UITEST_WORKFLOW_FIXTURE") {
+                // The UI runner supplies bounded, offline PDFs. The app still
+                // uses the production importer and merge/save implementations.
+                struct MergeFixture: Decodable { let name: String; let base64: String }
+                guard let payload = ProcessInfo.processInfo.environment["PAPERPATH_MERGE_CORPUS"],
+                      payload.utf8.count <= 256 * 1_024 else {
+                    throw PaperPathError.storageFailure("Missing or oversized merge UI corpus")
+                }
+                let fixtures = try JSONDecoder().decode([MergeFixture].self, from: Data(payload.utf8))
+                guard (4...10).contains(fixtures.count) else {
+                    throw PaperPathError.storageFailure("Merge UI corpus must contain 4–10 PDFs")
+                }
+                try await store.eraseAllData()
+                for entry in fixtures {
+                    guard let data = Data(base64Encoded: entry.base64),
+                          data.count <= 96 * 1_024,
+                          data.starts(with: Data("%PDF-".utf8)) else {
+                        throw PaperPathError.storageFailure("Invalid merge UI PDF")
+                    }
+                    let fixture = ProtectedTemporaryPDF(prefix: "PaperPath-MergeUITest-")
+                    defer { fixture.remove() }
+                    try fixture.prepare()
+                    try data.write(to: fixture.fileURL)
+                    _ = try await store.importPDF(from: fixture.fileURL,
+                        preferredName: entry.name, preserveSourceLocation: false)
+                }
+                applyBootstrapSnapshot(try await store.loadBootstrapSnapshot())
+                if arguments.contains("UITEST_MERGE_DAMAGE_SOURCE"),
+                   let damaged = documents.first(where: { $0.displayName == "Merge 09 Damaged PDF" }),
+                   let damagedURL = documentURLs[damaged.id] {
+                    // Simulate an imported file becoming unreadable. This is
+                    // confined to the UUID-isolated debug fixture store.
+                    try Data("%PDF-1.7\nbroken-source\n".utf8).write(to: damagedURL)
+                }
+            } else if arguments.contains("UITEST_REAL_PDF_FIXTURE"), arguments.contains("UITEST_WORKFLOW_FIXTURE"),
+               let encoded = ProcessInfo.processInfo.environment["PAPERPATH_REAL_PDF_BASE64"],
+               let data = Data(base64Encoded: encoded), data.count <= 96 * 1_024, data.starts(with: Data("%PDF-".utf8)) {
+                try await store.eraseAllData()
+                let fixture = ProtectedTemporaryPDF(prefix: "PaperPath-RealUITest-")
+                defer { fixture.remove() }
+                try fixture.prepare()
+                try data.write(to: fixture.fileURL)
+                for suffix in ["A", "B"] {
+                    _ = try await store.importPDF(from: fixture.fileURL, preferredName: "Downloaded scan \(suffix)", preserveSourceLocation: false)
+                }
+                applyBootstrapSnapshot(try await store.loadBootstrapSnapshot())
+            } else if arguments.contains(
                 "UITEST_OFFICE_CORPUS_FIXTURE"
             ) {
                 try await prepareOfficeCorpusUITestFixture()
             } else if arguments.contains("UITEST_RESET_DEMO") {
                 try await store.eraseAllData()
                 try await signatureStore.remove()
-                AppEntitlement.resetVerifiedOutputHistoryForUITesting()
+                AppUsageHistory.resetVerifiedOutputHistoryForUITesting()
                 verifiedOutputSuccessCount = 0
-                await Task.detached(priority: .utility) {
-                    try? ExternalPDFInbox.removeAll()
-                }.value
+                if !arguments.contains("UITEST_WORKFLOW_FIXTURE") {
+                    await Task.detached(priority: .utility) {
+                        try? ExternalPDFInbox.removeAll()
+                    }.value
+                }
                 try await seedDemo()
                 applyBootstrapSnapshot(
                     try await store.loadBootstrapSnapshot()
@@ -927,6 +976,30 @@ final class PaperPathModel: ObservableObject {
                 applyBootstrapSnapshot(
                     try await store.loadBootstrapSnapshot()
                 )
+            }
+            if arguments.contains("UITEST_QUALITY_ORIGINAL_CORPUS"),
+               ProcessInfo.processInfo.environment["PAPERPATH_QUALITY_CASE_ID"] != nil,
+               let documentsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+                let directory = documentsFolder.appendingPathComponent("QualityInputCorpus")
+                let metadata = try JSONSerialization.jsonObject(with: Data(contentsOf: directory.appendingPathComponent("manifest.json"))) as? [String: Any]
+                let entries = metadata?["documents"] as? [[String: Any]] ?? []
+                let requested = ProcessInfo.processInfo.environment["PAPERPATH_QUALITY_INPUTS"]?.split(separator: ",").map(String.init) ?? ["nasa-webb.pdf"]
+                for fileName in requested {
+                    guard fileName == (fileName as NSString).lastPathComponent, fileName.hasSuffix(".pdf"),
+                          let expected = entries.first(where: { $0["file"] as? String == fileName })?["sha256"] as? String else {
+                        throw PaperPathError.unreadablePDF
+                    }
+                    let name = "Quality " + String(fileName.dropLast(4))
+                    if documents.contains(where: { $0.displayName == name }) { continue }
+                    let url = directory.appendingPathComponent(fileName)
+                    let data = try Data(contentsOf: url)
+                    guard data.count <= 8 * 1_024 * 1_024,
+                          SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == expected else {
+                        throw PaperPathError.unreadablePDF
+                    }
+                    _ = try await store.importPDF(from: url, preferredName: name, preserveSourceLocation: false)
+                    applyBootstrapSnapshot(try await store.loadBootstrapSnapshot())
+                }
             }
             if arguments.contains("UITEST_PREPARE_FIND_INDEX") {
                 await prepareFindIndexForUITest()
@@ -969,16 +1042,37 @@ final class PaperPathModel: ObservableObject {
                 present(error)
             }
             rebuildSearchCorpora()
+#if DEBUG
+            try captureQualityFixtureIfNeeded()
+#endif
             didBootstrap = true
 #if DEBUG
+            // Marketing captures use the normal importer with original fictional
+            // PDFs, inside the isolated UITEST_DOCUMENT_LIFECYCLE store.
+            if let heroArgument = arguments.first(where: {
+                $0.hasPrefix("UITEST_HERO_DOCUMENT=")
+            }), documents.isEmpty,
+               let documentsURL = FileManager.default.urls(
+                for: .documentDirectory, in: .userDomainMask
+               ).first {
+                let name = String(heroArgument.dropFirst("UITEST_HERO_DOCUMENT=".count))
+                _ = await importPDF(from: documentsURL
+                    .appendingPathComponent("HeroFixtures")
+                    .appendingPathComponent(name))
+                noticeMessage = nil
+            }
             if arguments.contains("SCREENSHOT_SETTINGS") {
                 requestSettingsPresentation(in: nil)
-            } else if arguments.contains("SCREENSHOT_FULL_UNLOCK") {
-                presentFullUnlock(.settings)
             }
 #endif
             isLoading = false
+#if DEBUG
+            if !ProcessInfo.processInfo.arguments.contains("UITEST_WORKFLOW_FIXTURE") {
+                await processPendingExternalPDFs()
+            }
+#else
             await processPendingExternalPDFs()
+#endif
             guard !isRunningAutomatedTests else { return true }
             resumeDeferredBackgroundWork()
             return true
@@ -1056,13 +1150,13 @@ final class PaperPathModel: ObservableObject {
             }
             .map(\.id)
         deliveryPreflightCache = snapshot.deliveryPreflightCache
-        if AppEntitlement.verifiedOutputCount == 0,
+        if AppUsageHistory.verifiedOutputCount == 0,
            documents.contains(where: isVerifiedSafeShareOutput) {
             verifiedOutputSuccessCount =
-                AppEntitlement.recordVerifiedOutput()
+                AppUsageHistory.recordVerifiedOutput()
         } else {
             verifiedOutputSuccessCount =
-                AppEntitlement.verifiedOutputCount
+                AppUsageHistory.verifiedOutputCount
         }
     }
 
@@ -5714,29 +5808,9 @@ final class PaperPathModel: ObservableObject {
     func feedbackSceneDidDisconnect(_ sceneID: UUID) {
         activeFeedbackSceneIDs.remove(sceneID)
         feedbackSceneRecency[sceneID] = nil
-        fullUnlockContextsBySceneID[sceneID] = nil
         settingsPresentationSceneIDs.remove(sceneID)
         if let targetSceneID = preferredActiveFeedbackSceneID {
             adoptUnscopedFeedback(into: targetSceneID)
-        }
-    }
-
-    func fullUnlockContext(
-        for sceneID: UUID
-    ) -> FullUnlockContext? {
-        if let context = fullUnlockContextsBySceneID[sceneID] {
-            return context
-        }
-        guard preferredActiveFeedbackSceneID == sceneID
-        else { return nil }
-        return unscopedFullUnlockContext
-    }
-
-    func dismissFullUnlock(from sceneID: UUID) {
-        if fullUnlockContextsBySceneID[sceneID] != nil {
-            fullUnlockContextsBySceneID[sceneID] = nil
-        } else if preferredActiveFeedbackSceneID == sceneID {
-            unscopedFullUnlockContext = nil
         }
     }
 
@@ -6087,6 +6161,7 @@ final class PaperPathModel: ObservableObject {
             try await store.eraseAllData()
             try await signatureStore.remove()
             metadataSyncService.clearLocalMetadata()
+            handoffWorkspace = HandoffWorkspace()
             if let metadataSyncObserver {
                 NotificationCenter.default.removeObserver(
                     metadataSyncObserver
@@ -6352,7 +6427,8 @@ final class PaperPathModel: ObservableObject {
         do {
             _ = try await store.createVersionSnapshot(
                 for: record,
-                label: label
+                label: label,
+                automatic: true
             )
             retainedEvidenceRevision &+= 1
             return true
@@ -6512,6 +6588,32 @@ final class PaperPathModel: ObservableObject {
         } catch {
             present(error)
             return nil
+        }
+    }
+
+    func clearIntermediateVersions() async {
+        guard !hasActiveLocalDataOperations else {
+            noticeMessage = "Wait for document tasks to finish before clearing history.".localizedUI
+            return
+        }
+        isUpdatingVersionStorage = true
+        defer {
+            isUpdatingVersionStorage = false
+            retainedEvidenceRevision &+= 1
+            releaseEvidenceCaches()
+        }
+        do {
+            let count = try await store.clearIntermediateVersions()
+            let undoIDs = Set(pageMutationUndos.keys)
+            for id in undoIDs {
+                discardPageMutationUndo(recordID: id)
+            }
+            clearActionNotice(referencing: undoIDs)
+            noticeMessage = AppLocalization.format("%lld intermediate versions cleared", count)
+        } catch is CancellationError {
+            return
+        } catch {
+            present(error)
         }
     }
 
@@ -7590,7 +7692,8 @@ final class PaperPathModel: ObservableObject {
                 try await store.createVersionSnapshot(
                     for: record,
                     label: "Restore version".localizedUI,
-                    preservingVersionID: snapshotID
+                    preservingVersionID: snapshotID,
+                    allowsLockedDocument: true
                 )
             }
             let currentVersion =
@@ -8296,19 +8399,11 @@ final class PaperPathModel: ObservableObject {
             else {
                 throw CancellationError()
             }
-            let importTask = Task { @MainActor in
-                try await self.importSinglePDF(
-                    from: temporaryURL,
-                    preferredName: AppLocalization.format(
-                        "%@ - searchable",
-                        record.displayName
-                    ),
-                    contentRevisionID: outputRevisionID
-                )
-            }
-            let created = try await valuePropagatingExclusiveCancellation(
-                from: importTask,
-                recordID: recordID,
+            let created = try await saveProcessedDocument(
+                record: record,
+                preparedURL: temporaryURL,
+                label: "Make searchable".localizedUI,
+                revisionID: outputRevisionID,
                 operationToken: operationToken
             )
             operationProgress[recordID] = PDFOperationProgress(
@@ -8324,14 +8419,14 @@ final class PaperPathModel: ObservableObject {
                 recordID: recordID,
                 token: operationToken
             )
-            noticeMessage = "Searchable PDF copy created".localizedUI
+            noticeMessage = "Searchable text saved in document".localizedUI
             return created
         } catch is CancellationError {
             if let committed = documents.first(where: {
                 $0.contentRevisionID == outputRevisionID
             }) {
                 noticeMessage =
-                    "Searchable copy finished before stopping · copy kept in Library"
+                    "Document saved before stopping"
                         .localizedUI
                 return committed
             }
@@ -8345,6 +8440,7 @@ final class PaperPathModel: ObservableObject {
     func createCompressedCopy(
         recordID: UUID,
         quality: PDFCompressionQuality,
+        mode: PDFCompressionMode = .preserveContent,
         expectedContentRevisionID: UUID,
         presentsFeedback: Bool = true,
         onFailure: ((PDFBatchDeliveryIssue) -> Void)? = nil
@@ -8356,6 +8452,7 @@ final class PaperPathModel: ObservableObject {
             outputNameKey: "Compressed copy",
             notice: "Compressed copy created and verified",
             operationKind: .compressed,
+            compressionPreservesContent: mode != .imageCopy,
             presentsFeedback: presentsFeedback,
             onFailure: onFailure
         ) { [outputService] source, destination, progress in
@@ -8363,6 +8460,7 @@ final class PaperPathModel: ObservableObject {
                 sourceURL: source,
                 destination: destination,
                 quality: quality,
+                mode: mode,
                 progress: progress
             )
         }
@@ -8371,6 +8469,7 @@ final class PaperPathModel: ObservableObject {
     func compressionEstimate(
         recordID: UUID,
         quality: PDFCompressionQuality,
+        mode: PDFCompressionMode = .preserveContent,
         expectedContentRevisionID: UUID
     ) async throws -> PDFCompressionEstimate {
         guard record(id: recordID)?.contentRevisionID
@@ -8383,7 +8482,8 @@ final class PaperPathModel: ObservableObject {
         let task = Task.detached(priority: .utility) {
             try service.estimateCompression(
                 sourceURL: sourceURL,
-                quality: quality
+                quality: quality,
+                mode: mode
             )
         }
         let estimate = try await withTaskCancellationHandler {
@@ -8524,15 +8624,17 @@ final class PaperPathModel: ObservableObject {
 
     func createFlattenedCopy(
         recordID: UUID,
-        expectedContentRevisionID: UUID
+        expectedContentRevisionID: UUID,
+        forExport: Bool = false
     ) async -> DocumentRecord? {
         await createOutputCopy(
             recordID: recordID,
             expectedContentRevisionID:
                 expectedContentRevisionID,
-            outputNameKey: "Flattened copy",
+            outputNameKey: "Flattened export",
             notice: "Flattened copy created and verified",
-            operationKind: .flattened
+            operationKind: .flattened,
+            savesAsExport: forExport
         ) { [outputService] source, destination, progress in
             try outputService.flatten(
                 sourceURL: source,
@@ -8589,7 +8691,7 @@ final class PaperPathModel: ObservableObject {
             recordID: recordID,
             expectedContentRevisionID:
                 expectedContentRevisionID,
-            outputNameKey: "Print-ready copy",
+            outputNameKey: "Print export",
             notice: "Print-ready copy created and verified",
             operationKind: .printPrepared
         ) { [outputService] source, destination, progress in
@@ -8648,7 +8750,7 @@ final class PaperPathModel: ObservableObject {
             recordID: recordID,
             expectedContentRevisionID:
                 expectedContentRevisionID,
-            outputNameKey: "Booklet copy",
+            outputNameKey: "Booklet export",
             notice: "Booklet copy created and verified",
             operationKind: .bookletPrepared
         ) { [outputService] source, destination, progress in
@@ -8971,24 +9073,6 @@ final class PaperPathModel: ObservableObject {
         onFailure: ((PDFBatchDeliveryIssue) -> Void)? = nil,
         bypassesEntitlement: Bool = false
     ) async -> DocumentRecord? {
-        let reservesFreeOutput: Bool
-        if bypassesEntitlement
-            || isRunningAutomatedTests
-            || AppEntitlement.canCreateVerifiedOutput {
-            reservesFreeOutput = false
-        } else if AppEntitlement.verifiedOutputCount == 0,
-                  !isFreeVerifiedOutputReserved {
-            isFreeVerifiedOutputReserved = true
-            reservesFreeOutput = true
-        } else {
-            presentFullUnlock(.singleVerifiedOutput)
-            return nil
-        }
-        defer {
-            if reservesFreeOutput {
-                isFreeVerifiedOutputReserved = false
-            }
-        }
         let existingOutputIDs = verifiedSafeShareOutputIDs(
             for: recordID
         )
@@ -8997,7 +9081,7 @@ final class PaperPathModel: ObservableObject {
             recordID: recordID,
             expectedContentRevisionID:
                 expectedContentRevisionID,
-            outputNameKey: "Verified copy",
+            outputNameKey: "Export",
             notice: "Verified copy created and checked",
             operationKind: .safeShare,
             completesAction: .safeShare,
@@ -9019,11 +9103,11 @@ final class PaperPathModel: ObservableObject {
                 .isSubset(of: existingOutputIDs)
         if createdDurableOutput, !isRunningAutomatedTests {
             verifiedOutputSuccessCount =
-                AppEntitlement.recordVerifiedOutput()
+                AppUsageHistory.recordVerifiedOutput()
         } else if !createdDurableOutput,
                   !isRunningAutomatedTests,
                   creationIssue?.phase != .cancelled {
-            AppEntitlement.recordVerifiedFailure()
+            AppUsageHistory.recordVerifiedFailure()
         }
         return created
     }
@@ -9093,19 +9177,6 @@ final class PaperPathModel: ObservableObject {
         guard sourceIDs.count <= 64 else {
             let issue = PDFBatchDeliveryIssue.blocked(
                 "Choose up to 64 PDFs in one batch."
-            )
-            return sourceIDs.map {
-                PDFBatchDeliveryItem(
-                    sourceRecordID: $0,
-                    stage: .blocked,
-                    detail: issue.message,
-                    issue: issue
-                )
-            }
-        }
-        guard authorizeBatchVerifiedOutput() else {
-            let issue = PDFBatchDeliveryIssue.blocked(
-                "Lifetime access is required for batch Verified Output."
             )
             return sourceIDs.map {
                 PDFBatchDeliveryItem(
@@ -9388,27 +9459,6 @@ final class PaperPathModel: ObservableObject {
             )
         }
         return results
-    }
-
-    @discardableResult
-    func authorizeBatchVerifiedOutput() -> Bool {
-        guard isRunningAutomatedTests
-                || AppEntitlement.canCreateVerifiedOutput
-        else {
-            presentFullUnlock(.batchVerifiedOutput)
-            return false
-        }
-        return true
-    }
-
-    private func presentFullUnlock(_ context: FullUnlockContext) {
-        if let sceneID = resolvedFeedbackTarget(
-            AppFeedbackContext.targetSceneID
-        ) {
-            fullUnlockContextsBySceneID[sceneID] = context
-        } else {
-            unscopedFullUnlockContext = context
-        }
     }
 
     @discardableResult
@@ -10703,6 +10753,9 @@ final class PaperPathModel: ObservableObject {
                 recordID: recordID,
                 operationToken: operationToken
             )
+#if DEBUG
+            try captureQualityPageImagesIfNeeded(recordID: recordID, preset: preset, urls: urls)
+#endif
             return urls
         } catch is CancellationError {
             await discardTemporaryExportCopies(at: [directory])
@@ -11630,7 +11683,8 @@ final class PaperPathModel: ObservableObject {
                 let snapshotTask = Task {
                     try await store.createVersionSnapshot(
                         for: record,
-                        label: label
+                        label: label,
+                        automatic: true
                     )
                 }
                 _ = try await valuePropagatingExclusiveCancellation(
@@ -11801,6 +11855,17 @@ final class PaperPathModel: ObservableObject {
                     currentDocumentName: updated.displayName
                 )
             }
+            if updatedRecords.contains(where: { updated in
+                PDFHistoryStoragePolicy.usesCompactHistory(byteCount: max(
+                    updated.profile.byteCount, recordsByID[updated.id]?.profile.byteCount ?? 0))
+            }) {
+                for updated in updatedRecords {
+                    discardPageMutationUndo(recordID: updated.id)
+                }
+                clearActionNotice(referencing: Set(updatedRecords.map(\.id)))
+                noticeMessage = "Changes saved · starting version retained".localizedUI
+                return true
+            }
             keepsBackupsForUndo = true
             presentActionNotice(
                 message: AppLocalization.format(
@@ -11970,7 +12035,8 @@ final class PaperPathModel: ObservableObject {
                 let snapshotTask = Task {
                     try await store.createVersionSnapshot(
                         for: record,
-                        label: label
+                        label: label,
+                        automatic: true
                     )
                 }
                 _ = try await valuePropagatingExclusiveCancellation(
@@ -12149,6 +12215,17 @@ final class PaperPathModel: ObservableObject {
                         receipt.payload.totalPageCount,
                     currentDocumentName: updated.displayName
                 )
+            }
+            if commit.records.contains(where: { updated in
+                PDFHistoryStoragePolicy.usesCompactHistory(byteCount: max(
+                    updated.profile.byteCount, recordsByID[updated.id]?.profile.byteCount ?? 0))
+            }) {
+                for updated in commit.records {
+                    discardPageMutationUndo(recordID: updated.id)
+                }
+                clearActionNotice(referencing: Set(commit.records.map(\.id)))
+                noticeMessage = "Changes saved · starting version retained".localizedUI
+                return true
             }
             keepsBackupsForUndo = true
             presentActionNotice(
@@ -12459,6 +12536,15 @@ final class PaperPathModel: ObservableObject {
             )
         }
         return succeeded
+    }
+
+    @discardableResult
+    func setTextFormValue(recordID: UUID, field: PDFFormFieldSnapshot,
+                          value: String, expectedContentRevisionID: UUID) async -> Bool {
+        await mutate(recordID: recordID, expectedContentRevisionID: expectedContentRevisionID,
+            invalidatesAnalysis: false, snapshotLabel: "Fill Form".localizedUI, presentsFeedback: false) { service, url in
+                try service.setTextFormValue(value, field: field, in: url)
+            }
     }
 
     func inspectForm(
@@ -12871,7 +12957,8 @@ final class PaperPathModel: ObservableObject {
                     label: AppLocalization.format(
                         "Undo %@",
                         undo.label.localizedUI
-                    )
+                    ),
+                    automatic: true
                 )
             }
             _ = try await valuePropagatingExclusiveCancellation(
@@ -12996,7 +13083,8 @@ final class PaperPathModel: ObservableObject {
                         label: AppLocalization.format(
                             "Undo %@",
                             entry.undo.label.localizedUI
-                        )
+                        ),
+                        automatic: true
                     )
                 }
                 _ = try await valuePropagatingExclusiveCancellation(
@@ -13083,7 +13171,7 @@ final class PaperPathModel: ObservableObject {
             replace(refreshed)
             refreshTokens[recordID, default: 0] += 1
             await synchronizeCompletionState(recordID: recordID)
-            noticeMessage = "Markup saved in the working copy".localizedUI
+            noticeMessage = "Markup saved".localizedUI
         } catch {
             present(error)
         }
@@ -13624,6 +13712,166 @@ final class PaperPathModel: ObservableObject {
         }
     }
 
+    /// Always creates a separate fictional PDF, even when the user has documents.
+    func createShareCheckSample() async throws -> DocumentRecord {
+        guard !isErasingAllLocalData else { throw CancellationError() }
+        let token = beginImportOperation()
+        defer { finishImportOperation(token) }
+        let temporary = ProtectedTemporaryPDF(prefix: "PaperPath-DocumentExport-")
+        defer { temporary.remove() }
+        try temporary.prepare()
+        let url = temporary.fileURL
+        let render = Task.detached(priority: .userInitiated) {
+            try DemoPDFBuilder.createSharingSample(at: url)
+        }
+        try await valuePropagatingCancellation(from: render)
+        try Task.checkCancellation()
+        return try await importSinglePDF(from: url,
+            preferredName: "Fictional sharing sample".localizedUI, preserveSourceLocation: false)
+    }
+
+    func createHandoffSampleDocuments() async throws -> (main: UUID, supporting: UUID, corrected: UUID) {
+        let importToken = beginImportOperation()
+        defer { finishImportOperation(importToken) }
+        let main = ProtectedTemporaryPDF(prefix: "PaperPath-DocumentExport-")
+        let supporting = ProtectedTemporaryPDF(prefix: "PaperPath-DocumentExport-")
+        let corrected = ProtectedTemporaryPDF(prefix: "PaperPath-DocumentExport-")
+        defer { main.remove(); supporting.remove(); corrected.remove() }
+        try main.prepare(); try supporting.prepare(); try corrected.prepare()
+        let mainURL = main.fileURL, supportingURL = supporting.fileURL, correctedURL = corrected.fileURL
+        let task = Task.detached(priority: .userInitiated) {
+            try DemoPDFBuilder.createHandoffMaterial(at: mainURL, title: "Project application", reference: "A102")
+            try DemoPDFBuilder.createHandoffMaterial(at: supportingURL, title: "Supporting invoice", reference: "A120")
+            try DemoPDFBuilder.createHandoffMaterial(at: correctedURL, title: "Corrected supporting invoice", reference: "A102")
+        }
+        try await valuePropagatingCancellation(from: task)
+        try Task.checkCancellation()
+        let first = try await importSinglePDF(from: mainURL, preferredName: "Sample application".localizedUI, preserveSourceLocation: false)
+        let second = try await importSinglePDF(from: supportingURL, preferredName: "Sample supporting invoice".localizedUI, preserveSourceLocation: false)
+        let third = try await importSinglePDF(from: correctedURL, preferredName: "Sample corrected invoice".localizedUI, preserveSourceLocation: false)
+        return (first.id, second.id, third.id)
+    }
+
+    func checkHandoffKeyDetails(packetID: UUID) async throws {
+        guard !isErasingAllLocalData else { throw CancellationError() }
+        let original = handoffWorkspace
+        guard let packet = original.packets.first(where: { $0.id == packetID }),
+              packet.isValid, !packet.detailsToCheck.isEmpty else {
+            throw PaperPathError.insufficientSelection("Add a key detail to check across at least two materials.")
+        }
+        let documents = handoffDocuments(for: packet)
+        let scope = Set(packet.detailsToCheck.flatMap(\.requirementIDs))
+        let ids = Set(packet.requirements.filter { scope.contains($0.id) }.compactMap(\.recordID))
+        var sources: [UUID: HandoffKeyDetailSource] = [:]
+        var privateCopies: [URL] = []
+        do {
+            for id in ids {
+                try Task.checkCancellation()
+                guard let snapshot = documents[id], let record = record(id: id) else { continue }
+                var copy: URL?
+                if !snapshot.isLocked, snapshot.byteCount <= 128_000_000, record.profile.pageCount <= 100 {
+                    copy = await makeFilesExportCopy(recordID: id, presentsFeedback: false)
+                }
+                if let copy { privateCopies.append(copy) }
+                sources[id] = HandoffKeyDetailSource(document: snapshot, privateCopyURL: copy,
+                    pageCount: record.profile.pageCount)
+            }
+            let frozenSources = sources
+            let job = Task.detached(priority: .userInitiated) {
+                try HandoffKeyDetailService().check(packet: packet, sources: frozenSources)
+            }
+            let report = try await withTaskCancellationHandler { try await job.value } onCancel: { job.cancel() }
+            try Task.checkCancellation()
+            guard !isErasingAllLocalData, handoffWorkspace.revision == original.revision,
+                  ids.allSatisfy({ documents[$0] == record(id: $0)?.handoffSnapshot }), report.isStructurallyValid else {
+                throw PaperPathError.outputVerificationFailed("the materials or check conditions changed; check the latest versions again")
+            }
+            var next = original
+            guard let index = next.packets.firstIndex(where: { $0.id == packetID }) else { throw CancellationError() }
+            next.packets[index].keyDetailReport = report
+            try await saveHandoffWorkspace(next)
+            for copy in privateCopies { await discardFilesExportCopy(at: copy) }
+        } catch {
+            for copy in privateCopies { await discardFilesExportCopy(at: copy) }
+            throw error
+        }
+    }
+
+    func loadHandoffWorkspace() async throws {
+        guard !isErasingAllLocalData else { throw CancellationError() }
+        let loaded = try await store.loadHandoffWorkspace()
+        guard !isErasingAllLocalData else { throw CancellationError() }
+        if loaded.revision >= handoffWorkspace.revision { handoffWorkspace = loaded }
+    }
+
+    func saveHandoffWorkspace(_ workspace: HandoffWorkspace) async throws {
+        guard !isErasingAllLocalData else { throw CancellationError() }
+        let saved = try await store.saveHandoffWorkspace(workspace)
+        guard !isErasingAllLocalData else { throw CancellationError() }
+        if saved.revision >= handoffWorkspace.revision { handoffWorkspace = saved }
+    }
+
+    func handoffDocuments(for packet: HandoffPacket) -> [UUID: HandoffDocumentSnapshot] {
+        let ids = Set(packet.requirements.compactMap(\.recordID))
+        return Dictionary(uniqueKeysWithValues: ids.compactMap { id in
+            record(id: id).map { (id, $0.handoffSnapshot) }
+        })
+    }
+
+    func makeHandoffPacketExport(packetID: UUID) async throws -> URL {
+        guard !isErasingAllLocalData,
+              let packet = handoffWorkspace.packets.first(where: { $0.id == packetID }),
+              let rule = handoffWorkspace.rules.first(where: { $0.id == packet.ruleID }) else {
+            throw PaperPathError.insufficientSelection("Choose a delivery rule.")
+        }
+        let workspaceRevision = handoffWorkspace.revision
+        let snapshots = handoffDocuments(for: packet)
+        guard HandoffEvaluator.isReady(packet: packet, assessments: HandoffEvaluator.assess(packet: packet, rule: rule, documents: snapshots)) else {
+            throw PaperPathError.insufficientSelection("Complete the packet checks before exporting.")
+        }
+        let packetBytes = packet.requirements.compactMap { $0.recordID.flatMap { snapshots[$0]?.byteCount } }.reduce(Int64(0)) { total, size in
+            let sum = total.addingReportingOverflow(size)
+            return sum.overflow ? Int64.max : sum.partialValue
+        }
+        guard packetBytes <= 1_000_000_000 else {
+            throw PaperPathError.insufficientSelection("The combined PDFs exceed the 1 GB packet limit. Create smaller packets.")
+        }
+        var sources: [UUID: HandoffArchiveSource] = [:]
+        var copies: [URL] = []
+        var archiveURL: URL?
+        do {
+            for item in packet.requirements {
+                try Task.checkCancellation()
+                guard let id = item.recordID, let snapshot = snapshots[id],
+                      let url = await makeFilesExportCopy(recordID: id, presentsFeedback: false) else {
+                    throw PaperPathError.unreadablePDF
+                }
+                copies.append(url)
+                sources[id] = HandoffArchiveSource(document: snapshot, url: url, receipt: record(id: id)?.deliveryReceipt)
+            }
+            let frozenSources = sources
+            let task = Task.detached(priority: .userInitiated) {
+                try HandoffArchiveService().create(packet: packet, rule: rule, sources: frozenSources)
+            }
+            archiveURL = try await withTaskCancellationHandler { try await task.value } onCancel: { task.cancel() }
+            try Task.checkCancellation()
+            guard !isErasingAllLocalData, handoffWorkspace.revision == workspaceRevision,
+                  packet.requirements.allSatisfy({ item in
+                      guard let id = item.recordID else { return false }
+                      return snapshots[id] == record(id: id)?.handoffSnapshot
+                  }) else {
+                throw PaperPathError.outputVerificationFailed("the packet or a document changed during export; review it again")
+            }
+            for url in copies { await discardFilesExportCopy(at: url) }
+            guard let archiveURL else { throw PaperPathError.unreadablePDF }
+            return archiveURL
+        } catch {
+            for url in copies { await discardFilesExportCopy(at: url) }
+            if let archiveURL { await discardFilesExportCopy(at: archiveURL) }
+            throw error
+        }
+    }
+
     func record(id: UUID) -> DocumentRecord? {
         documentRecordsByID[id]
     }
@@ -13668,6 +13916,19 @@ final class PaperPathModel: ObservableObject {
             return nil
         }
         return record(id: sourceDocumentID)
+    }
+
+    /// Old releases could produce chains of result files. Navigation can jump
+    /// directly to the original without changing immediate receipt provenance.
+    func originalDocument(for output: DocumentRecord) -> DocumentRecord? {
+        var current = output
+        var visited = Set<UUID>()
+        while let parentID = current.sourceDocumentID {
+            guard visited.insert(current.id).inserted,
+                  let parent = record(id: parentID) else { return nil }
+            current = parent
+        }
+        return current.id == output.id ? nil : current
     }
 
     func verifiedShareTarget(
@@ -14954,16 +15215,18 @@ final class PaperPathModel: ObservableObject {
     private func updateOperationFraction(
         recordID: UUID,
         label: String,
-        fractionCompleted: Double
+        fractionCompleted: Double,
+        allowsLabelChange: Bool = false
     ) {
         guard let current = operationProgress[recordID],
-              current.label == label
+              current.label == label || allowsLabelChange
         else { return }
         let boundedFraction = fractionCompleted.isFinite
             ? min(1, max(0, fractionCompleted))
             : current.fractionCompleted
         operationProgress[recordID] = PDFOperationProgress(
-            label: label,
+            label: allowsLabelChange && boundedFraction < current.fractionCompleted
+                ? current.label : label,
             fractionCompleted: max(
                 current.fractionCompleted,
                 boundedFraction
@@ -15607,6 +15870,13 @@ final class PaperPathModel: ObservableObject {
             present(error)
             return false
         }
+        if PDFHistoryStoragePolicy.usesCompactHistory(byteCount: max(record.profile.byteCount, refreshed.profile.byteCount)) {
+            backupArtifact.remove()
+            discardPageMutationUndo(recordID: recordID)
+            clearActionNotice(referencing: [recordID])
+            noticeMessage = "Changes saved · starting version retained".localizedUI
+            return true
+        }
         if let previous = pageMutationUndos[recordID] {
             removePageMutationTemporaryItem(
                 containing: previous.backupURL
@@ -15768,7 +16038,8 @@ final class PaperPathModel: ObservableObject {
         let snapshotTask = Task {
             try await store.createVersionSnapshot(
                 for: record,
-                label: snapshotLabel
+                label: snapshotLabel,
+                automatic: true
             )
         }
         _ = try await valuePropagatingExclusiveCancellation(
@@ -15816,6 +16087,7 @@ final class PaperPathModel: ObservableObject {
             textIndices[record.id] = nil
             setOCRResult(nil, for: record.id)
         }
+        documentURLs[record.id] = await store.url(for: refreshed)
         replace(refreshed)
         refreshTokens[record.id, default: 0] += 1
         guard exclusiveDocumentOperationIsCurrent(
@@ -15880,12 +16152,43 @@ final class PaperPathModel: ObservableObject {
         )
     }
 
+    private func saveProcessedDocument(
+        record: DocumentRecord,
+        preparedURL: URL,
+        label: String,
+        revisionID: UUID,
+        receipt: PDFDeliveryReceipt? = nil,
+        operationToken: UUID
+    ) async throws -> DocumentRecord {
+        let store = self.store
+        let commitTask = Task {
+            try await store.saveProcessedDocument(
+                record, from: preparedURL, label: label,
+                revisionID: revisionID, receipt: receipt
+            )
+        }
+        let updated = try await valueCompletingAtomicExclusiveCommit(
+            from: commitTask, recordID: record.id,
+            operationToken: operationToken
+        )
+        // Atomic replacement invalidates cached URL resource values as well as
+        // PDF previews. Rebuild the URL before the next action reads its size.
+        documentURLs[record.id] = await store.url(for: updated)
+        textIndices[record.id] = nil
+        setOCRResult(nil, for: record.id)
+        replace(updated)
+        refreshTokens[record.id, default: 0] += 1
+        return updated
+    }
+
     private func createOutputCopy(
         recordID: UUID,
         expectedContentRevisionID: UUID,
         outputNameKey: String,
         notice: String,
         operationKind: PDFDeliveryOperation,
+        savesAsExport: Bool = false,
+        compressionPreservesContent: Bool = false,
         unlockPassword: String? = nil,
         completesAction: DocumentAction? = nil,
         marksSourceReady: Bool = false,
@@ -15927,10 +16230,7 @@ final class PaperPathModel: ObservableObject {
             }
             return nil
         }
-        let operationLabel = AppLocalization.format(
-            "Creating %@",
-            operationKind.title.localizedUI
-        )
+        let operationLabel = operationKind.actionTitle.localizedUI
         do {
             try markExclusiveDocumentOperationBackgroundCancellable(
                 recordID: recordID,
@@ -15973,7 +16273,9 @@ final class PaperPathModel: ObservableObject {
             onFailure?(.cancelled)
             return nil
         }
+        let progressEmission = PDFOutputProgressEmission()
         let reportProgress: PDFProgressHandler = { [weak self] value in
+            guard progressEmission.shouldReport(value) else { return }
             Task { @MainActor [weak self] in
                 guard let self,
                       self.exclusiveDocumentOperationIsCurrent(
@@ -15983,8 +16285,11 @@ final class PaperPathModel: ObservableObject {
                 else { return }
                 self.updateOperationFraction(
                     recordID: recordID,
-                    label: operationLabel,
-                    fractionCompleted: min(0.98, max(0, value))
+                    label: operationKind == .compressed
+                        ? (value < 0.8 ? "Compressing PDF" : value < 0.96 ? "Verifying compressed PDF" : "Saving document").localizedUI
+                        : operationLabel,
+                    fractionCompleted: min(0.98, max(0, value)),
+                    allowsLabelChange: operationKind == .compressed
                 )
             }
         }
@@ -16003,6 +16308,13 @@ final class PaperPathModel: ObservableObject {
                         AppLocalization.userFacingErrorDescription(error)
                     )
                 }
+                if operationKind == .compressed, case .insufficientSelection = error {
+                    // Unsupported structures and signed files need a different
+                    // method or source; repeating the same operation cannot help.
+                    throw PDFBatchDeliveryIssue.blocked(
+                        AppLocalization.userFacingErrorDescription(error)
+                    )
+                }
                 throw PDFBatchDeliveryIssue.renderingFailed(
                     AppLocalization.userFacingErrorDescription(error)
                 )
@@ -16018,8 +16330,10 @@ final class PaperPathModel: ObservableObject {
                     sourceURL: sourceURL,
                     outputURL: destination,
                     operation: operationKind,
+                    compressionPreservesContent: compressionPreservesContent,
                     unlockPassword: unlockPassword,
-                    timeAnchor: deliveryTimeAnchor
+                    timeAnchor: deliveryTimeAnchor,
+                    progress: { value in reportProgress(0.82 + value * 0.12) }
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -16048,25 +16362,36 @@ final class PaperPathModel: ObservableObject {
             receipt.outputRevisionID = outputRevisionID
             let created: DocumentRecord
             do {
-                let importTask = Task { @MainActor in
-                    try await self.importSinglePDF(
-                        from: destination,
-                        preferredName: AppLocalization.format(
-                            "%@ - %@",
-                            record.displayName,
-                            outputNameKey.localizedUI
-                        ),
-                        deliveryReceipt: receipt,
-                        sourceDocumentID: recordID,
-                        contentRevisionID: outputRevisionID,
-                        analyzeAfterImport: false
+                if (operationKind.updatesCurrentDocument && !savesAsExport) {
+                    created = try await saveProcessedDocument(
+                        record: record,
+                        preparedURL: destination,
+                        label: operationKind.actionTitle.localizedUI,
+                        revisionID: outputRevisionID,
+                        receipt: receipt,
+                        operationToken: operationToken
+                    )
+                } else {
+                    let importTask = Task { @MainActor in
+                        try await self.importSinglePDF(
+                            from: destination,
+                            preferredName: AppLocalization.format(
+                                "%@ - %@",
+                                record.displayName,
+                                outputNameKey.localizedUI
+                            ),
+                            deliveryReceipt: receipt,
+                            sourceDocumentID: recordID,
+                            contentRevisionID: outputRevisionID,
+                            analyzeAfterImport: false
+                        )
+                    }
+                    created = try await valuePropagatingExclusiveCancellation(
+                        from: importTask,
+                        recordID: recordID,
+                        operationToken: operationToken
                     )
                 }
-                created = try await valuePropagatingExclusiveCancellation(
-                    from: importTask,
-                    recordID: recordID,
-                    operationToken: operationToken
-                )
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -16090,7 +16415,9 @@ final class PaperPathModel: ObservableObject {
                 )
             }
             if presentsFeedback {
-                noticeMessage = notice
+                noticeMessage = (operationKind.updatesCurrentDocument && !savesAsExport)
+                    ? "Document saved · previous version in History".localizedUI
+                    : "Export saved · current document unchanged".localizedUI
             }
             return created
         } catch is CancellationError {
@@ -16098,9 +16425,9 @@ final class PaperPathModel: ObservableObject {
                 $0.contentRevisionID == outputRevisionID
             }) {
                 if presentsFeedback {
-                    noticeMessage =
-                        "Copy finished before stopping · copy kept in Library"
-                            .localizedUI
+                    noticeMessage = ((operationKind.updatesCurrentDocument && !savesAsExport)
+                        ? "Document saved before stopping"
+                        : "Export saved before stopping").localizedUI
                 }
                 return committed
             }
@@ -16211,20 +16538,33 @@ final class PaperPathModel: ObservableObject {
         clearActionNotice(referencing: recordIDs)
     }
 
+    // Persisted ISO-8601 timestamps omit fractional seconds. Keep a newer
+    // in-memory reading position instead of rejecting an otherwise current
+    // metadata change (such as renaming an open document).
+    private func currentMetadataRecord(
+        _ updated: DocumentRecord
+    ) -> DocumentRecord? {
+        guard let resident = record(id: updated.id),
+              resident.contentRevisionID == updated.contentRevisionID,
+              resident.modifiedAt <= updated.modifiedAt
+        else { return nil }
+        var merged = updated
+        if (resident.lastViewedAt ?? .distantPast)
+            > (updated.lastViewedAt ?? .distantPast) {
+            merged.lastViewedAt = resident.lastViewedAt
+            merged.lastPageIndex = resident.lastPageIndex
+        }
+        return merged
+    }
+
     @discardableResult
     private func replaceMetadataRecordIfCurrent(
         _ updated: DocumentRecord,
         schedulesMetadataSync: Bool = true
     ) -> Bool {
-        guard let resident = record(id: updated.id),
-              resident.contentRevisionID
-                == updated.contentRevisionID,
-              resident.modifiedAt <= updated.modifiedAt,
-              (resident.lastViewedAt ?? .distantPast)
-                <= (updated.lastViewedAt ?? .distantPast)
-        else { return false }
+        guard let merged = currentMetadataRecord(updated) else { return false }
         replace(
-            updated,
+            merged,
             schedulesMetadataSync: schedulesMetadataSync,
             invalidatesSearchText: false
         )
@@ -16236,16 +16576,7 @@ final class PaperPathModel: ObservableObject {
         _ updatedRecords: [DocumentRecord],
         schedulesMetadataSync: Bool = true
     ) -> Int {
-        let currentRecords = updatedRecords.filter { updated in
-            guard let resident = record(id: updated.id) else {
-                return false
-            }
-            return resident.contentRevisionID
-                    == updated.contentRevisionID
-                && resident.modifiedAt <= updated.modifiedAt
-                && (resident.lastViewedAt ?? .distantPast)
-                    <= (updated.lastViewedAt ?? .distantPast)
-        }
+        let currentRecords = updatedRecords.compactMap { currentMetadataRecord($0) }
         replace(
             currentRecords,
             schedulesMetadataSync: schedulesMetadataSync,
@@ -16415,11 +16746,6 @@ final class PaperPathModel: ObservableObject {
             presentationErrorsBySceneID[sceneID] =
                 error.targetingScene(sceneID)
             unscopedPresentationError = nil
-        }
-        if fullUnlockContextsBySceneID[sceneID] == nil,
-           let context = unscopedFullUnlockContext {
-            fullUnlockContextsBySceneID[sceneID] = context
-            unscopedFullUnlockContext = nil
         }
         if hasUnscopedSettingsPresentationRequest {
             settingsPresentationSceneIDs.insert(sceneID)
@@ -17749,6 +18075,75 @@ final class PaperPathModel: ObservableObject {
         searchTextCorpusCost = 0
     }
 
+#if DEBUG
+    private func captureQualityPageImagesIfNeeded(recordID: UUID, preset: PDFPageImageExportPreset, urls: [URL]) throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard ProcessInfo.processInfo.arguments.contains("UITEST_WORKFLOW_FIXTURE"),
+              let raw = environment["PAPERPATH_QUALITY_CASE_ID"], let caseID = UUID(uuidString: raw),
+              let testID = environment["PAPERPATH_QUALITY_TEST_ID"],
+              let documentsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let evidence = documentsFolder.appendingPathComponent("QualityEvidence").appendingPathComponent(caseID.uuidString)
+        guard FileManager.default.fileExists(atPath: evidence.appendingPathComponent("initial.json").path),
+              !urls.isEmpty, urls.count <= 1_000,
+              Set(urls.map(\.lastPathComponent)).count == urls.count else {
+            throw PaperPathError.storageFailure("Quality image export needs distinct files and its original source capture")
+        }
+        let group = evidence.appendingPathComponent("image-exports").appendingPathComponent(UUID().uuidString)
+        try LocalFileSecurity.prepareProtectedDirectory(at: group)
+        var files: [[String: Any]] = []
+        for (index, url) in urls.enumerated() {
+            let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+            guard url.isFileURL, values.isRegularFile == true, values.isSymbolicLink != true,
+                  let count = values.fileSize, count > 0, count <= 32 * 1_024 * 1_024 else { throw PaperPathError.unreadableImage }
+            let data = try Data(contentsOf: url)
+            let target = group.appendingPathComponent(url.lastPathComponent)
+            try data.write(to: target, options: .atomic)
+            try LocalFileSecurity.requireCompleteProtection(to: target)
+            files.append(["pageIndex": index, "fileName": url.lastPathComponent,
+                "sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()])
+        }
+        let manifest: [String: Any] = ["caseID": caseID.uuidString, "testID": testID,
+            "recordID": recordID.uuidString, "preset": preset.rawValue, "createdAt": Date().timeIntervalSince1970, "files": files]
+        try JSONSerialization.data(withJSONObject: manifest, options: [.sortedKeys])
+            .write(to: group.appendingPathComponent("manifest.json"), options: .atomic)
+    }
+
+    private func captureQualityFixtureIfNeeded() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let arguments = ProcessInfo.processInfo.arguments
+        guard arguments.contains("UITEST_WORKFLOW_FIXTURE"),
+              let rawID = environment["PAPERPATH_QUALITY_CASE_ID"], let caseID = UUID(uuidString: rawID),
+              let testID = environment["PAPERPATH_QUALITY_TEST_ID"],
+              let feature = environment["PAPERPATH_QUALITY_FEATURE"],
+              let fixtureArgument = arguments.last(where: { $0.hasPrefix("UITEST_DOCUMENT_LIFECYCLE=") }),
+              let fixtureID = UUID(uuidString: String(fixtureArgument.dropFirst("UITEST_DOCUMENT_LIFECYCLE=".count))),
+              let documentsFolder = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let storeRoot = documentsFolder.appendingPathComponent("DocumentLifecycleUITestFixtures").appendingPathComponent(fixtureID.uuidString)
+        let evidence = documentsFolder.appendingPathComponent("QualityEvidence").appendingPathComponent(caseID.uuidString)
+        let manifest = evidence.appendingPathComponent("initial.json")
+        guard !FileManager.default.fileExists(atPath: manifest.path) else { return }
+        let sourceFolder = evidence.appendingPathComponent("sources")
+        try FileManager.default.createDirectory(at: sourceFolder, withIntermediateDirectories: true)
+        var originals: [[String: Any]] = []
+        for record in documents {
+            guard let url = documentURLs[record.id],
+                  url.deletingLastPathComponent().standardizedFileURL.path == storeRoot.appendingPathComponent("Documents").standardizedFileURL.path else {
+                throw PaperPathError.storageFailure("Quality capture must use the isolated fixture store")
+            }
+            let data = try Data(contentsOf: url)
+            let fileName = record.id.uuidString + ".pdf"
+            try data.write(to: sourceFolder.appendingPathComponent(fileName))
+            originals.append(["id": record.id.uuidString, "name": record.displayName, "fileName": record.fileName,
+                              "captureFile": fileName, "sha256": SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()])
+        }
+        let proof: [String: Any] = ["schema": "paperpath-quality-session-v1", "caseID": caseID.uuidString,
+            "testID": testID, "feature": feature, "storeRoot": storeRoot.path,
+            "createdAt": Date().timeIntervalSince1970,
+            "contentSize": UIApplication.shared.preferredContentSizeCategory.rawValue, "sources": originals]
+        try JSONSerialization.data(withJSONObject: proof, options: [.sortedKeys]).write(to: manifest, options: .atomic)
+    }
+#endif
+
     private func seedDemo() async throws {
         var fixtures: [(String, (URL) throws -> Void)] = [
             ("Project handoff", DemoPDFBuilder.create),
@@ -17942,4 +18337,19 @@ final class PaperPathModel: ObservableObject {
         trimResidentAnalysisCache()
     }
 #endif
+}
+
+/// Limits main-actor updates to changes in the displayed percentage.
+private final class PDFOutputProgressEmission: @unchecked Sendable {
+    private let lock = NSLock()
+    private var percent = -1
+    func shouldReport(_ value: Double) -> Bool {
+        guard value.isFinite else { return false }
+        let next = Int(min(1, max(0, value)) * 100)
+        lock.lock()
+        defer { lock.unlock() }
+        guard next > percent else { return false }
+        percent = next
+        return true
+    }
 }

@@ -434,7 +434,7 @@ struct InkCaptureView: View {
                 else {
                     isLoadingPagePreview = false
                     pagePreviewErrorMessage =
-                        "The private working copy could not be opened."
+                        "The document could not be opened."
                             .localizedUI
                     return
                 }
@@ -453,7 +453,7 @@ struct InkCaptureView: View {
                 else {
                     isLoadingPagePreview = false
                     pagePreviewErrorMessage =
-                        "The private working copy could not be opened."
+                        "The document could not be opened."
                             .localizedUI
                     return
                 }

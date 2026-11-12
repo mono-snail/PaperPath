@@ -1,9 +1,30 @@
 """The release gate must never accept empty, filtered, skipped or failed runs."""
 import unittest
-from RunReleaseChecks import validate_results, test_inventory, partition_tests
+from unittest.mock import patch
+from RunReleaseChecks import validate_results, test_inventory, partition_tests, simulator_test_jobs, require_idle_simulator_tests, registered_session
 
 
 class ReleaseGateTests(unittest.TestCase):
+    def test_release_uses_one_registered_slot(self):
+        pool = {'slots': {'ios26-phone': {'udid': 'phone'}, 'ios26-ipad': {'udid': 'pad'}}}
+        self.assertEqual(registered_session('iphone', pool=pool), ('ios26-phone', 'phone'))
+        self.assertEqual(registered_session('ipad', ipad='pad', pool=pool), ('ios26-ipad', 'pad'))
+        for kwargs in [dict(iphone='new-device'), dict(iphone='phone', ipad='pad'), dict(ipad='pad')]:
+            with self.assertRaises(ValueError): registered_session('iphone', pool=pool, **kwargs)
+        with self.assertRaises(ValueError): registered_session('ipad', iphone='phone', pool=pool)
+
+    def test_detects_other_xcode_test_jobs_and_ignores_builds(self):
+        processes = "101 /Applications/Xcode.app/usr/bin/xcodebuild test -destination one\n102 /Applications/Xcode.app/usr/bin/xcodebuild -project P test-without-building\n103 /Applications/Xcode.app/usr/bin/xcodebuild build\n104 /bin/zsh -c xcodebuild test\n"
+        with patch("RunReleaseChecks.subprocess.check_output", return_value=processes):
+            self.assertEqual(simulator_test_jobs(), [101, 102])
+            with self.assertRaisesRegex(RuntimeError, "busy"):
+                require_idle_simulator_tests()
+
+    def test_allows_idle_host_without_provisioning_a_device(self):
+        with patch("RunReleaseChecks.subprocess.check_output", return_value="103 xcodebuild build\n"):
+            self.assertEqual(simulator_test_jobs(), [])
+            self.assertIsNone(require_idle_simulator_tests())
+
     def test_partition_runs_every_case_once(self):
         expected = {f"A/test{index}()" for index in range(89)}
         shards = partition_tests(expected, 2)
@@ -52,10 +73,10 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertTrue(self.validate(cases=[
             {"nodeType": "Test Case", "nodeIdentifier": "A/testOther()", "result": "Passed"}]))
 
-    def test_inventory_includes_release_and_commerce_tests(self):
+    def test_inventory_includes_release_and_paid_download_tests(self):
         self.assertIn("ReleaseExperienceLogicTests/testOutputHistoryClampsCorruptCountsAndSaturates()",
                       test_inventory("PaperPathTests"))
-        self.assertIn("ReleaseReadinessUITests/testPurchasePersistsAcrossProcessRelaunchAndRefundRevokesAccess()",
+        self.assertIn("ReleaseReadinessUITests/testPaidDownloadHasNoTrialOrPurchaseFlow()",
                       test_inventory("PaperPathUITests"))
 
     def test_only_declared_device_skip_is_allowed(self):

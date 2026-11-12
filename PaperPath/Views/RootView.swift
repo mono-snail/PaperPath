@@ -400,7 +400,6 @@ struct RootView: View {
 
     @EnvironmentObject private var model: PaperPathModel
     @EnvironmentObject private var appLock: AppLockController
-    @EnvironmentObject private var purchase: PurchaseController
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.requestReview) private var requestReview
@@ -457,8 +456,9 @@ struct RootView: View {
     @State private var layoutTransitionTask: Task<Void, Never>?
     @State private var navigationTask: Task<Void, Never>?
     @State private var pendingFirstRunDocumentID: UUID?
+    @State private var pendingFirstRunImport = false
+    @State private var libraryImportRequestID: UUID?
     @State private var isFirstRunPresentationActive = false
-    @State private var isFullUnlockPresentationActive = false
     @State private var activeLifecycleGeneration = UUID()
     @State private var navigationGeneration = UUID()
     @State private var pendingExternalOpenGeneration = UUID()
@@ -470,6 +470,7 @@ struct RootView: View {
     @State private var sceneID = UUID()
     @State private var librarySearchText = ""
     @State private var libraryAppliedSearchText = ""
+    @State private var librarySearchHistory: [String] = []
     @State private var librarySearchScope = LibrarySearchScope.all
     @State private var libraryStatusFilter: DocumentWorkflowStatus?
     @State private var libraryCategoryFilter: DocumentCategory?
@@ -784,6 +785,7 @@ struct RootView: View {
                 resumePendingRootNavigationIfPossible()
                 resumeNoticePresentationIfNeeded()
             case .background:
+                librarySearchHistory.removeAll(keepingCapacity: false)
                 isPDFDropTargeted = false
                 model.feedbackSceneDidResignActive(sceneID)
                 suspendNoticePresentation()
@@ -813,6 +815,7 @@ struct RootView: View {
         ) { _ in
             isPDFDropTargeted = false
             protectedDataAvailable = false
+            librarySearchHistory.removeAll(keepingCapacity: false)
             model.feedbackSceneDidResignActive(sceneID)
             suspendNoticePresentation()
             suspendActiveLifecycle()
@@ -907,7 +910,12 @@ struct RootView: View {
             onDismiss: completeFirstRunPresentation
         ) {
             FirstRunExperienceView(
-                hasExistingDocuments: !model.workingDocuments.isEmpty
+                hasExistingDocuments: !model.workingDocuments.isEmpty,
+                onImport: {
+                    pendingFirstRunImport = true
+                    onboardingCompleted = true
+                    onboardingReplayRequested = false
+                }
             ) {
                 let recordID = await model.withFeedbackTarget(sceneID) {
                     await model.createSampleWorkspace()
@@ -926,31 +934,6 @@ struct RootView: View {
             .onAppear {
                 isFirstRunPresentationActive = true
             }
-        }
-        .sheet(
-            isPresented: Binding(
-                get: {
-                    model.fullUnlockContext(for: sceneID) != nil
-                },
-                set: { isPresented in
-                    if !isPresented {
-                        model.dismissFullUnlock(from: sceneID)
-                    }
-                }
-            ),
-            onDismiss: {
-                isFullUnlockPresentationActive = false
-                model.dismissFullUnlock(from: sceneID)
-                resumePendingRootNavigationIfPossible()
-            }
-        ) {
-            FullUnlockView(
-                context: model.fullUnlockContext(for: sceneID)
-                    ?? .settings
-            )
-                .onAppear {
-                    isFullUnlockPresentationActive = true
-                }
         }
         .onChange(of: model.isLoading, initial: true) {
             _, isLoading in
@@ -1077,7 +1060,7 @@ struct RootView: View {
     private var firstRunPresentation: Binding<Bool> {
         Binding(
             get: {
-                guard !isRunningAutomatedTests,
+                guard (!isRunningAutomatedTests || onboardingReplayRequested),
                       !model.isLoading
                 else { return false }
                 return onboardingReplayRequested
@@ -1111,10 +1094,17 @@ struct RootView: View {
               protectedDataAvailable,
               !appLock.isLocked,
               !firstRunPresentation.wrappedValue,
-              !isFirstRunPresentationActive,
-              model.fullUnlockContext(for: sceneID) == nil,
-              !isFullUnlockPresentationActive
+              !isFirstRunPresentationActive
         else { return }
+        if pendingFirstRunImport {
+            pendingFirstRunImport = false
+            path.removeAll()
+            selectedWorkspaceRoute = nil
+            isDeskVisible = true
+            isSelectingLibraryDocuments = false
+            libraryImportRequestID = UUID()
+            return
+        }
         if let recordID = pendingFirstRunDocumentID {
             guard model.record(id: recordID) != nil else {
                 pendingFirstRunDocumentID = nil
@@ -1146,8 +1136,6 @@ struct RootView: View {
                   !appLock.isLocked,
                   !firstRunPresentation.wrappedValue,
                   !isFirstRunPresentationActive,
-                  model.fullUnlockContext(for: sceneID) == nil,
-                  !isFullUnlockPresentationActive,
                   model.pendingExternalDocumentID(
                     for: sceneID
                   ) == recordID,
@@ -1296,8 +1284,10 @@ struct RootView: View {
            isDeskVisible || selectedWorkspaceRoute == nil {
             NavigationStack {
                 LibraryView(
+                    requestedPDFImport: $libraryImportRequestID,
                     searchText: $librarySearchText,
                     appliedSearchText: $libraryAppliedSearchText,
+                    searchHistory: $librarySearchHistory,
                     searchScope: $librarySearchScope,
                     statusFilter: $libraryStatusFilter,
                     categoryFilter: $libraryCategoryFilter,
@@ -1314,12 +1304,14 @@ struct RootView: View {
                 columnVisibility: $splitVisibility
             ) {
                 LibraryView(
+                    requestedPDFImport: $libraryImportRequestID,
                     selectedRecordID:
                         selectedWorkspaceRoute?.recordID,
                     isWorkspaceSidebar:
                         selectedWorkspaceRoute != nil,
                     searchText: $librarySearchText,
                     appliedSearchText: $libraryAppliedSearchText,
+                    searchHistory: $librarySearchHistory,
                     searchScope: $librarySearchScope,
                     statusFilter: $libraryStatusFilter,
                     categoryFilter: $libraryCategoryFilter,
@@ -1479,8 +1471,10 @@ struct RootView: View {
         } else {
             NavigationStack(path: $path) {
                 LibraryView(
+                    requestedPDFImport: $libraryImportRequestID,
                     searchText: $librarySearchText,
                     appliedSearchText: $libraryAppliedSearchText,
+                    searchHistory: $librarySearchHistory,
                     searchScope: $librarySearchScope,
                     statusFilter: $libraryStatusFilter,
                     categoryFilter: $libraryCategoryFilter,
@@ -1788,7 +1782,6 @@ struct RootView: View {
             && !appLock.isLocked
             && !model.isLoading
             && !isFirstRunPresentationActive
-            && !isFullUnlockPresentationActive
     }
 
     private func handleDroppedPDFURLs(_ urls: [URL]) -> Bool {
@@ -1993,8 +1986,6 @@ struct RootView: View {
                 resumePendingRootNavigationIfPossible()
             }
             guard pendingGlobalActivation else { return }
-            async let purchaseRefresh: Void =
-                purchase.refreshForLaunch()
             await model.bootstrap()
             guard !Task.isCancelled,
                   activeLifecycleGeneration == generation,
@@ -2004,7 +1995,6 @@ struct RootView: View {
 #if DEBUG
             await runDeviceGoldenPathIfRequested()
 #endif
-            _ = await purchaseRefresh
         }
     }
 
@@ -2252,7 +2242,7 @@ struct RootView: View {
         ratingRequestTask?.cancel()
         ratingRequestTask = nil
         guard !isRunningAutomatedTests,
-              AppEntitlement.shouldRequestRating
+              AppUsageHistory.shouldRequestRating
         else { return }
         let generation = UUID()
         ratingRequestGeneration = generation
@@ -2267,14 +2257,13 @@ struct RootView: View {
                   ratingRequestGeneration == generation,
                   scenePhase == .active,
                   !appLock.isLocked,
-                  model.fullUnlockContext(for: sceneID) == nil,
                   !model.hasActiveLocalDataOperations,
                   sceneTransientNotice == nil,
                   sceneActionNotice == nil,
-                  AppEntitlement.shouldRequestRating
+                  AppUsageHistory.shouldRequestRating
             else { return }
             requestReview()
-            AppEntitlement.markRatingRequested()
+            AppUsageHistory.markRatingRequested()
         }
     }
 }
@@ -2692,7 +2681,6 @@ private struct StudioDocumentInspector: View {
         return VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "EVIDENCE",
-                detail: "Deterministic document state",
                 symbol: "checklist",
                 count: profile.signals.count,
                 tint: inspectorTint(profile.readiness)
@@ -2733,7 +2721,6 @@ private struct StudioDocumentInspector: View {
         return VStack(alignment: .leading, spacing: PPSpacing.small) {
             StudioSectionRule(
                 title: "NEXT",
-                detail: "Open directly in the current workspace",
                 symbol: "arrow.right",
                 tint: PPColor.mint
             )

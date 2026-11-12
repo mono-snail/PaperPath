@@ -1,3 +1,4 @@
+import Security
 import CryptoKit
 import CoreImage
 import Darwin
@@ -24,14 +25,14 @@ final class ReleaseExperienceLogicTests: XCTestCase {
 
     func testRatingRequiresTwoSuccessfulOutputsAndOnlyRequestsOnce() {
         withHistory { _ in
-            XCTAssertFalse(AppEntitlement.shouldRequestRating)
-            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 1)
-            XCTAssertFalse(AppEntitlement.shouldRequestRating)
-            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 2)
-            XCTAssertTrue(AppEntitlement.shouldRequestRating)
-            AppEntitlement.markRatingRequested()
-            AppEntitlement.recordVerifiedOutput()
-            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating)
+            XCTAssertEqual(AppUsageHistory.recordVerifiedOutput(), 1)
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating)
+            XCTAssertEqual(AppUsageHistory.recordVerifiedOutput(), 2)
+            XCTAssertTrue(AppUsageHistory.shouldRequestRating)
+            AppUsageHistory.markRatingRequested()
+            AppUsageHistory.recordVerifiedOutput()
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating)
         }
     }
 
@@ -41,23 +42,23 @@ final class ReleaseExperienceLogicTests: XCTestCase {
             let now = Date()
             defaults.set(now.addingTimeInterval(-60), forKey: "commerce.lastVerifiedOutputAt")
             defaults.set(now, forKey: "commerce.lastVerifiedFailureAt")
-            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating)
             defaults.set(now.addingTimeInterval(-120), forKey: "commerce.lastVerifiedFailureAt")
-            XCTAssertTrue(AppEntitlement.shouldRequestRating)
+            XCTAssertTrue(AppUsageHistory.shouldRequestRating)
             defaults.set(now.addingTimeInterval(-60), forKey: "commerce.lastVerifiedFailureAt")
-            XCTAssertFalse(AppEntitlement.shouldRequestRating, "Equal timestamps must fail closed")
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating, "Equal timestamps must fail closed")
         }
     }
 
     func testRatingRejectsMissingMalformedAndImplausibleSuccessDates() {
         withHistory { defaults in
             defaults.set(2, forKey: "commerce.verifiedOutputCount")
-            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating)
             let invalidDates: [Any] = ["invalid", Date(timeIntervalSince1970: -1),
                                        Date().addingTimeInterval(3600)]
             for invalid in invalidDates {
                 defaults.set(invalid, forKey: "commerce.lastVerifiedOutputAt")
-                XCTAssertFalse(AppEntitlement.shouldRequestRating)
+                XCTAssertFalse(AppUsageHistory.shouldRequestRating)
             }
         }
     }
@@ -68,7 +69,7 @@ final class ReleaseExperienceLogicTests: XCTestCase {
             defaults.set(Date(), forKey: "commerce.lastVerifiedOutputAt")
             for invalid in [Date(timeIntervalSince1970: -1), Date().addingTimeInterval(3600)] {
                 defaults.set(invalid, forKey: "commerce.lastVerifiedFailureAt")
-                XCTAssertFalse(AppEntitlement.shouldRequestRating)
+                XCTAssertFalse(AppUsageHistory.shouldRequestRating)
             }
         }
     }
@@ -76,14 +77,14 @@ final class ReleaseExperienceLogicTests: XCTestCase {
     func testOutputHistoryClampsCorruptCountsAndSaturates() {
         withHistory { defaults in
             defaults.set(-100, forKey: "commerce.verifiedOutputCount")
-            XCTAssertEqual(AppEntitlement.verifiedOutputCount, 0)
-            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 1)
+            XCTAssertEqual(AppUsageHistory.verifiedOutputCount, 0)
+            XCTAssertEqual(AppUsageHistory.recordVerifiedOutput(), 1)
             defaults.set(Int.max, forKey: "commerce.verifiedOutputCount")
-            XCTAssertEqual(AppEntitlement.verifiedOutputCount, 1_000_000)
-            XCTAssertEqual(AppEntitlement.recordVerifiedOutput(), 1_000_000)
-            AppEntitlement.recordVerifiedFailure()
+            XCTAssertEqual(AppUsageHistory.verifiedOutputCount, 1_000_000)
+            XCTAssertEqual(AppUsageHistory.recordVerifiedOutput(), 1_000_000)
+            AppUsageHistory.recordVerifiedFailure()
             XCTAssertNotNil(defaults.object(forKey: "commerce.lastVerifiedFailureAt") as? Date)
-            XCTAssertFalse(AppEntitlement.shouldRequestRating)
+            XCTAssertFalse(AppUsageHistory.shouldRequestRating)
         }
     }
 
@@ -5857,5 +5858,176 @@ private final class TestServiceMetadataKeyValueStore:
 
     func synchronize() -> Bool {
         synchronizeResult
+    }
+}
+
+private final class SupportStubProtocol: URLProtocol {
+    static var handler: ((URLRequest) throws -> (Int, Data))?
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func startLoading() {
+        do {
+            let (status, data) = try Self.handler!(request)
+            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status,
+                httpVersion: nil, headerFields: ["Content-Type": "application/json"])!, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch { client?.urlProtocol(self, didFailWithError: error) }
+    }
+    override func stopLoading() { }
+}
+
+@MainActor
+final class SupportIntegrationTests: XCTestCase {
+    private let thread = SupportThread(id: "62c6845e-7c9b-4c0e-ba5a-ced4e1c8770a",
+        conversationToken: String(repeating: "a", count: 64), title: "Export stops", createdAt: "2026-10-26T10:00:00.000Z")
+
+    func testReplyDraftAndUnconfirmedDeliverySurviveInboxNavigation() {
+        let inbox = SupportInbox()
+        let draft = inbox.replySession(for: thread.id)
+        draft.reply = "Please keep this unsent reply."
+        draft.uncertainReply = draft.reply
+        draft.knownMessageIDs = ["existing-message"]
+        draft.error = SupportFailure.uncertain.localizedDescription
+        draft.reconciled = true
+        draft.busy = true
+
+        let reopened = inbox.replySession(for: thread.id)
+        XCTAssertTrue(reopened === draft)
+        XCTAssertEqual(reopened.reply, "Please keep this unsent reply.")
+        XCTAssertEqual(reopened.uncertainReply, reopened.reply)
+        XCTAssertEqual(reopened.knownMessageIDs, ["existing-message"])
+        XCTAssertNotNil(reopened.error)
+        XCTAssertTrue(reopened.reconciled)
+        XCTAssertTrue(reopened.busy)
+    }
+
+    func testReplySessionsDoNotLeakBetweenConversationsOrInboxes() {
+        let inbox = SupportInbox()
+        let first = inbox.replySession(for: thread.id)
+        first.reply = "Private draft"
+        first.uncertainReply = first.reply
+        let other = inbox.replySession(for: UUID().uuidString)
+        XCTAssertFalse(first === other)
+        XCTAssertTrue(other.reply.isEmpty)
+        XCTAssertNil(other.uncertainReply)
+        let reopenedSupport = SupportInbox().replySession(for: thread.id)
+        XCTAssertFalse(first === reopenedSupport)
+        XCTAssertTrue(reopenedSupport.reply.isEmpty)
+    }
+
+    private func service() -> SupportService {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SupportStubProtocol.self]
+        return SupportService(configuration: configuration)
+    }
+
+    private func body(_ request: URLRequest) throws -> [String: Any] {
+        var data = request.httpBody ?? Data()
+        if data.isEmpty, let stream = request.httpBodyStream {
+            stream.open()
+            defer { stream.close() }
+            var buffer = [UInt8](repeating: 0, count: 1024)
+            while stream.hasBytesAvailable {
+                let count = stream.read(&buffer, maxLength: buffer.count)
+                guard count > 0 else { break }
+                data.append(buffer, count: count)
+            }
+        }
+        return try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+    }
+
+    override func tearDown() {
+        SupportStubProtocol.handler = nil
+        super.tearDown()
+    }
+
+    func testCreateUsesCanonicalAPIAndDoesNotAttachPrivateData() async throws {
+        SupportStubProtocol.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://support.monoware.app/api/v1/feedback")
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+            let body = try self.body(request)
+            XCTAssertEqual(Set(body.keys), Set(["product", "type", "email", "title", "description"]))
+            XCTAssertEqual(body["product"] as? String, "paperpath")
+            XCTAssertEqual(body["email"] as? String, "user@example.com")
+            return (201, Data("""
+                {"ok":true,"id":"\(self.thread.id)","conversationToken":"\(self.thread.conversationToken)","createdAt":"\(self.thread.createdAt)"}
+                """.utf8))
+        }
+        let result = try await service().create(email: " user@example.com ", title: thread.title,
+            description: "Export stops at page two.", type: "bug", includeDeviceInfo: false)
+        XCTAssertEqual(result, thread)
+    }
+
+    func testConversationAndReplyUseBearerWithoutPuttingTokenInURL() async throws {
+        let service = service()
+        SupportStubProtocol.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer \(self.thread.conversationToken)")
+            XCTAssertNil(request.url?.query)
+            XCTAssertFalse(request.url!.absoluteString.contains(self.thread.conversationToken))
+            if request.httpMethod == "POST" {
+                XCTAssertEqual(request.url?.lastPathComponent, "messages")
+                XCTAssertEqual(try self.body(request)["message"] as? String, "More details")
+                return (201, Data("{\"ok\":true}".utf8))
+            }
+            return (200, Data("""
+                {"feedback":{"id":"\(self.thread.id)","product":"paperpath","title":"Export stops","status":"resolved"},"messages":[{"id":"m1","author":"agent","body":"Please update.","createdAt":"2026-10-26T12:00:00.000Z"}]}
+                """.utf8))
+        }
+        let result = try await service.conversation(thread)
+        XCTAssertEqual(result.feedback.status, "resolved")
+        XCTAssertEqual(result.messages.first?.body, "Please update.")
+        try await service.reply(" More details ", to: thread)
+    }
+
+    func testAmbiguousSubmissionIsNotRetriedAutomatically() async {
+        var calls = 0
+        SupportStubProtocol.handler = { _ in
+            calls += 1
+            throw URLError(.networkConnectionLost)
+        }
+        do {
+            _ = try await service().create(email: "user@example.com", title: thread.title,
+                description: "Export stops at page two.", type: "bug", includeDeviceInfo: false)
+            XCTFail("Expected ambiguous delivery")
+        } catch { XCTAssertEqual(error as? SupportFailure, .uncertain) }
+        XCTAssertEqual(calls, 1)
+    }
+
+    func testStatusErrorsAndInvalidCredentialsStayActionable() async {
+        let service = service()
+        for (code, expected) in [(401, SupportFailure.credentials), (404, .credentials), (507, .capacity), (503, .unavailable)] {
+            SupportStubProtocol.handler = { _ in (code, Data()) }
+            do { _ = try await service.conversation(thread); XCTFail("Expected error") }
+            catch { XCTAssertEqual(error as? SupportFailure, expected) }
+        }
+        SupportStubProtocol.handler = { _ in XCTFail("Malformed credentials must not leave the device"); return (200, Data()) }
+        do {
+            _ = try await service.conversation(SupportThread(id: "../admin", conversationToken: "bad", title: "", createdAt: ""))
+            XCTFail("Expected credentials error")
+        } catch { XCTAssertEqual(error as? SupportFailure, .credentials) }
+    }
+
+    func testKeychainRoundTripUpdatesWithoutDuplicatingThreads() throws {
+        let serviceName = "com.monoware.paperpath.support.test." + UUID().uuidString
+        let store = SupportThreadStore(service: serviceName)
+        defer {
+            SecItemDelete([kSecClass as String: kSecClassGenericPassword,
+                           kSecAttrService as String: serviceName] as CFDictionary)
+        }
+        XCTAssertTrue(try store.load().isEmpty)
+        try store.save(thread)
+        try store.save(thread)
+        XCTAssertEqual(try SupportThreadStore(service: serviceName).load(), [thread])
+    }
+
+    func testValidationMatchesTrimmedLengthsAndEmailRules() {
+        XCTAssertTrue(SupportService.valid(email: "user+pdf@example.com", title: " Test ", description: "Some details"))
+        for email in ["", "a@", "a@b", "a b@example.com", "a@-host.com"] {
+            XCTAssertFalse(SupportService.valid(email: email, title: "Test", description: "Some details"))
+        }
+        XCTAssertFalse(SupportService.valid(email: "a@b.com", title: "ab", description: "Some details"))
+        XCTAssertFalse(SupportService.valid(email: "a@b.com", title: "Test", description: String(repeating: "a", count: 5001)))
     }
 }

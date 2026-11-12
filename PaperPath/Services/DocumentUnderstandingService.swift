@@ -6,8 +6,15 @@ enum DocumentSearchNormalization {
     static let maximumTermCharacters = 64
     static let maximumTermCount = 16
 
+    // A discretionary hyphen is invisible unless used for a line break.
+    // PDF extraction may retain it inside words; ignore it in both queries
+    // and indexed text without changing the source document or stored index.
+    static func removingSoftHyphens(from value: String) -> String {
+        value.replacingOccurrences(of: "\u{00ad}", with: "")
+    }
+
     static func text(_ value: String) -> String {
-        value.folding(
+        removingSoftHyphens(from: value).folding(
             options: [
                 .caseInsensitive,
                 .diacriticInsensitive,
@@ -43,6 +50,22 @@ enum DocumentSearchNormalization {
             }
         }
         return result
+    }
+}
+
+// OCR review filters use a continuous phrase, unlike the library's all-term
+// query. Prepare its normalization once before scanning pages off the main actor.
+struct DocumentPhraseSearch: Sendable {
+    private let query: String
+
+    init(query: String) {
+        self.query = DocumentSearchNormalization.text(query)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func matches(_ text: String) -> Bool {
+        !query.isEmpty
+            && DocumentSearchNormalization.text(text).contains(query)
     }
 }
 
@@ -277,7 +300,8 @@ struct DocumentTextIndex: Codable, Hashable, Sendable {
         terms: [String],
         excerptLimit: Int
     ) -> DocumentTextMatch? {
-        let text = page.text
+        let text = DocumentSearchNormalization
+            .removingSoftHyphens(from: page.text)
             .split(whereSeparator: \.isWhitespace)
             .joined(separator: " ")
         guard !text.isEmpty else { return nil }

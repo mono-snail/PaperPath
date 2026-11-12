@@ -347,7 +347,7 @@ enum PDFQuickTask: String, CaseIterable, Identifiable, Hashable {
         case .splitPDF, .organizePages:
             return record.profile.pageCount > 1 && !record.profile.isLocked
         case .fillForms:
-            return record.profile.kind == .form && !record.profile.isLocked
+            return !record.profile.isLocked
         case .recognizeText:
             return (
                 record.profile.kind == .scan
@@ -370,6 +370,9 @@ enum PDFQuickTask: String, CaseIterable, Identifiable, Hashable {
         case .organizePages:
             return "\(record.profile.pageCount) pages ready to organize"
         case .fillForms:
+            guard record.profile.formFieldCount > 0 else {
+                return "Add fields to fill this PDF"
+            }
             return "\(record.profile.formFieldCount) interactive field\(record.profile.formFieldCount == 1 ? "" : "s")"
         case .recognizeText:
             return "Image-based pages detected"
@@ -426,7 +429,7 @@ enum PDFTaskPackage: String, CaseIterable, Identifiable, Hashable {
         case .makeSearchable: return "Read scanned pages"
         case .convertForWork:
             return "Word, Excel, or PowerPoint"
-        case .compressForEmail: return "Create a smaller copy"
+        case .compressForEmail: return "Reduce this document’s size"
         case .redactAndProve: return "Remove, then verify"
         case .fixPages:
             return "Reorder, crop, extract"
@@ -6221,15 +6224,15 @@ enum DocumentAction:
         case .recognizeText:
             return "Extract text locally from image-based pages."
         case .makeSearchable:
-            return "Create a new PDF copy with a searchable local text layer."
+            return "Save a searchable text layer in this document."
         case .organizePages:
-            return "Rotate, move, or remove pages in the working copy."
+            return "Rotate, move, or remove pages in this document."
         case .reviewForm:
             return "Review the detected form fields in the document."
         case .sign:
             return "Draw or reuse a signature and place it on this page."
         case .safeShare:
-            return "Create a flattened copy and verify every output page."
+            return "Prepare an export and verify every page."
         case .inspect:
             return "See what PaperPath found and why it recommended these actions."
         case .shareCopy:
@@ -6390,7 +6393,7 @@ struct DocumentActionPlanner {
                 .localizedUI
         case .makeSearchable:
             return hasRecognizedText
-                ? "Recognized text is ready to embed in a new PDF copy."
+                ? "Recognized text is ready to save in this document."
                     .localizedUI
                 : action.explanation.localizedUI
         case .reviewForm:
@@ -6512,6 +6515,29 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
         }
     }
 
+    /// Full task names for the catalog; compact toolbar labels stay familiar.
+    var catalogTitle: String {
+        switch self {
+        case .brief: return "Document summary"
+        case .find: return "Find in document"
+        case .recognize: return "Recognize text (OCR)"
+        case .strikeOut: return "Strikethrough"
+        case .note: return "Add a note"
+        case .bates: return "Page IDs (Bates)"
+        case .content: return "Add text, images & links"
+        case .annotations: return "Review annotations"
+        case .attachments: return "Embedded attachments"
+        case .sign: return "Sign PDF"
+        case .redact: return "Permanently redact"
+        case .fillForm: return "Fill forms"
+        case .organize: return "Organize pages"
+        case .compress: return "Compress PDF"
+        case .protect: return "Password protect"
+        case .export: return "Export & share"
+        default: return title
+        }
+    }
+
     var compactTitle: String {
         switch self {
         case .recognize: return "OCR"
@@ -6586,8 +6612,8 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
         case .bookmarks: return "Open saved pages and document outline"
         case .organize:
             return "Reorder, number, crop, insert, or extract pages"
-        case .compress: return "Create a smaller sharing copy"
-        case .protect: return "Create a password-protected copy"
+        case .compress: return "Compress this document; previous versions stay in History"
+        case .protect: return "Set a password on this document"
         case .export:
             return "PDF, Word, Excel, PowerPoint, text, or images"
         }
@@ -6658,11 +6684,14 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
         let normalizedCompactTitle = SearchTextNormalizer.normalize(
             compactTitle
         )
+        let normalizedCatalogTitle = SearchTextNormalizer.normalize(catalogTitle)
+        let localizedCatalogTitle = catalogTitle.localizedUI
+        let normalizedLocalizedTitle = SearchTextNormalizer.normalize(localizedCatalogTitle)
         let normalizedDetail = SearchTextNormalizer.normalize(detail)
         let normalizedGroup = SearchTextNormalizer.normalize(group.title)
         let normalizedAliases = SearchTextNormalizer.normalize(searchAliases)
         let text = SearchTextNormalizer.normalize(
-            "\(title) \(detail) \(group.title) \(searchAliases)"
+            "\(title) \(catalogTitle) \(localizedCatalogTitle) \(detail) \(group.title) \(searchAliases)"
         )
         let matchedTermCount = terms.reduce(into: 0) { count, term in
             if text.contains(term) {
@@ -6679,16 +6708,22 @@ enum DocumentTool: String, CaseIterable, Identifiable, Hashable {
 
         var score = 0
         if normalizedTitle == normalizedQuery
-            || normalizedCompactTitle == normalizedQuery {
+            || normalizedCompactTitle == normalizedQuery
+            || normalizedCatalogTitle == normalizedQuery
+            || normalizedLocalizedTitle == normalizedQuery {
             score += 1_000
         } else if normalizedTitle.hasPrefix(normalizedQuery)
-            || normalizedCompactTitle.hasPrefix(normalizedQuery) {
+            || normalizedCompactTitle.hasPrefix(normalizedQuery)
+            || normalizedCatalogTitle.hasPrefix(normalizedQuery)
+            || normalizedLocalizedTitle.hasPrefix(normalizedQuery) {
             score += 700
         }
 
         for term in terms {
             if normalizedTitle.contains(term)
-                || normalizedCompactTitle.contains(term) {
+                || normalizedCompactTitle.contains(term)
+                || normalizedCatalogTitle.contains(term)
+                || normalizedLocalizedTitle.contains(term) {
                 score += 180
             } else if normalizedAliases.contains(term) {
                 score += 90
@@ -10422,16 +10457,38 @@ enum PDFDeliveryOperation: String, Codable, Hashable, Sendable {
 
     var title: String {
         switch self {
-        case .compressed: return "Compressed copy"
-        case .redacted: return "Redacted copy"
-        case .protected: return "Protected copy"
-        case .unlocked: return "Editable copy"
-        case .flattened: return "Flattened copy"
-        case .safeShare: return "Verified copy"
-        case .edited: return "Edited copy"
-        case .textReplaced: return "Text replacement copy"
-        case .printPrepared: return "Print-ready copy"
-        case .bookletPrepared: return "Booklet copy"
+        case .compressed: return "Compression"
+        case .redacted: return "Redaction"
+        case .protected: return "Password protection"
+        case .unlocked: return "Password removal"
+        case .flattened: return "Flattened PDF"
+        case .safeShare: return "Export"
+        case .edited: return "Content edit"
+        case .textReplaced: return "Text replacement"
+        case .printPrepared: return "Print export"
+        case .bookletPrepared: return "Booklet export"
+        }
+    }
+
+    var updatesCurrentDocument: Bool {
+        switch self {
+        case .safeShare, .printPrepared, .bookletPrepared: return false
+        default: return true
+        }
+    }
+
+    var actionTitle: String {
+        switch self {
+        case .compressed: return "Compress PDF"
+        case .redacted: return "Apply redaction"
+        case .protected: return "Protect PDF"
+        case .unlocked: return "Remove password"
+        case .flattened: return "Flatten PDF"
+        case .safeShare: return "Prepare export"
+        case .edited: return "Save changes"
+        case .textReplaced: return "Replace text"
+        case .printPrepared: return "Export for printing"
+        case .bookletPrepared: return "Export booklet"
         }
     }
 
@@ -10931,7 +10988,7 @@ struct PDFBatchDeliveryIssue: Codable, LocalizedError, Hashable, Sendable {
             code: "V-102",
             message: message,
             recovery:
-                "The original is already smaller. PaperPath kept it unchanged.",
+                "This PDF is already efficiently compressed. The document was left unchanged.",
             isRetryable: false
         )
     }
@@ -12655,7 +12712,7 @@ struct PDFDeliveryReceipt: Codable, Hashable, Identifiable, Sendable {
     var outcomeTitle: String {
         guard isVerified else { return "Needs review".localizedUI }
         if operation == .unlocked {
-            return "Editable copy ready".localizedUI
+            return "Password removed".localizedUI
         }
         guard warningCount > 0 else {
             return "Ready to share".localizedUI
@@ -13321,7 +13378,7 @@ struct DocumentRecord: Codable, Identifiable, Hashable {
     var deliveryReceipt: PDFDeliveryReceipt?
     var officeReceipts: [PDFOfficeExportReceipt]
     var officeBatchRun: PDFOfficeBatchRun?
-    let sourceDocumentID: UUID?
+    var sourceDocumentID: UUID?
     var sourceBookmarkData: Data?
     var sourceLocationName: String?
     var sourceImportedFingerprint: String?
@@ -13789,6 +13846,14 @@ struct LibraryCommandSummary: Hashable {
     }
 }
 
+enum PDFHistoryStoragePolicy {
+    static let largeFileThreshold: Int64 = 100 * 1_024 * 1_024
+
+    static func usesCompactHistory(byteCount: Int64) -> Bool {
+        byteCount >= largeFileThreshold
+    }
+}
+
 struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
     let id: UUID
     let documentID: UUID
@@ -13806,6 +13871,12 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
     let isPinned: Bool?
     let linkedDeliveryReceiptID: UUID?
     let linkedDeliveryReceipt: PDFDeliveryReceipt?
+
+    // Optional for compatibility with histories saved before original retention.
+    var isOriginalRecoveryPoint: Bool? = nil
+    var compactHistoryEnabled: Bool? = nil
+
+    var isProtectedOriginal: Bool { isOriginalRecoveryPoint == true }
 
     var formattedSize: String {
         ByteCountFormatter.string(
@@ -13837,7 +13908,10 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
     }
 
     var displayTitle: String {
-        resolvedMilestoneName
+        if isProtectedOriginal && resolvedMilestoneName == nil {
+            return "Starting version".localizedUI
+        }
+        return resolvedMilestoneName
             ?? AppLocalization.format(
                 "Before %@",
                 label.localizedUI
@@ -13912,7 +13986,9 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
                 : nil,
             linkedDeliveryReceipt: pinned
                 ? resolvedReceipt
-                : nil
+                : nil,
+            isOriginalRecoveryPoint: isOriginalRecoveryPoint,
+            compactHistoryEnabled: compactHistoryEnabled
         )
     }
 
@@ -13935,7 +14011,9 @@ struct PDFVersionSnapshot: Codable, Identifiable, Hashable, Sendable {
             milestoneName: milestoneName,
             isPinned: isPinned,
             linkedDeliveryReceiptID: linkedDeliveryReceiptID,
-            linkedDeliveryReceipt: linkedDeliveryReceipt
+            linkedDeliveryReceipt: linkedDeliveryReceipt,
+            isOriginalRecoveryPoint: isOriginalRecoveryPoint,
+            compactHistoryEnabled: compactHistoryEnabled
         )
     }
 }
@@ -15035,6 +15113,62 @@ struct OCRResult: Codable, Hashable, Sendable {
     }
 }
 
+enum PDFProtectionPasswordValidation {
+    static func message(password: String, confirmation: String) -> String? {
+        if password.isEmpty && confirmation.isEmpty { return nil }
+        if password.count > 128 || confirmation.count > 128 {
+            return "Use a PDF password between 8 and 128 characters."
+        }
+        if password.count < 8 { return "Use at least eight characters." }
+        if password != confirmation { return "Passwords do not match." }
+        return nil
+    }
+}
+
+enum PDFCompressionBatchOutputState: Equatable {
+    case compressed
+    case unchanged
+    case unavailable
+
+    init(successfulCount: Int, unchangedCount: Int, failedCount: Int) {
+        if successfulCount > 0 {
+            self = .compressed
+        } else if unchangedCount > 0, failedCount == 0 {
+            self = .unchanged
+        } else {
+            self = .unavailable
+        }
+    }
+
+    var placeholder: String? {
+        switch self {
+        case .compressed: return nil
+        case .unchanged: return "No change needed"
+        case .unavailable: return "No compressed output"
+        }
+    }
+}
+
+enum PDFPageNumberInput {
+    static func pageIndex(_ text: String, pageCount: Int) -> Int? {
+        let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (1...6).contains(value.unicodeScalars.count), pageCount > 0 else {
+            return nil
+        }
+        var page = 0
+        for scalar in value.unicodeScalars {
+            // Accept localized decimal digits, but never reinterpret separators,
+            // signs, fractions, superscripts, or a pasted range as one page.
+            guard scalar.properties.generalCategory == .decimalNumber,
+                  let digit = Character(String(scalar)).wholeNumberValue
+            else { return nil }
+            page = page * 10 + digit
+        }
+        guard page > 0, page <= pageCount else { return nil }
+        return page - 1
+    }
+}
+
 enum PDFPageSelection {
     enum SelectionError: LocalizedError {
         case empty
@@ -15144,14 +15278,14 @@ enum PaperPathError: LocalizedError {
             return "Use a PDF password between 8 and 128 characters."
                 .localizedUI
         case .missingRecognizedText:
-            return "Recognize the document text before creating a searchable copy."
+            return "Recognize the text before saving it in this document."
                 .localizedUI
         case .compressionNotBeneficial(
             let sourceByteCount,
             let candidateByteCount
         ):
             return AppLocalization.format(
-                "Compression would grow this PDF from %@ to %@. PaperPath did not save the larger copy.",
+                "No size reduction with this method (%@ → %@). The document was left unchanged.",
                 ByteCountFormatter.string(
                     fromByteCount: sourceByteCount,
                     countStyle: .file

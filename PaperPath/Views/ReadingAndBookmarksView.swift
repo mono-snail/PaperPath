@@ -376,7 +376,7 @@ struct BookmarksSheet: View {
                 else {
                     isLoadingNavigation = false
                     navigationLoadErrorMessage =
-                        "The private working copy could not be opened."
+                        "The document could not be opened."
                             .localizedUI
                     return
                 }
@@ -397,7 +397,7 @@ struct BookmarksSheet: View {
                 guard let loadedOutline = values.0 else {
                     isLoadingNavigation = false
                     navigationLoadErrorMessage =
-                        "The private working copy could not be opened."
+                        "The document could not be opened."
                             .localizedUI
                     return
                 }
@@ -766,8 +766,8 @@ struct BookmarksSheet: View {
                 } label: {
                     Label(
                         outlineCreationTask == nil
-                            ? "Create PDF Outline Copy"
-                            : "Creating outline copy",
+                            ? "Save PDF Outline"
+                            : "Saving PDF outline",
                         systemImage: outlineCreationTask == nil
                             ? "list.bullet.indent"
                             : "hourglass"
@@ -1092,7 +1092,7 @@ struct BookmarksSheet: View {
                     isEditingPageLabels = true
                 } label: {
                     Label(
-                        "Create Page Labels Copy",
+                        "Edit Page Labels",
                         systemImage: "number.square"
                     )
                 }
@@ -1269,10 +1269,10 @@ struct BookmarksSheet: View {
             in: .whitespacesAndNewlines
         )
         guard !query.isEmpty else { return nil }
-        if let page = Int(query),
-           page >= 1,
-           page <= record.profile.pageCount {
-            return page - 1
+        if let index = PDFPageNumberInput.pageIndex(
+            query, pageCount: record.profile.pageCount
+        ) {
+            return index
         }
         return pageIndexByNormalizedLabel[
             Self.normalizedPageLabel(query)
@@ -1290,10 +1290,10 @@ struct BookmarksSheet: View {
             in: .whitespacesAndNewlines
         )
         guard !query.isEmpty else { return nil }
-        if let page = Int(query),
-           page >= 1,
-           page <= record.profile.pageCount {
-            return page - 1
+        if let index = PDFPageNumberInput.pageIndex(
+            query, pageCount: record.profile.pageCount
+        ) {
+            return index
         }
         return pageIndexByNormalizedLabel[
             Self.normalizedPageLabel(query)
@@ -1512,14 +1512,14 @@ struct BookmarksSheet: View {
             if wasStopped {
                 model[noticeFor: paperPathSceneID] = (
                     created == nil
-                        ? "Copy creation stopped"
-                        : "Copy finished before stopping · copy kept in Library"
+                        ? "Changes stopped"
+                        : "Document saved before stopping"
                 ).localizedUI
                 return
             }
             guard let created else {
                 outlineCreationErrorMessage =
-                    "The outline copy could not be created. Try again."
+                    "The PDF outline could not be saved. Try again."
                         .localizedUI
                 navigationErrorFeedback += 1
                 return
@@ -1578,7 +1578,7 @@ struct BookmarksSheet: View {
         if outlineCreationTask != nil {
             return outlineCreationStopRequested
                 ? "Finishing current file commit"
-                : "Creating outline copy"
+                : "Saving PDF outline"
         }
         if bookmarkSaveTask != nil {
             return bookmarkSaveStopRequested
@@ -1756,6 +1756,7 @@ private struct PageLabelEditorSheet: View {
 
     @State private var rules: [PDFPageLabelRule]
     @State private var isCreating = false
+    @State private var committedRevisionID: UUID?
     @State private var createTask: Task<Void, Never>?
     @State private var createGeneration = UUID()
     @State private var createStopRequested = false
@@ -1796,7 +1797,6 @@ private struct PageLabelEditorSheet: View {
                         WorkflowCommandHeader(
                             eyebrow: "PAGE LABEL WORKFLOW",
                             title: "Number page ranges",
-                            detail: "Create a separate PDF with explicit navigation labels.",
                             symbol: "number.square",
                             tint: PPColor.amber,
                             metrics: [
@@ -2000,8 +2000,8 @@ private struct PageLabelEditorSheet: View {
                             createStopRequested
                                 ? "Finishing current file commit"
                                 : isCreating
-                                    ? "Creating labeled copy"
-                                    : "Create Labeled Copy",
+                                    ? "Saving page labels"
+                                    : "Save Page Labels",
                             systemImage: isCreating
                                 ? "hourglass"
                                 : "number.square"
@@ -2077,7 +2077,7 @@ private struct PageLabelEditorSheet: View {
                 of: model.record(id: recordID)?
                     .contentRevisionID
             ) { _, revisionID in
-                guard revisionID
+                guard !isCreating, revisionID != committedRevisionID, revisionID
                         != expectedContentRevisionID
                 else { return }
                 model[noticeFor: paperPathSceneID] =
@@ -2134,7 +2134,7 @@ private struct PageLabelEditorSheet: View {
 
     private var createAccessibilityHint: String {
         if isCreating {
-            return "Wait for the labeled copy to finish."
+            return "Wait for page labels to finish saving."
                 .localizedUI
         }
         if !hasUniqueStarts {
@@ -2142,10 +2142,10 @@ private struct PageLabelEditorSheet: View {
                 .localizedUI
         }
         if !canCreate {
-            return "Review the page label rules before creating the copy."
+            return "Review the page label rules before saving."
                 .localizedUI
         }
-        return "Creates a separate PDF with these page labels."
+        return "Saves page labels in this document. Previous versions are in History."
             .localizedUI
     }
 
@@ -2229,20 +2229,21 @@ private struct PageLabelEditorSheet: View {
             guard createGeneration == generation else { return }
             let wasStopped =
                 createStopRequested || Task.isCancelled
+            committedRevisionID = created?.contentRevisionID
             isCreating = false
             createTask = nil
             createStopRequested = false
             if wasStopped {
                 model[noticeFor: paperPathSceneID] = (
                     created == nil
-                        ? "Copy creation stopped"
-                        : "Copy finished before stopping · copy kept in Library"
+                        ? "Changes stopped"
+                        : "Document saved before stopping"
                 ).localizedUI
                 return
             }
             guard let created else {
                 creationErrorMessage =
-                    "The labeled copy could not be created. Try again."
+                    "The page labels could not be saved. Try again."
                         .localizedUI
                 creationErrorFeedback += 1
                 return

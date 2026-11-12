@@ -5,7 +5,11 @@ import UniformTypeIdentifiers
 
 enum AppBrand {
     static let name = "PaperPath"
-    static let title = "PaperPath: Secure PDF Studio"
+    #if DEBUG && !PAPERPATH_REVIEW_BUILD
+    static let title = "PaperPath: PDF Assistant"
+    #else
+    static let title = "PaperPath: Private PDF"
+    #endif
     static let subtitle = "Private PDFs. Verified output."
 }
 

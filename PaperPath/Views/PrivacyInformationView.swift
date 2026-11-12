@@ -8,14 +8,9 @@ struct PrivacyInformationView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: PPSpacing.large) {
-                    Label("Your files, under your control".localizedUI, systemImage: "hand.raised")
-                        .font(.title2.bold())
-                        .foregroundStyle(PPColor.textPrimary)
-                        .accessibilityAddTraits(.isHeader)
-
                     information(
                         "Works offline",
-                        "Merge, split, compress, and recognize text on this device. No document uploads or PaperPath processing server. Apple purchases and optional iCloud metadata sync use the internet. Sharing or exporting may send files to the destination you choose."
+                        "Merge, split, compress, and recognize text on this device. No document uploads or PaperPath processing server. App Store downloads, optional iCloud metadata sync, and support conversations use the internet. Sharing or exporting may send files to the destination you choose."
                     )
                     information(
                         "Documents and recognition",
@@ -34,12 +29,16 @@ struct PrivacyInformationView: View {
                         "Files leave only when shared or exported. Diagnostics exclude document content."
                     )
                     information(
+                        "Support conversations",
+                        "When you send feedback, your email and message go to Monoware Support. App and OS versions are optional. Conversation credentials stay in this device’s Keychain and do not sync through iCloud."
+                    )
+                    information(
                         "Permissions you control",
                         "Camera scans documents, Face ID locks the app, and notifications show due dates."
                     )
                     information(
                         "Purchases and tracking",
-                        "Apple handles payments. PaperPath has no ads or third-party analytics."
+                        "PaperPath is a one-time paid download from the App Store. All PDF tools are included, with no subscription or in-app purchases. Apple handles payment; PaperPath does not receive your payment card details. Core PDF processing works offline. PaperPath has no ads or third-party analytics."
                     )
                     information(
                         "Delete and protect your data",

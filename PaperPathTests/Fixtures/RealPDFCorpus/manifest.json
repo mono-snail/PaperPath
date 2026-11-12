@@ -1,0 +1,53 @@
+{
+  "retrieved": "2026-10-28",
+  "documents": [
+    {
+      "file": "nasa-webb.pdf",
+      "url": "https://science.nasa.gov/wp-content/uploads/2024/08/webbfactsheet.pdf",
+      "bytes": 2719771,
+      "sha256": "84933f93b67aacaf2871ced720d76cd18d1637fde65ae9c561282ddfc692c71e"
+    },
+    {
+      "file": "irs-w4.pdf",
+      "url": "https://www.irs.gov/pub/irs-pdf/fw4.pdf",
+      "bytes": 208845,
+      "sha256": "92444d8856ce55d9e25dca8b6d1420634fc68b11e1ab1f760916ea29ddd312b2"
+    },
+    {
+      "file": "mozilla-paper.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/tracemonkey.pdf",
+      "bytes": 1016315,
+      "sha256": "3662ff519e485810520552bf301d8c3b2b917fd2f83303f4965d7abed367e113"
+    },
+    {
+      "file": "mozilla-cmyk.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/cmykjpeg.pdf",
+      "bytes": 374080,
+      "sha256": "659d6b19912f63db988b0b26b9bde0e6d8100667ef162051a4a84ea8e5b90272"
+    },
+    {
+      "file": "mozilla-large-jpeg.pdf",
+      "url": "https://raw.githubusercontent.com/mozilla/pdf.js/master/test/pdfs/large_jpeg_downscale.pdf",
+      "bytes": 121794,
+      "sha256": "876d768b597e5176afb2bb35119916414f03851d544bc4589467a2491f8c86f5"
+    },
+    {
+      "file": "ocr-multipage.pdf",
+      "url": "https://raw.githubusercontent.com/ocrmypdf/OCRmyPDF/main/tests/resources/multipage.pdf",
+      "bytes": 1120291,
+      "sha256": "07987c44650938fa8dcf08c0937691712fdd800669b4607c2c7e3fee21cb1f80"
+    },
+    {
+      "file": "ocr-ccitt.pdf",
+      "url": "https://raw.githubusercontent.com/ocrmypdf/OCRmyPDF/main/tests/resources/ccitt.pdf",
+      "bytes": 103856,
+      "sha256": "5f4b129bf0eb0d32358a917cd1754c6fd68cac589ad79076b6d0191ebe84f0f1"
+    },
+    {
+      "file": "ocr-jbig2.pdf",
+      "url": "https://raw.githubusercontent.com/ocrmypdf/OCRmyPDF/main/tests/resources/jbig2.pdf",
+      "bytes": 42818,
+      "sha256": "210b845b62eab7118bc1e6076a3235a37eb947218254198c6102d06422f35037"
+    }
+  ]
+}

@@ -3,14 +3,42 @@ import Compression
 import CoreImage
 import CoreText
 import CryptoKit
+import Darwin
 import Foundation
 import ImageIO
 import PDFKit
 import Security
 import UIKit
 import UniformTypeIdentifiers
+import zlib
 
 typealias PDFProgressHandler = @Sendable (Double) -> Void
+
+enum PDFCompressionMode: String, CaseIterable, Identifiable, Sendable {
+    case preserveContent
+    case optimizedImages
+    case imageCopy
+
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .preserveContent: return "Lossless"
+        case .optimizedImages: return "High quality (lossy)"
+        case .imageCopy: return "Image pages (lossy)"
+        }
+    }
+    var detail: String {
+        switch self {
+        case .preserveContent:
+            return "Keeps image pixels and resolution unchanged. Preserves text, links, forms, and notes. Savings depend on the file."
+        case .optimizedImages:
+            return "Lossy image compression. Keeps text, links, forms, and notes. Fine image detail may change; your original is kept."
+        case .imageCopy:
+            return "Lossy conversion: rebuilds pages as images. Removes search, links, forms, and editable notes."
+        }
+    }
+
+}
 
 struct PDFReplacementTextLayout {
     let font: UIFont
@@ -93,6 +121,9 @@ struct PDFCompressionEstimate: Equatable, Sendable {
     }
 
     var summary: String {
+        if sampledPageCount == 0 {
+            return "Measured after compression".localizedUI
+        }
         if let savingsPercent {
             return AppLocalization.format(
                 "About %lld%% smaller · sampled %lld page%@",
@@ -102,9 +133,9 @@ struct PDFCompressionEstimate: Equatable, Sendable {
             )
         }
         return AppLocalization.format(
-            "Original is already smaller · %@ now · about %@ if rebuilt",
-            formattedSourceSize,
-            formattedSize
+            "Sample estimate: %@ versus %@ original. Actual size may differ.",
+            formattedSize,
+            formattedSourceSize
         )
     }
 }
@@ -605,8 +636,8 @@ struct PDFOutputService: @unchecked Sendable {
                 )
             }
             let pageInfo = [
-                kCGPDFContextMediaBox as String: sheetBounds,
-                kCGPDFContextCropBox as String: sheetBounds
+                kCGPDFContextMediaBox as String: pdfPageBoxData(sheetBounds),
+                kCGPDFContextCropBox as String: pdfPageBoxData(sheetBounds)
             ] as CFDictionary
             context.beginPDFPage(pageInfo)
             context.setFillColor(UIColor.white.cgColor)
@@ -934,8 +965,8 @@ struct PDFOutputService: @unchecked Sendable {
                 )
             }
             let pageInfo = [
-                kCGPDFContextMediaBox as String: pageBounds,
-                kCGPDFContextCropBox as String: pageBounds
+                kCGPDFContextMediaBox as String: pdfPageBoxData(pageBounds),
+                kCGPDFContextCropBox as String: pdfPageBoxData(pageBounds)
             ] as CFDictionary
             context.beginPDFPage(pageInfo)
             context.setFillColor(UIColor.white.cgColor)
@@ -1060,8 +1091,12 @@ struct PDFOutputService: @unchecked Sendable {
 
     func estimateCompression(
         sourceURL: URL,
-        quality: PDFCompressionQuality
+        quality: PDFCompressionQuality,
+        mode: PDFCompressionMode = .preserveContent
     ) throws -> PDFCompressionEstimate {
+        try PDFCompressionExecutionGate.shared.enter()
+        defer { PDFCompressionExecutionGate.shared.leave() }
+        try Task.checkCancellation()
         let sourceValues = try sourceURL.resourceValues(
             forKeys: [
                 .fileSizeKey,
@@ -1084,14 +1119,23 @@ struct PDFOutputService: @unchecked Sendable {
         else {
             throw PaperPathError.unreadablePDF
         }
-        guard document.pageCount
-                <= Self.maximumPageImageExportCount
+        guard document.pageCount <= (mode != .imageCopy
+                ? Self.maximumPageCount : Self.maximumPageImageExportCount)
         else {
             throw PaperPathError.insufficientSelection(
                 "Compression supports PDFs up to 1,000 pages."
             )
         }
         let sourceByteCount = Int64(rawSourceByteCount)
+        if mode != .imageCopy {
+            // A page thumbnail cannot predict savings from embedded objects.
+            // Return the current size as a neutral baseline, never a veto.
+            return PDFCompressionEstimate(
+                sourceByteCount: sourceByteCount,
+                estimatedByteCount: sourceByteCount,
+                sampledPageCount: 0
+            )
+        }
         let lastIndex = document.pageCount - 1
         let sampleIndices = Array(
             Set([0, lastIndex / 2, lastIndex])
@@ -1110,10 +1154,10 @@ struct PDFOutputService: @unchecked Sendable {
                     return nil
                 }
                 let size = fittedSize(
-                    bounds.size,
+                    rasterPageSize(page),
                     longestEdge: quality.longestEdge
                 )
-                return page.thumbnail(of: size, for: .cropBox)
+                return rasterPageImage(page, size: size)?
                     .jpegData(compressionQuality: quality.jpegQuality)?
                     .count
             }
@@ -1716,8 +1760,20 @@ struct PDFOutputService: @unchecked Sendable {
         sourceURL: URL,
         destination: URL,
         quality: PDFCompressionQuality,
+        mode: PDFCompressionMode = .preserveContent,
         progress: @escaping PDFProgressHandler = { _ in }
     ) throws {
+        try PDFCompressionExecutionGate.shared.enter()
+        defer { PDFCompressionExecutionGate.shared.leave() }
+        try Task.checkCancellation()
+        if mode != .imageCopy {
+            try compressPreservingContent(
+                sourceURL: sourceURL, destination: destination,
+                imageQuality: mode == .optimizedImages ? quality : nil,
+                progress: progress
+            )
+            return
+        }
         try renderRasterized(
             sourceURL: sourceURL,
             destination: destination,
@@ -1858,14 +1914,7 @@ struct PDFOutputService: @unchecked Sendable {
                 try? FileManager.default.removeItem(at: destination)
             }
         }
-        guard document.write(
-            to: encryptedBase,
-            withOptions: options
-        ) else {
-            throw PaperPathError.storageFailure(
-                "The protected PDF could not be written."
-            )
-        }
+        try PDFContentPreservingWriter.write(document, to: encryptedBase, sourceURLs: [sourceURL], options: options, password: password)
         try Task.checkCancellation()
         try requireStructuralRewriteFile(at: encryptedBase)
         let encryptedData = try Data(
@@ -2021,11 +2070,7 @@ struct PDFOutputService: @unchecked Sendable {
             from: document,
             to: editableDocument
         )
-        guard editableDocument.write(to: editableBase) else {
-            throw PaperPathError.storageFailure(
-                "The editable PDF copy could not be written."
-            )
-        }
+        try PDFContentPreservingWriter.write(editableDocument, to: editableBase, sourceURLs: [sourceURL], sourcePassword: password)
         try Task.checkCancellation()
         try requireStructuralRewriteFile(at: editableBase)
         let editableData = try Data(
@@ -2167,21 +2212,10 @@ struct PDFOutputService: @unchecked Sendable {
                 throw PaperPathError.invalidPage
             }
             let pageInfo = [
-                kCGPDFContextMediaBox as String: mediaBox,
-                kCGPDFContextCropBox as String: cropBox
+                kCGPDFContextMediaBox as String: pdfPageBoxData(mediaBox),
+                kCGPDFContextCropBox as String: pdfPageBoxData(cropBox)
             ] as CFDictionary
             context.beginPDFPage(pageInfo)
-            context.saveGState()
-            let transform = sourcePage.getDrawingTransform(
-                .mediaBox,
-                rect: mediaBox,
-                rotate: 0,
-                preserveAspectRatio: true
-            )
-            context.concatenate(transform)
-            context.drawPDFPage(sourcePage)
-            context.restoreGState()
-
             for overlay in overlaysByPage[pageNumber - 1, default: []] {
                 if case .image(_, let bounds, let data) = overlay {
                     try drawImage(
@@ -2204,12 +2238,12 @@ struct PDFOutputService: @unchecked Sendable {
         didCloseContext = true
         try Task.checkCancellation()
 
-        guard let outputDocument = PDFDocument(url: destination),
-              outputDocument.pageCount == sourceDocument.pageCount
-        else {
-            throw PaperPathError.outputVerificationFailed(
-                "the edited copy could not be reopened"
-            )
+        guard let imageDocument = CGPDFDocument(destination as CFURL) else { throw PaperPathError.unreadablePDF }
+        let outputDocument = sourceDocument
+        let sourceAnnotationCounts = (0..<sourceDocument.pageCount).map { sourceDocument.page(at: $0)?.annotations.count ?? 0 }
+        var imagePages: [Int: CGPDFPage] = [:]
+        for (index, overlays) in overlaysByPage where overlays.contains(where: { if case .image = $0 { return true }; return false }) {
+            if let page = imageDocument.page(at: index + 1) { imagePages[index] = page }
         }
         for pageIndex in 0..<sourceDocument.pageCount {
             try Task.checkCancellation()
@@ -2219,14 +2253,6 @@ struct PDFOutputService: @unchecked Sendable {
                 throw PaperPathError.outputVerificationFailed(
                     "an edited PDF page could not be reopened"
                 )
-            }
-            for annotation in sourcePage.annotations {
-                guard let copy = annotation.copy() as? PDFAnnotation else {
-                    throw PaperPathError.outputVerificationFailed(
-                        "an existing annotation could not be preserved"
-                    )
-                }
-                outputPage.addAnnotation(copy)
             }
             let pageBounds = outputPage.bounds(for: .cropBox)
             guard Self.hasValidPageBounds(pageBounds) else {
@@ -2267,10 +2293,8 @@ struct PDFOutputService: @unchecked Sendable {
         let finalizedURL = destination.deletingLastPathComponent()
             .appendingPathComponent(".\(UUID().uuidString)-edited.pdf")
         defer { try? FileManager.default.removeItem(at: finalizedURL) }
-        guard outputDocument.write(to: finalizedURL) else {
-            throw PaperPathError.storageFailure(
-                "The added content could not be encoded."
-            )
+        try withExtendedLifetime(imageDocument) {
+            try PDFContentPreservingWriter.write(outputDocument, to: finalizedURL, sourceURLs: [sourceURL], imageOverlayPages: imagePages)
         }
         try LocalFileSecurity.requireCompleteProtection(to: finalizedURL)
         guard let finalizedDocument = PDFDocument(url: finalizedURL),
@@ -2292,7 +2316,7 @@ struct PDFOutputService: @unchecked Sendable {
                     "a finalized edited PDF page has invalid geometry"
                 )
             }
-            let expectedAnnotationCount = sourcePage.annotations.count
+            let expectedAnnotationCount = sourceAnnotationCounts[pageIndex]
                 + overlayValidation.annotationAdditionsByPage[
                     pageIndex,
                     default: 0
@@ -2546,11 +2570,7 @@ struct PDFOutputService: @unchecked Sendable {
                 try? fileManager.removeItem(at: destination)
             }
         }
-        guard document.write(to: stagingURL) else {
-            throw PaperPathError.storageFailure(
-                "The outlined PDF copy could not be written."
-            )
-        }
+        try PDFContentPreservingWriter.write(document, to: stagingURL, sourceURLs: [sourceURL])
         try LocalFileSecurity.requireCompleteProtection(to: stagingURL)
         guard let reopened = PDFDocument(url: stagingURL),
               reopened.pageCount == document.pageCount,
@@ -2649,8 +2669,8 @@ struct PDFOutputService: @unchecked Sendable {
             defer {
                 try? FileManager.default.removeItem(at: normalizedURL)
             }
-            guard document.write(to: normalizedURL),
-                  let normalized = PDFDocument(url: normalizedURL),
+            try PDFContentPreservingWriter.write(document, to: normalizedURL, sourceURLs: [sourceURL])
+            guard let normalized = PDFDocument(url: normalizedURL),
                   normalized.pageCount == document.pageCount
             else {
                 throw PaperPathError.insufficientSelection(
@@ -3655,8 +3675,8 @@ struct PDFOutputService: @unchecked Sendable {
                 throw PaperPathError.invalidPage
             }
             let pageInfo = [
-                kCGPDFContextMediaBox as String: mediaBox,
-                kCGPDFContextCropBox as String: cropBox
+                kCGPDFContextMediaBox as String: pdfPageBoxData(mediaBox),
+                kCGPDFContextCropBox as String: pdfPageBoxData(cropBox)
             ] as CFDictionary
             context.beginPDFPage(pageInfo)
             let pageIndex = pageNumber - 1
@@ -4150,10 +4170,10 @@ struct PDFOutputService: @unchecked Sendable {
                     ? 1_600
                     : 2_400
                 let size = fittedSize(
-                    bounds.size,
+                    rasterPageSize(page),
                     longestEdge: longestEdge
                 )
-                let image = page.thumbnail(of: size, for: .cropBox)
+                guard let image = rasterPageImage(page, size: size) else { throw PaperPathError.invalidPage }
                 guard let cgImage = image.cgImage,
                       cgImage.width > 0,
                       cgImage.height > 0,
@@ -4834,7 +4854,7 @@ struct PDFOutputService: @unchecked Sendable {
                         }
                         let outputBounds = CGRect(
                             origin: .zero,
-                            size: pageBounds.size
+                            size: rasterPageSize(page)
                         )
                         context.beginPage(
                             withBounds: outputBounds,
@@ -4842,13 +4862,12 @@ struct PDFOutputService: @unchecked Sendable {
                         )
 
                         let imageSize = fittedSize(
-                            pageBounds.size,
+                            outputBounds.size,
                             longestEdge: longestEdge
                         )
-                        let rendered = page.thumbnail(
-                            of: imageSize,
-                            for: .cropBox
-                        )
+                        guard let rendered = rasterPageImage(page, size: imageSize) else {
+                            renderingError = .invalidPage; return
+                        }
                         let pageMarks = marksByPage[index, default: []]
                         let sanitized: UIImage
                         if pageMarks.isEmpty {
@@ -4871,12 +4890,7 @@ struct PDFOutputService: @unchecked Sendable {
                                     bitmapContext.cgContext.setFillColor(
                                         fillColor.cgColor
                                     )
-                                    let rect = CGRect(
-                                        x: mark.normalizedX * imageSize.width,
-                                        y: (1 - mark.normalizedY - mark.normalizedHeight) * imageSize.height,
-                                        width: mark.normalizedWidth * imageSize.width,
-                                        height: mark.normalizedHeight * imageSize.height
-                                    ).insetBy(
+                                    let rect = rasterRedactionRect(mark, rotation: page.rotation, size: imageSize).insetBy(
                                         dx: -2 * imageSize.width / outputBounds.width,
                                         dy: -imageSize.height / outputBounds.height
                                     )
@@ -7734,7 +7748,7 @@ private func pdfIsStringTokenDelimiter(
         || "()<>[]{}/%".contains(character)
 }
 
-private func pdfInflateZlib(
+func pdfInflateZlib(
     _ data: Data,
     maximumOutputByteCount: Int
 ) -> Data? {
@@ -8242,6 +8256,12 @@ func pdfObjectValueEnd(
     limit: Int
 ) -> Int? {
     guard start < limit else { return nil }
+    if data[start] == 0x2f {
+        // PDF names include their leading slash; it is a delimiter for other
+        // tokens, so starting the generic scan at the slash returns no value.
+        let end = pdfTokenEnd(in: data, start: start + 1, limit: limit)
+        return end > start + 1 ? end : nil
+    }
     if data[start] == 0x3c,
        start + 1 < limit,
        data[start + 1] == 0x3c {
@@ -8548,12 +8568,14 @@ enum PDFImageObjectDocument {
     case classic(PDFClassicXRefDocument)
     case xrefStream(PDFXRefStreamDocument)
 
-    init(data: Data) throws {
-        if let classic = try? PDFClassicXRefDocument(data: data) {
+    init(data: Data, allowZeroOffsetPlaceholders: Bool = false) throws {
+        if let classic = try? PDFClassicXRefDocument(data: data, allowZeroOffsetPlaceholders: allowZeroOffsetPlaceholders) {
             self = .classic(classic)
         } else {
             self = .xrefStream(
-                try PDFXRefStreamDocument(data: data)
+                try allowZeroOffsetPlaceholders
+                    ? PDFXRefStreamDocument(compressionData: data)
+                    : PDFXRefStreamDocument(data: data)
             )
         }
     }
@@ -8721,6 +8743,7 @@ struct PDFXRefStreamDocument {
     private let xrefObjectNumber: Int
     private let xrefGeneration: Int
     private let entries: [Int: Entry]
+    private let compressionTrailer: Data?
 
     init(data: Data) throws {
         guard data.count > 64,
@@ -8954,6 +8977,7 @@ struct PDFXRefStreamDocument {
         self.xrefObjectNumber = xrefObjectNumber
         self.xrefGeneration = xrefGeneration
         self.entries = parsedEntries
+        self.compressionTrailer = nil
     }
 
     func imageObject(
@@ -9377,7 +9401,7 @@ struct PDFXRefStreamDocument {
     }
 }
 
-private struct PDFCatalogStructureAppender {
+struct PDFCatalogStructureAppender {
     private static let maximumAttachmentCount = 256
     private static let maximumAttachmentBytes =
         64 * 1_024 * 1_024
@@ -9484,6 +9508,8 @@ private struct PDFCatalogStructureAppender {
                 }
                 if fields[2] == "n" {
                     let number = firstObject + index
+                    // PDFKit reserves unused slots as in-use entries at zero.
+                    if number > 0, offset == 0 { continue }
                     guard parsedEntries[number] == nil else {
                         throw PaperPathError.outputVerificationFailed(
                             "the PDF cross-reference table contains duplicate entries"
@@ -9841,6 +9867,20 @@ private struct PDFCatalogStructureAppender {
             .joined()
     }
 
+    func originalObjectEncryption(password: String) throws -> PDFOriginalObjectEncryption {
+        let reference = try reference(following: "/Encrypt", in: trailerDictionary)
+        guard let entry = entries[reference.number],
+              let range = pdfFirstDictionaryRange(in: objectData(for: entry)),
+              let identifier = Self.firstIdentifier(in: trailerDictionary) else { throw PaperPathError.unreadablePDF }
+        let dictionary = Data(objectData(for: entry)[range])
+        return PDFOriginalObjectEncryption(context: try encryptionContext(password: password), dictionary: dictionary,
+            identifier: identifier, encryptMetadata: !String(decoding: dictionary, as: UTF8.self).contains("/EncryptMetadata false"))
+    }
+
+    func originalStreamReferences() -> [PDFImageObjectReference] {
+        entries.values.sorted { $0.offset < $1.offset }
+    }
+
     private func encryptionContext(
         password: String
     ) throws -> PDFAESV2EncryptionContext {
@@ -10083,7 +10123,7 @@ private struct PDFCatalogStructureAppender {
     }
 }
 
-private struct PDFAESV2EncryptionContext {
+struct PDFAESV2EncryptionContext {
     private static let passwordPadding = Data([
         0x28, 0xbf, 0x4e, 0x5e, 0x4e, 0x75, 0x8a, 0x41,
         0x64, 0x00, 0x4e, 0x56, 0xff, 0xfa, 0x01, 0x08,
@@ -10199,6 +10239,34 @@ private struct PDFAESV2EncryptionContext {
         result.append(contentsOf: output.prefix(outputLength))
         return result
     }
+
+    func decrypt(_ data: Data, objectNumber: Int, generation: Int) throws -> Data {
+        guard data.count >= 32, (data.count - 16).isMultiple(of: 16) else { throw PaperPathError.unreadablePDF }
+        var material = fileKey
+        material.append(UInt8(objectNumber & 0xff))
+        material.append(UInt8((objectNumber >> 8) & 0xff))
+        material.append(UInt8((objectNumber >> 16) & 0xff))
+        material.append(UInt8(generation & 0xff)); material.append(UInt8((generation >> 8) & 0xff))
+        material.append(contentsOf: [0x73, 0x41, 0x6c, 0x54])
+        let key = Data(Insecure.MD5.hash(data: material).prefix(min(fileKey.count + 5, 16)))
+        let iv = Data(data.prefix(16)), ciphertext = Data(data.dropFirst(16))
+        let capacity = ciphertext.count
+        var output = Data(count: capacity), count = 0
+        let status = output.withUnsafeMutableBytes { destination in
+            key.withUnsafeBytes { keyBytes in
+                iv.withUnsafeBytes { ivBytes in
+                    ciphertext.withUnsafeBytes { source in
+                        CCCrypt(CCOperation(kCCDecrypt), CCAlgorithm(kCCAlgorithmAES), CCOptions(kCCOptionPKCS7Padding),
+                            keyBytes.baseAddress, key.count, ivBytes.baseAddress, source.baseAddress, ciphertext.count,
+                            destination.baseAddress, capacity, &count)
+                    }
+                }
+            }
+        }
+        guard status == kCCSuccess else { throw PaperPathError.unreadablePDF }
+        output.count = count
+        return output
+    }
 }
 
 struct PDFClassicXRefDocument {
@@ -10210,7 +10278,7 @@ struct PDFClassicXRefDocument {
     private let trailerDictionary: String
     private let entries: [Int: PDFImageObjectReference]
 
-    init(data: Data) throws {
+    init(data: Data, allowZeroOffsetPlaceholders: Bool = false) throws {
         guard data.count > 32,
               data.prefix(8).starts(with: Data("%PDF-".utf8)),
               data.prefix(min(data.count, 2_048))
@@ -10306,6 +10374,10 @@ struct PDFClassicXRefDocument {
                 }
                 if fields[2] == "n" {
                     let number = firstObject + index
+                    // Some Apple-generated PDFs reserve unused slots as in-use
+                    // entries at byte zero. There is no object at the PDF header;
+                    // treat these unresolved placeholders as free on compression.
+                    if allowZeroOffsetPlaceholders, number > 0, offset == 0 { continue }
                     guard parsedEntries[number] == nil else {
                         throw PaperPathError.outputVerificationFailed(
                             "the PDF cross-reference table contains duplicate entries"
@@ -10611,4 +10683,890 @@ struct PDFClassicXRefDocument {
     ) -> Int? {
         pdfParsedInteger(following: key, in: value)
     }
+}
+
+// MARK: - Content-preserving, bounded-memory compression
+
+private extension PDFOutputService {
+    func compressPreservingContent(
+        sourceURL: URL, destination: URL,
+        imageQuality: PDFCompressionQuality?,
+        progress: @escaping PDFProgressHandler
+    ) throws {
+        try Task.checkCancellation()
+        let manager = FileManager.default
+        let identity = try sourceURL.resourceValues(forKeys: [
+            .fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey,
+            .contentModificationDateKey, .fileResourceIdentifierKey
+        ])
+        guard identity.isRegularFile == true,
+              identity.isSymbolicLink != true,
+              let sourceBytes = identity.fileSize,
+              sourceBytes > 0, sourceBytes <= Self.maximumImageExportSourceBytes
+        else { throw PaperPathError.fileTooLarge }
+        guard !manager.fileExists(atPath: destination.path) else {
+            throw PaperPathError.storageFailure("The output PDF destination already exists.")
+        }
+        try requireTemporaryWriteCapacity(at: destination, byteCount: sourceBytes)
+        try pdfRequireUnsignedCompressionSource(sourceURL)
+        progress(0.01)
+        // Mapping avoids allocating the complete source or output in RAM.
+        let mapping = try PDFCompressionMappedInput(url: sourceURL, count: sourceBytes)
+        guard let eof = try pdfCompressionEndOfFile(reader: mapping.reader, count: sourceBytes) else {
+            throw PaperPathError.unreadablePDF
+        }
+        let source = mapping.data.prefix(eof)
+        let structure: PDFImageObjectDocument
+        do {
+            structure = try PDFImageObjectDocument(data: source, allowZeroOffsetPlaceholders: true)
+        } catch {
+            throw PaperPathError.insufficientSelection(
+                "This PDF structure cannot yet be optimized while keeping its content. Choose Image copy only if you can remove search, links, forms, and notes. The original is unchanged."
+            )
+        }
+        let staging = destination.deletingLastPathComponent()
+            .appendingPathComponent(".compression-\(UUID().uuidString).pdf")
+        var published = false
+        var completed = false
+        defer {
+            try? manager.removeItem(at: staging)
+            if published && !completed { try? manager.removeItem(at: destination) }
+        }
+        guard manager.createFile(atPath: staging.path, contents: nil, attributes: [
+            .protectionKey: FileProtectionType.complete
+        ]) else { throw PaperPathError.insufficientStorage }
+        LocalFileSecurity.excludeFromBackup(staging)
+        let handle = try FileHandle(forWritingTo: staging)
+        do {
+            let references = structure.allObjects()
+            let byNumber = Dictionary(uniqueKeysWithValues: references.map { ($0.number, $0) })
+            // Stream lengths are often separate integer objects (e.g. scanner
+            // exports). Resolve through the xref, never by searching image bytes.
+            let resolveLength: (String) throws -> Int? = { value in
+                if let direct = Int(value) { return direct }
+                let tokens = value.split(whereSeparator: \.isWhitespace)
+                guard tokens.count == 3, tokens[2] == "R",
+                      let number = Int(tokens[0]), let generation = Int(tokens[1]),
+                      let reference = byNumber[number], reference.generation == generation else { return nil }
+                try mapping.reader.seek(toOffset: UInt64(reference.offset))
+                guard let bytes = try mapping.reader.read(upToCount: 256) else { return nil }
+                let body = String(decoding: bytes, as: UTF8.self).split(whereSeparator: \.isWhitespace)
+                guard body.count >= 5, body[0] == tokens[0], body[1] == tokens[1],
+                      body[2] == "obj", body[4] == "endobj" else { return nil }
+                return Int(body[3])
+            }
+            let transform: (Data) throws -> Data? = { object in
+                try Task.checkCancellation()
+                return try autoreleasepool {
+                    try pdfLosslessCompressionObject(object, imageQuality: imageQuality, resolveLength: resolveLength)
+                }
+            }
+            switch structure {
+            case .classic(let document):
+                try document.writeCompressed(to: handle, transform: transform, progress: progress, reader: mapping.reader)
+            case .xrefStream(let document):
+                try document.writeCompressed(to: handle, transform: transform, progress: progress, reader: mapping.reader)
+            }
+            try handle.synchronize()
+            try handle.close()
+        } catch {
+            try? handle.close()
+            throw error
+        }
+        try Task.checkCancellation()
+        let outputBytes = try staging.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard outputBytes > 0 else { throw PaperPathError.unreadablePDF }
+        guard outputBytes + 128 < sourceBytes else {
+            throw PaperPathError.compressionNotBeneficial(
+                sourceByteCount: Int64(sourceBytes), candidateByteCount: Int64(outputBytes)
+            )
+        }
+        progress(0.88)
+        // Every non-image object is copied verbatim or losslessly deflated.
+        // Independently reopen pages to catch invalid geometry/text/annotations.
+        guard let original = PDFDocument(url: sourceURL), !original.isLocked,
+              let output = PDFDocument(url: staging), !output.isLocked,
+              original.pageCount > 0, original.pageCount <= Self.maximumPageCount,
+              original.pageCount == output.pageCount else {
+            throw PaperPathError.outputVerificationFailed("the compressed PDF could not be reopened with every page")
+        }
+        var lastPercent = 87
+        for index in 0..<original.pageCount {
+            try Task.checkCancellation()
+            try autoreleasepool {
+                guard let before = original.page(at: index), let after = output.page(at: index),
+                      before.bounds(for: .mediaBox) == after.bounds(for: .mediaBox),
+                      before.bounds(for: .cropBox) == after.bounds(for: .cropBox),
+                      before.rotation == after.rotation,
+                      before.string == after.string,
+                      before.annotations.count == after.annotations.count else {
+                    throw PaperPathError.outputVerificationFailed("compression changed page geometry, searchable text, or annotations")
+                }
+            }
+            let fraction = 0.88 + 0.1 * Double(index + 1) / Double(original.pageCount)
+            let percent = Int(fraction * 100)
+            if percent > lastPercent { progress(fraction); lastPercent = percent }
+        }
+        try Self.requireUnchangedSource(at: sourceURL, initialValues: identity)
+        try Task.checkCancellation()
+        try manager.moveItem(at: staging, to: destination)
+        published = true
+        try LocalFileSecurity.requireCompleteProtection(to: destination)
+        LocalFileSecurity.excludeFromBackup(destination)
+        try Task.checkCancellation()
+        completed = true
+        progress(1)
+    }
+}
+
+/// Only replaces top-level values, preserving all unknown dictionary entries.
+private func pdfCompressionDictionary(
+    _ dictionary: Data, setting values: [String: String]
+) -> Data? {
+    guard let range = pdfFirstDictionaryRange(in: dictionary) else { return nil }
+    var edits: [(Range<Int>, Data)] = []
+    var additions = ""
+    for key in values.keys.sorted() {
+        guard let value = values[key] else { continue }
+        if let valueRange = pdfTopLevelValueRange(for: key, in: dictionary, dictionaryRange: range) {
+            edits.append((valueRange, Data(value.utf8)))
+        } else {
+            additions += " /\(key) \(value)"
+        }
+    }
+    var result = dictionary
+    for edit in edits.sorted(by: { $0.0.lowerBound > $1.0.lowerBound }) {
+        result.replaceSubrange(edit.0, with: edit.1)
+    }
+    guard let updatedRange = pdfFirstDictionaryRange(in: result) else { return nil }
+    result.insert(contentsOf: additions.utf8, at: updatedRange.upperBound - 2)
+    return result
+}
+
+private func pdfLosslessCompressionObject(
+    _ object: Data, imageQuality: PDFCompressionQuality?,
+    resolveLength: (String) throws -> Int?
+) throws -> Data? {
+    // Cap both encoded and decoded work per object. Large objects are streamed
+    // unchanged; masks, 1-bit scans, ICC, and unfamiliar filters stay intact.
+    guard let dictionaryRange = pdfFirstDictionaryRange(in: object),
+          dictionaryRange.count <= 64 * 1_024 else { return nil }
+    let dictionary = Data(object[dictionaryRange])
+    guard let values = pdfCompressionValues(dictionary) else { return nil }
+    func value(_ key: String) -> String? {
+        values[key]
+    }
+    if value("Type") == "/Sig" || value("ByteRange") != nil {
+        throw PaperPathError.insufficientSelection(
+            "This PDF contains a digital signature. Recompression would invalidate it, so compression was stopped. Use an unsigned version to compress this document."
+        )
+    }
+    if value("Linearized") != nil {
+        // The rewritten file has new offsets and is no longer linearized.
+        // Keep the object number valid but discard its obsolete hint dictionary.
+        var result = Data(object[..<dictionaryRange.lowerBound])
+        result.append(Data("null\nendobj\n".utf8))
+        return result
+    }
+    guard let lengthText = value("Length"), let length = try resolveLength(lengthText),
+          length > 0, length <= 32 * 1_024 * 1_024,
+          let marker = object.range(of: Data("stream".utf8), in: dictionaryRange.upperBound..<object.endIndex)
+    else { return nil }
+    var start = marker.upperBound
+    guard start < object.count else { return nil }
+    if object[start] == 13 {
+        start += 1
+        if start < object.count, object[start] == 10 { start += 1 }
+    } else if object[start] == 10 {
+        start += 1
+    } else { return nil }
+    guard length <= object.count - start else { return nil }
+    let end = start + length
+    let streamEnd = pdfSkipWhitespaceAndComments(in: object, start: end, limit: object.count)
+    guard object[streamEnd...].starts(with: Data("endstream".utf8)) else { return nil }
+    let encoded = Data(object[start..<end])
+    var replacement: Data?
+    var settings: [String: String] = [:]
+    if let imageQuality, value("Subtype") == "/Image" {
+        if let candidate = try pdfHighQualityCompressionImage(encoded, values: values, quality: imageQuality) {
+            replacement = candidate.bytes
+            settings = candidate.settings
+            if settings["Filter"] == "/DCTDecode", value("DecodeParms") != nil {
+                settings["DecodeParms"] = "null"
+            }
+        }
+    }
+    if replacement == nil, value("Filter") == nil, value("DecodeParms") == nil,
+              value("Type") != "/EmbeddedFile" {
+        // Default lossless path: no image decoding, resizing, or JPEG encoding.
+        // Every proposed Flate stream must round-trip to identical bytes.
+        replacement = pdfCompressionDeflate(encoded)
+        settings = ["Filter": "/FlateDecode"]
+    } else if replacement == nil, value("Type") != "/EmbeddedFile",
+              let filter = value("Filter"),
+              ["/FlateDecode", "/Fl", "[/FlateDecode]", "[ /FlateDecode ]", "[/Fl]"].contains(filter),
+              let decoded = pdfInflateZlib(encoded, maximumOutputByteCount: 32 * 1_024 * 1_024) {
+        // Re-encode existing Flate streams at level 9 as well. Predictor bytes
+        // and DecodeParms stay intact: identical inflated bytes mean identical
+        // pixels, text, fonts and object-stream contents after PDF decoding.
+        try Task.checkCancellation()
+        replacement = pdfCompressionDeflate(decoded)
+    }
+    try Task.checkCancellation()
+    guard let replacement, replacement.count + 128 < encoded.count else { return nil }
+    settings["Length"] = "\(replacement.count)"
+    guard let updated = pdfCompressionDictionary(dictionary, setting: settings) else { return nil }
+    var result = Data(object[..<dictionaryRange.lowerBound])
+    result.append(updated)
+    result.append(object[dictionaryRange.upperBound..<start])
+    result.append(replacement)
+    result.append(object[end...])
+    return result.count < object.count ? result : nil
+}
+
+/// Writes one object at a time, never retaining all replacement images or an
+/// output-sized Data buffer. Offset lookup is O(n), rather than sorting per object.
+private func pdfWriteCompressionBody(
+    data: Data, startXRef: Int, objects: [PDFImageObjectReference],
+    to handle: FileHandle, transform: (Data) throws -> Data?,
+    progress: PDFProgressHandler, reader: FileHandle
+) throws -> [Int: Int] {
+    guard let first = objects.first, first.offset > 0 else { throw PaperPathError.unreadablePDF }
+    var offsets: [Int: Int] = [:]
+    var written = 0
+    var lastPercent = -1
+    func read(_ range: Range<Int>) throws -> Data {
+        try reader.seek(toOffset: UInt64(range.lowerBound))
+        guard let bytes = try reader.read(upToCount: range.count), bytes.count == range.count else {
+            throw PaperPathError.outputVerificationFailed("the source PDF changed or became unreadable during compression")
+        }
+        return bytes
+    }
+    func copy(_ range: Range<Int>) throws {
+        var cursor = range.lowerBound
+        while cursor < range.upperBound {
+            try Task.checkCancellation()
+            let end = min(cursor + 256 * 1_024, range.upperBound)
+            try autoreleasepool {
+                try handle.write(contentsOf: read(cursor..<end))
+            }
+            written += end - cursor
+            cursor = end
+        }
+    }
+    try copy(0..<first.offset)
+    for (index, object) in objects.enumerated() {
+        try Task.checkCancellation()
+        let end = index + 1 < objects.count ? objects[index + 1].offset : startXRef
+        guard object.offset < end, end <= data.count else { throw PaperPathError.unreadablePDF }
+        offsets[object.number] = written
+        try autoreleasepool {
+            if end - object.offset <= 32 * 1_024 * 1_024 {
+                let bytes = try read(object.offset..<end)
+                if let replacement = try transform(bytes) {
+                    try handle.write(contentsOf: replacement)
+                    written += replacement.count
+                } else {
+                    try handle.write(contentsOf: bytes)
+                    written += bytes.count
+                }
+            } else {
+                // Oversized objects are copied in bounded chunks, without
+                // paging their entire payload into the metadata mapping.
+                let prefix = try read(object.offset..<min(end, object.offset + 64 * 1_024))
+                if prefix.range(of: Data("/ByteRange".utf8)) != nil {
+                    throw PaperPathError.insufficientSelection("This PDF contains a digital signature. Recompression would invalidate it, so compression was stopped. Use an unsigned version to compress this document.")
+                }
+                try copy(object.offset..<end)
+            }
+        }
+        let fraction = 0.02 + 0.82 * Double(end) / Double(startXRef)
+        let percent = Int(fraction * 100)
+        if percent > lastPercent { progress(fraction); lastPercent = percent }
+    }
+    return offsets
+}
+
+private extension PDFClassicXRefDocument {
+    func writeCompressed(to handle: FileHandle, transform: (Data) throws -> Data?, progress: PDFProgressHandler, reader: FileHandle) throws {
+        let objects = allObjects()
+        let offsets = try pdfWriteCompressionBody(data: data, startXRef: startXRef, objects: objects,
+            to: handle, transform: transform, progress: progress, reader: reader)
+        try handle.write(contentsOf: Data("\n".utf8))
+        let xrefOffset = try handle.offset()
+        try handle.write(contentsOf: Data("xref\n0 \(size)\n0000000000 65535 f \n".utf8))
+        for number in 1..<size {
+            try Task.checkCancellation()
+            let line: String
+            if let entry = entries[number], let offset = offsets[number] {
+                line = String(format: "%010lld %05d n \n", Int64(offset), entry.generation)
+            } else { line = "0000000000 00000 f \n" }
+            try handle.write(contentsOf: Data(line.utf8))
+        }
+        try handle.write(contentsOf: Data("trailer\n\(trailerDictionary)\nstartxref\n\(xrefOffset)\n%%EOF\n".utf8))
+    }
+}
+
+private extension PDFXRefStreamDocument {
+    func writeCompressed(to handle: FileHandle, transform: (Data) throws -> Data?, progress: PDFProgressHandler, reader: FileHandle) throws {
+        let objects = uncompressedReferences
+        let offsets = try pdfWriteCompressionBody(data: data, startXRef: startXRef, objects: objects,
+            to: handle, transform: transform, progress: progress, reader: reader)
+        var updatedEntries = entries
+        for object in objects {
+            guard let offset = offsets[object.number], let entry = entries[object.number] else { throw PaperPathError.unreadablePDF }
+            updatedEntries[object.number] = Entry(type: 1, field1: UInt64(offset), field2: entry.field2)
+        }
+        try handle.write(contentsOf: Data("\n".utf8))
+        let xrefOffset = try handle.offset()
+        updatedEntries[xrefObjectNumber] = Entry(type: 1, field1: xrefOffset, field2: UInt64(xrefGeneration))
+        let originalDictionary: Data
+        if let compressionTrailer { originalDictionary = compressionTrailer }
+        else {
+            let prefix = Data(data[startXRef..<min(data.count, startXRef + 64 * 1_024)])
+            guard let range = pdfFirstDictionaryRange(in: prefix) else { throw PaperPathError.unreadablePDF }
+            originalDictionary = Data(prefix[range])
+        }
+        guard let compressed = pdfCompressionDeflate(Self.xrefBytes(entries: updatedEntries, size: size)),
+              let dictionary = pdfCompressionDictionary(originalDictionary, setting: [
+                "W": "[1 8 4]", "Index": "[0 \(size)]", "Length": "\(compressed.count)", "Filter": "/FlateDecode"
+              ]) else { throw PaperPathError.unreadablePDF }
+        try handle.write(contentsOf: Data("\(xrefObjectNumber) \(xrefGeneration) obj\n".utf8))
+        try handle.write(contentsOf: dictionary)
+        try handle.write(contentsOf: Data("\nstream\n".utf8))
+        try handle.write(contentsOf: compressed)
+        try handle.write(contentsOf: Data("\nendstream\nendobj\nstartxref\n\(xrefOffset)\n%%EOF\n".utf8))
+    }
+}
+
+/// Cancellation-aware admission shared by estimates and compression, including
+/// work from different windows. Waiting never occupies the main actor.
+private final class PDFCompressionExecutionGate: @unchecked Sendable {
+    static let shared = PDFCompressionExecutionGate()
+    private let condition = NSCondition()
+    private var busy = false
+
+    func enter() throws {
+        condition.lock()
+        defer { condition.unlock() }
+        while busy {
+            try Task.checkCancellation()
+            _ = condition.wait(until: Date(timeIntervalSinceNow: 0.05))
+        }
+        try Task.checkCancellation()
+        busy = true
+    }
+
+    func leave() {
+        condition.lock()
+        busy = false
+        condition.broadcast()
+        condition.unlock()
+    }
+}
+
+/// The mapping is used only to parse structural metadata. Payloads are read
+/// through a file handle, so sequential image processing does not make the
+/// whole input mapping resident in the process.
+private final class PDFCompressionMappedInput {
+    let data: Data
+    let reader: FileHandle
+
+    init(url: URL, count: Int) throws {
+        let handle = try FileHandle(forReadingFrom: url)
+        var status = stat()
+        guard fstat(handle.fileDescriptor, &status) == 0,
+              status.st_size == Int64(count),
+              let pointer = mmap(nil, count, PROT_READ, MAP_PRIVATE, handle.fileDescriptor, 0),
+              pointer != MAP_FAILED else {
+            try? handle.close()
+            throw PaperPathError.storageFailure("The PDF could not be opened for local compression.")
+        }
+        reader = handle
+        data = Data(bytesNoCopy: pointer, count: count, deallocator: .unmap)
+    }
+
+    deinit { try? reader.close() }
+}
+
+func pdfCompressionDeflate(_ data: Data) -> Data? {
+    guard !data.isEmpty, data.count <= 32 * 1_024 * 1_024 else { return nil }
+    var count = compressBound(uLong(data.count))
+    var output = Data(count: Int(count))
+    let status = output.withUnsafeMutableBytes { destination in
+        data.withUnsafeBytes { source in
+            compress2(destination.bindMemory(to: Bytef.self).baseAddress!, &count,
+                source.bindMemory(to: Bytef.self).baseAddress!, uLong(data.count), Z_BEST_COMPRESSION)
+        }
+    }
+    guard status == Z_OK else { return nil }
+    output.count = Int(count)
+    // An exact round trip is required for every proposed stream replacement,
+    // including images. Visual similarity and OCR text are not sufficient.
+    var restoredCount = uLong(data.count)
+    var restored = Data(count: data.count)
+    let verification = restored.withUnsafeMutableBytes { destination in
+        output.withUnsafeBytes { source in
+            uncompress(destination.bindMemory(to: Bytef.self).baseAddress!, &restoredCount,
+                source.bindMemory(to: Bytef.self).baseAddress!, uLong(output.count))
+        }
+    }
+    guard verification == Z_OK, restoredCount == data.count,
+          restored == data else { return nil }
+    return output
+}
+
+private func pdfRequireUnsignedCompressionSource(_ url: URL) throws {
+    guard let document = CGPDFDocument(url as CFURL),
+          let catalog = document.catalog else { throw PaperPathError.unreadablePDF }
+    var acroForm: CGPDFDictionaryRef?
+    guard CGPDFDictionaryGetDictionary(catalog, "AcroForm", &acroForm), let acroForm else { return }
+    var fields: CGPDFArrayRef?
+    guard CGPDFDictionaryGetArray(acroForm, "Fields", &fields), let fields else { return }
+    var queue: [(CGPDFArrayRef, Int)] = [(fields, 0)]
+    var visited = 0
+    while let (array, depth) = queue.popLast() {
+        try Task.checkCancellation()
+        guard depth <= 32 else { throw PaperPathError.unreadablePDF }
+        for index in 0..<CGPDFArrayGetCount(array) {
+            visited += 1
+            guard visited <= 100_000 else { throw PaperPathError.unreadablePDF }
+            var field: CGPDFDictionaryRef?
+            guard CGPDFArrayGetDictionary(array, index, &field), let field else { continue }
+            var value: CGPDFDictionaryRef?
+            if CGPDFDictionaryGetDictionary(field, "V", &value), let value {
+                var range: CGPDFArrayRef?
+                if CGPDFDictionaryGetArray(value, "ByteRange", &range) {
+                    throw PaperPathError.insufficientSelection("This PDF contains a digital signature. Recompression would invalidate it, so compression was stopped. Use an unsigned version to compress this document.")
+                }
+            }
+            var kids: CGPDFArrayRef?
+            if CGPDFDictionaryGetArray(field, "Kids", &kids), let kids { queue.append((kids, depth + 1)) }
+        }
+    }
+}
+
+/// Reject ambiguous or escaped keys rather than confusing a missing /Filter
+/// with an unfamiliar spelling of /Filter. Never searches inside string values.
+func pdfCompressionValues(_ dictionary: Data) -> [String: String]? {
+    guard let range = pdfFirstDictionaryRange(in: dictionary) else { return nil }
+    let limit = range.upperBound - 2
+    var index = range.lowerBound + 2
+    var values: [String: String] = [:]
+    while index < limit {
+        index = pdfSkipWhitespaceAndComments(in: dictionary, start: index, limit: limit)
+        if index == limit { break }
+        guard dictionary[index] == 0x2f else { return nil }
+        let end = pdfTokenEnd(in: dictionary, start: index + 1, limit: limit)
+        guard end > index + 1 else { return nil }
+        let key = String(decoding: dictionary[(index + 1)..<end], as: UTF8.self)
+        guard !key.contains("#"), values[key] == nil else { return nil }
+        let valueStart = pdfSkipWhitespaceAndComments(in: dictionary, start: end, limit: limit)
+        guard let valueEnd = pdfObjectValueEnd(in: dictionary, start: valueStart, limit: limit), valueEnd > valueStart else { return nil }
+        values[key] = String(decoding: dictionary[valueStart..<valueEnd], as: UTF8.self)
+        index = valueEnd
+    }
+    return values
+}
+
+private func pdfCompressionEndOfFile(reader: FileHandle, count: Int) throws -> Int? {
+    let marker = Data("%%EOF".utf8)
+    var end = count
+    while end > 0 {
+        try Task.checkCancellation()
+        let start = max(0, end - 64 * 1_024)
+        try reader.seek(toOffset: UInt64(start))
+        guard let bytes = try reader.read(upToCount: end - start), bytes.count == end - start else {
+            throw PaperPathError.unreadablePDF
+        }
+        if let range = bytes.range(of: marker, options: .backwards) { return start + range.upperBound }
+        if start == 0 { break }
+        end = start + marker.count - 1
+    }
+    return nil
+}
+
+/// Used only after the user selects a lossy mode. Document text and interactive
+/// objects remain untouched; image pixels are allowed to change in this mode.
+private func pdfHighQualityCompressionImage(
+    _ encoded: Data, values: [String: String], quality: PDFCompressionQuality
+) throws -> (bytes: Data, settings: [String: String])? {
+    guard values["BitsPerComponent"] == "8",
+          values["SMask"] == nil, values["Mask"] == nil,
+          values["Decode"] == nil,
+          values["ImageMask"] != "true", values["Alternates"] == nil,
+          values["SMaskInData"] == nil,
+          let widthText = values["Width"], let width = Int(widthText),
+          let heightText = values["Height"], let height = Int(heightText),
+          width >= 64, height >= 64, width <= 100_000, height <= 100_000,
+          width * height <= 100_000_000,
+          let color = values["ColorSpace"], ["/DeviceRGB", "/DeviceGray", "/DeviceCMYK"].contains(color)
+    else { return nil }
+    let channels = color == "/DeviceGray" ? 1 : color == "/DeviceCMYK" ? 4 : 3
+    let filter = values["Filter"]?.filter { !$0.isWhitespace }
+    let targetEdge = Int(quality.longestEdge)
+    let image: CGImage
+    var lossless: Data?
+    if filter == "/DCTDecode" || filter == "[/DCTDecode]" {
+        guard values["DecodeParms"] == nil || values["DecodeParms"] == "null" else { return nil }
+        guard let source = CGImageSourceCreateWithData(encoded as CFData, [kCGImageSourceShouldCache: false] as CFDictionary),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              (properties[kCGImagePropertyPixelWidth] as? Int) == width,
+              (properties[kCGImagePropertyPixelHeight] as? Int) == height else { return nil }
+        if channels == 4 {
+            // ImageIO's JPEG thumbnail path applies Adobe's inverted CMYK
+            // decode. PDF /DeviceCMYK with no /Decode uses [0 1] per channel.
+            // Decode bounded full CMYK samples and apply PDF's mapping before
+            // RGB conversion; otherwise gold artwork can become blue/gray.
+            guard width * height * 4 <= 48 * 1_024 * 1_024,
+                  let raw = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary),
+                  raw.bitsPerComponent == 8, raw.bitsPerPixel == 32,
+                  let provider = raw.dataProvider,
+                  let corrected = CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                    bytesPerRow: raw.bytesPerRow, space: CGColorSpaceCreateDeviceCMYK(), bitmapInfo: raw.bitmapInfo,
+                    provider: provider, decode: [0, 1, 0, 1, 0, 1, 0, 1], shouldInterpolate: true, intent: .defaultIntent)
+            else { return nil }
+            image = corrected
+        } else {
+            guard let thumbnail = CGImageSourceCreateThumbnailAtIndex(source, 0, [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: min(targetEdge, max(width, height)),
+                kCGImageSourceCreateThumbnailWithTransform: false,
+                kCGImageSourceShouldCacheImmediately: true
+              ] as CFDictionary) else { return nil }
+            image = thumbnail
+        }
+    } else if filter == "/FlateDecode" || filter == "[/FlateDecode]" || filter == nil {
+        let byteCount = width * height * channels
+        guard byteCount <= 32 * 1_024 * 1_024 else { return nil }
+        let decoded: Data
+        if filter != nil {
+            guard let bytes = pdfInflateZlib(encoded, maximumOutputByteCount: min(32 * 1_024 * 1_024, byteCount + height)) else { return nil }
+            if let parms = values["DecodeParms"], parms != "null" {
+                guard let options = pdfCompressionValues(Data(parms.utf8)),
+                      let restored = pdfUndoCompressionPredictor(bytes, values: options), restored.count == byteCount else { return nil }
+                decoded = restored
+            } else {
+                guard bytes.count == byteCount else { return nil }
+                decoded = bytes
+            }
+        } else {
+            guard encoded.count == byteCount else { return nil }
+            decoded = encoded
+            lossless = pdfCompressionDeflate(encoded)
+        }
+        guard let provider = CGDataProvider(data: decoded as CFData),
+              let raw = CGImage(width: width, height: height, bitsPerComponent: 8,
+                bitsPerPixel: channels * 8, bytesPerRow: width * channels,
+                space: channels == 1 ? CGColorSpaceCreateDeviceGray() : channels == 4 ? CGColorSpaceCreateDeviceCMYK() : CGColorSpaceCreateDeviceRGB(),
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
+        else { return nil }
+        image = raw
+    } else { return nil }
+    try Task.checkCancellation()
+    let scale = min(1, CGFloat(targetEdge) / CGFloat(max(image.width, image.height)))
+    let outWidth = max(1, Int((CGFloat(image.width) * scale).rounded()))
+    let outHeight = max(1, Int((CGFloat(image.height) * scale).rounded()))
+    guard let context = CGContext(data: nil, width: outWidth, height: outHeight, bitsPerComponent: 8, bytesPerRow: 0,
+            space: channels == 1 ? CGColorSpaceCreateDeviceGray() : CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: channels == 1 ? CGImageAlphaInfo.none.rawValue : CGImageAlphaInfo.noneSkipLast.rawValue)
+    else { return nil }
+    context.interpolationQuality = .high
+    context.draw(image, in: CGRect(x: 0, y: 0, width: outWidth, height: outHeight))
+    guard let resized = context.makeImage() else { return nil }
+    let jpeg = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(jpeg, UTType.jpeg.identifier as CFString, 1, nil) else { return nil }
+    CGImageDestinationAddImage(destination, resized, [kCGImageDestinationLossyCompressionQuality: quality.jpegQuality] as CFDictionary)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    try Task.checkCancellation()
+    if let lossless, lossless.count <= jpeg.length {
+        return (lossless, ["Filter": "/FlateDecode"])
+    }
+    return (jpeg as Data, ["Filter": "/DCTDecode", "Width": "\(outWidth)", "Height": "\(outHeight)",
+                          "ColorSpace": channels == 1 ? "/DeviceGray" : "/DeviceRGB"])
+}
+
+// Compression-only xref reader. Other mutation paths retain their stricter
+// admission rules. Resolves newest entries first, including free entries, and
+// follows both incremental and linearized /Prev chains with cycle/budget guards.
+private extension PDFXRefStreamDocument {
+    init(compressionData data: Data) throws {
+        guard data.starts(with: Data("%PDF-".utf8)),
+              let marker = data.range(of: Data("startxref".utf8), options: .backwards) else {
+            throw PaperPathError.unreadablePDF
+        }
+        func integer(_ text: String?) -> Int? { text.flatMap(Int.init) }
+        func array(_ text: String?) -> [Int]? {
+            guard let text, text.first == "[", text.last == "]" else { return nil }
+            let tokens = text.dropFirst().dropLast().split(whereSeparator: \.isWhitespace)
+            let values = tokens.compactMap { Int($0) }
+            return values.count == tokens.count ? values : nil
+        }
+        func dictionary(at offset: Int) throws -> Data {
+            guard offset >= 0, offset < data.count else { throw PaperPathError.unreadablePDF }
+            let prefix = Data(data[offset..<min(data.count, offset + 64 * 1_024)])
+            guard let range = pdfFirstDictionaryRange(in: prefix) else { throw PaperPathError.unreadablePDF }
+            return Data(prefix[range])
+        }
+        var cursor = marker.upperBound
+        func token() throws -> String {
+            cursor = pdfSkipWhitespaceAndComments(in: data, start: cursor, limit: data.count)
+            guard cursor < data.count else { throw PaperPathError.unreadablePDF }
+            let end = pdfTokenEnd(in: data, start: cursor, limit: data.count)
+            guard end > cursor, end - cursor < 128 else { throw PaperPathError.unreadablePDF }
+            defer { cursor = end }
+            return String(decoding: data[cursor..<end], as: UTF8.self)
+        }
+        guard let firstOffset = Int(try token()) else { throw PaperPathError.unreadablePDF }
+        var pending = [firstOffset], visited = Set<Int>(), parsed: [Int: Entry] = [:]
+        var trailer: Data?, trailerValues: [String: String] = [:], maximumSize = 0
+        var totalEntries = 0
+        while let offset = pending.popLast() {
+            try Task.checkCancellation()
+            guard visited.insert(offset).inserted, visited.count <= 64,
+                  offset > 0, offset < data.count else { throw PaperPathError.unreadablePDF }
+            cursor = offset
+            let first = try token()
+            let currentDictionary: Data
+            var current: [Int: Entry] = [:]
+            if first == "xref" {
+                while true {
+                    let number = try token()
+                    if number == "trailer" { break }
+                    guard let start = Int(number), let count = Int(try token()),
+                          start >= 0, count >= 0, start <= 500_000,
+                          count <= 500_000 - start, count <= 1_000_000 - totalEntries else {
+                        throw PaperPathError.unreadablePDF
+                    }
+                    totalEntries += count
+                    for n in start..<(start + count) {
+                        guard let position = UInt64(try token()), let generation = UInt64(try token()) else {
+                            throw PaperPathError.unreadablePDF
+                        }
+                        let kind = try token()
+                        guard kind == "n" || kind == "f", current[n] == nil else { throw PaperPathError.unreadablePDF }
+                        current[n] = Entry(type: kind == "n" && position > 0 ? 1 : 0, field1: position, field2: generation)
+                    }
+                }
+                currentDictionary = try dictionary(at: cursor)
+            } else {
+                guard Int(first) != nil, Int(try token()) != nil, try token() == "obj" else {
+                    throw PaperPathError.unreadablePDF
+                }
+                let start = pdfSkipWhitespaceAndComments(in: data, start: cursor, limit: data.count)
+                currentDictionary = try dictionary(at: start)
+                guard data[start...].starts(with: currentDictionary),
+                      let values = pdfCompressionValues(currentDictionary), values["Type"] == "/XRef",
+                      let size = integer(values["Size"]), size > 0, size <= 500_000,
+                      let widths = array(values["W"]), widths.count == 3,
+                      widths.allSatisfy({ (0...8).contains($0) }), widths.reduce(0, +) > 0,
+                      let length = integer(values["Length"]), length > 0, length <= 24 * 1_024 * 1_024 else {
+                    throw PaperPathError.unreadablePDF
+                }
+                cursor = start + currentDictionary.count
+                guard try token() == "stream" else { throw PaperPathError.unreadablePDF }
+                if cursor < data.count, data[cursor] == 13 {
+                    cursor += 1
+                    if cursor < data.count, data[cursor] == 10 { cursor += 1 }
+                } else if cursor < data.count, data[cursor] == 10 { cursor += 1 }
+                else { throw PaperPathError.unreadablePDF }
+                guard length <= data.count - cursor else { throw PaperPathError.unreadablePDF }
+                let encoded = Data(data[cursor..<(cursor + length)])
+                let filter = values["Filter"]?.filter { !$0.isWhitespace }
+                let inflated: Data
+                if filter == nil { inflated = encoded }
+                else if ["/FlateDecode", "/Fl", "[/FlateDecode]", "[/Fl]"].contains(filter!) {
+                    guard let decoded = pdfInflateZlib(encoded, maximumOutputByteCount: 32 * 1_024 * 1_024) else {
+                        throw PaperPathError.unreadablePDF
+                    }
+                    inflated = decoded
+                } else { throw PaperPathError.unreadablePDF }
+                let decoded: Data
+                if let parms = values["DecodeParms"], parms != "null" {
+                    guard let options = pdfCompressionValues(Data(parms.utf8)),
+                          let bytes = pdfUndoCompressionPredictor(inflated, values: options) else {
+                        throw PaperPathError.unreadablePDF
+                    }
+                    decoded = bytes
+                } else { decoded = inflated }
+                let indices = array(values["Index"]) ?? [0, size]
+                guard indices.count.isMultiple(of: 2), indices.count <= 2_048 else { throw PaperPathError.unreadablePDF }
+                let stride = widths.reduce(0, +)
+                var position = 0
+                func read(_ width: Int) -> UInt64 {
+                    var value: UInt64 = 0
+                    for _ in 0..<width { value = (value << 8) | UInt64(decoded[position]); position += 1 }
+                    return value
+                }
+                for pair in Swift.stride(from: 0, to: indices.count, by: 2) {
+                    let first = indices[pair], count = indices[pair + 1]
+                    guard first >= 0, count >= 0, first <= size, count <= size - first,
+                          count <= (decoded.count - position) / stride,
+                          count <= 1_000_000 - totalEntries else { throw PaperPathError.unreadablePDF }
+                    totalEntries += count
+                    for n in first..<(first + count) {
+                        guard current[n] == nil else { throw PaperPathError.unreadablePDF }
+                        let type = widths[0] == 0 ? 1 : read(widths[0])
+                        let field1 = read(widths[1]), field2 = read(widths[2])
+                        guard type <= 2 else { throw PaperPathError.unreadablePDF }
+                        current[n] = Entry(type: type, field1: field1, field2: field2)
+                    }
+                }
+                guard position == decoded.count else { throw PaperPathError.unreadablePDF }
+            }
+            guard let values = pdfCompressionValues(currentDictionary), values["Encrypt"] == nil,
+                  let size = integer(values["Size"]), size > 0, size < 500_000 else { throw PaperPathError.unreadablePDF }
+            maximumSize = max(maximumSize, size)
+            if trailer == nil { trailer = currentDictionary; trailerValues = values }
+            else {
+                // Inherit omitted trailer entries without re-encoding binary strings.
+                for key in ["Root", "Info", "ID"] where trailerValues[key] == nil {
+                    if let range = pdfFirstDictionaryRange(in: currentDictionary),
+                       let valueRange = pdfTopLevelValueRange(for: key, in: currentDictionary, dictionaryRange: range),
+                       var inherited = trailer {
+                        inherited.insert(contentsOf: Data(" /\(key) ".utf8) + currentDictionary[valueRange], at: inherited.count - 2)
+                        trailer = inherited; trailerValues[key] = values[key]
+                    }
+                }
+            }
+            for (n, entry) in current where parsed[n] == nil { parsed[n] = entry }
+            if let previous = integer(values["Prev"]) { pending.append(previous) }
+            if let hybrid = integer(values["XRefStm"]) { pending.append(hybrid) }
+        }
+        guard let originalTrailer = trailer, let root = trailerValues["Root"], root.hasSuffix(" R"),
+              parsed.count <= 500_000,
+              parsed.allSatisfy({ n, e in
+                  n >= 0 && n < maximumSize && (e.type != 1 || (e.field1 > 0 && e.field1 < UInt64(data.count) && e.field2 <= 65_535))
+              }),
+              let cleaned = pdfCompressionRemovingKeys(originalTrailer, keys: ["Prev", "XRefStm", "Type", "W", "Index", "Length", "Filter", "DecodeParms"]),
+              let dictionary = pdfCompressionDictionary(cleaned, setting: ["Type": "/XRef", "Size": "\(maximumSize + 1)"])
+        else { throw PaperPathError.unreadablePDF }
+        self.data = data
+        self.startXRef = data.count
+        self.size = maximumSize + 1
+        self.rootReference = root
+        self.infoReference = trailerValues["Info"]
+        self.xrefObjectNumber = maximumSize
+        self.xrefGeneration = 0
+        self.entries = parsed
+        self.compressionTrailer = dictionary
+    }
+}
+
+private func pdfCompressionRemovingKeys(_ dictionary: Data, keys: Set<String>) -> Data? {
+    guard let range = pdfFirstDictionaryRange(in: dictionary) else { return nil }
+    var cursor = range.lowerBound + 2, edits: [Range<Int>] = []
+    let limit = range.upperBound - 2
+    while cursor < limit {
+        cursor = pdfSkipWhitespaceAndComments(in: dictionary, start: cursor, limit: limit)
+        if cursor == limit { break }
+        let start = cursor
+        guard dictionary[cursor] == 47 else { return nil }
+        let keyEnd = pdfTokenEnd(in: dictionary, start: cursor + 1, limit: limit)
+        let key = String(decoding: dictionary[(cursor + 1)..<keyEnd], as: UTF8.self)
+        let valueStart = pdfSkipWhitespaceAndComments(in: dictionary, start: keyEnd, limit: limit)
+        guard let end = pdfObjectValueEnd(in: dictionary, start: valueStart, limit: limit) else { return nil }
+        if keys.contains(key) { edits.append(start..<end) }
+        cursor = end
+    }
+    var result = dictionary
+    for range in edits.reversed() { result.removeSubrange(range) }
+    return result
+}
+
+/// Undo PDF TIFF/PNG prediction on already-inflated bytes, bounded by callers.
+/// PNG always carries one filter byte per row, including fixed predictors 10-14.
+private func pdfUndoCompressionPredictor(_ data: Data, values: [String: String]) -> Data? {
+    let predictor = Int(values["Predictor"] ?? "1") ?? -1
+    if predictor == 1 { return data }
+    guard let columns = Int(values["Columns"] ?? "1"), columns > 0, columns <= 100_000,
+          let colors = Int(values["Colors"] ?? "1"), (1...4).contains(colors),
+          let bits = Int(values["BitsPerComponent"] ?? "8"), bits == 8 else { return nil }
+    let width = columns * colors
+    if predictor == 2 {
+        guard data.count.isMultiple(of: width) else { return nil }
+        var result = data
+        result.withUnsafeMutableBytes { (bytes: UnsafeMutableRawBufferPointer) in
+            for row in Swift.stride(from: 0, to: data.count, by: width) {
+                for i in colors..<width { bytes[row + i] = bytes[row + i] &+ bytes[row + i - colors] }
+            }
+        }
+        return result
+    }
+    guard (10...15).contains(predictor), data.count.isMultiple(of: width + 1) else { return nil }
+    let rows = data.count / (width + 1)
+    var result = Data(count: rows * width)
+    return result.withUnsafeMutableBytes { (output: UnsafeMutableRawBufferPointer) -> Data? in
+        for row in 0..<rows {
+            let input = row * (width + 1), target = row * width
+            let filter = data[input]
+            guard filter <= 4 else { return nil }
+            for column in 0..<width {
+                let left = column >= colors ? Int(output[target + column - colors]) : 0
+                let up = row > 0 ? Int(output[target + column - width]) : 0
+                let corner = row > 0 && column >= colors ? Int(output[target + column - width - colors]) : 0
+                let prediction: Int
+                switch filter {
+                case 0: prediction = 0
+                case 1: prediction = left
+                case 2: prediction = up
+                case 3: prediction = (left + up) / 2
+                default:
+                    let p = left + up - corner
+                    let a = abs(p - left), b = abs(p - up), c = abs(p - corner)
+                    prediction = a <= b && a <= c ? left : b <= c ? up : corner
+                }
+                output[target + column] = data[input + 1 + column] &+ UInt8(prediction)
+            }
+        }
+        return Data(bytes: output.baseAddress!, count: output.count)
+    }
+}
+
+private func rasterPageSize(_ page: PDFPage) -> CGSize {
+    let size = page.bounds(for: .cropBox).size
+    let rotation = ((page.rotation % 360) + 360) % 360
+    return rotation == 90 || rotation == 270 ? CGSize(width: size.height, height: size.width) : size
+}
+
+/// Delivery images are exact page renders, not PDFKit's decorated thumbnails.
+/// Render at scale 1 to keep the pixel/memory budget independent of screen scale.
+private func rasterPageImage(_ page: PDFPage, size: CGSize) -> UIImage? {
+    guard let source = page.pageRef, size.width.isFinite, size.height.isFinite,
+          size.width > 0, size.height > 0, size.width * size.height <= 16_000_000 else { return nil }
+    let format = UIGraphicsImageRendererFormat()
+    format.scale = 1; format.opaque = true; format.preferredRange = .standard
+    return UIGraphicsImageRenderer(size: size, format: format).image { renderer in
+        let context = renderer.cgContext
+        let rectangle = CGRect(origin: .zero, size: size)
+        context.setFillColor(UIColor.white.cgColor); context.fill(rectangle)
+        context.saveGState()
+        context.translateBy(x: 0, y: size.height); context.scaleBy(x: 1, y: -1)
+        let displayedSize = rasterPageSize(page)
+        context.scaleBy(x: size.width / displayedSize.width, y: size.height / displayedSize.height)
+        context.concatenate(source.getDrawingTransform(.cropBox, rect: CGRect(origin: .zero, size: displayedSize), rotate: 0, preserveAspectRatio: true))
+        context.drawPDFPage(source)
+        for annotation in page.annotations where annotation.shouldDisplay {
+            let isWidget = annotation.type?.trimmingCharacters(in: CharacterSet(charactersIn: "/")).lowercased() == "widget"
+            // PDFKit draws the field name as an editing placeholder for empty
+            // widgets without appearances. That label is not document content.
+            if isWidget && !annotation.hasAppearanceStream && (annotation.widgetStringValue ?? "").isEmpty { continue }
+            annotation.draw(with: .cropBox, in: context)
+        }
+        context.restoreGState()
+    }
+}
+
+private func rasterRedactionRect(_ mark: PDFRedactionMark, rotation: Int, size: CGSize) -> CGRect {
+    let x = mark.normalizedX, y = mark.normalizedY, w = mark.normalizedWidth, h = mark.normalizedHeight
+    let normalized: CGRect
+    switch ((rotation % 360) + 360) % 360 {
+    case 90: normalized = CGRect(x: y, y: x, width: h, height: w)
+    case 180: normalized = CGRect(x: 1 - x - w, y: y, width: w, height: h)
+    case 270: normalized = CGRect(x: 1 - y - h, y: 1 - x - w, width: h, height: w)
+    default: normalized = CGRect(x: x, y: 1 - y - h, width: w, height: h)
+    }
+    return CGRect(x: normalized.minX * size.width, y: normalized.minY * size.height,
+                  width: normalized.width * size.width, height: normalized.height * size.height)
 }

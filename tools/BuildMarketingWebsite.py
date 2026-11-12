@@ -42,8 +42,8 @@ def build(destination, origin, preview=False):
 <link rel="alternate" hreflang="x-default" href="{origin}/en/">
 <link rel="icon" href="{assets}app-icon.webp" type="image/webp"><link rel="apple-touch-icon" href="{assets}apple-touch-icon.png">
 <link rel="manifest" href="{prefix}site.webmanifest">
-<link rel="preload" as="image" href="{assets}launch/ipad-workspace.webp" fetchpriority="high">
-<link rel="stylesheet" href="{prefix}launch.css?v=20261026">
+<link rel="preload" as="image" href="{assets}launch/hero-ipad.webp" fetchpriority="high">
+<link rel="stylesheet" href="{prefix}launch.css?v=20261028">
 <meta property="og:type" content="website"><meta property="og:site_name" content="PaperPath"><meta property="og:locale" content="{c['ogLocale']}">
 <meta property="og:title" content="{esc(c['title'])}"><meta property="og:description" content="{esc(c['description'])}"><meta property="og:url" content="{url}">
 <meta property="og:image" content="{origin}/assets/launch/og-paperpath.png"><meta property="og:image:width" content="1200"><meta property="og:image:height" content="630"><meta property="og:image:alt" content="{esc(c['imageAlt'])}">
@@ -58,11 +58,11 @@ def build(destination, origin, preview=False):
 <section class="hero" aria-labelledby="hero-title"><div class="hero-copy"><p class="platform">{icon('device')}<span>iPhone &amp; iPad</span></p>
 <h1 id="hero-title">{esc(c['hero1'])}<br>{esc(c['hero2'])}</h1><p class="hero-description">{esc(c['heroDescription'])}</p>
 <ul class="hero-promises"><li>{icon('local')}{esc(c['promise1'])}</li><li>{icon('device')}{esc(c['promise2'])}</li><li>{icon('check')}{esc(c['promise3'])}</li></ul>
-<div class="hero-actions"><a class="button primary" href="#features">{esc(c['explore'])}{icon('arrow')}</a><a class="price-link" href="#price">US$9.99 <span>{esc(c['oneTime'])}</span></a></div>
+<div class="hero-actions"><a class="button primary" href="#features">{esc(c['explore'])}{icon('arrow')}</a><a class="price-link" href="#price">US$6.99 <span>{esc(c['oneTime'])}</span></a></div>
 <p class="hero-availability">{esc(c['heroAvailability'])}</p></div>
-<figure class="hero-art"><div class="paper-sheet" aria-hidden="true"><span>Project handoff</span><i></i><i></i><i></i><b></b><i></i><em>PaperPath</em></div>
-<div class="tablet-frame"><img src="{assets}launch/ipad-workspace.webp" width="1200" height="1600" alt="{esc(c['ipadAlt'])}" fetchpriority="high"></div>
-<div class="phone-frame hero-phone"><img src="{assets}launch/verified-copy.webp" width="660" height="1435" alt="{esc(c['verifiedAlt'])}"></div>
+<figure class="hero-art">
+<div class="tablet-frame"><img src="{assets}launch/hero-ipad.webp" width="1800" height="1350" alt="{esc(c['heroIpadAlt'])}" fetchpriority="high"></div>
+<div class="phone-frame hero-phone"><img src="{assets}launch/hero-phone.webp" width="1206" height="2622" alt="{esc(c['heroPhoneAlt'])}"></div>
 <figcaption>{esc(c['realScreens'])}</figcaption></figure></section>
 <div class="value-strip"><p>{esc(c['strip1'])}</p><p>{esc(c['strip2'])}</p><p>{esc(c['strip3'])}</p></div>
 <section class="workflow section-wrap" id="workflow"><div class="section-heading"><p class="section-tag">{esc(c['workflowTag'])}</p><h2>{esc(c['workflowTitle'])}</h2><p>{esc(c['workflowIntro'])}</p></div>
@@ -75,7 +75,7 @@ def build(destination, origin, preview=False):
 <section class="capabilities section-wrap" id="features"><div class="section-heading"><p class="section-tag">{esc(c['featuresTag'])}</p><h2>{esc(c['featuresTitle'])}</h2></div>
 <div class="feature-list">{''.join(f'<article>{icon(s[0])}<div><h3>{esc(s[1])}</h3><p>{esc(s[2])}</p></div></article>' for s in c['features'])}</div></section>
 <section class="ipad-section"><div class="section-wrap ipad-layout"><div><p class="section-tag">{esc(c['ipadTag'])}</p><h2>{esc(c['ipadTitle'])}</h2><p>{esc(c['ipadIntro'])}</p><p class="screen-note">{esc(c['ipadNote'])}</p></div><figure class="ipad-landscape"><img src="{assets}launch/ipad-dark.webp" width="1200" height="1600" alt="{esc(c['ipadDarkAlt'])}" loading="lazy"></figure></div></section>
-<section class="pricing section-wrap" id="price"><div class="pricing-copy"><p class="section-tag">{esc(c['priceTag'])}</p><h2>{esc(c['priceTitle'])}</h2><p>{esc(c['priceIntro'])}</p><a class="text-link" href="support/">{esc(c['supportLink'])}{icon('arrow')}</a></div><div class="price-panel"><img src="{assets}app-icon.webp" width="64" height="64" alt=""><h3>PaperPath</h3><p class="price">US$9.99</p><p class="price-term">{esc(c['priceTerm'])}</p><ul>{''.join(f'<li>{icon("check")}{esc(s)}</li>' for s in c['priceIncludes'])}</ul><p class="launch-status">{esc(c['comingSoon'])}</p><p class="price-note">{esc(c['priceNote'])}</p></div></section>
+<section class="pricing section-wrap" id="price"><div class="pricing-copy"><p class="section-tag">{esc(c['priceTag'])}</p><h2>{esc(c['priceTitle'])}</h2><p>{esc(c['priceIntro'])}</p><a class="text-link" href="support/">{esc(c['supportLink'])}{icon('arrow')}</a></div><div class="price-panel"><img src="{assets}app-icon.webp" width="64" height="64" alt=""><h3>PaperPath</h3><p class="price">US$6.99</p><p class="price-term">{esc(c['priceTerm'])}</p><ul>{''.join(f'<li>{icon("check")}{esc(s)}</li>' for s in c['priceIncludes'])}</ul><p class="launch-status">{esc(c['comingSoon'])}</p><p class="price-note">{esc(c['priceNote'])}</p></div></section>
 <section class="faq section-wrap" id="faq"><h2>{esc(c['faqTitle'])}</h2><div>{faqs}</div></section>
 <section class="closing"><div class="section-wrap"><p>{esc(c['closing'])}</p><a class="button light" href="#price">{esc(c['closingCTA'])}{icon('arrow')}</a></div></section>
 </main><footer class="footer section-wrap"><a class="brand" href="/{route + '/' if route else ''}"><img src="{assets}app-icon.webp" width="30" height="30" alt=""><span>PaperPath</span></a><nav aria-label="{esc(c['footerNav'])}"><a href="privacy/">{esc(c['privacyLink'])}</a><a href="support/">{esc(c['supportLink'])}</a><a href="https://www.monoware.app/" target="_blank" rel="noopener noreferrer">MonoWare</a></nav><p>© 2026 MonoWare</p></footer>
@@ -85,7 +85,7 @@ def build(destination, origin, preview=False):
         support.mkdir(exist_ok=True)
         support_url = url + 'support/'
         support_alternates = '\n'.join(f'<link rel="alternate" hreflang="{lang}" href="{origin}/{r + "/" if r else ""}support/">' for lang,r in ROUTES.items())
-        support_html = f'''<!doctype html><html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(c['supportLink'])} — PaperPath PDF</title><meta name="description" content="{esc(c['supportIntro'])}"><meta name="robots" content="{robots}"><link rel="canonical" href="{support_url}">{support_alternates}<link rel="alternate" hreflang="x-default" href="{origin}/en/support/"><link rel="icon" href="{origin}/assets/app-icon.webp"><link rel="stylesheet" href="{prefix}../launch.css?v=20261026"></head><body><header class="header"><a class="brand" href="{home_path}">PaperPath</a><a href="{home_path}">{esc(c['back'])}</a></header><main class="support-page section-wrap"><h1>{esc(c['supportLink'])}</h1><p>{esc(c['supportIntro'])}</p><p><a class="button primary" href="mailto:hello@monoware.app">hello@monoware.app</a></p><p>{esc(c['contactNote'])}</p><div class="support-answers">{''.join(f'<section><h2>{esc(q)}</h2><p>{esc(a)}</p></section>' for q,a in c['support'])}</div><a href="../privacy/">{esc(c['privacyLink'])}</a></main></body></html>'''
+        support_html = f'''<!doctype html><html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(c['supportLink'])} — PaperPath PDF</title><meta name="description" content="{esc(c['supportIntro'])}"><meta name="robots" content="{robots}"><link rel="canonical" href="{support_url}">{support_alternates}<link rel="alternate" hreflang="x-default" href="{origin}/en/support/"><link rel="icon" href="{origin}/assets/app-icon.webp"><link rel="stylesheet" href="{prefix}../launch.css?v=20261028"></head><body><header class="header"><a class="brand" href="{home_path}">PaperPath</a><a href="{home_path}">{esc(c['back'])}</a></header><main class="support-page section-wrap"><h1>{esc(c['supportLink'])}</h1><p>{esc(c['supportIntro'])}</p><p><a class="button primary" href="mailto:hello@monoware.app">hello@monoware.app</a></p><p>{esc(c['contactNote'])}</p><div class="support-answers">{''.join(f'<section><h2>{esc(q)}</h2><p>{esc(a)}</p></section>' for q,a in c['support'])}</div><a href="../privacy/">{esc(c['privacyLink'])}</a></main></body></html>'''
         (support / 'index.html').write_text(support_html)
         urls.extend([url, support_url, url+'privacy/'])
     ET.register_namespace('', 'http://www.sitemaps.org/schemas/sitemap/0.9')
@@ -94,7 +94,7 @@ def build(destination, origin, preview=False):
     sitemap=ET.Element(ns+'urlset')
     for url in urls:
         item=ET.SubElement(sitemap,ns+'url');ET.SubElement(item,ns+'loc').text=url
-        ET.SubElement(item,ns+'lastmod').text='2026-10-26'
+        ET.SubElement(item,ns+'lastmod').text='2026-10-28'
         kind = 'support/' if url.endswith('support/') else 'privacy/' if url.endswith('privacy/') else ''
         for lang, route in [*ROUTES.items(), ('x-default','en')]:
             ET.SubElement(item,'{http://www.w3.org/1999/xhtml}link',{'rel':'alternate','hreflang':lang,'href':origin+'/'+(route+'/' if route else '')+kind})

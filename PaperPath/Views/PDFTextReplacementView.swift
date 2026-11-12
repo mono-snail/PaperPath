@@ -105,13 +105,13 @@ struct PDFTextReplacementView: View {
                         saveStopRequested
                             ? "Waiting for the current file commit to finish safely"
                             : isSaving
-                            ? "Stops waiting; a copy already committed remains in the Library"
-                            : "Closes without creating a copy"
+                            ? "Stops waiting; changes already saved remain in the document"
+                            : "Closes without saving changes"
                     )
                     .keyboardShortcut(.cancelAction)
                 }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create Copy") {
+                    Button("Save Changes") {
                         createCopy()
                     }
                     .disabled(!canCreateCopy)
@@ -143,7 +143,8 @@ struct PDFTextReplacementView: View {
                 of: model.record(id: recordID)?
                     .contentRevisionID
             ) { _, revisionID in
-                guard let sourceContentRevisionID,
+                guard !isSaving,
+                      let sourceContentRevisionID,
                       revisionID != sourceContentRevisionID
                 else { return }
                 model[noticeFor: paperPathSceneID] =
@@ -535,7 +536,7 @@ struct PDFTextReplacementView: View {
                             (
                                 saveStopRequested
                                     ? "Finishing current file commit"
-                                    : "Creating private copy"
+                                    : "Saving document"
                             ).localizedUI
                         )
                         .font(.caption.weight(.semibold))
@@ -782,7 +783,7 @@ struct PDFTextReplacementView: View {
             return "Wait for every selected page preview to be verified"
         }
         if assessment?.isReady == true {
-            return "Creates a separate edited PDF copy"
+            return "Saves changes to this document. Previous versions are in History."
         }
         return assessment?.detail
             ?? "Wait for the local layout check"
@@ -947,13 +948,14 @@ struct PDFTextReplacementView: View {
             }
             guard saveGeneration == generation else { return }
             let wasStopped = saveStopRequested || Task.isCancelled
+            if let created { self.sourceContentRevisionID = created.contentRevisionID }
             isSaving = false
             saveTask = nil
             saveStopRequested = false
             guard !wasStopped else {
                 model[noticeFor: paperPathSceneID] = created == nil
-                    ? "Copy creation stopped".localizedUI
-                    : "Copy finished before stopping · copy kept in Library"
+                    ? "Changes stopped".localizedUI
+                    : "Document saved before stopping"
                         .localizedUI
                 return
             }
@@ -1063,7 +1065,7 @@ struct PDFTextReplacementView: View {
         guard let url = model.url(for: recordID) else {
             for pageIndex in pageIndices {
                 previewErrorMessages[pageIndex] =
-                    "The working copy is unavailable.".localizedUI
+                    "The document is unavailable.".localizedUI
             }
             return
         }

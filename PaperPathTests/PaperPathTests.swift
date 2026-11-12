@@ -43,22 +43,16 @@ final class OCRAccuracyTests: XCTestCase {
         for (name, lines, fontSize, rotation) in cases {
             let source = directory.appendingPathComponent("\(name).pdf")
             let bounds = CGRect(x: 0, y: 0, width: 595, height: 842)
-            let format = UIGraphicsImageRendererFormat()
-            format.scale = 300 / 72
-            format.opaque = true
-            let scan = UIGraphicsImageRenderer(size: bounds.size, format: format).image { context in
-                UIColor.white.setFill()
-                context.fill(bounds)
-                for (index, line) in lines.enumerated() {
-                    (line as NSString).draw(
-                        at: CGPoint(x: 48, y: 60 + CGFloat(index) * 27),
-                        withAttributes: [
-                            .font: UIFont.systemFont(ofSize: fontSize),
-                            .foregroundColor: UIColor.black
-                        ]
-                    )
-                }
-            }
+            // Fixed raster fixtures make the input independent of optional simulator fonts.
+            // A missing CJK fallback previously rendered squares before OCR even ran.
+            let rasterName = name.hasPrefix("bilingual") ? "bilingual-10pt"
+                : name.hasPrefix("chinese") ? (fontSize == 8 ? "chinese-8pt" : "chinese-11pt")
+                : "english-8pt"
+            let corpus = try XCTUnwrap(Bundle(for: Self.self).url(forResource: "RealPDFCorpus", withExtension: nil))
+            let rasterURL = corpus.appendingPathComponent("OCRAccuracyRaster/\(rasterName).png")
+            let scan = try XCTUnwrap(UIImage(contentsOfFile: rasterURL.path))
+            XCTAssertEqual(scan.cgImage?.width, 2479)
+            XCTAssertEqual(scan.cgImage?.height, 3508)
             // Draw the full-resolution scan into a point-sized PDF page.
             // Changing PDFPage(image:)'s media box crops pixels rather than scaling them.
             let pdfData = UIGraphicsPDFRenderer(bounds: bounds).pdfData { context in
@@ -158,6 +152,28 @@ final class OCRAccuracyTests: XCTestCase {
 }
 
 final class PaperPathTests: XCTestCase {
+    func testToolCatalogNamesRemainSearchableAlongsideToolbarNames() {
+        for tool in DocumentTool.allCases {
+            XCTAssertTrue(tool.matches(tool.catalogTitle), "Catalog query lost \(tool)")
+            XCTAssertTrue(tool.matches(tool.title), "Existing query lost \(tool)")
+        }
+        XCTAssertTrue(DocumentTool.recognize.matches("recognize text"))
+        XCTAssertTrue(DocumentTool.protect.matches("password protect"))
+        XCTAssertTrue(DocumentTool.bates.matches("Page IDs"))
+        XCTAssertTrue(DocumentTool.redact.matches("永久脱敏"))
+    }
+
+    func testChineseToolCatalogNamesRemainSearchable() {
+        UserDefaults.standard.set(AppLanguage.simplifiedChinese.rawValue,
+                                  forKey: AppLanguage.defaultsKey)
+        for tool in DocumentTool.allCases {
+            XCTAssertTrue(tool.matches(tool.catalogTitle.localizedUI),
+                          "Displayed Chinese task name lost \(tool)")
+        }
+        XCTAssertTrue(DocumentTool.bates.matches("连续页编号（贝茨）"))
+        XCTAssertTrue(DocumentTool.protect.matches("设置打开密码"))
+    }
+
     private var temporaryDirectory: URL!
     private var previousLanguageCode: String?
 
@@ -855,6 +871,41 @@ final class PaperPathTests: XCTestCase {
             includingPropertiesForKeys: nil
         )
         XCTAssertTrue(documentURLs.isEmpty)
+    }
+
+    @MainActor
+    func testRenameAfterReadingUpdatesVisibleNameAndExportFilename() async throws {
+        let source = temporaryDirectory.appendingPathComponent("Review.pdf")
+        try makePDF(at: source, pages: ["First page", "Second page"])
+        let store = DocumentStore(rootURL: temporaryDirectory.appendingPathComponent("RenameAfterReading"))
+        let model = PaperPathModel(store: store)
+        await model.bootstrap()
+        let importedResult = await model.importPDF(from: source)
+        let imported = try XCTUnwrap(importedResult)
+        let viewedAt = Date(timeIntervalSince1970: floor(Date().timeIntervalSince1970) + 0.875)
+        await model.updateReadingPosition(
+            recordID: imported.id, pageIndex: 1,
+            expectedContentRevisionID: imported.contentRevisionID,
+            viewedAt: viewedAt
+        )
+        let renamed = await model.rename(
+            recordID: imported.id, to: "Approved review",
+            expectedName: imported.displayName
+        )
+        XCTAssertTrue(renamed)
+        let visible = try XCTUnwrap(model.record(id: imported.id))
+        XCTAssertEqual(visible.displayName, "Approved review")
+        XCTAssertEqual(visible.lastPageIndex, 1)
+        XCTAssertEqual(visible.lastViewedAt, viewedAt)
+        XCTAssertEqual(visible.contentRevisionID, imported.contentRevisionID)
+        let exportResult = await model.makeFilesExportCopy(recordID: imported.id)
+        let exported = try XCTUnwrap(exportResult)
+        XCTAssertEqual(exported.lastPathComponent, "Approved review.pdf")
+        await model.discardFilesExportCopy(at: exported)
+        let reopened = PaperPathModel(store: store)
+        await reopened.bootstrap()
+        XCTAssertEqual(reopened.record(id: imported.id)?.displayName, "Approved review")
+        XCTAssertEqual(reopened.record(id: imported.id)?.lastPageIndex, 1)
     }
 
     func testRenameChangesMetadataNotFileLocation() async throws {
@@ -2195,6 +2246,15 @@ final class PaperPathTests: XCTestCase {
         let importedRecord = await model.importPDF(from: source)
         let imported = try XCTUnwrap(importedRecord)
 
+        let originalBytes = try Data(contentsOf: source)
+        await model.addStamp(recordID: imported.id, pageIndex: 0, kind: .approved)
+        let edited = try XCTUnwrap(model.record(id: imported.id))
+        XCTAssertNotEqual(edited.contentRevisionID, imported.contentRevisionID)
+        let workingURL = try XCTUnwrap(model.url(for: imported.id))
+        let workingPDF = try XCTUnwrap(PDFDocument(url: workingURL))
+        let editedAnnotations = try XCTUnwrap(workingPDF.page(at: 0)).annotations
+        XCTAssertFalse(editedAnnotations.isEmpty)
+
         let exportResult = await model.makeFilesExportCopy(
             recordID: imported.id
         )
@@ -2214,6 +2274,13 @@ final class PaperPathTests: XCTestCase {
             try Data(contentsOf: exportURL),
             try Data(contentsOf: XCTUnwrap(model.url(for: imported.id)))
         )
+
+        let exportedPDF = try XCTUnwrap(PDFDocument(url: exportURL))
+        XCTAssertEqual(exportedPDF.pageCount, workingPDF.pageCount)
+        XCTAssertTrue(exportedPDF.string?.contains("Readable export") == true)
+        XCTAssertEqual(exportedPDF.page(at: 0)?.annotations.count, editedAnnotations.count)
+        XCTAssertEqual(try Data(contentsOf: source), originalBytes,
+                       "Exporting an edited working copy must preserve the imported source")
 
         await model.discardFilesExportCopy(at: exportURL)
         XCTAssertFalse(
@@ -3801,7 +3868,13 @@ final class PaperPathTests: XCTestCase {
             PDFQuickTask.safeShare.matchScore("sign") ?? 0
         )
         XCTAssertTrue(PDFQuickTask.fillForms.supports(form))
-        XCTAssertFalse(PDFQuickTask.fillForms.supports(scan))
+        XCTAssertTrue(PDFQuickTask.fillForms.supports(scan))
+        let plain = DocumentRecord(displayName: "Invoice", fileName: "invoice.pdf", profile: profile(kind: .text, pageCount: 1))
+        XCTAssertTrue(PDFQuickTask.fillForms.supports(plain))
+        XCTAssertEqual(PDFQuickTask.fillForms.compatibilityNote(for: plain), "Add fields to fill this PDF")
+        var locked = plain
+        locked.profile.isLocked = true
+        XCTAssertFalse(PDFQuickTask.fillForms.supports(locked))
         XCTAssertTrue(PDFQuickTask.recognizeText.supports(scan))
         XCTAssertFalse(PDFQuickTask.organizePages.supports(scan))
     }
@@ -4013,7 +4086,7 @@ final class PaperPathTests: XCTestCase {
                 for: source,
                 hasRecognizedText: false
             ).reason,
-            "Verified copy checked with a SHA-256 receipt."
+            "Export checked with a SHA-256 receipt."
         )
     }
 
@@ -4471,6 +4544,41 @@ final class PaperPathTests: XCTestCase {
     }
 
     @MainActor
+    func testPaidDownloadCreatesRepeatedAndBatchOutputsAfterOldTrialWasUsed() async throws {
+        let defaults = UserDefaults.standard
+        let keys = ["commerce.fullUnlock.cached", "commerce.verifiedOutputCount"]
+        let previous = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, previous) { defaults.set(value, forKey: key) } }
+        defaults.set(false, forKey: keys[0])
+        defaults.set(20, forKey: keys[1])
+        let firstURL = temporaryDirectory.appendingPathComponent("paid-first.pdf")
+        let secondURL = temporaryDirectory.appendingPathComponent("paid-second.pdf")
+        try makePDF(at: firstURL, pages: ["First paid app document"])
+        try makePDF(at: secondURL, pages: ["Second paid app document"])
+        let original = try Data(contentsOf: firstURL)
+        let model = PaperPathModel(store: DocumentStore(
+            rootURL: temporaryDirectory.appendingPathComponent("PaidModelStore")
+        ))
+        await model.bootstrap()
+        let firstImport = await model.importPDF(from: firstURL)
+        let secondImport = await model.importPDF(from: secondURL)
+        let first = try XCTUnwrap(firstImport)
+        let second = try XCTUnwrap(secondImport)
+        for _ in 0..<2 {
+            let result = await model.createSafeShareCopy(
+                recordID: first.id,
+                expectedContentRevisionID: first.contentRevisionID
+            )
+            XCTAssertNotNil(result)
+            XCTAssertTrue(result?.deliveryReceipt?.isDeliveryOutput == true)
+        }
+        let results = await model.createSafeShareBatch(recordIDs: [first.id, second.id], onUpdate: { _ in })
+        XCTAssertEqual(results.count, 2)
+        XCTAssertTrue(results.allSatisfy { $0.stage.isShareable }, "\(results)")
+        XCTAssertEqual(try Data(contentsOf: firstURL), original)
+    }
+
+    @MainActor
     func testSafeShareCopyMarksSourceReadyAndCompleted() async throws {
         let source = temporaryDirectory.appendingPathComponent("ready.pdf")
         try makePDF(at: source, pages: ["Ready to deliver"])
@@ -4552,14 +4660,19 @@ final class PaperPathTests: XCTestCase {
         let sourceURL = try XCTUnwrap(model.url(for: imported.id))
         let outputURL = try XCTUnwrap(model.url(for: output.id))
 
-        XCTAssertTrue(PDFDocument(url: sourceURL)?.isLocked == true)
+        XCTAssertEqual(output.id, imported.id)
+        XCTAssertEqual(sourceURL, outputURL)
+        let versions = try await store.versions(for: imported.id)
+        let encryptedVersion = try XCTUnwrap(versions.first { $0.contentRevisionID == imported.contentRevisionID })
+        let encryptedURL = try await store.versionFileURL(snapshotID: encryptedVersion.id, recordID: imported.id)
+        XCTAssertTrue(PDFDocument(url: encryptedURL)?.isLocked == true)
         XCTAssertFalse(output.profile.isLocked)
         XCTAssertFalse(PDFDocument(url: outputURL)?.isEncrypted == true)
         XCTAssertEqual(output.deliveryReceipt?.operation, .unlocked)
         XCTAssertTrue(output.hasCurrentDeliveryReceipt)
         XCTAssertEqual(
             output.deliveryReceipt?.outcomeTitle,
-            "Editable copy ready"
+            "Password removed"
         )
         XCTAssertNil(model.verifiedShareTarget(for: output.id))
         XCTAssertNotEqual(
@@ -5791,5 +5904,51 @@ private func currentResidentMemory() -> UInt64 {
 private extension UInt64 {
     func saturatingSubtracting(_ other: UInt64) -> UInt64 {
         self >= other ? self - other : 0
+    }
+}
+
+@MainActor
+final class SupportPendingPersistenceTests: XCTestCase {
+    private let thread = SupportThread(id: "8C94C77A-37D1-4670-987D-C15D0E676A15",
+        conversationToken: String(repeating: "a", count: 64),
+        title: "Support persistence fixture", createdAt: "2026-11-03T00:00:00Z")
+
+    func testPendingConversationSurvivesFailedSaveAndCanRetry() throws {
+        var unavailable = true
+        var saved: [SupportThread] = []
+        let inbox = SupportInbox(loadThreads: { saved }, saveThread: { thread in
+            if unavailable { throw SupportFailure.storage }
+            saved = [thread]
+        })
+        inbox.pending = thread
+        inbox.savePending()
+        XCTAssertEqual(inbox.pending, thread)
+        XCTAssertNotNil(inbox.error)
+        XCTAssertTrue(saved.isEmpty)
+        // Reopening Support retries persistence without sending a new request.
+        inbox.load()
+        XCTAssertEqual(inbox.pending, thread)
+        unavailable = false
+        inbox.load()
+        XCTAssertNil(inbox.pending)
+        XCTAssertNil(inbox.error)
+        XCTAssertEqual(inbox.threads, [thread])
+    }
+
+    func testPendingConversationRemainsAvailableWhenReadbackFails() {
+        var unreadable = true
+        var writes = 0
+        let inbox = SupportInbox(loadThreads: {
+            if unreadable { throw SupportFailure.storage }
+            return [self.thread]
+        }, saveThread: { _ in writes += 1 })
+        inbox.pending = thread
+        inbox.savePending()
+        XCTAssertEqual(inbox.pending, thread)
+        XCTAssertEqual(writes, 1)
+        unreadable = false
+        inbox.savePending()
+        XCTAssertNil(inbox.pending)
+        XCTAssertEqual(inbox.threads, [thread])
     }
 }

@@ -4,12 +4,26 @@ import SwiftUI
 struct PaperPathApp: App {
     @StateObject private var model = PaperPathApp.makeModel()
     @StateObject private var appLock = AppLockController()
-    @StateObject private var purchase = PurchaseController()
     @AppStorage(AppLanguage.defaultsKey)
     private var languageCode = AppLanguage.system.rawValue
 
     private static func makeModel() -> PaperPathModel {
 #if DEBUG
+        if let fixtureArgument = ProcessInfo.processInfo.arguments.last(where: {
+            $0.hasPrefix("UITEST_DOCUMENT_LIFECYCLE=")
+        }), let fixtureID = UUID(uuidString: String(fixtureArgument.dropFirst("UITEST_DOCUMENT_LIFECYCLE=".count))),
+           let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            let root = documents.appendingPathComponent("DocumentLifecycleUITestFixtures")
+                .appendingPathComponent(fixtureID.uuidString)
+            return PaperPathModel(store: DocumentStore(rootURL: root),
+                                 signatureStore: SignatureStore(rootURL: root.appendingPathComponent("Signatures")))
+        }
+        if ProcessInfo.processInfo.arguments.contains("UITEST_COMPRESSION_FIXTURE"),
+           let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
+            return PaperPathModel(store: DocumentStore(
+                rootURL: documents.appendingPathComponent("CompressionUITestFixture")
+            ))
+        }
         if ProcessInfo.processInfo.arguments.contains("UITEST_POLISH_OCR"),
            let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
             return PaperPathModel(store: DocumentStore(
@@ -52,6 +66,21 @@ struct PaperPathApp: App {
                 )
             ))
         }
+        if let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("UITEST_HANDOFF_FIXTURE=") }),
+           let token = UUID(uuidString: String(argument.dropFirst("UITEST_HANDOFF_FIXTURE=".count))) {
+            let root = FileManager.default.temporaryDirectory.appendingPathComponent("PaperPathHandoffTests-\(token.uuidString)")
+            return PaperPathModel(store: DocumentStore(rootURL: root.appendingPathComponent("Documents")),
+                                  signatureStore: SignatureStore(rootURL: root.appendingPathComponent("Signatures")))
+        }
+        if ProcessInfo.processInfo.arguments.contains("UITEST_WORKFLOW_FIXTURE")
+            || ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+            let root = FileManager.default.temporaryDirectory
+                .appendingPathComponent("PaperPathWorkflowTestFixture", isDirectory: true)
+            return PaperPathModel(
+                store: DocumentStore(rootURL: root.appendingPathComponent("Documents")),
+                signatureStore: SignatureStore(rootURL: root.appendingPathComponent("Signatures"))
+            )
+        }
 #endif
         return PaperPathModel()
     }
@@ -60,6 +89,11 @@ struct PaperPathApp: App {
         AppPreferences.registerDefaults()
 #if DEBUG
         let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains(where: { $0.hasPrefix("UITEST_") }) {
+            // A failed replay test must not present the introduction in the
+            // next isolated fixture. Explicit replay still works after launch.
+            UserDefaults.standard.set(false, forKey: AppPreferences.onboardingReplayRequestedKey)
+        }
         if arguments.contains("UITEST_RESET_DEMO") {
             UserDefaults.standard.set(
                 "work",
@@ -78,7 +112,6 @@ struct PaperPathApp: App {
             appContent(initialRecordID: initialRecordID)
                 .environmentObject(model)
                 .environmentObject(appLock)
-                .environmentObject(purchase)
                 .environment(
                     \.locale,
                     AppLanguage(rawValue: languageCode)?.locale

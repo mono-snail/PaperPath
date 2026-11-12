@@ -1264,8 +1264,10 @@ struct PDFDeliveryAuditService: @unchecked Sendable {
         sourceURL: URL,
         outputURL: URL,
         operation: PDFDeliveryOperation,
+        compressionPreservesContent: Bool = false,
         unlockPassword: String? = nil,
-        timeAnchor: PDFOfficeTimeAnchor = .process
+        timeAnchor: PDFOfficeTimeAnchor = .process,
+        progress: @escaping PDFProgressHandler = { _ in }
     ) throws -> PDFDeliveryReceipt {
         try Task.checkCancellation()
         guard timeAnchor.evidenceIssuanceDate() != nil else {
@@ -1324,11 +1326,17 @@ struct PDFDeliveryAuditService: @unchecked Sendable {
         )
         let sourceSnapshot = try snapshot(
             of: sourceDocument,
-            options: comparisonOptions
+            options: comparisonOptions,
+            progress: { completed, total in
+                progress(0.4 * Double(completed) / Double(max(1, total)))
+            }
         )
         let outputSnapshot = try snapshot(
             of: outputDocument,
-            options: comparisonOptions
+            options: comparisonOptions,
+            progress: { completed, total in
+                progress(0.4 + 0.4 * Double(completed) / Double(max(1, total)))
+            }
         )
         let outputChangeReview = try changeReview(
             source: sourceSnapshot,
@@ -1416,7 +1424,7 @@ struct PDFDeliveryAuditService: @unchecked Sendable {
             )
         }
 
-        let regeneratesPageAppearance = operation == .compressed
+        let regeneratesPageAppearance = (operation == .compressed && !compressionPreservesContent)
             || operation == .redacted
             || operation == .flattened
             || operation == .safeShare
@@ -1444,12 +1452,10 @@ struct PDFDeliveryAuditService: @unchecked Sendable {
                     ? "\(outputSnapshot.annotationCount) editable annotations remain"
                     : "\(outputSnapshot.annotationCount) annotations retained",
                 status: regeneratesPageAppearance
-                    ? (
-                        outputSnapshot.annotationCount == 0
-                            ? .passed
-                            : .failed
-                    )
-                    : .notApplicable
+                    ? (outputSnapshot.annotationCount == 0 ? .passed : .failed)
+                    : compressionPreservesContent
+                        ? (outputSnapshot.annotationCount == sourceSnapshot.annotationCount ? .passed : .failed)
+                        : .notApplicable
             )
         )
 
@@ -1475,9 +1481,9 @@ struct PDFDeliveryAuditService: @unchecked Sendable {
                     detail: outputSnapshot.textCharacterCount == 0
                         ? "Compression converted pages to images"
                         : "Searchable text remains available",
-                    status: outputSnapshot.textCharacterCount == 0
-                        ? .warning
-                        : .passed
+                    status: compressionPreservesContent
+                        ? (outputSnapshot.textCharacterCount == sourceSnapshot.textCharacterCount ? .passed : .failed)
+                        : outputSnapshot.textCharacterCount == 0 ? .warning : .passed
                 )
             )
         } else if (

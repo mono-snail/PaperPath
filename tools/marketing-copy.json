@@ -136,7 +136,7 @@
       ],
       [
         "Is this a subscription?",
-        "No. The planned launch model is a US$9.99 one-time paid download, with no separate PaperPath Pro unlock. The App Store will show the local price when available."
+        "No. The planned launch model is a US$6.99 one-time paid download, with no separate PaperPath Pro unlock. The App Store will show the local price when available."
       ],
       [
         "Can I use it on Mac?",
@@ -188,7 +188,9 @@
         "The launch plan is a one-time paid App Store download. Apple manages payments, download history and refund requests. Download again using the Apple Account that purchased the app."
       ]
     ],
-    "heroAvailability": "Coming soon to the App Store · Planned launch price"
+    "heroAvailability": "Coming soon to the App Store · Planned launch price",
+    "heroIpadAlt": "Actual PaperPath iPad workspace displaying an original illustrated garden proposal with project facts and a budget table",
+    "heroPhoneAlt": "Actual PaperPath iPhone workspace displaying a fictional completed project approval with an example signature"
   },
   "zh-Hans": {
     "title": "PaperPath PDF — iPhone、iPad 本地合并、压缩与 OCR",
@@ -327,7 +329,7 @@
       ],
       [
         "需要订阅或再次解锁吗？",
-        "不需要。计划以 US$9.99 一次付费下载，不另设 PaperPath Pro 解锁。上架后可在 App Store 查看当地价格。"
+        "不需要。计划以 US$6.99 一次付费下载，不另设 PaperPath Pro 解锁。上架后可在 App Store 查看当地价格。"
       ],
       [
         "可以在 Mac 上用吗？",
@@ -379,7 +381,9 @@
         "首发计划为 App Store 一次付费下载。付款、下载历史与退款由 Apple 管理；重新下载时请使用原购买 Apple 账户。"
       ]
     ],
-    "heroAvailability": "即将登陆 App Store · 当前为计划首发价格"
+    "heroAvailability": "即将登陆 App Store · 当前为计划首发价格",
+    "heroIpadAlt": "PaperPath iPad 实际界面，展示含花园效果图、项目数据和预算表的原创方案 PDF",
+    "heroPhoneAlt": "PaperPath iPhone 实际界面，展示填写完整并带示例签名的虚构项目审批 PDF"
   },
   "zh-Hant": {
     "title": "PaperPath PDF — iPhone、iPad 本機合併、壓縮與 OCR",
@@ -518,7 +522,7 @@
       ],
       [
         "需要訂閱或再次解鎖嗎？",
-        "不需要。規劃以 US$9.99 一次付費下載，不另設 PaperPath Pro 解鎖。上架後可在 App Store 查看當地價格。"
+        "不需要。規劃以 US$6.99 一次付費下載，不另設 PaperPath Pro 解鎖。上架後可在 App Store 查看當地價格。"
       ],
       [
         "可以在 Mac 上用嗎？",
@@ -570,7 +574,9 @@
         "首發規劃為 App Store 一次付費下載。付款、下載記錄與退款由 Apple 管理；重新下載時請使用原購買 Apple 帳號。"
       ]
     ],
-    "heroAvailability": "即將登陸 App Store · 目前為預計首發價格"
+    "heroAvailability": "即將登陸 App Store · 目前為預計首發價格",
+    "heroIpadAlt": "PaperPath iPad 實際介面，展示含花園效果圖、專案數據和預算表的原創方案 PDF",
+    "heroPhoneAlt": "PaperPath iPhone 實際介面，展示填寫完整並附範例簽名的虛構專案審批 PDF"
   },
   "ja": {
     "title": "PaperPath — iPhone・iPadでオフラインPDF結合・圧縮・OCR",
@@ -709,7 +715,7 @@
       ],
       [
         "定期購読ですか？",
-        "いいえ。US$9.99の有料ダウンロードを予定しており、別途Pro解除はありません。地域の価格は公開後のApp Storeで表示します。"
+        "いいえ。US$6.99の有料ダウンロードを予定しており、別途Pro解除はありません。地域の価格は公開後のApp Storeで表示します。"
       ],
       [
         "Macで使えますか？",
@@ -761,7 +767,9 @@
         "有料ダウンロードを予定しています。支払い、購入履歴、返金はAppleが管理します。購入に使ったApple Accountで再ダウンロードしてください。"
       ]
     ],
-    "heroAvailability": "App Storeで近日公開 · 予定の発売価格"
+    "heroAvailability": "App Storeで近日公開 · 予定の発売価格",
+    "heroIpadAlt": "図版、プロジェクト概要、予算表を含むオリジナル提案書を表示した実際のiPad画面",
+    "heroPhoneAlt": "記入済みの架空の承認書とサンプル署名を表示した実際のiPhone画面"
   },
   "ko": {
     "title": "PaperPath — iPhone·iPad 오프라인 PDF 병합·압축·OCR",
@@ -900,7 +908,7 @@
       ],
       [
         "구독이 필요한가요?",
-        "아니요. US$9.99 유료 다운로드로 출시할 예정이며 별도 Pro 잠금 해제는 없습니다. 지역 가격은 출시 후 App Store에서 표시합니다."
+        "아니요. US$6.99 유료 다운로드로 출시할 예정이며 별도 Pro 잠금 해제는 없습니다. 지역 가격은 출시 후 App Store에서 표시합니다."
       ],
       [
         "Mac에서 사용할 수 있나요?",
@@ -952,6 +960,8 @@
         "일회성 유료 다운로드로 출시할 예정입니다. 결제, 구매 기록과 환불은 Apple이 관리합니다. 구매한 Apple Account로 다시 다운로드하세요."
       ]
     ],
-    "heroAvailability": "App Store 출시 예정 · 계획된 출시 가격"
+    "heroAvailability": "App Store 출시 예정 · 계획된 출시 가격",
+    "heroIpadAlt": "정원 일러스트, 프로젝트 데이터와 예산표가 담긴 제안서를 표시한 실제 iPad 화면",
+    "heroPhoneAlt": "작성된 가상 프로젝트 승인서와 예시 서명을 표시한 실제 iPhone 화면"
   }
 }
